@@ -10,6 +10,7 @@
 #include <mutex>
 #include <queue>
 #include <condition_variable>
+#include "VisionModule.h"
 
 JavaVM* g_jvm = nullptr;
 
@@ -20,11 +21,6 @@ JNIEXPORT jint JNI_OnLoad(JavaVM* vm, void* reserved) {
 
 #define TAG "NavSight-Native"
 
-struct GyroReading {
-    long timestamp;
-    float x, y, z;
-};
-
 // --- Threading and Data Synchronization ---
 std::thread vio_thread;
 std::mutex vio_mutex;
@@ -32,7 +28,7 @@ std::condition_variable vio_cv;
 bool running = false;
 
 struct CamFrame {
-    long timestamp;
+    jlong timestamp;
     cv::Mat yuvMat;
     int width;
     int height;
@@ -42,10 +38,6 @@ struct CamFrame {
 std::queue<CamFrame> frame_queue;
 std::mutex frame_queue_mutex;
 
-std::queue<GyroReading> gyro_queue;
-std::mutex gyro_queue_mutex;
-
-std::queue<cv::Point3f> accel_queue;
 std::mutex accel_queue_mutex;
 
 // Latest calculated pose (protected by vio_mutex)
@@ -53,13 +45,16 @@ cv::Mat latest_global_R = cv::Mat::eye(3, 3, CV_64F);
 cv::Mat latest_global_t = cv::Mat::zeros(3, 1, CV_64F);
 std::vector<float> latest_points;
 
+// Latest IMU readings (protected by their respective mutexes)
+std::mutex latest_imu_mutex;
+float latest_accel_x = 0.0f, latest_accel_y = 0.0f, latest_accel_z = 0.0f;
+float latest_gyro_x = 0.0f, latest_gyro_y = 0.0f, latest_gyro_z = 0.0f;
+
 
 // --- VIO State Variables (used only by VIO thread) ---
-static cv::Mat prevGray;
-static std::vector<cv::Point2f> prevCorners;
+static navsight::VisionModule* vision_module = nullptr;
 static cv::Mat global_R = cv::Mat::eye(3, 3, CV_64F);
 static cv::Mat global_t = cv::Mat::zeros(3, 1, CV_64F);
-static long prev_timestamp = 0;
 static double g_scale = 1.0;
 
 // Buffer for accel data for reset
@@ -84,6 +79,20 @@ cv::Vec3d rotationMatrixToEulerAngles(const cv::Mat &R) {
 }
 
 void vio_thread_loop() {
+    // Initialize VisionModule
+    if (!vision_module) {
+        try {
+            vision_module = new navsight::VisionModule(navsight::FeatureDetectorType::GOOD_FEATURES, 200);
+            __android_log_print(ANDROID_LOG_INFO, TAG, "VisionModule created successfully");
+        } catch (const std::exception& e) {
+            __android_log_print(ANDROID_LOG_ERROR, TAG, "Failed to create VisionModule: %s", e.what());
+            return;
+        } catch (...) {
+            __android_log_print(ANDROID_LOG_ERROR, TAG, "Failed to create VisionModule: unknown error");
+            return;
+        }
+    }
+
     while (running) {
         CamFrame frame;
         {
@@ -94,118 +103,81 @@ void vio_thread_loop() {
             frame_queue.pop();
         }
 
-        __android_log_print(ANDROID_LOG_INFO, TAG, "VIO Thread: Processing frame %ld", frame.timestamp);
+        __android_log_print(ANDROID_LOG_INFO, TAG, "VIO Thread: Processing frame %ld", (long)frame.timestamp);
 
-        // --- Main VIO Logic ---
-        cv::Mat grayMat;
-        cv::cvtColor(frame.yuvMat, grayMat, cv::COLOR_YUV2GRAY_NV21);
-
-        if (prevGray.empty()) {
-            cv::goodFeaturesToTrack(grayMat, prevCorners, 200, 0.01, 10);
-            grayMat.copyTo(prevGray);
-            prev_timestamp = frame.timestamp;
-            __android_log_print(ANDROID_LOG_DEBUG, TAG, "VIO Thread: First frame, detected %zu features.", prevCorners.size());
+        // Safety check
+        if (!vision_module) {
+            __android_log_print(ANDROID_LOG_ERROR, TAG, "VisionModule is null!");
             continue;
         }
 
-        // Gyro Integration
-        cv::Mat delta_R_from_gyro = cv::Mat::eye(3, 3, CV_64F);
-        long last_gyro_ts = prev_timestamp;
-        std::queue<GyroReading> temp_gyro_queue;
-        {
-            std::lock_guard<std::mutex> lock(gyro_queue_mutex);
-            temp_gyro_queue = gyro_queue;
-            while(!gyro_queue.empty()) gyro_queue.pop();
+        // Process frame using VisionModule
+        navsight::VisionOutput vision_output;
+        try {
+            vision_output = vision_module->processFrame(
+                frame.yuvMat.data,
+                frame.width,
+                frame.height,
+                frame.timestamp
+            );
+        } catch (const std::exception& e) {
+            __android_log_print(ANDROID_LOG_ERROR, TAG, "processFrame failed: %s", e.what());
+            continue;
         }
-        while(!temp_gyro_queue.empty()) {
-            GyroReading reading = temp_gyro_queue.front();
-            temp_gyro_queue.pop();
-            if (reading.timestamp > last_gyro_ts) {
-                double dt = (reading.timestamp - last_gyro_ts) / 1e9;
-                cv::Mat rot_vec = (cv::Mat_<double>(3, 1) << reading.x * dt, reading.y * dt, reading.z * dt);
-                cv::Mat delta_R;
-                cv::Rodrigues(rot_vec, delta_R);
-                delta_R_from_gyro = delta_R * delta_R_from_gyro;
-                last_gyro_ts = reading.timestamp;
-            }
-        }
-
-        // Optical Flow
-        std::vector<cv::Point2f> nextCorners;
-        std::vector<uchar> status;
-        std::vector<float> err;
-        cv::calcOpticalFlowPyrLK(prevGray, grayMat, prevCorners, nextCorners, status, err);
-
-        std::vector<cv::Point2f> good_prev_corners, good_next_corners;
-        for (size_t i = 0; i < status.size(); i++) {
-            if (status[i]) {
-                good_prev_corners.push_back(prevCorners[i]);
-                good_next_corners.push_back(nextCorners[i]);
-            }
-        }
-        __android_log_print(ANDROID_LOG_DEBUG, TAG, "VIO Thread: Features tracked: %zu / %zu", good_prev_corners.size(), prevCorners.size());
 
         // Prepare points for UI
         std::vector<float> points_for_ui;
-        points_for_ui.reserve(good_next_corners.size() * 2);
-        for(const auto& p : good_next_corners) {
+        points_for_ui.reserve(vision_output.tracked_points.size() * 2);
+        for(const auto& p : vision_output.tracked_points) {
             points_for_ui.push_back(p.x);
             points_for_ui.push_back(p.y);
         }
 
-        if (good_prev_corners.size() > 5) {
-            cv::Mat E, R, t;
-            double focal = frame.width;
-            cv::Point2d principal_point(frame.width / 2.0, frame.height / 2.0);
-            cv::Mat K = (cv::Mat_<double>(3, 3) << focal, 0, principal_point.x, 0, focal, principal_point.y, 0, 0, 1);
-            E = cv::findEssentialMat(good_next_corners, good_prev_corners, K, cv::RANSAC, 0.999, 1.0, cv::noArray());
+        // Update global pose if vision output is valid
+        if (vision_output.is_valid) {
+            std::lock_guard<std::mutex> lock(vio_mutex);
 
-            if (!E.empty()) {
-                __android_log_print(ANDROID_LOG_INFO, TAG, "Essential Matrix found!");
-                cv::recoverPose(E, good_next_corners, good_prev_corners, K, R, t, cv::noArray());
-                const double alpha = 0.98;
-                cv::Mat rot_vec_vo, rot_vec_gyro;
-                cv::Rodrigues(R, rot_vec_vo);
-                cv::Rodrigues(delta_R_from_gyro, rot_vec_gyro);
-                cv::Mat rot_vec_fused = alpha * rot_vec_gyro + (1.0 - alpha) * rot_vec_vo;
-                cv::Mat R_fused;
-                cv::Rodrigues(rot_vec_fused, R_fused);
-
-                std::lock_guard<std::mutex> lock(vio_mutex);
-                global_t = global_t + (g_scale * (global_R * t));
-                global_R = R_fused * global_R;
-                latest_global_t = global_t.clone();
-                latest_global_R = global_R.clone();
-                latest_points = points_for_ui;
-            } else {
-                __android_log_print(ANDROID_LOG_WARN, TAG, "Essential Matrix not found.");
-                std::lock_guard<std::mutex> lock(vio_mutex);
-                latest_points = points_for_ui;
+            // Get estimated scale from VisionModule (or use manual scale if not estimated yet)
+            double scale_to_use = vision_module->getEstimatedScale();
+            if (scale_to_use < 0.01) {
+                scale_to_use = g_scale;  // Fall back to manual scale if auto-scale not ready
             }
+
+            // Update global translation: t_global = t_global + scale * (R_global * t_relative)
+            global_t = global_t + (scale_to_use * (global_R * vision_output.translation));
+
+            // Update global rotation: R_global = R_relative * R_global
+            global_R = vision_output.rotation * global_R;
+
+            latest_global_t = global_t.clone();
+            latest_global_R = global_R.clone();
+            latest_points = points_for_ui;
+
+            __android_log_print(ANDROID_LOG_DEBUG, TAG,
+                "Pose updated - Position: (%.2f, %.2f, %.2f), Quality: %.2f, Scale: %.3f",
+                global_t.at<double>(0), global_t.at<double>(1), global_t.at<double>(2),
+                vision_output.tracking_quality, scale_to_use);
         } else {
             std::lock_guard<std::mutex> lock(vio_mutex);
             latest_points = points_for_ui;
+
+            __android_log_print(ANDROID_LOG_DEBUG, TAG,
+                "Vision output not valid - Tracked: %d/%d",
+                vision_output.tracked_features, vision_output.total_features);
         }
-        grayMat.copyTo(prevGray);
-        prevCorners = good_next_corners;
-        if (prevCorners.size() < 100) {
-            std::vector<cv::Point2f> new_corners;
-            cv::goodFeaturesToTrack(grayMat, new_corners, 200 - prevCorners.size(), 0.01, 10);
-            prevCorners.insert(prevCorners.end(), new_corners.begin(), new_corners.end());
-        }
-        prev_timestamp = frame.timestamp;
+    }
+
+    // Log statistics when thread exits
+    if (vision_module) {
+        auto stats = vision_module->getStatistics();
+        __android_log_print(ANDROID_LOG_INFO, TAG,
+            "VisionModule Stats - Frames: %d, Success: %d, Avg Features: %.1f, Avg Quality: %.2f",
+            stats.total_frames_processed, stats.successful_tracks,
+            stats.average_features_tracked, stats.average_tracking_quality);
     }
 }
 
 extern "C" {
-
-JNIEXPORT jstring JNICALL
-Java_com_example_navsight1_MainActivity_stringFromJNI(
-        JNIEnv* env,
-        jobject /* this */) {
-    std::string hello = "NATIVE CODE VERSION 2";
-    return env->NewStringUTF(hello.c_str());
-}
 
 JNIEXPORT void JNICALL
 Java_com_example_navsight1_MainActivity_startVIO(JNIEnv *env, jobject /* this */) {
@@ -223,6 +195,14 @@ Java_com_example_navsight1_MainActivity_stopVIO(JNIEnv *env, jobject /* this */)
     if (vio_thread.joinable()) {
         vio_thread.join();
     }
+
+    // Clean up VisionModule
+    if (vision_module) {
+        delete vision_module;
+        vision_module = nullptr;
+        __android_log_print(ANDROID_LOG_INFO, TAG, "VisionModule destroyed");
+    }
+
     __android_log_print(ANDROID_LOG_INFO, TAG, "VIO thread stopped.");
 }
 
@@ -252,17 +232,45 @@ Java_com_example_navsight1_MainActivity_processCameraFrame(
     }
 
     jclass vioDataClass = jni_env->FindClass("com/example/navsight1/VioData");
-    jmethodID vioDataConstructor = jni_env->GetMethodID(vioDataClass, "<init>", "(DDDDDD[F)V");
-    
+    jmethodID vioDataConstructor = jni_env->GetMethodID(vioDataClass, "<init>", "(DDDDDD[FDIIDZFFFFFF)V");
+
     cv::Mat current_R, current_t;
     std::vector<float> current_points;
+    double tracking_quality = 0.0;
+    int tracked_features = 0;
+    int total_features = 0;
+    double estimated_scale = 1.0;
+    bool is_initialized = false;
+
     {
         std::lock_guard<std::mutex> lock(vio_mutex);
         current_R = latest_global_R.clone();
         current_t = latest_global_t.clone();
         current_points = latest_points;
+
+        // Get VisionModule stats if available
+        if (vision_module) {
+            auto stats = vision_module->getStatistics();
+            tracking_quality = stats.average_tracking_quality;
+            tracked_features = (int)stats.average_features_tracked;
+            total_features = 200; // max_features
+            estimated_scale = vision_module->getEstimatedScale();
+            is_initialized = vision_module->isInitialized();
+        }
     }
     cv::Vec3d eulerAngles = rotationMatrixToEulerAngles(current_R);
+
+    // Get latest IMU readings
+    float accel_x, accel_y, accel_z, gyro_x, gyro_y, gyro_z;
+    {
+        std::lock_guard<std::mutex> lock(latest_imu_mutex);
+        accel_x = latest_accel_x;
+        accel_y = latest_accel_y;
+        accel_z = latest_accel_z;
+        gyro_x = latest_gyro_x;
+        gyro_y = latest_gyro_y;
+        gyro_z = latest_gyro_z;
+    }
 
     jfloatArray pointsArray = jni_env->NewFloatArray(current_points.size());
     if (pointsArray != nullptr && !current_points.empty()) {
@@ -271,7 +279,9 @@ Java_com_example_navsight1_MainActivity_processCameraFrame(
 
     jobject result = jni_env->NewObject(vioDataClass, vioDataConstructor,
                           current_t.at<double>(0), current_t.at<double>(1), current_t.at<double>(2),
-                          eulerAngles[0], eulerAngles[1], eulerAngles[2], pointsArray);
+                          eulerAngles[0], eulerAngles[1], eulerAngles[2], pointsArray,
+                          tracking_quality, tracked_features, total_features, estimated_scale, is_initialized,
+                          accel_x, accel_y, accel_z, gyro_x, gyro_y, gyro_z);
 
     if (attached) {
         g_jvm->DetachCurrentThread();
@@ -283,11 +293,33 @@ Java_com_example_navsight1_MainActivity_processCameraFrame(
 JNIEXPORT void JNICALL
 Java_com_example_navsight1_MainActivity_processAccelerometer(
         JNIEnv* env, jobject /* this */, jlong timestamp, jfloat x, jfloat y, jfloat z) {
-    
-    std::lock_guard<std::mutex> lock(accel_queue_mutex);
-    accel_buffer_for_reset.push_back(cv::Point3f(x, y, z));
-    if (accel_buffer_for_reset.size() > ACCEL_BUFFER_SIZE) {
-        accel_buffer_for_reset.erase(accel_buffer_for_reset.begin());
+
+    // Store latest reading for display
+    {
+        std::lock_guard<std::mutex> lock(latest_imu_mutex);
+        latest_accel_x = x;
+        latest_accel_y = y;
+        latest_accel_z = z;
+    }
+
+    // Store for reset functionality
+    {
+        std::lock_guard<std::mutex> lock(accel_queue_mutex);
+        accel_buffer_for_reset.push_back(cv::Point3f(x, y, z));
+        if (accel_buffer_for_reset.size() > ACCEL_BUFFER_SIZE) {
+            accel_buffer_for_reset.erase(accel_buffer_for_reset.begin());
+        }
+    }
+
+    // Pass to VisionModule for scale estimation and initialization
+    // Check if VIO is running before accessing vision_module
+    if (running && vision_module) {
+        navsight::AccelData accel;
+        accel.timestamp_ns = timestamp;
+        accel.x = x;
+        accel.y = y;
+        accel.z = z;
+        vision_module->addAccelData(accel);
     }
 }
 
@@ -298,7 +330,7 @@ Java_com_example_navsight1_MainActivity_resetVIO(JNIEnv *env, jobject /* this */
         __android_log_print(ANDROID_LOG_WARN, TAG, "Reset VIO called, but accel buffer is empty.");
         return;
     }
-    
+
     cv::Point3f avg_accel(0, 0, 0);
     {
         std::lock_guard<std::mutex> accel_lock(accel_queue_mutex);
@@ -318,20 +350,40 @@ Java_com_example_navsight1_MainActivity_resetVIO(JNIEnv *env, jobject /* this */
     double pitch = atan2(-avg_accel.x, sqrt(avg_accel.y * avg_accel.y + avg_accel.z * avg_accel.z)) * 180.0 / M_PI;
     __android_log_print(ANDROID_LOG_INFO, TAG, "VIO Reset. Initial orientation: Roll=%.2f, Pitch=%.2f", roll, pitch);
 
+    // Reset global pose
     global_R = cv::Mat::eye(3, 3, CV_64F);
     global_t = cv::Mat::zeros(3, 1, CV_64F);
     latest_global_R = global_R.clone();
     latest_global_t = global_t.clone();
     latest_points.clear();
-    prevGray.release();
-    prevCorners.clear();
+
+    // Reset VisionModule
+    if (vision_module) {
+        vision_module->reset();
+    }
 }
 
 JNIEXPORT void JNICALL
 Java_com_example_navsight1_MainActivity_processGyroscope(
         JNIEnv* env, jobject /* this */, jlong timestamp, jfloat x, jfloat y, jfloat z) {
-    std::lock_guard<std::mutex> lock(gyro_queue_mutex);
-    gyro_queue.push({timestamp, x, y, z});
+    // Store latest reading for display
+    {
+        std::lock_guard<std::mutex> lock(latest_imu_mutex);
+        latest_gyro_x = x;
+        latest_gyro_y = y;
+        latest_gyro_z = z;
+    }
+
+    // Pass gyro data to VisionModule for sensor fusion
+    // Check if VIO is running before accessing vision_module
+    if (running && vision_module) {
+        navsight::GyroData gyro;
+        gyro.timestamp_ns = timestamp;
+        gyro.x = x;
+        gyro.y = y;
+        gyro.z = z;
+        vision_module->addGyroData(gyro);
+    }
 }
 
 JNIEXPORT void JNICALL
