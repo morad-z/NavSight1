@@ -7,7 +7,19 @@ data class VioData(
     val roll: Double = 0.0,
     val pitch: Double = 0.0,
     val yaw: Double = 0.0,
-    val trackedPoints: FloatArray = floatArrayOf()
+    val trackedPoints: FloatArray = floatArrayOf(),
+    val trackingQuality: Double = 0.0,
+    val trackedFeatures: Int = 0,
+    val totalFeatures: Int = 0,
+    val estimatedScale: Double = 1.0,
+    val isInitialized: Boolean = false,
+    // Raw IMU data
+    val accelX: Float = 0.0f,
+    val accelY: Float = 0.0f,
+    val accelZ: Float = 0.0f,
+    val gyroX: Float = 0.0f,
+    val gyroY: Float = 0.0f,
+    val gyroZ: Float = 0.0f
 ) {
     override fun equals(other: Any?): Boolean {
         if (this === other) return true
