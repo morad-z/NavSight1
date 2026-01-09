@@ -22,7 +22,7 @@ JNI/Bridge Layer (Kotlin/Java & C++): The interface between the high-level Andro
 
 VIO Engine Layer (C++ with OpenCV): The core intelligence. Processes raw camera frames and IMU data to calculate the device's 6-DOF (Degrees of Freedom) pose (position x,y,z and orientation roll, pitch, yaw).
 
-Google Maps Layer (Kotlin/Java): Displays and updates the user's position and heading on a map.
+Google Maps Layer (Kotlin/Java): Provides a real-time, navigation-style map view that follows the user's calculated position and orientation.
 
 Part 3: Detailed Implementation Requirements (Phase-by-Phase)
 Phase 1: Project Setup & Raw Sensor Data Acquisition

@@ -43,6 +43,7 @@ android {
     }
     buildFeatures {
         compose = true
+        buildConfig = true
         // This is the feature that allows CMake to see our remote C++ libraries.
         prefab = true
     }
@@ -76,6 +77,9 @@ dependencies {
     implementation("com.google.maps.android:maps-compose:2.11.4")
     implementation("com.google.android.gms:play-services-maps:18.2.0")
     implementation("com.google.android.gms:play-services-location:21.0.1")
+
+    // Google Places API for address search
+    implementation("com.google.android.libraries.places:places:3.3.0")
 
     // Accompanist for Permissions
     implementation("com.google.accompanist:accompanist-permissions:0.32.0")
