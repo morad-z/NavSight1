@@ -25,6 +25,8 @@
 #include <opencv2/features2d.hpp>
 #include <vector>
 #include <mutex>
+#include <atomic>
+#include "IMUPreintegrator.h"
 
 namespace navsight {
 
@@ -176,6 +178,7 @@ public:
     /**
      * Check if module is initialized with gravity
      */
+    bool isInitialized() const { return is_initialized_.load(); }
     bool isInitialized() const { return is_initialized_; }
 
     /**
@@ -204,6 +207,9 @@ private:
     std::vector<AccelData> accel_buffer_;
     std::mutex accel_mutex_;
 
+    // IMU Preintegrator (handles sensor fusion)
+    IMUPreintegrator imu_preintegrator_;
+
     // Fusion parameters
     float gyro_fusion_weight_;  // Default: 0.98 (98% gyro, 2% vision)
 
@@ -215,6 +221,8 @@ private:
     double estimated_scale_;
     cv::Point3f gravity_direction_;
 
+    // Initialization state (atomic for thread-safe double-checked locking)
+    std::atomic<bool> is_initialized_;
     // Initialization state
     bool is_initialized_;
 
