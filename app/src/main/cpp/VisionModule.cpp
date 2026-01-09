@@ -310,6 +310,25 @@ VisionOutput VisionModule::processFrame(
     // Set output
     output.rotation = R_fused;
     output.translation = t_scaled;  // Now includes scale
+    // Estimate scale from accelerometer if we have data
+    long dt_ns = timestamp_ns - prev_timestamp_ns_;
+    if (is_initialized_ && dt_ns > 0 && dt_ns < 1000000000) {  // Sanity check: < 1 second
+        try {
+            estimateScaleFromAccel(t_vision, dt_ns);
+        } catch (const std::exception& e) {
+            __android_log_print(ANDROID_LOG_ERROR, TAG, "Scale estimation failed: %s", e.what());
+        }
+    }
+
+    // Integrate gyroscope data if available
+    cv::Mat R_gyro = integrateGyro(prev_timestamp_ns_, timestamp_ns);
+
+    // Fuse vision and gyro rotations
+    cv::Mat R_fused = fuseRotations(R_vision, R_gyro);
+
+    // Set output (translation is unit-less, scale should be applied externally)
+    output.rotation = R_fused;
+    output.translation = t_vision;
     output.is_valid = true;
 
     __android_log_print(ANDROID_LOG_INFO, TAG,
@@ -400,6 +419,15 @@ void VisionModule::addGyroData(const GyroData& gyro) {
         __android_log_print(ANDROID_LOG_DEBUG, TAG,
             "Added gyro measurement (count=%d, buffer_size=%zu, matched=%d)",
             gyro_count, imu_preintegrator_.getBufferSize(), have_matching_accel);
+    std::lock_guard<std::mutex> lock(gyro_mutex_);
+
+    // Add to buffer
+    gyro_buffer_.push_back(gyro);
+
+    // Keep buffer size reasonable (last 1 second at 100Hz = 100 samples)
+    const size_t MAX_GYRO_BUFFER_SIZE = 100;
+    if (gyro_buffer_.size() > MAX_GYRO_BUFFER_SIZE) {
+        gyro_buffer_.erase(gyro_buffer_.begin());
     }
 }
 
@@ -418,6 +446,8 @@ void VisionModule::addAccelData(const AccelData& accel) {
 
         // Add transformed data to buffer
         accel_buffer_.push_back(accel_camera_frame);
+        // Add to buffer
+        accel_buffer_.push_back(accel);
 
         // Keep buffer size reasonable (last 1 second at 100Hz = 100 samples)
         const size_t MAX_ACCEL_BUFFER_SIZE = 100;
@@ -675,12 +705,39 @@ bool VisionModule::initializeFromGravity() {
     }
 
     // --- 4. If stationary, proceed with initialization ---
+    cv::Point3f avg_accel(0, 0, 0);
+    size_t buffer_size = 0;
+
+    {
+        std::lock_guard<std::mutex> lock(accel_mutex_);
+
+        if (accel_buffer_.empty()) {
+            return false;
+        }
+
+        // Average accelerometer readings to get gravity direction
+        for (const auto& accel : accel_buffer_) {
+            avg_accel.x += accel.x;
+            avg_accel.y += accel.y;
+            avg_accel.z += accel.z;
+        }
+        buffer_size = accel_buffer_.size();
+    }
+
+    avg_accel.x /= buffer_size;
+    avg_accel.y /= buffer_size;
+    avg_accel.z /= buffer_size;
+
+    // Normalize to get gravity direction
     float norm = std::sqrt(avg_accel.x * avg_accel.x +
                           avg_accel.y * avg_accel.y +
                           avg_accel.z * avg_accel.z);
 
     if (norm < 8.0f || norm > 12.0f) {
         __android_log_print(ANDROID_LOG_WARN, TAG, "Cannot initialize: gravity magnitude %.2f m/s^2 is unreasonable (variance was low)", norm);
+        // Unreasonable gravity magnitude, device might be moving
+        __android_log_print(ANDROID_LOG_WARN, TAG,
+            "Cannot initialize: gravity magnitude %.2f m/s^2 is unreasonable", norm);
         return false;
     }
 
@@ -696,6 +753,9 @@ bool VisionModule::initializeFromGravity() {
 
     __android_log_print(ANDROID_LOG_INFO, TAG, "VIO Initialized from Gravity: direction=(%.3f, %.3f, %.3f), mag=%.2f, variance=%.3f",
                         gravity_direction_.x, gravity_direction_.y, gravity_direction_.z, norm, variance);
+    __android_log_print(ANDROID_LOG_INFO, TAG,
+        "Initialized from gravity: direction = (%.3f, %.3f, %.3f)",
+        gravity_direction_.x, gravity_direction_.y, gravity_direction_.z);
 
     return true;
 }
