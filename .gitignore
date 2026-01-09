@@ -13,3 +13,18 @@
 .externalNativeBuild
 .cxx
 local.properties
+
+# Ignore Android Studio generated files
+*.apk
+*.ap_
+*.aab
+
+# Ignore OpenCV SDK build files
+/OpenCV-android-sdk/sdk/build/
+
+# Ignore local notes and logs
+*.md
+*.txt
+
+# Ignore Claude files
+.claude/

@@ -238,25 +238,78 @@ VisionOutput VisionModule::processFrame(
     // Calculate tracking quality based on inliers
     output.tracking_quality = calculateTrackingQuality(good_prev_corners, good_next_corners, status);
 
-    // Estimate scale from accelerometer if we have data
+    // Use IMU preintegration for better sensor fusion
     long dt_ns = timestamp_ns - prev_timestamp_ns_;
+    cv::Mat R_fused = R_vision.clone();
+    cv::Mat t_scaled = t_vision.clone();
+
+    __android_log_print(ANDROID_LOG_DEBUG, TAG,
+        "Preintegration check: initialized=%d, dt_ns=%ld, buffer_size=%zu",
+        is_initialized_.load(), dt_ns, imu_preintegrator_.getBufferSize());
+
     if (is_initialized_ && dt_ns > 0 && dt_ns < 1000000000) {  // Sanity check: < 1 second
         try {
-            estimateScaleFromAccel(t_vision, dt_ns);
+            // Get preintegrated IMU measurements between frames
+            PreintegratedIMU preint = imu_preintegrator_.integrate(prev_timestamp_ns_, timestamp_ns);
+
+            __android_log_print(ANDROID_LOG_DEBUG, TAG,
+                "Preintegration result: %d measurements, dt=%.3fs",
+                preint.num_measurements, preint.dt);
+
+            if (preint.num_measurements > 0) {
+                // Use IMU rotation (more accurate than vision for fast motion)
+                R_fused = fuseRotations(R_vision, preint.delta_R);
+
+                // Estimate scale from IMU position displacement
+                double vision_displacement = cv::norm(t_vision);
+                double imu_displacement = cv::norm(preint.delta_p);
+
+                __android_log_print(ANDROID_LOG_DEBUG, TAG,
+                    "Displacement check: vision=%.4fm, imu=%.4fm",
+                    vision_displacement, imu_displacement);
+
+                if (vision_displacement > 0.01 && imu_displacement > 0.001) {
+                    double scale = imu_displacement / vision_displacement;
+
+                    __android_log_print(ANDROID_LOG_DEBUG, TAG,
+                        "Scale computed: %.3f (range check: 0.1 to 10.0)",
+                        scale);
+
+                    // Sanity check and smooth scale estimate
+                    if (scale > 0.1 && scale < 10.0) {
+                        // Weighted average with previous scale for stability
+                        estimated_scale_ = 0.7 * estimated_scale_ + 0.3 * scale;
+                        scale_initialized_ = true;
+
+                        __android_log_print(ANDROID_LOG_DEBUG, TAG,
+                            "IMU Preintegration: displacement=%.3fm, scale=%.3f (smoothed=%.3f)",
+                            imu_displacement, scale, estimated_scale_);
+                    } else {
+                        __android_log_print(ANDROID_LOG_WARN, TAG,
+                            "Scale %.3f outside valid range [0.1, 10.0]", scale);
+                    }
+                } else {
+                    __android_log_print(ANDROID_LOG_WARN, TAG,
+                        "Displacement too small: vision=%.4f, imu=%.4f (thresholds: 0.01, 0.001)",
+                        vision_displacement, imu_displacement);
+                }
+            } else {
+                __android_log_print(ANDROID_LOG_DEBUG, TAG,
+                    "No IMU measurements in time window, using fallback");
+            }
         } catch (const std::exception& e) {
-            __android_log_print(ANDROID_LOG_ERROR, TAG, "Scale estimation failed: %s", e.what());
+            __android_log_print(ANDROID_LOG_ERROR, TAG, "IMU preintegration failed: %s", e.what());
+            // Fallback to vision-only
+            R_fused = R_vision.clone();
         }
     }
 
-    // Integrate gyroscope data if available
-    cv::Mat R_gyro = integrateGyro(prev_timestamp_ns_, timestamp_ns);
+    // Apply scale to translation
+    t_scaled = t_vision * estimated_scale_;
 
-    // Fuse vision and gyro rotations
-    cv::Mat R_fused = fuseRotations(R_vision, R_gyro);
-
-    // Set output (translation is unit-less, scale should be applied externally)
+    // Set output
     output.rotation = R_fused;
-    output.translation = t_vision;
+    output.translation = t_scaled;  // Now includes scale
     output.is_valid = true;
 
     __android_log_print(ANDROID_LOG_INFO, TAG,
@@ -301,26 +354,70 @@ VisionOutput VisionModule::processFrame(
 }
 
 void VisionModule::addGyroData(const GyroData& gyro) {
-    std::lock_guard<std::mutex> lock(gyro_mutex_);
+    // Transform from Android sensor frame to camera frame (X right, Y down, Z forward)
+    GyroData gyro_camera_frame;
+    gyro_camera_frame.timestamp_ns = gyro.timestamp_ns;
+    gyro_camera_frame.x = gyro.x;
+    gyro_camera_frame.y = -gyro.y;
+    gyro_camera_frame.z = -gyro.z;
 
-    // Add to buffer
-    gyro_buffer_.push_back(gyro);
+    {
+        std::lock_guard<std::mutex> lock(gyro_mutex_);
 
-    // Keep buffer size reasonable (last 1 second at 100Hz = 100 samples)
-    const size_t MAX_GYRO_BUFFER_SIZE = 100;
-    if (gyro_buffer_.size() > MAX_GYRO_BUFFER_SIZE) {
-        gyro_buffer_.erase(gyro_buffer_.begin());
+        // Add transformed data to buffer (kept for backward compatibility with old integration)
+        gyro_buffer_.push_back(gyro_camera_frame);
+
+        // Keep buffer size reasonable (last 1 second at 100Hz = 100 samples)
+        const size_t MAX_GYRO_BUFFER_SIZE = 100;
+        if (gyro_buffer_.size() > MAX_GYRO_BUFFER_SIZE) {
+            gyro_buffer_.erase(gyro_buffer_.begin());
+        }
+    }
+
+    // Feed to IMU preintegrator only if we have a recent, matching accel measurement
+    cv::Vec3d accel_vec;
+    bool have_matching_accel = false;
+    {
+        std::lock_guard<std::mutex> lock(accel_mutex_);
+        if (!accel_buffer_.empty()) {
+            // Use the most recent accelerometer reading, but only if it's close in time
+            const auto& latest_accel = accel_buffer_.back();
+            if (std::abs(gyro_camera_frame.timestamp_ns - latest_accel.timestamp_ns) < 20000000LL) { // 20ms threshold
+                accel_vec = {latest_accel.x, latest_accel.y, latest_accel.z};
+                have_matching_accel = true;
+            }
+        }
+    }
+
+    if (have_matching_accel) {
+        cv::Vec3d gyro_vec(gyro_camera_frame.x, gyro_camera_frame.y, gyro_camera_frame.z);
+        imu_preintegrator_.addMeasurement(gyro_camera_frame.timestamp_ns, accel_vec, gyro_vec);
+    }
+
+    // Debug: Log every 30th gyro measurement to avoid spam
+    static int gyro_count = 0;
+    if (++gyro_count % 30 == 0) {
+        __android_log_print(ANDROID_LOG_DEBUG, TAG,
+            "Added gyro measurement (count=%d, buffer_size=%zu, matched=%d)",
+            gyro_count, imu_preintegrator_.getBufferSize(), have_matching_accel);
     }
 }
 
 void VisionModule::addAccelData(const AccelData& accel) {
+    // Transform from Android sensor frame to camera frame (X right, Y down, Z forward)
+    AccelData accel_camera_frame;
+    accel_camera_frame.timestamp_ns = accel.timestamp_ns;
+    accel_camera_frame.x = accel.x;
+    accel_camera_frame.y = -accel.y;
+    accel_camera_frame.z = -accel.z;
+
     bool should_initialize = false;
 
     {
         std::lock_guard<std::mutex> lock(accel_mutex_);
 
-        // Add to buffer
-        accel_buffer_.push_back(accel);
+        // Add transformed data to buffer
+        accel_buffer_.push_back(accel_camera_frame);
 
         // Keep buffer size reasonable (last 1 second at 100Hz = 100 samples)
         const size_t MAX_ACCEL_BUFFER_SIZE = 100;
@@ -335,6 +432,17 @@ void VisionModule::addAccelData(const AccelData& accel) {
     // Initialize OUTSIDE the lock to avoid deadlock
     if (should_initialize) {
         initializeFromGravity();
+    }
+
+    // The call to imu_preintegrator_.addMeasurement() has been removed from here.
+    // It is now handled exclusively in addGyroData to prevent duplicate/bad measurements.
+
+    // Debug: Log every 30th accel measurement to avoid spam
+    static int accel_count = 0;
+    if (++accel_count % 30 == 0) {
+        __android_log_print(ANDROID_LOG_DEBUG, TAG,
+            "Buffered accel measurement (count=%d, buffer_size=%zu)",
+            accel_count, accel_buffer_.size());
     }
 }
 
@@ -483,6 +591,9 @@ void VisionModule::reset() {
         accel_buffer_.clear();
     }
 
+    // Reset IMU preintegrator
+    imu_preintegrator_.reset();
+
     // Don't reset initialization state - keep gravity direction
     // But reset scale
     scale_initialized_ = false;
@@ -526,38 +637,50 @@ bool VisionModule::initializeFromGravity() {
         return true;
     }
 
-    cv::Point3f avg_accel(0, 0, 0);
-    size_t buffer_size = 0;
-
+    std::vector<AccelData> accel_buffer_copy;
     {
         std::lock_guard<std::mutex> lock(accel_mutex_);
-
-        if (accel_buffer_.empty()) {
+        if (accel_buffer_.size() < 20) { // Need enough samples
             return false;
         }
-
-        // Average accelerometer readings to get gravity direction
-        for (const auto& accel : accel_buffer_) {
-            avg_accel.x += accel.x;
-            avg_accel.y += accel.y;
-            avg_accel.z += accel.z;
-        }
-        buffer_size = accel_buffer_.size();
+        accel_buffer_copy = accel_buffer_;
     }
 
-    avg_accel.x /= buffer_size;
-    avg_accel.y /= buffer_size;
-    avg_accel.z /= buffer_size;
+    // --- 1. Calculate Mean ---
+    cv::Point3f avg_accel(0, 0, 0);
+    for (const auto& accel : accel_buffer_copy) {
+        avg_accel.x += accel.x;
+        avg_accel.y += accel.y;
+        avg_accel.z += accel.z;
+    }
+    avg_accel.x /= accel_buffer_copy.size();
+    avg_accel.y /= accel_buffer_copy.size();
+    avg_accel.z /= accel_buffer_copy.size();
 
-    // Normalize to get gravity direction
+    // --- 2. Calculate Variance ---
+    // If variance is high, it means the device is moving.
+    double variance = 0.0;
+    for (const auto& accel : accel_buffer_copy) {
+        variance += std::pow(accel.x - avg_accel.x, 2);
+        variance += std::pow(accel.y - avg_accel.y, 2);
+        variance += std::pow(accel.z - avg_accel.z, 2);
+    }
+    variance /= accel_buffer_copy.size();
+
+    // --- 3. Check if device is stationary ---
+    const double MAX_VARIANCE_FOR_INIT = 0.5; // Threshold for motion, can be tuned.
+    if (variance > MAX_VARIANCE_FOR_INIT) {
+        __android_log_print(ANDROID_LOG_WARN, TAG, "Device in motion (variance=%.3f), deferring gravity initialization.", variance);
+        return false;
+    }
+
+    // --- 4. If stationary, proceed with initialization ---
     float norm = std::sqrt(avg_accel.x * avg_accel.x +
                           avg_accel.y * avg_accel.y +
                           avg_accel.z * avg_accel.z);
 
     if (norm < 8.0f || norm > 12.0f) {
-        // Unreasonable gravity magnitude, device might be moving
-        __android_log_print(ANDROID_LOG_WARN, TAG,
-            "Cannot initialize: gravity magnitude %.2f m/s^2 is unreasonable", norm);
+        __android_log_print(ANDROID_LOG_WARN, TAG, "Cannot initialize: gravity magnitude %.2f m/s^2 is unreasonable (variance was low)", norm);
         return false;
     }
 
@@ -567,9 +690,12 @@ bool VisionModule::initializeFromGravity() {
 
     is_initialized_ = true;
 
-    __android_log_print(ANDROID_LOG_INFO, TAG,
-        "Initialized from gravity: direction = (%.3f, %.3f, %.3f)",
-        gravity_direction_.x, gravity_direction_.y, gravity_direction_.z);
+    // Set gravity in IMU preintegrator for proper sensor fusion
+    cv::Vec3d gravity_vec(gravity_direction_.x, gravity_direction_.y, gravity_direction_.z);
+    imu_preintegrator_.setGravity(gravity_vec, norm);
+
+    __android_log_print(ANDROID_LOG_INFO, TAG, "VIO Initialized from Gravity: direction=(%.3f, %.3f, %.3f), mag=%.2f, variance=%.3f",
+                        gravity_direction_.x, gravity_direction_.y, gravity_direction_.z, norm, variance);
 
     return true;
 }
