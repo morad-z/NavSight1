@@ -179,6 +179,7 @@ public:
      * Check if module is initialized with gravity
      */
     bool isInitialized() const { return is_initialized_.load(); }
+    bool isInitialized() const { return is_initialized_; }
 
     /**
      * Configuration
@@ -222,6 +223,8 @@ private:
 
     // Initialization state (atomic for thread-safe double-checked locking)
     std::atomic<bool> is_initialized_;
+    // Initialization state
+    bool is_initialized_;
 
     // Statistics
     mutable std::mutex stats_mutex_;
