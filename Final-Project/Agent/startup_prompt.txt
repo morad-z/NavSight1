@@ -1,0 +1,1 @@
+gemini --sys-prompt "$(Get-Content manager.md -Raw)"
