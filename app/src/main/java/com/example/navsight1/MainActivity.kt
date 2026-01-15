@@ -29,6 +29,7 @@ import androidx.compose.ui.graphics.drawscope.Stroke
 import androidx.compose.ui.platform.LocalContext
 import androidx.compose.ui.platform.LocalLifecycleOwner
 import androidx.compose.ui.text.style.TextAlign
+import androidx.compose.ui.unit.dp
 import androidx.compose.ui.viewinterop.AndroidView
 import com.google.accompanist.permissions.ExperimentalPermissionsApi
 import com.google.accompanist.permissions.rememberMultiplePermissionsState
@@ -86,6 +87,7 @@ class MainActivity : ComponentActivity(), SensorEventListener {
             Log.e(TAG, "Stack trace: ${throwable.stackTraceToString()}")
             // Let the system handle it after logging
             defaultExceptionHandler?.uncaughtException(thread, throwable)
+            Thread.getDefaultUncaughtExceptionHandler()?.uncaughtException(thread, throwable)
         }
 
         Log.d(TAG, "onCreate started")
@@ -278,6 +280,10 @@ class MainActivity : ComponentActivity(), SensorEventListener {
                 result = result or (b and 0x1f shl shift)
                 shift += 5
             } while (b >= 0x20 && index < len)
+                b = encoded[index++].code - 63
+                result = result or (b and 0x1f shl shift)
+                shift += 5
+            } while (b >= 0x20)
             val dlat = if (result and 1 != 0) (result shr 1).inv() else result shr 1
             lat += dlat
 
@@ -292,6 +298,10 @@ class MainActivity : ComponentActivity(), SensorEventListener {
                 result = result or (b and 0x1f shl shift)
                 shift += 5
             } while (b >= 0x20 && index < len)
+                b = encoded[index++].code - 63
+                result = result or (b and 0x1f shl shift)
+                shift += 5
+            } while (b >= 0x20)
             val dlng = if (result and 1 != 0) (result shr 1).inv() else result shr 1
             lng += dlng
 
@@ -408,6 +418,7 @@ class MainActivity : ComponentActivity(), SensorEventListener {
                     Log.d(TAG, "Initializing OpenCV in RELEASE mode")
                     OpenCVLoader.initDebug()
                 }
+                isOpenCVInitialized = OpenCVLoader.initDebug()
                 if (isOpenCVInitialized) {
                     Log.d(TAG, "OpenCV is initialized successfully.")
                 } else {
@@ -602,6 +613,7 @@ fun DebugOverlay(vioData: VioData) {
                 )
                 Text(
                     text = "X: ${"%.2f".format(vioData.x)}  Y: ${"%.2f".format(vioData.y)}  Z: ${"%.2f".format(vioData.z)}",
+                    text = String.format("X: %.2f  Y: %.2f  Z: %.2f", vioData.x, vioData.y, vioData.z),
                     color = Color.Cyan,
                     style = MaterialTheme.typography.bodySmall
                 )
@@ -616,6 +628,11 @@ fun DebugOverlay(vioData: VioData) {
                 )
                 Text(
                     text = "R: ${"%.1f".format(Math.toDegrees(vioData.roll))}  P: ${"%.1f".format(Math.toDegrees(vioData.pitch))}  Y: ${"%.1f".format(Math.toDegrees(vioData.yaw))}",
+                    text = String.format("R: %.1f  P: %.1f  Y: %.1f",
+                        Math.toDegrees(vioData.roll),
+                        Math.toDegrees(vioData.pitch),
+                        Math.toDegrees(vioData.yaw)
+                    ),
                     color = Color.Cyan,
                     style = MaterialTheme.typography.bodySmall
                 )
@@ -630,6 +647,7 @@ fun DebugOverlay(vioData: VioData) {
                 }
                 Text(
                     text = "Tracking Quality: ${"%.1f%%".format(vioData.trackingQuality * 100)}",
+                    text = "Tracking Quality: ${String.format("%.1f%%", vioData.trackingQuality * 100)}",
                     color = qualityColor,
                     style = MaterialTheme.typography.labelMedium
                 )
@@ -644,6 +662,7 @@ fun DebugOverlay(vioData: VioData) {
                 // Scale
                 Text(
                     text = "Scale: ${"%.3f".format(vioData.estimatedScale)} m/unit",
+                    text = "Scale: ${String.format("%.3f", vioData.estimatedScale)} m/unit",
                     color = if (vioData.estimatedScale > 0.01) Color.Green else Color.Gray,
                     style = MaterialTheme.typography.bodySmall
                 )
@@ -668,6 +687,8 @@ fun DebugOverlay(vioData: VioData) {
                 // Accelerometer
                 Text(
                     text = "Accel (m/s²): X:${"%.2f".format(vioData.accelX)} Y:${"%.2f".format(vioData.accelY)} Z:${"%.2f".format(vioData.accelZ)}",
+                    text = String.format("Accel (m/s²): X:%.2f Y:%.2f Z:%.2f",
+                        vioData.accelX, vioData.accelY, vioData.accelZ),
                     color = Color.Cyan,
                     style = MaterialTheme.typography.bodySmall
                 )
@@ -675,6 +696,8 @@ fun DebugOverlay(vioData: VioData) {
                 // Gyroscope
                 Text(
                     text = "Gyro (rad/s): X:${"%.2f".format(vioData.gyroX)} Y:${"%.2f".format(vioData.gyroY)} Z:${"%.2f".format(vioData.gyroZ)}",
+                    text = String.format("Gyro (rad/s): X:%.2f Y:%.2f Z:%.2f",
+                        vioData.gyroX, vioData.gyroY, vioData.gyroZ),
                     color = Color.Cyan,
                     style = MaterialTheme.typography.bodySmall
                 )
@@ -846,6 +869,8 @@ fun CameraView(modifier: Modifier = Modifier, context: Context) {
                                     throw e
                                 }
                                 // Continue processing for recoverable exceptions
+                            } catch (e: Exception) {
+                                Log.e(MainActivity.TAG, "Error processing camera frame: ${e.message}")
                             }
                         }
                     }
@@ -1142,6 +1167,8 @@ fun parseLatLng(text: String): LatLng? {
 fun metersToLatLng(start: LatLng, dx: Double, dz: Double): LatLng {
     val lat = start.latitude + (dz / MainActivity.METERS_PER_DEGREE)
     val lng = start.longitude + (dx / (MainActivity.METERS_PER_DEGREE * Math.cos(Math.toRadians(start.latitude))))
+    val lat = start.latitude + (dz / 111111.0)
+    val lng = start.longitude + (dx / (111111.0 * Math.cos(Math.toRadians(start.latitude))))
     return LatLng(lat, lng)
 }
 

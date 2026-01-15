@@ -58,6 +58,9 @@ std::thread vio_thread;
 // Acquire order: Always acquire vio_mutex before accessing vision_module or global pose state
 std::mutex vio_mutex;
 
+// --- Threading and Data Synchronization ---
+std::thread vio_thread;
+std::mutex vio_mutex;
 std::condition_variable vio_cv;
 bool running = false;
 
@@ -90,6 +93,8 @@ float latest_gyro_x = 0.0f, latest_gyro_y = 0.0f, latest_gyro_z = 0.0f;
 
 // --- VIO State Variables (shared_ptr for thread-safe lifecycle management) ---
 static std::shared_ptr<navsight::VisionModule> vision_module;
+// --- VIO State Variables (used only by VIO thread) ---
+static navsight::VisionModule* vision_module = nullptr;
 static cv::Mat global_R = cv::Mat::eye(3, 3, CV_64F);
 static cv::Mat global_t = cv::Mat::zeros(3, 1, CV_64F);
 static double g_scale = 1.0;
@@ -131,6 +136,17 @@ void vio_thread_loop() {
                 __android_log_print(ANDROID_LOG_ERROR, TAG, "Failed to create VisionModule: unknown error");
                 return;
             }
+    // Initialize VisionModule
+    if (!vision_module) {
+        try {
+            vision_module = new navsight::VisionModule(navsight::FeatureDetectorType::GOOD_FEATURES, 200);
+            __android_log_print(ANDROID_LOG_INFO, TAG, "VisionModule created successfully");
+        } catch (const std::exception& e) {
+            __android_log_print(ANDROID_LOG_ERROR, TAG, "Failed to create VisionModule: %s", e.what());
+            return;
+        } catch (...) {
+            __android_log_print(ANDROID_LOG_ERROR, TAG, "Failed to create VisionModule: unknown error");
+            return;
         }
     }
 
@@ -268,6 +284,41 @@ Java_com_example_navsight1_MainActivity_processCameraFrame(
     if (!jni_env) {
         __android_log_print(ANDROID_LOG_ERROR, TAG, "Failed to get JNI environment");
         return nullptr;
+}
+
+JNIEXPORT void JNICALL
+Java_com_example_navsight1_MainActivity_stopVIO(JNIEnv *env, jobject /* this */) {
+    if (!running) return;
+    running = false;
+    vio_cv.notify_one();
+    if (vio_thread.joinable()) {
+        vio_thread.join();
+    }
+
+    // Clean up VisionModule
+    if (vision_module) {
+        delete vision_module;
+        vision_module = nullptr;
+        __android_log_print(ANDROID_LOG_INFO, TAG, "VisionModule destroyed");
+    }
+
+    __android_log_print(ANDROID_LOG_INFO, TAG, "VIO thread stopped.");
+}
+
+JNIEXPORT jobject JNICALL
+Java_com_example_navsight1_MainActivity_processCameraFrame(
+        JNIEnv* env, jobject /* this */, jbyteArray frameData, jint width, jint height, jlong timestamp) {
+    
+    JNIEnv* jni_env = nullptr;
+    bool attached = false;
+    if (g_jvm->GetEnv(reinterpret_cast<void**>(&jni_env), JNI_VERSION_1_6) != JNI_OK) {
+        if (g_jvm->AttachCurrentThread(&jni_env, nullptr) == JNI_OK) {
+            attached = true;
+        } else {
+            return nullptr;
+        }
+    } else {
+        jni_env = env;
     }
 
     jbyte* buffer = jni_env->GetByteArrayElements(frameData, nullptr);
@@ -284,6 +335,9 @@ Java_com_example_navsight1_MainActivity_processCameraFrame(
             frame_queue.push({timestamp, yuvMat.clone(), width, height});
             vio_cv.notify_one();
         }
+        std::lock_guard<std::mutex> lock(frame_queue_mutex);
+        frame_queue.push({timestamp, yuvMat.clone(), width, height});
+        vio_cv.notify_one();
         jni_env->ReleaseByteArrayElements(frameData, buffer, JNI_ABORT);
     }
 
@@ -316,6 +370,16 @@ Java_com_example_navsight1_MainActivity_processCameraFrame(
         total_features = 200; // max_features
         estimated_scale = local_module->getEstimatedScale();
         is_initialized = local_module->isInitialized();
+
+        // Get VisionModule stats if available
+        if (vision_module) {
+            auto stats = vision_module->getStatistics();
+            tracking_quality = stats.average_tracking_quality;
+            tracked_features = (int)stats.average_features_tracked;
+            total_features = 200; // max_features
+            estimated_scale = vision_module->getEstimatedScale();
+            is_initialized = vision_module->isInitialized();
+        }
     }
     cv::Vec3d eulerAngles = rotationMatrixToEulerAngles(current_R);
 
@@ -345,6 +409,7 @@ Java_com_example_navsight1_MainActivity_processCameraFrame(
             0.0, 0.0, 0.0, 0.0, 0.0, 0.0);
     }
     if (!current_points.empty()) {
+    if (pointsArray != nullptr && !current_points.empty()) {
         jni_env->SetFloatArrayRegion(pointsArray, 0, current_points.size(), current_points.data());
     }
 
@@ -355,6 +420,10 @@ Java_com_example_navsight1_MainActivity_processCameraFrame(
                           accel_x, accel_y, accel_z, gyro_x, gyro_y, gyro_z);
 
     // JNIThreadGuard destructor will automatically detach thread if needed
+    if (attached) {
+        g_jvm->DetachCurrentThread();
+    }
+
     return result;
 }
 
@@ -386,12 +455,16 @@ Java_com_example_navsight1_MainActivity_processAccelerometer(
         local_module = vision_module;
     }
     if (running && local_module) {
+    // Pass to VisionModule for scale estimation and initialization
+    // Check if VIO is running before accessing vision_module
+    if (running && vision_module) {
         navsight::AccelData accel;
         accel.timestamp_ns = timestamp;
         accel.x = x;
         accel.y = y;
         accel.z = z;
         local_module->addAccelData(accel);
+        vision_module->addAccelData(accel);
     }
 }
 
@@ -453,12 +526,16 @@ Java_com_example_navsight1_MainActivity_processGyroscope(
         local_module = vision_module;
     }
     if (running && local_module) {
+    // Pass gyro data to VisionModule for sensor fusion
+    // Check if VIO is running before accessing vision_module
+    if (running && vision_module) {
         navsight::GyroData gyro;
         gyro.timestamp_ns = timestamp;
         gyro.x = x;
         gyro.y = y;
         gyro.z = z;
         local_module->addGyroData(gyro);
+        vision_module->addGyroData(gyro);
     }
 }
 
