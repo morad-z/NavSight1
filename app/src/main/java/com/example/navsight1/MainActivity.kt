@@ -3,12 +3,10 @@ package com.example.navsight1
 import android.Manifest
 import android.annotation.SuppressLint
 import android.content.Context
-import android.content.Intent
 import android.hardware.Sensor
 import android.hardware.SensorEvent
 import android.hardware.SensorEventListener
 import android.hardware.SensorManager
-import android.net.Uri
 import android.os.Bundle
 import android.util.Log
 import android.widget.Toast
@@ -20,7 +18,6 @@ import androidx.compose.foundation.background
 import androidx.compose.foundation.layout.*
 import androidx.compose.material3.*
 import androidx.compose.runtime.*
-import androidx.compose.ui.unit.dp
 import androidx.compose.ui.Alignment
 import androidx.compose.ui.Modifier
 import androidx.compose.ui.geometry.Offset
@@ -31,32 +28,27 @@ import androidx.compose.ui.platform.LocalLifecycleOwner
 import androidx.compose.ui.text.style.TextAlign
 import androidx.compose.ui.unit.dp
 import androidx.compose.ui.viewinterop.AndroidView
+import androidx.lifecycle.lifecycleScope
 import com.google.accompanist.permissions.ExperimentalPermissionsApi
 import com.google.accompanist.permissions.rememberMultiplePermissionsState
 import com.google.android.gms.location.FusedLocationProviderClient
 import com.google.android.gms.location.LocationServices
 import com.google.android.gms.location.Priority
+import com.google.android.gms.maps.CameraUpdateFactory
 import com.google.android.gms.maps.model.CameraPosition
 import com.google.android.gms.maps.model.LatLng
 import com.google.android.gms.tasks.CancellationTokenSource
+import com.google.android.libraries.places.api.Places
+import com.google.android.libraries.places.api.net.PlacesClient
 import com.google.maps.android.compose.*
-import androidx.compose.runtime.LaunchedEffect
-import com.google.android.gms.maps.CameraUpdateFactory
 import com.otaliastudios.cameraview.CameraListener
 import com.otaliastudios.cameraview.CameraOptions
 import com.otaliastudios.cameraview.CameraView
-import org.opencv.android.OpenCVLoader
 import kotlinx.coroutines.Dispatchers
-import kotlinx.coroutines.withContext
 import kotlinx.coroutines.launch
-import androidx.compose.runtime.rememberCoroutineScope
-import androidx.lifecycle.lifecycleScope
-import com.google.android.libraries.places.api.Places
-import com.google.android.libraries.places.api.model.Place
-import com.google.android.libraries.places.api.net.FindAutocompletePredictionsRequest
-import com.google.android.libraries.places.api.net.FetchPlaceRequest
-import com.google.android.libraries.places.api.net.PlacesClient
+import kotlinx.coroutines.withContext
 import org.json.JSONObject
+import org.opencv.android.OpenCVLoader
 import java.net.URL
 import java.net.URLEncoder
 
@@ -85,9 +77,7 @@ class MainActivity : ComponentActivity(), SensorEventListener {
         Thread.setDefaultUncaughtExceptionHandler { thread, throwable ->
             Log.e(TAG, "UNCAUGHT EXCEPTION in thread ${thread.name}", throwable)
             Log.e(TAG, "Stack trace: ${throwable.stackTraceToString()}")
-            // Let the system handle it after logging
             defaultExceptionHandler?.uncaughtException(thread, throwable)
-            Thread.getDefaultUncaughtExceptionHandler()?.uncaughtException(thread, throwable)
         }
 
         Log.d(TAG, "onCreate started")
@@ -98,8 +88,6 @@ class MainActivity : ComponentActivity(), SensorEventListener {
         } catch (e: Exception) {
             Log.e(TAG, "Failed to enable edge-to-edge: ${e.message}", e)
         }
-
-        // Native library loaded - ready to use
 
         try {
             fusedLocationClient = LocationServices.getFusedLocationProviderClient(this)
@@ -121,7 +109,7 @@ class MainActivity : ComponentActivity(), SensorEventListener {
             Log.d(TAG, "Content set successfully")
         } catch (e: Exception) {
             Log.e(TAG, "Failed to set content: ${e.message}", e)
-            throw e // Re-throw to prevent app from continuing in bad state
+            throw e
         }
 
         try {
@@ -135,16 +123,18 @@ class MainActivity : ComponentActivity(), SensorEventListener {
 
         // Initialize Google Places API
         try {
-            val apiKey = packageManager
-                .getApplicationInfo(packageName, android.content.pm.PackageManager.GET_META_DATA)
-                .metaData
-                .getString("com.google.android.geo.API_KEY") ?: ""
+            val appInfo = packageManager.getApplicationInfo(packageName, android.content.pm.PackageManager.GET_META_DATA)
+            val apiKey = appInfo.metaData?.getString("com.google.android.geo.API_KEY") ?: ""
 
-            if (!Places.isInitialized()) {
-                Places.initialize(applicationContext, apiKey)
+            if (apiKey.isNotEmpty()) {
+                if (!Places.isInitialized()) {
+                    Places.initialize(applicationContext, apiKey)
+                }
+                placesClient = Places.createClient(this)
+                Log.d(TAG, "Places API initialized")
+            } else {
+                Log.e(TAG, "Google Maps API Key not found in manifest")
             }
-            placesClient = Places.createClient(this)
-            Log.d(TAG, "Places API initialized")
         } catch (e: Exception) {
             Log.e(TAG, "Failed to initialize Places API: ${e.message}", e)
         }
@@ -230,10 +220,8 @@ class MainActivity : ComponentActivity(), SensorEventListener {
     suspend fun fetchRoute(origin: LatLng, destination: LatLng): List<LatLng> {
         return withContext(Dispatchers.IO) {
             try {
-                val apiKey = packageManager
-                    .getApplicationInfo(packageName, android.content.pm.PackageManager.GET_META_DATA)
-                    .metaData
-                    .getString("com.google.android.geo.API_KEY") ?: ""
+                val appInfo = packageManager.getApplicationInfo(packageName, android.content.pm.PackageManager.GET_META_DATA)
+                val apiKey = appInfo.metaData?.getString("com.google.android.geo.API_KEY") ?: ""
 
                 val url = "https://maps.googleapis.com/maps/api/directions/json?" +
                         "origin=${origin.latitude},${origin.longitude}" +
@@ -260,6 +248,7 @@ class MainActivity : ComponentActivity(), SensorEventListener {
         }
     }
 
+    // Fixed Polyline Decoding Algorithm
     private fun decodePolyline(encoded: String): List<LatLng> {
         val poly = ArrayList<LatLng>()
         var index = 0
@@ -272,14 +261,6 @@ class MainActivity : ComponentActivity(), SensorEventListener {
             var shift = 0
             var result = 0
             do {
-                if (index >= len) {
-                    Log.e(TAG, "Malformed polyline encoding at index $index")
-                    break
-                }
-                b = encoded[index++].code - 63
-                result = result or (b and 0x1f shl shift)
-                shift += 5
-            } while (b >= 0x20 && index < len)
                 b = encoded[index++].code - 63
                 result = result or (b and 0x1f shl shift)
                 shift += 5
@@ -290,14 +271,6 @@ class MainActivity : ComponentActivity(), SensorEventListener {
             shift = 0
             result = 0
             do {
-                if (index >= len) {
-                    Log.e(TAG, "Malformed polyline encoding at index $index")
-                    break
-                }
-                b = encoded[index++].code - 63
-                result = result or (b and 0x1f shl shift)
-                shift += 5
-            } while (b >= 0x20 && index < len)
                 b = encoded[index++].code - 63
                 result = result or (b and 0x1f shl shift)
                 shift += 5
@@ -308,7 +281,6 @@ class MainActivity : ComponentActivity(), SensorEventListener {
             val p = LatLng(lat.toDouble() / 1E5, lng.toDouble() / 1E5)
             poly.add(p)
         }
-
         return poly
     }
 
@@ -355,10 +327,8 @@ class MainActivity : ComponentActivity(), SensorEventListener {
     suspend fun searchPlace(query: String): LatLng? {
         return withContext(Dispatchers.IO) {
             try {
-                val apiKey = packageManager
-                    .getApplicationInfo(packageName, android.content.pm.PackageManager.GET_META_DATA)
-                    .metaData
-                    .getString("com.google.android.geo.API_KEY") ?: ""
+                val appInfo = packageManager.getApplicationInfo(packageName, android.content.pm.PackageManager.GET_META_DATA)
+                val apiKey = appInfo.metaData?.getString("com.google.android.geo.API_KEY") ?: ""
 
                 val encodedQuery = URLEncoder.encode(query, "UTF-8")
                 val url = "https://maps.googleapis.com/maps/api/geocode/json?address=$encodedQuery&key=$apiKey"
@@ -411,13 +381,6 @@ class MainActivity : ComponentActivity(), SensorEventListener {
             Log.d(TAG, "Companion object init block starting...")
             try {
                 Log.d(TAG, "Attempting to initialize OpenCV...")
-                isOpenCVInitialized = if (BuildConfig.DEBUG) {
-                    Log.d(TAG, "Initializing OpenCV in DEBUG mode")
-                    OpenCVLoader.initDebug()
-                } else {
-                    Log.d(TAG, "Initializing OpenCV in RELEASE mode")
-                    OpenCVLoader.initDebug()
-                }
                 isOpenCVInitialized = OpenCVLoader.initDebug()
                 if (isOpenCVInitialized) {
                     Log.d(TAG, "OpenCV is initialized successfully.")
@@ -499,7 +462,7 @@ fun NavSightApp(
             horizontalAlignment = Alignment.CenterHorizontally,
             verticalArrangement = Arrangement.Center
         ) {
-            androidx.compose.material3.CircularProgressIndicator(
+            CircularProgressIndicator(
                 modifier = Modifier.padding(16.dp)
             )
             Text(
@@ -612,7 +575,6 @@ fun DebugOverlay(vioData: VioData) {
                     style = MaterialTheme.typography.labelMedium
                 )
                 Text(
-                    text = "X: ${"%.2f".format(vioData.x)}  Y: ${"%.2f".format(vioData.y)}  Z: ${"%.2f".format(vioData.z)}",
                     text = String.format("X: %.2f  Y: %.2f  Z: %.2f", vioData.x, vioData.y, vioData.z),
                     color = Color.Cyan,
                     style = MaterialTheme.typography.bodySmall
@@ -627,7 +589,6 @@ fun DebugOverlay(vioData: VioData) {
                     style = MaterialTheme.typography.labelMedium
                 )
                 Text(
-                    text = "R: ${"%.1f".format(Math.toDegrees(vioData.roll))}  P: ${"%.1f".format(Math.toDegrees(vioData.pitch))}  Y: ${"%.1f".format(Math.toDegrees(vioData.yaw))}",
                     text = String.format("R: %.1f  P: %.1f  Y: %.1f",
                         Math.toDegrees(vioData.roll),
                         Math.toDegrees(vioData.pitch),
@@ -646,8 +607,7 @@ fun DebugOverlay(vioData: VioData) {
                     else -> Color.Red
                 }
                 Text(
-                    text = "Tracking Quality: ${"%.1f%%".format(vioData.trackingQuality * 100)}",
-                    text = "Tracking Quality: ${String.format("%.1f%%", vioData.trackingQuality * 100)}",
+                    text = String.format("Tracking Quality: %.1f%%", vioData.trackingQuality * 100),
                     color = qualityColor,
                     style = MaterialTheme.typography.labelMedium
                 )
@@ -661,8 +621,7 @@ fun DebugOverlay(vioData: VioData) {
 
                 // Scale
                 Text(
-                    text = "Scale: ${"%.3f".format(vioData.estimatedScale)} m/unit",
-                    text = "Scale: ${String.format("%.3f", vioData.estimatedScale)} m/unit",
+                    text = String.format("Scale: %.3f m/unit", vioData.estimatedScale),
                     color = if (vioData.estimatedScale > 0.01) Color.Green else Color.Gray,
                     style = MaterialTheme.typography.bodySmall
                 )
@@ -686,7 +645,6 @@ fun DebugOverlay(vioData: VioData) {
 
                 // Accelerometer
                 Text(
-                    text = "Accel (m/s²): X:${"%.2f".format(vioData.accelX)} Y:${"%.2f".format(vioData.accelY)} Z:${"%.2f".format(vioData.accelZ)}",
                     text = String.format("Accel (m/s²): X:%.2f Y:%.2f Z:%.2f",
                         vioData.accelX, vioData.accelY, vioData.accelZ),
                     color = Color.Cyan,
@@ -695,7 +653,6 @@ fun DebugOverlay(vioData: VioData) {
 
                 // Gyroscope
                 Text(
-                    text = "Gyro (rad/s): X:${"%.2f".format(vioData.gyroX)} Y:${"%.2f".format(vioData.gyroY)} Z:${"%.2f".format(vioData.gyroZ)}",
                     text = String.format("Gyro (rad/s): X:%.2f Y:%.2f Z:%.2f",
                         vioData.gyroX, vioData.gyroY, vioData.gyroZ),
                     color = Color.Cyan,
@@ -720,7 +677,9 @@ fun MainScreen(
 
     Box(modifier = Modifier.fillMaxSize()) {
         Column(modifier = Modifier.fillMaxSize()) {
-            Box(modifier = Modifier.fillMaxWidth().weight(1f)) {
+            Box(modifier = Modifier
+                .fillMaxWidth()
+                .weight(1f)) {
                 CameraView(
                     modifier = Modifier.fillMaxSize(),
                     context = context
@@ -739,7 +698,9 @@ fun MainScreen(
                     routePoints = routePoints
                 )
             } else {
-                Box(modifier = Modifier.fillMaxWidth().weight(1f), contentAlignment = Alignment.Center) {
+                Box(modifier = Modifier
+                    .fillMaxWidth()
+                    .weight(1f), contentAlignment = Alignment.Center) {
                     Text("Getting initial location...")
                 }
             }
@@ -748,10 +709,10 @@ fun MainScreen(
         if (isNavigating && destinationLocation != null && startLocation != null) {
             // Navigation mode: Show distance to destination
             val currentPos = remember(vioData, startLocation) {
-                metersToLatLng(startLocation!!, vioData.x, vioData.z)
+                metersToLatLng(startLocation, vioData.x, vioData.z)
             }
             val distance = remember(currentPos, destinationLocation) {
-                calculateDistance(currentPos, destinationLocation!!)
+                calculateDistance(currentPos, destinationLocation)
             }
             Column(
                 modifier = Modifier
@@ -842,11 +803,10 @@ fun CameraView(modifier: Modifier = Modifier, context: Context) {
                 Log.i(MainActivity.TAG, "Configuring CameraView...")
                 setLifecycleOwner(lifecycleOwner)
                 setAudio(com.otaliastudios.cameraview.controls.Audio.OFF)
-                setFrameProcessingFormat(android.graphics.ImageFormat.YUV_420_888) // Corrected constant
+                setFrameProcessingFormat(android.graphics.ImageFormat.YUV_420_888)
 
-                addFrameProcessor(object : com.otaliastudios.cameraview.frame.FrameProcessor { // Corrected API usage
+                addFrameProcessor(object : com.otaliastudios.cameraview.frame.FrameProcessor {
                     override fun process(frame: com.otaliastudios.cameraview.frame.Frame) {
-                        // Log.d(MainActivity.TAG, "Frame processor called. Timestamp: ${frame.time}")
                         if (!mainActivity.isNativeLibraryLoaded) {
                             return
                         }
@@ -864,13 +824,9 @@ fun CameraView(modifier: Modifier = Modifier, context: Context) {
                                 }
                             } catch (e: Throwable) {
                                 Log.e(MainActivity.TAG, "Error processing camera frame: ${e.message}", e)
-                                // Re-throw fatal errors that indicate unrecoverable app state
                                 if (e is OutOfMemoryError || e is VirtualMachineError) {
                                     throw e
                                 }
-                                // Continue processing for recoverable exceptions
-                            } catch (e: Exception) {
-                                Log.e(MainActivity.TAG, "Error processing camera frame: ${e.message}")
                             }
                         }
                     }
@@ -910,8 +866,7 @@ fun MapView(
     val heading = remember(vioData.yaw) {
         val degrees = (vioData.yaw * 180.0 / Math.PI).toFloat()
         // Normalize to 0-360
-        val normalized = (degrees + 360) % 360
-        normalized
+        (degrees + 360) % 360
     }
 
     val cameraPositionState = rememberCameraPositionState {
@@ -923,7 +878,7 @@ fun MapView(
         if (isNavigating) {
             // Navigation mode: Follow position with heading orientation
             cameraPositionState.animate(
-                update = com.google.android.gms.maps.CameraUpdateFactory.newCameraPosition(
+                update = CameraUpdateFactory.newCameraPosition(
                     CameraPosition.Builder()
                         .target(currentVioPosition)
                         .zoom(18f)
@@ -954,7 +909,7 @@ fun MapView(
     GoogleMap(
         modifier = modifier,
         cameraPositionState = cameraPositionState,
-        uiSettings = com.google.maps.android.compose.MapUiSettings(
+        uiSettings = MapUiSettings(
             zoomControlsEnabled = !isNavigating,
             rotationGesturesEnabled = !isNavigating,
             scrollGesturesEnabled = !isNavigating,
@@ -1165,10 +1120,13 @@ fun parseLatLng(text: String): LatLng? {
 }
 
 fun metersToLatLng(start: LatLng, dx: Double, dz: Double): LatLng {
+    // dx is East/West (Change in Longitude)
+    // dz is North/South (Change in Latitude)
+    // Note: VIO might use a different coordinate system (e.g. Z forward).
+    // Assuming here that Z in VIO maps to North (Latitude) and X maps to East (Longitude) for simplicity,
+    // or whatever the local frame is aligned to.
     val lat = start.latitude + (dz / MainActivity.METERS_PER_DEGREE)
     val lng = start.longitude + (dx / (MainActivity.METERS_PER_DEGREE * Math.cos(Math.toRadians(start.latitude))))
-    val lat = start.latitude + (dz / 111111.0)
-    val lng = start.longitude + (dx / (111111.0 * Math.cos(Math.toRadians(start.latitude))))
     return LatLng(lat, lng)
 }
 
