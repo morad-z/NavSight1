@@ -14,8 +14,11 @@ android {
         targetSdk = 34
         versionCode = 1
         versionName = "1.0"
-
         testInstrumentationRunner = "androidx.test.runner.AndroidJUnitRunner"
+
+        // 🔐 Google Maps API Key (from local.properties)
+        manifestPlaceholders["GOOGLE_MAPS_API_KEY"] =
+            project.findProperty("GOOGLE_MAPS_API_KEY") as String? ?: ""
 
         externalNativeBuild {
             cmake {
@@ -34,16 +37,16 @@ android {
             )
         }
     }
-    
+
     compileOptions {
         sourceCompatibility = JavaVersion.VERSION_11
         targetCompatibility = JavaVersion.VERSION_11
     }
-    
+
     kotlinOptions {
         jvmTarget = "11"
     }
-    
+
     buildFeatures {
         compose = true
         buildConfig = true
@@ -55,14 +58,12 @@ android {
             path = file("CMakeLists.txt")
         }
     }
-    
-    // אין צורך יותר ב-packagingOptions עבור libc++_shared כי עברנו לסטטי
 }
 
 dependencies {
     implementation(project(":sdk"))
 
-    // Core dependencies
+    // Core
     implementation("androidx.core:core-ktx:1.12.0")
     implementation("androidx.lifecycle:lifecycle-runtime-ktx:2.6.2")
     implementation("androidx.activity:activity-compose:1.8.2")
@@ -74,11 +75,12 @@ dependencies {
     implementation("androidx.compose.ui:ui-tooling-preview")
     implementation("androidx.compose.material3:material3")
 
-    // Google Maps
+    // Google Maps & Location
     implementation("com.google.maps.android:maps-compose:2.11.4")
     implementation("com.google.android.gms:play-services-maps:18.2.0")
     implementation("com.google.android.gms:play-services-location:21.0.1")
     implementation("com.google.android.libraries.places:places:3.3.0")
+    implementation("com.google.android.gms:play-services-tasks:18.1.0")
 
     // Permissions
     implementation("com.google.accompanist:accompanist-permissions:0.32.0")
