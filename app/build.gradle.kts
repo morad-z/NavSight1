@@ -59,6 +59,7 @@ android {
     // אין צורך יותר ב-packagingOptions עבור libc++_shared כי עברנו לסטטי
 }
 
+kotlin
 dependencies {
     implementation(project(":sdk"))
 
@@ -79,6 +80,7 @@ dependencies {
     implementation("com.google.android.gms:play-services-maps:18.2.0")
     implementation("com.google.android.gms:play-services-location:21.0.1")
     implementation("com.google.android.libraries.places:places:3.3.0")
+    implementation("com.google.android.gms:play-services-tasks:18.1.0") // <-- ADD THIS LINE
 
     // Permissions
     implementation("com.google.accompanist:accompanist-permissions:0.32.0")
