@@ -1,28 +1,41 @@
 package com.example.navsight1
 
+/**
+ * VIO Data class - מחזיק את כל המידע מה-Visual Inertial Odometry
+ * 
+ * משמש בעיקר אם אתה רוצה לחזור להשתמש ב-C++ VIO בעתיד
+ */
 data class VioData(
+    // Position (meters)
     val x: Double = 0.0,
     val y: Double = 0.0,
     val z: Double = 0.0,
+    
+    // Rotation (radians)
     val roll: Double = 0.0,
     val pitch: Double = 0.0,
     val yaw: Double = 0.0,
-    val trackedPoints: FloatArray = floatArrayOf(),
+    
+    // Tracking info
     val trackingQuality: Double = 0.0,
     val trackedFeatures: Int = 0,
     val totalFeatures: Int = 0,
     val estimatedScale: Double = 1.0,
+    
+    // Status
     val isInitialized: Boolean = false,
-    // Raw IMU data
-    val accelX: Float = 0.0f,
-    val accelY: Float = 0.0f,
-    val accelZ: Float = 0.0f,
-    val gyroX: Float = 0.0f,
-    val gyroY: Float = 0.0f,
-    val gyroZ: Float = 0.0f
+    
+    // Tracked points for visualization
+    val trackedPoints: FloatArray = floatArrayOf(),
+    
+    // IMU data
+    val accelX: Float = 0f,
+    val accelY: Float = 0f,
+    val accelZ: Float = 0f,
+    val gyroX: Float = 0f,
+    val gyroY: Float = 0f,
+    val gyroZ: Float = 0f
 ) {
-    // Custom equals/hashCode required because FloatArray uses referential equality by default
-    // Data class auto-generation would break value equality for trackedPoints
     override fun equals(other: Any?): Boolean {
         if (this === other) return true
         if (javaClass != other?.javaClass) return false
@@ -35,12 +48,12 @@ data class VioData(
         if (roll != other.roll) return false
         if (pitch != other.pitch) return false
         if (yaw != other.yaw) return false
-        if (!trackedPoints.contentEquals(other.trackedPoints)) return false
         if (trackingQuality != other.trackingQuality) return false
         if (trackedFeatures != other.trackedFeatures) return false
         if (totalFeatures != other.totalFeatures) return false
         if (estimatedScale != other.estimatedScale) return false
         if (isInitialized != other.isInitialized) return false
+        if (!trackedPoints.contentEquals(other.trackedPoints)) return false
         if (accelX != other.accelX) return false
         if (accelY != other.accelY) return false
         if (accelZ != other.accelZ) return false
@@ -58,12 +71,12 @@ data class VioData(
         result = 31 * result + roll.hashCode()
         result = 31 * result + pitch.hashCode()
         result = 31 * result + yaw.hashCode()
-        result = 31 * result + trackedPoints.contentHashCode()
         result = 31 * result + trackingQuality.hashCode()
         result = 31 * result + trackedFeatures
         result = 31 * result + totalFeatures
         result = 31 * result + estimatedScale.hashCode()
         result = 31 * result + isInitialized.hashCode()
+        result = 31 * result + trackedPoints.contentHashCode()
         result = 31 * result + accelX.hashCode()
         result = 31 * result + accelY.hashCode()
         result = 31 * result + accelZ.hashCode()
