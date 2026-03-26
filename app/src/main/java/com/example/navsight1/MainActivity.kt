@@ -3,1182 +3,803 @@ package com.example.navsight1
 import android.Manifest
 import android.annotation.SuppressLint
 import android.content.Context
-import android.content.Intent
 import android.hardware.Sensor
 import android.hardware.SensorEvent
 import android.hardware.SensorEventListener
 import android.hardware.SensorManager
-import android.net.Uri
 import android.os.Bundle
 import android.util.Log
-import android.widget.Toast
+import android.view.WindowManager
 import androidx.activity.ComponentActivity
 import androidx.activity.compose.setContent
 import androidx.activity.enableEdgeToEdge
+import androidx.compose.animation.core.*
+import androidx.compose.foundation.BorderStroke
 import androidx.compose.foundation.Canvas
 import androidx.compose.foundation.background
+import androidx.compose.foundation.border
 import androidx.compose.foundation.layout.*
+import androidx.compose.foundation.shape.RoundedCornerShape
+import androidx.compose.material.icons.Icons
+import androidx.compose.material.icons.filled.ArrowBack
+import androidx.compose.material.icons.filled.ArrowDropDown
+import androidx.compose.material.icons.filled.ArrowForward
+import androidx.compose.material.icons.filled.KeyboardArrowDown
+import androidx.compose.material.icons.filled.KeyboardArrowUp
+import androidx.compose.material.icons.filled.Phone
+import androidx.compose.material.icons.filled.Place
+import androidx.compose.material.icons.filled.Refresh
 import androidx.compose.material3.*
 import androidx.compose.runtime.*
-import androidx.compose.ui.unit.dp
 import androidx.compose.ui.Alignment
 import androidx.compose.ui.Modifier
+import androidx.compose.ui.draw.clip
+import androidx.compose.ui.draw.rotate
 import androidx.compose.ui.geometry.Offset
-import androidx.compose.ui.graphics.Color
+import androidx.compose.ui.graphics.*
 import androidx.compose.ui.graphics.drawscope.Stroke
-import androidx.compose.ui.platform.LocalContext
+import androidx.compose.ui.graphics.drawscope.rotate
 import androidx.compose.ui.platform.LocalLifecycleOwner
+import androidx.compose.ui.text.font.FontWeight
 import androidx.compose.ui.text.style.TextAlign
 import androidx.compose.ui.unit.dp
+import androidx.compose.ui.unit.sp
 import androidx.compose.ui.viewinterop.AndroidView
+import androidx.lifecycle.lifecycleScope
 import com.google.accompanist.permissions.ExperimentalPermissionsApi
 import com.google.accompanist.permissions.rememberMultiplePermissionsState
-import com.google.android.gms.location.FusedLocationProviderClient
-import com.google.android.gms.location.LocationServices
-import com.google.android.gms.location.Priority
-import com.google.android.gms.maps.model.CameraPosition
-import com.google.android.gms.maps.model.LatLng
+import com.google.android.gms.location.*
+import com.google.android.gms.maps.model.*
 import com.google.android.gms.tasks.CancellationTokenSource
 import com.google.maps.android.compose.*
-import androidx.compose.runtime.LaunchedEffect
-import com.google.android.gms.maps.CameraUpdateFactory
-import com.otaliastudios.cameraview.CameraListener
-import com.otaliastudios.cameraview.CameraOptions
 import com.otaliastudios.cameraview.CameraView
-import org.opencv.android.OpenCVLoader
-import kotlinx.coroutines.Dispatchers
-import kotlinx.coroutines.withContext
+import com.otaliastudios.cameraview.controls.Audio
+import com.otaliastudios.cameraview.frame.Frame
+import com.otaliastudios.cameraview.frame.FrameProcessor
+import kotlinx.coroutines.delay
 import kotlinx.coroutines.launch
-import androidx.compose.runtime.rememberCoroutineScope
-import androidx.lifecycle.lifecycleScope
-import com.google.android.libraries.places.api.Places
-import com.google.android.libraries.places.api.model.Place
-import com.google.android.libraries.places.api.net.FindAutocompletePredictionsRequest
-import com.google.android.libraries.places.api.net.FetchPlaceRequest
-import com.google.android.libraries.places.api.net.PlacesClient
-import org.json.JSONObject
-import java.net.URL
-import java.net.URLEncoder
+import kotlin.math.*
+
+/* ===================== COLORS ===================== */
+
+private val LuxuryBlack = Color(0xFF0A0A0F)
+private val LuxuryDarkGrey = Color(0xFF1C1C1E)
+private val LuxuryGreen = Color(0xFF00E676)
+private val LuxuryRed = Color(0xFFFF5252)
+private val LuxuryCyan = Color(0xFF00E5FF)
+private val LuxuryYellow = Color(0xFFFFEB3B)
+private val LuxuryTextGrey = Color(0xFF8E8E93)
+
+/* ===================== MAIN ACTIVITY ===================== */
 
 class MainActivity : ComponentActivity(), SensorEventListener {
 
+    companion object {
+        private const val TAG = "NavSight"
+    }
+
+    // Sensor Manager
     private lateinit var sensorManager: SensorManager
     private var accelerometer: Sensor? = null
+    private var magnetometer: Sensor? = null
     private var gyroscope: Sensor? = null
-    private var fusedLocationClient: FusedLocationProviderClient? = null
-    private var placesClient: PlacesClient? = null
-    internal var isNativeLibraryLoaded = false
-    private var isVioStarted = false
+    private lateinit var fusedLocationClient: FusedLocationProviderClient
 
-    // State to hold the latest VIO data
-    val vioDataState = mutableStateOf(VioData())
+    // מנועים
+    private val orientationTracker = DeviceOrientationTracker()
+    private val opticalFlowProcessor = OpticalFlowProcessor()
+
+    // UI States
+    val orientationState = mutableStateOf(DeviceOrientationTracker.OrientationResult(
+        pitch = 0f, roll = 0f, azimuth = 0f,
+        isHorizontal = false, deviationFromHorizontal = 90f, stabilityScore = 0f
+    ))
+    
+    val flowResultState = mutableStateOf(OpticalFlowProcessor.FlowResult(
+        dx = 0f, dy = 0f, magnitude = 0f,
+        direction = OpticalFlowProcessor.MovementDirection.STOPPED,
+        confidence = 0f,
+        mode = OpticalFlowProcessor.MovementMode.WALKING
+    ))
+    
+    // מיקום וירטואלי (במטרים) עבור הרדאר
+    private var virtualX = 0.0
+    private var virtualZ = 0.0
+    val pathHistory = mutableStateListOf<Pair<Float, Float>>()
+    
+    // GPS Start Location
     val startLocation = mutableStateOf<LatLng?>(null)
-    val destinationLocation = mutableStateOf<LatLng?>(null)
-    val routePoints = mutableStateOf<List<LatLng>>(emptyList())
-    val isNavigating = mutableStateOf(false)
+    
+    // מהירות לפי Optical Flow
+    private var lastFlowTime = 0L
+    private val velocityScale = 0.01f // קנה מידה להמרת pixels למטרים
 
     override fun onCreate(savedInstanceState: Bundle?) {
         super.onCreate(savedInstanceState)
+        enableEdgeToEdge()
+        window.addFlags(WindowManager.LayoutParams.FLAG_KEEP_SCREEN_ON)
 
-        // Set up global exception handler
-        val defaultExceptionHandler = Thread.getDefaultUncaughtExceptionHandler()
-        Thread.setDefaultUncaughtExceptionHandler { thread, throwable ->
-            Log.e(TAG, "UNCAUGHT EXCEPTION in thread ${thread.name}", throwable)
-            Log.e(TAG, "Stack trace: ${throwable.stackTraceToString()}")
-            // Let the system handle it after logging
-            defaultExceptionHandler?.uncaughtException(thread, throwable)
-            Thread.getDefaultUncaughtExceptionHandler()?.uncaughtException(thread, throwable)
-        }
+        // Initialize location client
+        fusedLocationClient = LocationServices.getFusedLocationProviderClient(this)
+        
+        // Initialize sensors
+        sensorManager = getSystemService(Context.SENSOR_SERVICE) as SensorManager
+        accelerometer = sensorManager.getDefaultSensor(Sensor.TYPE_ACCELEROMETER)
+        magnetometer = sensorManager.getDefaultSensor(Sensor.TYPE_MAGNETIC_FIELD)
+        gyroscope = sensorManager.getDefaultSensor(Sensor.TYPE_GYROSCOPE)
 
-        Log.d(TAG, "onCreate started")
+        Log.d(TAG, "Sensors initialized - Accel: ${accelerometer != null}, Mag: ${magnetometer != null}, Gyro: ${gyroscope != null}")
 
-        try {
-            enableEdgeToEdge()
-            Log.d(TAG, "Edge-to-edge enabled")
-        } catch (e: Exception) {
-            Log.e(TAG, "Failed to enable edge-to-edge: ${e.message}", e)
-        }
-
-        // Native library loaded - ready to use
-
-        try {
-            fusedLocationClient = LocationServices.getFusedLocationProviderClient(this)
-            Log.d(TAG, "Location client initialized")
-        } catch (e: Exception) {
-            Log.e(TAG, "Failed to initialize location client: ${e.message}", e)
-        }
-
-        try {
-            setContent {
-                NavSightApp(
-                    vioDataState.value,
-                    startLocation.value,
-                    destinationLocation.value,
-                    routePoints.value,
-                    isNavigating.value
-                )
+        setContent {
+            MaterialTheme(colorScheme = darkColorScheme()) {
+                NavSightApp()
             }
-            Log.d(TAG, "Content set successfully")
-        } catch (e: Exception) {
-            Log.e(TAG, "Failed to set content: ${e.message}", e)
-            throw e // Re-throw to prevent app from continuing in bad state
-        }
-
-        try {
-            sensorManager = getSystemService(Context.SENSOR_SERVICE) as SensorManager
-            accelerometer = sensorManager.getDefaultSensor(Sensor.TYPE_ACCELEROMETER)
-            gyroscope = sensorManager.getDefaultSensor(Sensor.TYPE_GYROSCOPE)
-            Log.d(TAG, "Sensors initialized - Accel: ${accelerometer != null}, Gyro: ${gyroscope != null}")
-        } catch (e: Exception) {
-            Log.e(TAG, "Failed to initialize sensors: ${e.message}", e)
-        }
-
-        // Initialize Google Places API
-        try {
-            val apiKey = packageManager
-                .getApplicationInfo(packageName, android.content.pm.PackageManager.GET_META_DATA)
-                .metaData
-                .getString("com.google.android.geo.API_KEY") ?: ""
-
-            if (!Places.isInitialized()) {
-                Places.initialize(applicationContext, apiKey)
-            }
-            placesClient = Places.createClient(this)
-            Log.d(TAG, "Places API initialized")
-        } catch (e: Exception) {
-            Log.e(TAG, "Failed to initialize Places API: ${e.message}", e)
-        }
-
-        Log.d(TAG, "onCreate completed successfully")
-    }
-
-    @SuppressLint("MissingPermission")
-    fun requestInitialLocation() {
-        fusedLocationClient?.getCurrentLocation(Priority.PRIORITY_HIGH_ACCURACY, CancellationTokenSource().token)
-            ?.addOnSuccessListener { location ->
-                if (location != null) {
-                    startLocation.value = LatLng(location.latitude, location.longitude)
-                    resetVIO() // Reset VIO origin to this new location
-                }
-            } ?: run {
-            Log.e(TAG, "Location client not initialized")
         }
     }
 
     override fun onResume() {
         super.onResume()
-        accelerometer?.also { accel ->
-            sensorManager.registerListener(this, accel, SensorManager.SENSOR_DELAY_FASTEST)
+        // רישום לחיישנים
+        accelerometer?.let { 
+            sensorManager.registerListener(this, it, SensorManager.SENSOR_DELAY_GAME) 
         }
-        gyroscope?.also { gyro ->
-            sensorManager.registerListener(this, gyro, SensorManager.SENSOR_DELAY_FASTEST)
+        magnetometer?.let { 
+            sensorManager.registerListener(this, it, SensorManager.SENSOR_DELAY_GAME) 
         }
-
-        // Only start VIO if native library is loaded and not already started
-        if (isNativeLibraryLoaded && !isVioStarted) {
-            try {
-                startVIO()
-                isVioStarted = true
-                Log.d(TAG, "VIO started successfully")
-            } catch (e: Exception) {
-                Log.e(TAG, "Failed to start VIO: ${e.message}", e)
-            }
+        gyroscope?.let {
+            sensorManager.registerListener(this, it, SensorManager.SENSOR_DELAY_GAME)
         }
     }
 
     override fun onPause() {
         super.onPause()
         sensorManager.unregisterListener(this)
+    }
 
-        if (isNativeLibraryLoaded && isVioStarted) {
-            try {
-                stopVIO()
-                isVioStarted = false
-                Log.d(TAG, "VIO stopped successfully")
-            } catch (e: Exception) {
-                Log.e(TAG, "Failed to stop VIO: ${e.message}", e)
+    override fun onSensorChanged(event: SensorEvent) {
+        when (event.sensor.type) {
+            Sensor.TYPE_ACCELEROMETER -> {
+                orientationTracker.updateAccelerometer(event.values)
+            }
+            Sensor.TYPE_MAGNETIC_FIELD -> {
+                orientationTracker.updateMagnetometer(event.values)
             }
         }
+        
+        // עדכון אוריינטציה
+        orientationState.value = orientationTracker.getOrientation()
     }
 
-    override fun onDestroy() {
-        super.onDestroy()
-        // Cleanup if needed
-    }
+    override fun onAccuracyChanged(sensor: Sensor?, accuracy: Int) {}
 
-    override fun onAccuracyChanged(sensor: Sensor?, accuracy: Int) {
-        // Do nothing
-    }
-
-    override fun onSensorChanged(event: SensorEvent?) {
-        if (event != null && isNativeLibraryLoaded) {
-            try {
-                when (event.sensor.type) {
-                    Sensor.TYPE_ACCELEROMETER -> {
-                        processAccelerometer(event.timestamp, event.values[0], event.values[1], event.values[2])
-                    }
-                    Sensor.TYPE_GYROSCOPE -> {
-                        processGyroscope(event.timestamp, event.values[0], event.values[1], event.values[2])
-                    }
-                }
-            } catch (e: Exception) {
-                Log.e(TAG, "Error processing sensor data: ${e.message}")
-            }
-        }
-    }
-
-    suspend fun fetchRoute(origin: LatLng, destination: LatLng): List<LatLng> {
-        return withContext(Dispatchers.IO) {
-            try {
-                val apiKey = packageManager
-                    .getApplicationInfo(packageName, android.content.pm.PackageManager.GET_META_DATA)
-                    .metaData
-                    .getString("com.google.android.geo.API_KEY") ?: ""
-
-                val url = "https://maps.googleapis.com/maps/api/directions/json?" +
-                        "origin=${origin.latitude},${origin.longitude}" +
-                        "&destination=${destination.latitude},${destination.longitude}" +
-                        "&mode=driving" +
-                        "&key=$apiKey"
-
-                val response = URL(url).readText()
-                val json = JSONObject(response)
-
-                val routes = json.getJSONArray("routes")
-                if (routes.length() > 0) {
-                    val route = routes.getJSONObject(0)
-                    val overviewPolyline = route.getJSONObject("overview_polyline")
-                    val points = overviewPolyline.getString("points")
-                    decodePolyline(points)
-                } else {
-                    emptyList()
-                }
-            } catch (e: Exception) {
-                Log.e(TAG, "Error fetching route: ${e.message}", e)
-                emptyList()
-            }
-        }
-    }
-
-    private fun decodePolyline(encoded: String): List<LatLng> {
-        val poly = ArrayList<LatLng>()
-        var index = 0
-        val len = encoded.length
-        var lat = 0
-        var lng = 0
-
-        while (index < len) {
-            var b: Int
-            var shift = 0
-            var result = 0
-            do {
-                if (index >= len) {
-                    Log.e(TAG, "Malformed polyline encoding at index $index")
-                    break
-                }
-                b = encoded[index++].code - 63
-                result = result or (b and 0x1f shl shift)
-                shift += 5
-            } while (b >= 0x20 && index < len)
-                b = encoded[index++].code - 63
-                result = result or (b and 0x1f shl shift)
-                shift += 5
-            } while (b >= 0x20)
-            val dlat = if (result and 1 != 0) (result shr 1).inv() else result shr 1
-            lat += dlat
-
-            shift = 0
-            result = 0
-            do {
-                if (index >= len) {
-                    Log.e(TAG, "Malformed polyline encoding at index $index")
-                    break
-                }
-                b = encoded[index++].code - 63
-                result = result or (b and 0x1f shl shift)
-                shift += 5
-            } while (b >= 0x20 && index < len)
-                b = encoded[index++].code - 63
-                result = result or (b and 0x1f shl shift)
-                shift += 5
-            } while (b >= 0x20)
-            val dlng = if (result and 1 != 0) (result shr 1).inv() else result shr 1
-            lng += dlng
-
-            val p = LatLng(lat.toDouble() / 1E5, lng.toDouble() / 1E5)
-            poly.add(p)
-        }
-
-        return poly
-    }
-
-    fun startNavigation(destination: LatLng) {
-        lifecycleScope.launch {
-            val origin = startLocation.value
-            if (origin != null) {
-                val route = fetchRoute(origin, destination)
-                routePoints.value = route
-                isNavigating.value = route.isNotEmpty()
-                destinationLocation.value = destination
-                if (route.isNotEmpty()) {
-                    Toast.makeText(this@MainActivity, "Route loaded!", Toast.LENGTH_SHORT).show()
-                } else {
-                    Toast.makeText(this@MainActivity, "Failed to load route", Toast.LENGTH_SHORT).show()
-                }
-            }
-        }
-    }
-
-    fun updateNavigationRoute() {
-        lifecycleScope.launch {
-            val destination = destinationLocation.value
-            val origin = startLocation.value
-            if (destination != null && origin != null && isNavigating.value) {
-                // Get current VIO position in LatLng
-                val currentVioPos = metersToLatLng(origin, vioDataState.value.x, vioDataState.value.z)
-                // Re-fetch route from current position to destination
-                val route = fetchRoute(currentVioPos, destination)
-                if (route.isNotEmpty()) {
-                    routePoints.value = route
-                }
-            }
-        }
-    }
-
-    fun stopNavigation() {
-        routePoints.value = emptyList()
-        destinationLocation.value = null
-        isNavigating.value = false
-        Toast.makeText(this, "Navigation stopped", Toast.LENGTH_SHORT).show()
-    }
-
-    suspend fun searchPlace(query: String): LatLng? {
-        return withContext(Dispatchers.IO) {
-            try {
-                val apiKey = packageManager
-                    .getApplicationInfo(packageName, android.content.pm.PackageManager.GET_META_DATA)
-                    .metaData
-                    .getString("com.google.android.geo.API_KEY") ?: ""
-
-                val encodedQuery = URLEncoder.encode(query, "UTF-8")
-                val url = "https://maps.googleapis.com/maps/api/geocode/json?address=$encodedQuery&key=$apiKey"
-
-                val response = URL(url).readText()
-                val json = JSONObject(response)
-
-                val results = json.getJSONArray("results")
-                if (results.length() > 0) {
-                    val location = results.getJSONObject(0)
-                        .getJSONObject("geometry")
-                        .getJSONObject("location")
-
-                    val lat = location.getDouble("lat")
-                    val lng = location.getDouble("lng")
-
-                    Log.d(TAG, "Found place: $query at $lat, $lng")
-                    LatLng(lat, lng)
-                } else {
-                    Log.w(TAG, "No results found for: $query")
-                    null
-                }
-            } catch (e: Exception) {
-                Log.e(TAG, "Error searching place: ${e.message}", e)
-                null
-            }
-        }
-    }
-
-    external fun processCameraFrame(
-        frameData: ByteArray,
-        width: Int, height: Int, timestamp: Long
-    ): VioData?
-    external fun processAccelerometer(timestamp: Long, x: Float, y: Float, z: Float)
-    external fun processGyroscope(timestamp: Long, x: Float, y: Float, z: Float)
-    external fun resetVIO()
-    external fun setScale(scale: Double)
-    external fun startVIO()
-    external fun stopVIO()
-    external fun pingNative()
-
-
-    companion object {
-        const val TAG = "NavSight"
-        internal const val METERS_PER_DEGREE = 111139.0  // Meters per degree latitude (standard Earth)
-        private var isOpenCVInitialized = false
-        private var isLibraryLoaded = false
-
-        init {
-            Log.d(TAG, "Companion object init block starting...")
-            try {
-                Log.d(TAG, "Attempting to initialize OpenCV...")
-                isOpenCVInitialized = if (BuildConfig.DEBUG) {
-                    Log.d(TAG, "Initializing OpenCV in DEBUG mode")
-                    OpenCVLoader.initDebug()
-                } else {
-                    Log.d(TAG, "Initializing OpenCV in RELEASE mode")
-                    OpenCVLoader.initDebug()
-                }
-                isOpenCVInitialized = OpenCVLoader.initDebug()
-                if (isOpenCVInitialized) {
-                    Log.d(TAG, "OpenCV is initialized successfully.")
-                } else {
-                    Log.e(TAG, "OpenCV initialization failed!")
-                }
-            } catch (e: Exception) {
-                Log.e(TAG, "Error initializing OpenCV: ${e.message}", e)
-                isOpenCVInitialized = false
-            } catch (e: Error) {
-                Log.e(TAG, "Critical error initializing OpenCV: ${e.message}", e)
-                isOpenCVInitialized = false
-            }
-
-            try {
-                Log.d(TAG, "Attempting to load native library 'navsight'...")
-                System.loadLibrary("navsight")
-                isLibraryLoaded = true
-                Log.d(TAG, "Native library loaded successfully.")
-            } catch (e: UnsatisfiedLinkError) {
-                Log.e(TAG, "Failed to load native library: ${e.message}", e)
-                isLibraryLoaded = false
-            } catch (e: Exception) {
-                Log.e(TAG, "Unexpected error loading native library: ${e.message}", e)
-                isLibraryLoaded = false
-            }
-
-            Log.d(TAG, "Companion init complete - OpenCV: $isOpenCVInitialized, Library: $isLibraryLoaded")
-        }
-    }
-
-    init {
-        try {
-            isNativeLibraryLoaded = isLibraryLoaded && isOpenCVInitialized
-            Log.d(TAG, "Instance init - Native library loaded: $isNativeLibraryLoaded")
-        } catch (e: Exception) {
-            Log.e(TAG, "Error in instance init: ${e.message}", e)
-            isNativeLibraryLoaded = false
-        }
-    }
-}
-
-@OptIn(ExperimentalPermissionsApi::class)
-@Composable
-fun NavSightApp(
-    vioData: VioData,
-    startLocation: LatLng?,
-    destinationLocation: LatLng?,
-    routePoints: List<LatLng>,
-    isNavigating: Boolean
-) {
-    val context = LocalContext.current
-    val mainActivity = context as MainActivity
-    var isLibraryReady by remember { mutableStateOf(mainActivity.isNativeLibraryLoaded) }
-    var retryCount by remember { mutableStateOf(0) }
-    val maxRetries = 10
-
-    // Check library loading status with retry mechanism
-    LaunchedEffect(Unit) {
-        while (!isLibraryReady && retryCount < maxRetries) {
-            kotlinx.coroutines.delay(500) // Wait 500ms between checks
-            isLibraryReady = mainActivity.isNativeLibraryLoaded
-            if (!isLibraryReady) {
-                retryCount++
-                Log.d(MainActivity.TAG, "Waiting for native library... Attempt ${retryCount}/${maxRetries}")
-            }
-        }
-        if (isLibraryReady) {
-            Log.d(MainActivity.TAG, "Native library loaded successfully!")
-        } else {
-            Log.e(MainActivity.TAG, "Failed to load native library after $maxRetries attempts")
-        }
-    }
-
-    if (!isLibraryReady) {
-        // Loading screen
-        Column(
-            modifier = Modifier.fillMaxSize(),
-            horizontalAlignment = Alignment.CenterHorizontally,
-            verticalArrangement = Arrangement.Center
-        ) {
-            androidx.compose.material3.CircularProgressIndicator(
-                modifier = Modifier.padding(16.dp)
-            )
-            Text(
-                text = if (retryCount < maxRetries) {
-                    "Initializing NavSight...\nLoading native libraries..."
-                } else {
-                    "Failed to load native libraries.\nPlease restart the app."
-                },
-                modifier = Modifier.padding(16.dp),
-                textAlign = TextAlign.Center
-            )
-            if (retryCount >= maxRetries) {
-                Button(
-                    onClick = {
-                        // Restart activity
-                        (context as ComponentActivity).recreate()
-                    },
-                    modifier = Modifier.padding(16.dp)
-                ) {
-                    Text("Retry")
-                }
-            }
-        }
-    } else {
-        // Library loaded, proceed with normal flow
-        val permissionsState = rememberMultiplePermissionsState(
-            permissions = listOf(
-                Manifest.permission.CAMERA,
-                Manifest.permission.ACCESS_FINE_LOCATION
-            )
+    /**
+     * עיבוד פריים מהמצלמה
+     */
+    fun processCameraFrame(frame: Frame) {
+        val data = frame.getData<ByteArray>() ?: return
+        
+        // עיבוד Optical Flow
+        val flowResult = opticalFlowProcessor.processFrame(
+            frame = data,
+            width = frame.size.width,
+            height = frame.size.height,
+            isYuv = true
         )
-
-        LaunchedEffect(permissionsState.allPermissionsGranted) {
-            if (permissionsState.allPermissionsGranted) {
-                mainActivity.requestInitialLocation()
+        
+        // עדכון state
+        flowResultState.value = flowResult
+        
+        // עדכון מיקום וירטואלי אם יש תנועה ואם הטלפון אופקי
+        if (flowResult.direction != OpticalFlowProcessor.MovementDirection.STOPPED &&
+            orientationState.value.isHorizontal) {
+            
+            val currentTime = System.currentTimeMillis()
+            val deltaTime = if (lastFlowTime > 0) (currentTime - lastFlowTime) / 1000.0 else 0.0
+            lastFlowTime = currentTime
+            
+            if (deltaTime > 0 && deltaTime < 0.5) {
+                // חישוב תזוזה בהתאם לכיוון המצפן
+                val azimuthRad = Math.toRadians(orientationState.value.azimuth.toDouble())
+                
+                // המרת תנועת Optical Flow לתנועה בעולם
+                // שים לב: dy חיובי = רצפה זזה למטה = אנחנו זזים קדימה
+                val forwardSpeed = flowResult.dy * velocityScale
+                val lateralSpeed = flowResult.dx * velocityScale
+                
+                // סיבוב לפי המצפן
+                val dx = forwardSpeed * sin(azimuthRad) + lateralSpeed * cos(azimuthRad)
+                val dz = forwardSpeed * cos(azimuthRad) - lateralSpeed * sin(azimuthRad)
+                
+                virtualX += dx
+                virtualZ += dz
+                
+                // הוספה להיסטוריה
+                pathHistory.add(Pair(virtualX.toFloat(), virtualZ.toFloat()))
+                if (pathHistory.size > 500) pathHistory.removeAt(0)
             }
         }
+    }
 
-        if (permissionsState.allPermissionsGranted) {
-            MainScreen(context, vioData, startLocation, destinationLocation, routePoints, isNavigating)
+    @SuppressLint("MissingPermission")
+    fun requestInitialLocation() {
+        val tokenSource = CancellationTokenSource()
+        fusedLocationClient.getCurrentLocation(Priority.PRIORITY_HIGH_ACCURACY, tokenSource.token)
+            .addOnSuccessListener { location ->
+                if (location != null) {
+                    startLocation.value = LatLng(location.latitude, location.longitude)
+                    Log.d(TAG, "Got initial location: ${location.latitude}, ${location.longitude}")
+                }
+            }
+    }
+
+    fun resetPath() {
+        pathHistory.clear()
+        virtualX = 0.0
+        virtualZ = 0.0
+        opticalFlowProcessor.reset()
+        orientationTracker.reset()
+    }
+
+    /* ===================== UI COMPOSABLES ===================== */
+
+    @OptIn(ExperimentalPermissionsApi::class)
+    @Composable
+    fun NavSightApp() {
+        var showSplash by remember { mutableStateOf(true) }
+        
+        if (showSplash) {
+            SplashScreen(onSplashFinished = { showSplash = false })
         } else {
-            Column(
-                modifier = Modifier.fillMaxSize(),
-                horizontalAlignment = Alignment.CenterHorizontally,
-                verticalArrangement = Arrangement.Center
-            ) {
-                Text(
-                    text = "Camera and Location permissions are required to use this app.",
-                    modifier = Modifier.padding(16.dp),
-                    textAlign = TextAlign.Center
-                )
-                Button(
-                    onClick = { permissionsState.launchMultiplePermissionRequest() },
-                    modifier = Modifier.padding(16.dp)
-                ) {
-                    Text("Grant Permissions")
-                }
-            }
-        }
-    }
-}
-
-@Composable
-fun TrackedPointsOverlay(points: FloatArray) {
-    Canvas(modifier = Modifier.fillMaxSize()) {
-        val pointCount = points.size / 2
-        for (i in 0 until pointCount) {
-            val x = points[i * 2]
-            val y = points[i * 2 + 1]
-            drawCircle(
-                color = Color.Green,
-                radius = 8f,
-                center = Offset(x, y),
-                style = Stroke(width = 3f)
+            val perms = rememberMultiplePermissionsState(
+                listOf(Manifest.permission.CAMERA, Manifest.permission.ACCESS_FINE_LOCATION)
             )
-        }
-    }
-}
 
-@Composable
-fun DebugOverlay(vioData: VioData) {
-    Column(
-        modifier = Modifier
-            .fillMaxSize()
-            .padding(16.dp),
-        verticalArrangement = Arrangement.Top,
-        horizontalAlignment = Alignment.Start
-    ) {
-        // Status card at top
-        Card(
-            colors = CardDefaults.cardColors(
-                containerColor = Color.Black.copy(alpha = 0.7f)
-            ),
-            modifier = Modifier.padding(bottom = 8.dp)
-        ) {
-            Column(modifier = Modifier.padding(12.dp)) {
-                // Initialization status
-                Text(
-                    text = if (vioData.isInitialized) "✅ Initialized" else "⏳ Initializing...",
-                    color = if (vioData.isInitialized) Color.Green else Color.Yellow,
-                    style = MaterialTheme.typography.labelLarge
-                )
-
-                Spacer(modifier = Modifier.height(8.dp))
-
-                // Position
-                Text(
-                    text = "Position (m):",
-                    color = Color.White,
-                    style = MaterialTheme.typography.labelMedium
-                )
-                Text(
-                    text = "X: ${"%.2f".format(vioData.x)}  Y: ${"%.2f".format(vioData.y)}  Z: ${"%.2f".format(vioData.z)}",
-                    text = String.format("X: %.2f  Y: %.2f  Z: %.2f", vioData.x, vioData.y, vioData.z),
-                    color = Color.Cyan,
-                    style = MaterialTheme.typography.bodySmall
-                )
-
-                Spacer(modifier = Modifier.height(4.dp))
-
-                // Rotation
-                Text(
-                    text = "Rotation (deg):",
-                    color = Color.White,
-                    style = MaterialTheme.typography.labelMedium
-                )
-                Text(
-                    text = "R: ${"%.1f".format(Math.toDegrees(vioData.roll))}  P: ${"%.1f".format(Math.toDegrees(vioData.pitch))}  Y: ${"%.1f".format(Math.toDegrees(vioData.yaw))}",
-                    text = String.format("R: %.1f  P: %.1f  Y: %.1f",
-                        Math.toDegrees(vioData.roll),
-                        Math.toDegrees(vioData.pitch),
-                        Math.toDegrees(vioData.yaw)
-                    ),
-                    color = Color.Cyan,
-                    style = MaterialTheme.typography.bodySmall
-                )
-
-                Spacer(modifier = Modifier.height(4.dp))
-
-                // Tracking quality
-                val qualityColor = when {
-                    vioData.trackingQuality > 0.7 -> Color.Green
-                    vioData.trackingQuality > 0.3 -> Color.Yellow
-                    else -> Color.Red
+            LaunchedEffect(perms.allPermissionsGranted) {
+                if (perms.allPermissionsGranted) {
+                    requestInitialLocation()
                 }
-                Text(
-                    text = "Tracking Quality: ${"%.1f%%".format(vioData.trackingQuality * 100)}",
-                    text = "Tracking Quality: ${String.format("%.1f%%", vioData.trackingQuality * 100)}",
-                    color = qualityColor,
-                    style = MaterialTheme.typography.labelMedium
-                )
+            }
 
-                // Features
-                Text(
-                    text = "Features: ${vioData.trackedFeatures} / ${vioData.totalFeatures}",
-                    color = Color.White,
-                    style = MaterialTheme.typography.bodySmall
-                )
-
-                // Scale
-                Text(
-                    text = "Scale: ${"%.3f".format(vioData.estimatedScale)} m/unit",
-                    text = "Scale: ${String.format("%.3f", vioData.estimatedScale)} m/unit",
-                    color = if (vioData.estimatedScale > 0.01) Color.Green else Color.Gray,
-                    style = MaterialTheme.typography.bodySmall
-                )
-
-                // Point count
-                val pointCount = vioData.trackedPoints.size / 2
-                Text(
-                    text = "Tracked Points: $pointCount 🟢",
-                    color = Color.White,
-                    style = MaterialTheme.typography.bodySmall
-                )
-
-                Spacer(modifier = Modifier.height(8.dp))
-
-                // IMU Data section
-                Text(
-                    text = "IMU Sensors:",
-                    color = Color.Yellow,
-                    style = MaterialTheme.typography.labelMedium
-                )
-
-                // Accelerometer
-                Text(
-                    text = "Accel (m/s²): X:${"%.2f".format(vioData.accelX)} Y:${"%.2f".format(vioData.accelY)} Z:${"%.2f".format(vioData.accelZ)}",
-                    text = String.format("Accel (m/s²): X:%.2f Y:%.2f Z:%.2f",
-                        vioData.accelX, vioData.accelY, vioData.accelZ),
-                    color = Color.Cyan,
-                    style = MaterialTheme.typography.bodySmall
-                )
-
-                // Gyroscope
-                Text(
-                    text = "Gyro (rad/s): X:${"%.2f".format(vioData.gyroX)} Y:${"%.2f".format(vioData.gyroY)} Z:${"%.2f".format(vioData.gyroZ)}",
-                    text = String.format("Gyro (rad/s): X:%.2f Y:%.2f Z:%.2f",
-                        vioData.gyroX, vioData.gyroY, vioData.gyroZ),
-                    color = Color.Cyan,
-                    style = MaterialTheme.typography.bodySmall
-                )
+            when {
+                !perms.allPermissionsGranted -> PermissionScreen { perms.launchMultiplePermissionRequest() }
+                else -> MainScreen()
             }
         }
     }
-}
 
-@Composable
-fun MainScreen(
-    context: Context,
-    vioData: VioData,
-    startLocation: LatLng?,
-    destinationLocation: LatLng?,
-    routePoints: List<LatLng>,
-    isNavigating: Boolean
-) {
-    var showNavigationDialog by remember { mutableStateOf(false) }
-    val mainActivity = context as MainActivity
-
-    Box(modifier = Modifier.fillMaxSize()) {
-        Column(modifier = Modifier.fillMaxSize()) {
-            Box(modifier = Modifier.fillMaxWidth().weight(1f)) {
-                CameraView(
-                    modifier = Modifier.fillMaxSize(),
-                    context = context
+    @Composable
+    fun PermissionScreen(onRequest: () -> Unit) {
+        Box(Modifier.fillMaxSize().background(LuxuryBlack), contentAlignment = Alignment.Center) {
+            Column(horizontalAlignment = Alignment.CenterHorizontally) {
+                Icon(
+                    Icons.Default.Place,
+                    contentDescription = null,
+                    tint = LuxuryGreen,
+                    modifier = Modifier.size(64.dp)
                 )
-                TrackedPointsOverlay(points = vioData.trackedPoints)
-                DebugOverlay(vioData = vioData)
+                Spacer(Modifier.height(16.dp))
+                Text(
+                    "Camera & Location Required",
+                    color = Color.White,
+                    fontSize = 18.sp
+                )
+                Spacer(Modifier.height(24.dp))
+                Button(
+                    onClick = onRequest, 
+                    colors = ButtonDefaults.buttonColors(containerColor = LuxuryGreen)
+                ) {
+                    Text("Enable Sensors", color = LuxuryBlack)
+                }
             }
-            if (startLocation != null) {
-                MapView(
+        }
+    }
+
+    @Composable
+    fun MainScreen() {
+        val orientation = orientationState.value
+        val flowResult = flowResultState.value
+        val azimuth = orientation.azimuth
+        
+        Box(Modifier.fillMaxSize().background(LuxuryBlack)) {
+            Column(Modifier.fillMaxSize()) {
+                
+                // === CAMERA + AR AREA (Top) ===
+                Box(
                     modifier = Modifier
+                        .weight(0.55f)
                         .fillMaxWidth()
-                        .weight(1f),
-                    startLocation = startLocation,
-                    vioData = vioData,
-                    destinationLocation = destinationLocation,
-                    routePoints = routePoints
-                )
-            } else {
-                Box(modifier = Modifier.fillMaxWidth().weight(1f), contentAlignment = Alignment.Center) {
-                    Text("Getting initial location...")
-                }
-            }
-        }
-        // Top center: Navigation info or VIO position
-        if (isNavigating && destinationLocation != null && startLocation != null) {
-            // Navigation mode: Show distance to destination
-            val currentPos = remember(vioData, startLocation) {
-                metersToLatLng(startLocation!!, vioData.x, vioData.z)
-            }
-            val distance = remember(currentPos, destinationLocation) {
-                calculateDistance(currentPos, destinationLocation!!)
-            }
-            Column(
-                modifier = Modifier
-                    .align(Alignment.TopCenter)
-                    .padding(16.dp)
-                    .background(Color(0xFF1E88E5).copy(alpha = 0.9f))
-                    .padding(horizontal = 16.dp, vertical = 12.dp),
-                horizontalAlignment = Alignment.CenterHorizontally
-            ) {
-                Text(
-                    text = if (distance >= 1000) "%.1f km".format(distance / 1000) else "%.0f m".format(distance),
-                    style = MaterialTheme.typography.headlineMedium,
-                    color = Color.White
-                )
-                Text(
-                    text = "to destination",
-                    style = MaterialTheme.typography.bodySmall,
-                    color = Color.White.copy(alpha = 0.9f)
-                )
-            }
-        } else {
-            // Normal mode: Show VIO position
-            Text(
-                text = "X: %.2f, Y: %.2f, Z: %.2f".format(vioData.x, vioData.y, vioData.z),
-                modifier = Modifier
-                    .align(Alignment.TopCenter)
-                    .padding(16.dp)
-                    .background(Color.Black.copy(alpha = 0.5f))
-                    .padding(8.dp),
-                color = Color.White
-            )
-        }
-
-        // Bottom controls
-        Column(
-            modifier = Modifier.align(Alignment.BottomCenter),
-            horizontalAlignment = Alignment.CenterHorizontally
-        ) {
-            Row(
-                modifier = Modifier.padding(8.dp),
-                horizontalArrangement = Arrangement.spacedBy(8.dp)
-            ) {
-                Button(
-                    onClick = { mainActivity.resetVIO() }
+                        .padding(12.dp)
+                        .clip(RoundedCornerShape(20.dp))
+                        .border(
+                            width = 2.dp,
+                            color = if (orientation.isHorizontal) LuxuryGreen else LuxuryRed,
+                            shape = RoundedCornerShape(20.dp)
+                        )
                 ) {
-                    Text("Reset VIO")
-                }
-                if (!isNavigating) {
-                    Button(
-                        onClick = { showNavigationDialog = true }
-                    ) {
-                        Text("Navigate")
+                    // Camera View
+                    CameraViewComposable()
+                    
+                    // AR Overlay
+                    AROverlay(flowResult = flowResult, orientation = orientation)
+                    
+                    // Radar at top right
+                    Box(Modifier.align(Alignment.TopEnd).padding(12.dp)) {
+                        SensorRadar(
+                            history = pathHistory.toList(),
+                            currentAzimuth = azimuth
+                        )
                     }
-                } else {
-                    Button(
-                        onClick = { mainActivity.stopNavigation() },
-                        colors = ButtonDefaults.buttonColors(containerColor = Color.Red)
-                    ) {
-                        Text("Stop Nav")
+                    
+                    // Direction indicator at top left
+                    Box(Modifier.align(Alignment.TopStart).padding(12.dp)) {
+                        DirectionBadge(direction = flowResult.direction, mode = flowResult.mode)
                     }
-                }
-            }
-        }
-    }
-
-    // Navigation dialog
-    if (showNavigationDialog) {
-        NavigationDialog(
-            onDismiss = { showNavigationDialog = false },
-            onNavigate = { destination ->
-                (context as MainActivity).destinationLocation.value = destination
-                showNavigationDialog = false
-            },
-            currentLocation = startLocation
-        )
-    }
-}
-
-@Composable
-fun CameraView(modifier: Modifier = Modifier, context: Context) {
-    val lifecycleOwner = LocalLifecycleOwner.current
-    val cameraView = remember { com.otaliastudios.cameraview.CameraView(context) }
-    val mainActivity = context as MainActivity
-
-    AndroidView(
-        factory = {
-            cameraView.apply {
-                Log.i(MainActivity.TAG, "Configuring CameraView...")
-                setLifecycleOwner(lifecycleOwner)
-                setAudio(com.otaliastudios.cameraview.controls.Audio.OFF)
-                setFrameProcessingFormat(android.graphics.ImageFormat.YUV_420_888) // Corrected constant
-
-                addFrameProcessor(object : com.otaliastudios.cameraview.frame.FrameProcessor { // Corrected API usage
-                    override fun process(frame: com.otaliastudios.cameraview.frame.Frame) {
-                        // Log.d(MainActivity.TAG, "Frame processor called. Timestamp: ${frame.time}")
-                        if (!mainActivity.isNativeLibraryLoaded) {
-                            return
-                        }
-                        val data = frame.getData<ByteArray>()
-                        if (data != null) {
-                            try {
-                                val result = mainActivity.processCameraFrame(
-                                    data,
-                                    frame.size.width,
-                                    frame.size.height,
-                                    frame.time
-                                )
-                                if (result != null) {
-                                    mainActivity.vioDataState.value = result
-                                }
-                            } catch (e: Throwable) {
-                                Log.e(MainActivity.TAG, "Error processing camera frame: ${e.message}", e)
-                                // Re-throw fatal errors that indicate unrecoverable app state
-                                if (e is OutOfMemoryError || e is VirtualMachineError) {
-                                    throw e
-                                }
-                                // Continue processing for recoverable exceptions
-                            } catch (e: Exception) {
-                                Log.e(MainActivity.TAG, "Error processing camera frame: ${e.message}")
-                            }
+                    
+                    // Phone orientation warning - show when NOT horizontal
+                    if (!orientation.isHorizontal) {
+                        Box(
+                            Modifier
+                                .align(Alignment.BottomCenter)
+                                .padding(12.dp)
+                        ) {
+                            PhoneOrientationWarning(deviation = orientation.deviationFromHorizontal)
                         }
                     }
-                })
-                addCameraListener(object : CameraListener() {
-                    override fun onCameraOpened(options: CameraOptions) {
-                        super.onCameraOpened(options)
-                        Log.i(MainActivity.TAG, "Camera opened!")
+                    
+                    // Stability indicator
+                    Box(Modifier.align(Alignment.BottomEnd).padding(12.dp)) {
+                        StabilityIndicator(
+                            stability = orientation.stabilityScore,
+                            confidence = flowResult.confidence
+                        )
                     }
+                }
 
-                    override fun onCameraError(exception: com.otaliastudios.cameraview.CameraException) {
-                        super.onCameraError(exception)
-                        Log.e(MainActivity.TAG, "Camera Error: ", exception)
+                // === MAP AREA (Bottom) ===
+                Box(
+                    modifier = Modifier
+                        .weight(0.45f)
+                        .fillMaxWidth()
+                        .padding(start = 7.dp, end = 7.dp, top = 7.dp, bottom = 50.dp)
+                        .clip(RoundedCornerShape(20.dp))
+                        .background(LuxuryDarkGrey)
+                ) {
+                    // מיקום ברירת מחדל אם אין GPS (תל אביב)
+                    val mapStartLocation = startLocation.value ?: LatLng(32.0853, 34.7818)
+                    
+                    GoogleMapWrapper(
+                        start = mapStartLocation,
+                        azimuth = azimuth,
+                        pathHistory = pathHistory.toList()
+                    )
+                    
+                    // Reset button
+                    FloatingActionButton(
+                        onClick = { resetPath() },
+                        containerColor = LuxuryGreen,
+                        modifier = Modifier
+                            .align(Alignment.BottomEnd)
+                            .padding(16.dp)
+                    ) {
+                        Icon(Icons.Default.Refresh, "Reset", tint = LuxuryBlack)
                     }
-                })
-            }
-        },
-        modifier = modifier
-    )
-}
-
-@Composable
-fun MapView(
-    modifier: Modifier = Modifier,
-    startLocation: LatLng,
-    vioData: VioData,
-    destinationLocation: LatLng?,
-    routePoints: List<LatLng>
-) {
-    val currentVioPosition = remember(vioData, startLocation) {
-        metersToLatLng(startLocation, vioData.x, vioData.z)
-    }
-
-    val isNavigating = routePoints.isNotEmpty()
-
-    // Calculate heading in degrees (0-360)
-    val heading = remember(vioData.yaw) {
-        val degrees = (vioData.yaw * 180.0 / Math.PI).toFloat()
-        // Normalize to 0-360
-        val normalized = (degrees + 360) % 360
-        normalized
-    }
-
-    val cameraPositionState = rememberCameraPositionState {
-        position = CameraPosition.fromLatLngZoom(startLocation, 16f)
-    }
-
-    // Auto-follow camera during navigation
-    LaunchedEffect(currentVioPosition, isNavigating, heading) {
-        if (isNavigating) {
-            // Navigation mode: Follow position with heading orientation
-            cameraPositionState.animate(
-                update = com.google.android.gms.maps.CameraUpdateFactory.newCameraPosition(
-                    CameraPosition.Builder()
-                        .target(currentVioPosition)
-                        .zoom(18f)
-                        .bearing(heading) // Rotate map to match heading
-                        .tilt(45f) // 3D perspective
-                        .build()
-                ),
-                durationMs = 1000
-            )
-        }
-    }
-
-    // Update route periodically during navigation
-    val context = LocalContext.current
-    var lastUpdateDistance by remember { mutableStateOf(0.0) }
-    LaunchedEffect(vioData.x, vioData.z, isNavigating) {
-        if (isNavigating) {
-            // Calculate distance traveled since last update
-            val distanceTraveled = kotlin.math.sqrt(vioData.x * vioData.x + vioData.z * vioData.z)
-            // Update route every 50 meters
-            if (kotlin.math.abs(distanceTraveled - lastUpdateDistance) > 50) {
-                lastUpdateDistance = distanceTraveled
-                (context as MainActivity).updateNavigationRoute()
-            }
-        }
-    }
-
-    GoogleMap(
-        modifier = modifier,
-        cameraPositionState = cameraPositionState,
-        uiSettings = com.google.maps.android.compose.MapUiSettings(
-            zoomControlsEnabled = !isNavigating,
-            rotationGesturesEnabled = !isNavigating,
-            scrollGesturesEnabled = !isNavigating,
-            tiltGesturesEnabled = !isNavigating,
-            myLocationButtonEnabled = false
-        )
-    ) {
-        // Current position marker (VIO-tracked position)
-        Marker(
-            state = MarkerState(position = currentVioPosition),
-            title = "My Position",
-            snippet = "VIO: %.1fm, %.1fm".format(vioData.x, vioData.z),
-            rotation = heading,
-            flat = true,
-            anchor = Offset(0.5f, 0.5f)
-        )
-
-        // Destination marker
-        if (destinationLocation != null) {
-            Marker(
-                state = MarkerState(position = destinationLocation),
-                title = "Destination"
-            )
-        }
-
-        // Route polyline
-        if (routePoints.isNotEmpty()) {
-            Polyline(
-                points = routePoints,
-                color = androidx.compose.ui.graphics.Color(0xFF4285F4), // Google Maps blue
-                width = 12f
-            )
-        }
-    }
-}
-
-@OptIn(ExperimentalMaterial3Api::class)
-@Composable
-fun NavigationDialog(
-    onDismiss: () -> Unit,
-    onNavigate: (LatLng) -> Unit,
-    currentLocation: LatLng?
-) {
-    var searchText by remember { mutableStateOf("") }
-    var selectedPlace by remember { mutableStateOf<LatLng?>(null) }
-    var errorMessage by remember { mutableStateOf("") }
-    var isSearching by remember { mutableStateOf(false) }
-    val context = LocalContext.current
-    val mainActivity = context as MainActivity
-    val coroutineScope = rememberCoroutineScope()
-
-    AlertDialog(
-        onDismissRequest = onDismiss,
-        title = { Text("Navigate to Destination") },
-        text = {
-            Column {
-                OutlinedTextField(
-                    value = searchText,
-                    onValueChange = {
-                        searchText = it
-                        selectedPlace = null
-                        errorMessage = ""
-                    },
-                    label = { Text("Enter address or place") },
-                    placeholder = { Text("e.g., Times Square, New York") },
-                    modifier = Modifier.fillMaxWidth(),
-                    singleLine = true,
-                    trailingIcon = {
-                        if (isSearching) {
-                            CircularProgressIndicator(
-                                modifier = Modifier.size(24.dp),
-                                strokeWidth = 2.dp
+                    
+                    // Debug info
+                    Box(
+                        Modifier
+                            .align(Alignment.TopStart)
+                            .padding(8.dp)
+                            .background(Color.Black.copy(alpha = 0.7f), RoundedCornerShape(8.dp))
+                            .padding(8.dp)
+                    ) {
+                        Column {
+                            Text(
+                                "X: ${"%.1f".format(virtualX)}m  Z: ${"%.1f".format(virtualZ)}m",
+                                color = LuxuryCyan,
+                                fontSize = 12.sp
+                            )
+                            Text(
+                                "Flow: ${"%.1f".format(flowResult.magnitude)}",
+                                color = LuxuryGreen,
+                                fontSize = 10.sp
                             )
                         }
                     }
-                )
-
-                if (errorMessage.isNotEmpty()) {
-                    Text(
-                        text = errorMessage,
-                        color = Color.Red,
-                        modifier = Modifier.padding(top = 8.dp),
-                        style = MaterialTheme.typography.bodySmall
-                    )
                 }
-
-                if (selectedPlace != null) {
-                    Text(
-                        text = "✓ Location found: ${selectedPlace!!.latitude}, ${selectedPlace!!.longitude}",
-                        color = Color(0xFF4CAF50),
-                        modifier = Modifier.padding(top = 8.dp),
-                        style = MaterialTheme.typography.bodySmall
-                    )
-                }
-
-                Spacer(modifier = Modifier.height(16.dp))
-                Text("Quick test destinations:", style = MaterialTheme.typography.bodySmall)
-                Row(
-                    modifier = Modifier.fillMaxWidth(),
-                    horizontalArrangement = Arrangement.spacedBy(8.dp)
-                ) {
-                    Button(
-                        onClick = {
-                            currentLocation?.let {
-                                selectedPlace = LatLng(it.latitude + 0.0045, it.longitude)
-                                searchText = "500m North"
-                                errorMessage = ""
-                            }
-                        },
-                        modifier = Modifier.weight(1f)
-                    ) {
-                        Text("500m N")
-                    }
-                    Button(
-                        onClick = {
-                            currentLocation?.let {
-                                selectedPlace = LatLng(it.latitude, it.longitude + 0.0045)
-                                searchText = "500m East"
-                                errorMessage = ""
-                            }
-                        },
-                        modifier = Modifier.weight(1f)
-                    ) {
-                        Text("500m E")
-                    }
-                }
-
-                Spacer(modifier = Modifier.height(8.dp))
-                Text(
-                    text = "VIO will track your position. Route shows on map.",
-                    style = MaterialTheme.typography.bodySmall,
-                    color = Color.Gray
-                )
-            }
-        },
-        confirmButton = {
-            Button(
-                onClick = {
-                    // First check if it's already a selected place
-                    if (selectedPlace != null) {
-                        mainActivity.destinationLocation.value = selectedPlace
-                        mainActivity.startNavigation(selectedPlace!!)
-                        onNavigate(selectedPlace!!)
-                        onDismiss()
-                        return@Button
-                    }
-
-                    // Try to parse as coordinates
-                    val coordDestination = parseLatLng(searchText)
-                    if (coordDestination != null) {
-                        mainActivity.destinationLocation.value = coordDestination
-                        mainActivity.startNavigation(coordDestination)
-                        onNavigate(coordDestination)
-                        onDismiss()
-                        return@Button
-                    }
-
-                    // Search as place name
-                    if (searchText.isNotBlank()) {
-                        isSearching = true
-                        errorMessage = ""
-                        coroutineScope.launch {
-                            val placeResult = mainActivity.searchPlace(searchText)
-                            isSearching = false
-                            if (placeResult != null) {
-                                selectedPlace = placeResult
-                                mainActivity.destinationLocation.value = placeResult
-                                mainActivity.startNavigation(placeResult)
-                                onNavigate(placeResult)
-                                onDismiss()
-                            } else {
-                                errorMessage = "Place not found. Try: 'City, Country' or 'lat,lng'"
-                            }
-                        }
-                    } else {
-                        errorMessage = "Please enter a destination"
-                    }
-                },
-                enabled = !isSearching
-            ) {
-                Text(if (isSearching) "Searching..." else "Show Route")
-            }
-        },
-        dismissButton = {
-            TextButton(
-                onClick = onDismiss,
-                enabled = !isSearching
-            ) {
-                Text("Cancel")
             }
         }
-    )
-}
-
-fun parseLatLng(text: String): LatLng? {
-    return try {
-        val parts = text.split(",")
-        if (parts.size == 2) {
-            val lat = parts[0].trim().toDouble()
-            val lng = parts[1].trim().toDouble()
-            LatLng(lat, lng)
-        } else {
-            null
-        }
-    } catch (e: Exception) {
-        null
     }
-}
 
-fun metersToLatLng(start: LatLng, dx: Double, dz: Double): LatLng {
-    val lat = start.latitude + (dz / MainActivity.METERS_PER_DEGREE)
-    val lng = start.longitude + (dx / (MainActivity.METERS_PER_DEGREE * Math.cos(Math.toRadians(start.latitude))))
-    val lat = start.latitude + (dz / 111111.0)
-    val lng = start.longitude + (dx / (111111.0 * Math.cos(Math.toRadians(start.latitude))))
-    return LatLng(lat, lng)
-}
+    @Composable
+    fun CameraViewComposable() {
+        val lifecycle = LocalLifecycleOwner.current
+        val mainActivity = this
+        
+        AndroidView(
+            factory = { ctx ->
+                CameraView(ctx).apply {
+                    setLifecycleOwner(lifecycle)
+                    setAudio(Audio.OFF)
+                    setFrameProcessingFormat(android.graphics.ImageFormat.YUV_420_888)
+                    
+                    addFrameProcessor(object : FrameProcessor {
+                        override fun process(frame: Frame) {
+                            mainActivity.processCameraFrame(frame)
+                        }
+                    })
+                }
+            },
+            modifier = Modifier.fillMaxSize()
+        )
+    }
 
-fun calculateDistance(from: LatLng, to: LatLng): Double {
-    val earthRadius = 6371000.0 // meters
-    val dLat = Math.toRadians(to.latitude - from.latitude)
-    val dLng = Math.toRadians(to.longitude - from.longitude)
-    val a = Math.sin(dLat / 2) * Math.sin(dLat / 2) +
-            Math.cos(Math.toRadians(from.latitude)) * Math.cos(Math.toRadians(to.latitude)) *
-            Math.sin(dLng / 2) * Math.sin(dLng / 2)
-    val c = 2 * Math.atan2(Math.sqrt(a), Math.sqrt(1 - a))
-    return earthRadius * c
+    @Composable
+    fun AROverlay(
+        flowResult: OpticalFlowProcessor.FlowResult,
+        orientation: DeviceOrientationTracker.OrientationResult
+    ) {
+        // Grid effect when moving
+        if (flowResult.direction != OpticalFlowProcessor.MovementDirection.STOPPED &&
+            orientation.isHorizontal) {
+            
+            val infiniteTransition = rememberInfiniteTransition(label = "grid")
+            val gridOffset by infiniteTransition.animateFloat(
+                initialValue = 0f,
+                targetValue = 60f,
+                animationSpec = infiniteRepeatable(
+                    animation = tween(800, easing = LinearEasing),
+                    repeatMode = RepeatMode.Restart
+                ),
+                label = "gridOffset"
+            )
+            
+            Canvas(Modifier.fillMaxSize()) {
+                val gridSpacing = 80f
+                
+                // Flow lines from center going down
+                val centerX = size.width / 2
+                val startY = size.height * 0.4f
+                
+                // אפקט של קווים זורמים כלפי מטה
+                for (i in 0..10) {
+                    val y = startY + (gridOffset + i * 40f) % (size.height * 0.6f)
+                    val alpha = ((y - startY) / (size.height * 0.6f) * 0.5f).coerceIn(0f, 0.5f)
+                    
+                    // קו מרכזי
+                    drawLine(
+                        color = LuxuryGreen.copy(alpha = alpha),
+                        start = Offset(centerX, y),
+                        end = Offset(centerX, y + 30f),
+                        strokeWidth = 3f,
+                        cap = StrokeCap.Round
+                    )
+                    
+                    // קווים צדדיים
+                    val spread = (y - startY) * 0.5f
+                    drawLine(
+                        color = LuxuryCyan.copy(alpha = alpha * 0.7f),
+                        start = Offset(centerX - spread, y),
+                        end = Offset(centerX - spread - 20f, y + 30f),
+                        strokeWidth = 2f
+                    )
+                    drawLine(
+                        color = LuxuryCyan.copy(alpha = alpha * 0.7f),
+                        start = Offset(centerX + spread, y),
+                        end = Offset(centerX + spread + 20f, y + 30f),
+                        strokeWidth = 2f
+                    )
+                }
+            }
+        }
+        
+        // Direction Arrow Overlay
+        Box(
+            Modifier.fillMaxSize(),
+            contentAlignment = Alignment.Center
+        ) {
+            AROverlayRenderer.DirectionArrow(
+                direction = flowResult.direction,
+                magnitude = flowResult.magnitude
+            )
+        }
+    }
+
+    @Composable
+    fun DirectionBadge(direction: OpticalFlowProcessor.MovementDirection, mode: OpticalFlowProcessor.MovementMode = OpticalFlowProcessor.MovementMode.WALKING) {
+        val (text, color, icon) = when (direction) {
+            OpticalFlowProcessor.MovementDirection.FORWARD -> Triple("שמאלה", LuxuryGreen, Icons.Default.KeyboardArrowUp)
+            OpticalFlowProcessor.MovementDirection.BACKWARD -> Triple("ימינה", LuxuryRed, Icons.Default.KeyboardArrowDown)
+            OpticalFlowProcessor.MovementDirection.LEFT -> Triple("קדימה", LuxuryCyan, Icons.Default.ArrowBack)
+            OpticalFlowProcessor.MovementDirection.RIGHT -> Triple("אחורה", LuxuryCyan, Icons.Default.ArrowForward)
+            OpticalFlowProcessor.MovementDirection.STOPPED -> Triple("עומד", LuxuryYellow, Icons.Default.Place)
+        }
+        
+        val modeText = when (mode) {
+            OpticalFlowProcessor.MovementMode.WALKING -> "🚶"
+            OpticalFlowProcessor.MovementMode.DRIVING -> "🚗"
+        }
+        
+        Surface(
+            color = Color.Black.copy(0.8f),
+            shape = RoundedCornerShape(12.dp),
+            border = BorderStroke(1.dp, color)
+        ) {
+            Row(
+                modifier = Modifier.padding(horizontal = 12.dp, vertical = 8.dp),
+                verticalAlignment = Alignment.CenterVertically
+            ) {
+                Text(modeText, fontSize = 16.sp)
+                Spacer(Modifier.width(6.dp))
+                Icon(icon, null, tint = color, modifier = Modifier.size(20.dp))
+                Spacer(Modifier.width(6.dp))
+                Text(text, color = color, fontWeight = FontWeight.Bold, fontSize = 14.sp)
+            }
+        }
+    }
+
+    @Composable
+    fun PhoneOrientationWarning(deviation: Float) {
+        val infiniteTransition = rememberInfiniteTransition(label = "blink")
+        val alpha by infiniteTransition.animateFloat(
+            initialValue = 0.6f,
+            targetValue = 1f,
+            animationSpec = infiniteRepeatable(
+                animation = tween(400),
+                repeatMode = RepeatMode.Reverse
+            ),
+            label = "blink"
+        )
+        
+        Surface(
+            color = LuxuryRed.copy(alpha = alpha * 0.3f),
+            shape = RoundedCornerShape(12.dp),
+            border = BorderStroke(2.dp, LuxuryRed.copy(alpha = alpha))
+        ) {
+            Row(
+                modifier = Modifier.padding(horizontal = 16.dp, vertical = 10.dp),
+                verticalAlignment = Alignment.CenterVertically
+            ) {
+                Icon(
+                    Icons.Default.Phone,
+                    null,
+                    tint = LuxuryRed,
+                    modifier = Modifier
+                        .size(24.dp)
+                        .rotate(deviation.coerceIn(-30f, 30f))
+                )
+                Spacer(Modifier.width(8.dp))
+                Column {
+                    Text(
+                        "החזק את הטלפון אופקית",
+                        color = LuxuryRed,
+                        fontWeight = FontWeight.Bold,
+                        fontSize = 14.sp
+                    )
+                    Text(
+                        "סטייה: ${"%.0f".format(deviation)}°",
+                        color = LuxuryRed.copy(alpha = 0.8f),
+                        fontSize = 12.sp
+                    )
+                }
+            }
+        }
+    }
+
+    @Composable
+    fun StabilityIndicator(stability: Float, confidence: Float) {
+        Surface(
+            color = Color.Black.copy(0.7f),
+            shape = RoundedCornerShape(8.dp)
+        ) {
+            Column(
+                modifier = Modifier.padding(8.dp),
+                horizontalAlignment = Alignment.CenterHorizontally
+            ) {
+                // Stability bar
+                Box(
+                    Modifier
+                        .width(40.dp)
+                        .height(4.dp)
+                        .clip(RoundedCornerShape(2.dp))
+                        .background(Color.White.copy(0.2f))
+                ) {
+                    Box(
+                        Modifier
+                            .fillMaxHeight()
+                            .fillMaxWidth(stability)
+                            .background(
+                                when {
+                                    stability > 0.7f -> LuxuryGreen
+                                    stability > 0.4f -> LuxuryYellow
+                                    else -> LuxuryRed
+                                }
+                            )
+                    )
+                }
+                Spacer(Modifier.height(4.dp))
+                Text(
+                    "${"%.0f".format(confidence * 100)}%",
+                    color = LuxuryTextGrey,
+                    fontSize = 10.sp
+                )
+            }
+        }
+    }
+
+    @Composable
+    fun SensorRadar(history: List<Pair<Float, Float>>, currentAzimuth: Float) {
+        Card(
+            shape = RoundedCornerShape(12.dp),
+            colors = CardDefaults.cardColors(containerColor = Color.Black.copy(0.85f)),
+            border = BorderStroke(1.dp, LuxuryGreen),
+            modifier = Modifier.size(110.dp)
+        ) {
+            Box(Modifier.fillMaxSize()) {
+                Canvas(Modifier.fillMaxSize().padding(8.dp)) {
+                    val cx = size.width / 2
+                    val cy = size.height / 2
+                    val radius = minOf(cx, cy)
+                    
+                    // Grid circles
+                    for (i in 1..3) {
+                        drawCircle(
+                            color = LuxuryGreen.copy(0.15f),
+                            radius = radius * i / 3,
+                            style = Stroke(1f)
+                        )
+                    }
+                    
+                    // Cross lines
+                    drawLine(LuxuryGreen.copy(0.2f), Offset(cx, 0f), Offset(cx, size.height))
+                    drawLine(LuxuryGreen.copy(0.2f), Offset(0f, cy), Offset(size.width, cy))
+
+                    // Draw path
+                    if (history.isNotEmpty()) {
+                        val path = Path()
+                        val scale = 3f  // 3 pixels per meter
+                        
+                        val rad = Math.toRadians((-currentAzimuth).toDouble())
+                        val cosA = cos(rad).toFloat()
+                        val sinA = sin(rad).toFloat()
+
+                        val currentX = history.last().first
+                        val currentZ = history.last().second
+
+                        fun transform(pX: Float, pZ: Float): Offset {
+                            val dx = pX - currentX
+                            val dz = pZ - currentZ
+                            // Rotate to align with compass heading
+                            val rotX = dx * cosA - dz * sinA
+                            val rotZ = dx * sinA + dz * cosA
+                            return Offset(
+                                (cx + rotX * scale).coerceIn(0f, size.width),
+                                (cy - rotZ * scale).coerceIn(0f, size.height)
+                            )
+                        }
+
+                        val start = transform(history.first().first, history.first().second)
+                        path.moveTo(start.x, start.y)
+                        
+                        for (i in 1 until history.size) {
+                            val p = transform(history[i].first, history[i].second)
+                            path.lineTo(p.x, p.y)
+                        }
+                        
+                        drawPath(path, LuxuryGreen, style = Stroke(2f))
+                        
+                        // Start point
+                        val startPoint = transform(history.first().first, history.first().second)
+                        drawCircle(LuxuryYellow, 4f, startPoint)
+                    }
+
+                    // Current position (center)
+                    drawCircle(Color.White, 5f, Offset(cx, cy))
+                    
+                    // Direction indicator
+                    drawLine(
+                        LuxuryCyan,
+                        Offset(cx, cy),
+                        Offset(cx, cy - 15f),
+                        strokeWidth = 3f,
+                        cap = StrokeCap.Round
+                    )
+                }
+                
+                // Label
+                Text(
+                    "RADAR",
+                    color = LuxuryGreen.copy(0.6f),
+                    fontSize = 8.sp,
+                    modifier = Modifier
+                        .align(Alignment.BottomCenter)
+                        .padding(bottom = 4.dp)
+                )
+            }
+        }
+    }
+
+    @Composable
+    fun GoogleMapWrapper(
+        start: LatLng,
+        azimuth: Float,
+        pathHistory: List<Pair<Float, Float>>
+    ) {
+        // Calculate current position based on virtual position
+        val currentPos = remember(virtualX, virtualZ, start) {
+            metersToLatLng(start, virtualX, virtualZ)
+        }
+        
+        val cameraState = rememberCameraPositionState {
+            position = CameraPosition.Builder()
+                .target(currentPos)
+                .zoom(18f)
+                .bearing(azimuth)
+                .tilt(0f)
+                .build()
+        }
+        
+        // Update camera to follow position
+        LaunchedEffect(currentPos, azimuth) {
+            cameraState.animate(
+                com.google.android.gms.maps.CameraUpdateFactory.newCameraPosition(
+                    CameraPosition.Builder()
+                        .target(currentPos)
+                        .zoom(18f)
+                        .bearing(azimuth)
+                        .tilt(30f)
+                        .build()
+                ),
+                durationMs = 500
+            )
+        }
+        
+        GoogleMap(
+            modifier = Modifier.fillMaxSize(),
+            cameraPositionState = cameraState,
+            uiSettings = MapUiSettings(
+                zoomControlsEnabled = false,
+                compassEnabled = false,
+                myLocationButtonEnabled = false
+            )
+        ) {
+            // Current position marker
+            Marker(
+                state = MarkerState(currentPos),
+                title = "You",
+                rotation = azimuth,
+                flat = true,
+                icon = BitmapDescriptorFactory.defaultMarker(BitmapDescriptorFactory.HUE_AZURE)
+            )
+            
+            // Draw path on map if we have history
+            if (pathHistory.isNotEmpty()) {
+                val mapPath = pathHistory.map { (x, z) ->
+                    metersToLatLng(start, x.toDouble(), z.toDouble())
+                }
+                
+                Polyline(
+                    points = mapPath,
+                    color = LuxuryGreen,
+                    width = 8f
+                )
+            }
+            
+            // Start point marker
+            Marker(
+                state = MarkerState(start),
+                title = "Start",
+                icon = BitmapDescriptorFactory.defaultMarker(BitmapDescriptorFactory.HUE_GREEN)
+            )
+        }
+    }
+
+    /**
+     * המרת מטרים ל-LatLng
+     */
+    private fun metersToLatLng(start: LatLng, dx: Double, dz: Double): LatLng {
+        val metersPerDegree = 111111.0
+        val lat = start.latitude + (dz / metersPerDegree)
+        val lng = start.longitude + (dx / (metersPerDegree * cos(Math.toRadians(start.latitude))))
+        return LatLng(lat, lng)
+    }
 }

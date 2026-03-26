@@ -14,13 +14,14 @@ android {
         targetSdk = 34
         versionCode = 1
         versionName = "1.0"
-
+        manifestPlaceholders["GOOGLE_MAPS_API_KEY"] =
+    project.findProperty("GOOGLE_MAPS_API_KEY") as String? ?: ""
         testInstrumentationRunner = "androidx.test.runner.AndroidJUnitRunner"
 
-        // Enable the C++ build
         externalNativeBuild {
             cmake {
                 cppFlags.add("-std=c++17")
+                arguments.add("-DANDROID_STL=c++_shared")
             }
         }
     }
@@ -34,30 +35,32 @@ android {
             )
         }
     }
+    
     compileOptions {
         sourceCompatibility = JavaVersion.VERSION_11
         targetCompatibility = JavaVersion.VERSION_11
     }
+    
     kotlinOptions {
         jvmTarget = "11"
     }
+    
     buildFeatures {
         compose = true
         buildConfig = true
-        // This is the feature that allows CMake to see our remote C++ libraries.
         prefab = true
     }
-    // Tell Gradle where to find our C++ build script.
+
     externalNativeBuild {
         cmake {
             path = file("CMakeLists.txt")
         }
     }
-    packagingOptions {
-        pickFirst("**/libc++_shared.so")
-    }
+    
+    // אין צורך יותר ב-packagingOptions עבור libc++_shared כי עברנו לסטטי
 }
 
+kotlin
 dependencies {
     implementation(project(":sdk"))
 
@@ -73,18 +76,17 @@ dependencies {
     implementation("androidx.compose.ui:ui-tooling-preview")
     implementation("androidx.compose.material3:material3")
 
-    // Google Maps for Compose
+    // Google Maps
     implementation("com.google.maps.android:maps-compose:2.11.4")
     implementation("com.google.android.gms:play-services-maps:18.2.0")
     implementation("com.google.android.gms:play-services-location:21.0.1")
-
-    // Google Places API for address search
     implementation("com.google.android.libraries.places:places:3.3.0")
+    implementation("com.google.android.gms:play-services-tasks:18.1.0") // <-- ADD THIS LINE
 
-    // Accompanist for Permissions
+    // Permissions
     implementation("com.google.accompanist:accompanist-permissions:0.32.0")
 
-    // CameraView
+    // Camera
     implementation("com.otaliastudios:cameraview:2.7.2")
 
     // Testing
