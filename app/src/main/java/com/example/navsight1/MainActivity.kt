@@ -151,6 +151,9 @@ class MainActivity : ComponentActivity(), SensorEventListener {
     private val accelMagnitudeHistory = ArrayDeque<Float>(20)
     private var lastShakeCheckMs = 0L
 
+    // Scale slider (FR15): user-adjustable translation scale, 0.1–5.0, default 1.0
+    private var scaleValue by mutableStateOf(1.0f)
+
     // מהירות לפי Optical Flow
     private var lastFlowTime = 0L
     private val velocityScale = 0.01f // קנה מידה להמרת pixels למטרים
@@ -638,6 +641,37 @@ class MainActivity : ComponentActivity(), SensorEventListener {
                                 fontSize = 10.sp
                             )
                         }
+                    }
+
+                    // FR15: Scale slider — adjusts VIO translation scale (0.1–5.0)
+                    Row(
+                        Modifier
+                            .align(Alignment.BottomStart)
+                            .fillMaxWidth()
+                            .padding(horizontal = 12.dp, vertical = 4.dp)
+                            .background(Color.Black.copy(alpha = 0.6f), RoundedCornerShape(8.dp))
+                            .padding(horizontal = 10.dp, vertical = 2.dp),
+                        verticalAlignment = Alignment.CenterVertically
+                    ) {
+                        Text(
+                            "Scale: ${"%.1f".format(scaleValue)}×",
+                            color = LuxuryCyan,
+                            fontSize = 11.sp,
+                            modifier = Modifier.width(72.dp)
+                        )
+                        Slider(
+                            value = scaleValue,
+                            onValueChange = { v ->
+                                scaleValue = v
+                                setScale(v.toDouble())
+                            },
+                            valueRange = 0.1f..5.0f,
+                            modifier = Modifier.weight(1f),
+                            colors = SliderDefaults.colors(
+                                thumbColor = LuxuryCyan,
+                                activeTrackColor = LuxuryCyan
+                            )
+                        )
                     }
                 }
             }
