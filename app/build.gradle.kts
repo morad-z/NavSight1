@@ -1,8 +1,14 @@
+import java.util.Properties
+
 plugins {
     alias(libs.plugins.android.application)
     alias(libs.plugins.kotlin.android)
     alias(libs.plugins.kotlin.compose)
 }
+
+val localProps = Properties()
+val localPropsFile = rootProject.file("local.properties")
+if (localPropsFile.exists()) localProps.load(localPropsFile.inputStream())
 
 android {
     namespace = "com.example.navsight1"
@@ -15,7 +21,8 @@ android {
         versionCode = 1
         versionName = "1.0"
         manifestPlaceholders["GOOGLE_MAPS_API_KEY"] =
-    project.findProperty("GOOGLE_MAPS_API_KEY") as String? ?: ""
+            localProps.getProperty("GOOGLE_MAPS_API_KEY")
+                ?: project.findProperty("GOOGLE_MAPS_API_KEY") as String? ?: ""
         testInstrumentationRunner = "androidx.test.runner.AndroidJUnitRunner"
 
         externalNativeBuild {
