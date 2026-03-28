@@ -72,12 +72,15 @@ class DeviceOrientationTracker {
         )
         
         if (!success) {
+            // getRotationMatrix fails when magnetometer is unavailable (all zeros) or at gimbal lock.
+            // Either way, use the raw accelerometer to determine tilt — it works without magnetometer.
+            val deviation = calculateHorizontalDeviation()
             return OrientationResult(
                 pitch = smoothedPitch,
                 roll = smoothedRoll,
                 azimuth = smoothedAzimuth,
-                isHorizontal = false,
-                deviationFromHorizontal = 90f,
+                isHorizontal = deviation <= HORIZONTAL_TOLERANCE_DEGREES,
+                deviationFromHorizontal = deviation,
                 stabilityScore = 0f
             )
         }

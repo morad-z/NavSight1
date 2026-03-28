@@ -57,4 +57,6 @@ private:
     static constexpr double RANSAC_THRESH = 1.0;
     static constexpr double ALPHA_FUSION  = 0.98;  // gyro weight
     static constexpr int64_t MAX_DT_NS   = 5'000'000'000LL; // 5 seconds
+    // Minimum mean pixel displacement to treat as real motion (not sensor noise)
+    static constexpr double MIN_FLOW_PX   = 2.0;
 };

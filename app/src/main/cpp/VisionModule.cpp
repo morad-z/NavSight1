@@ -173,7 +173,32 @@ VisionOutput VisionModule::processFrame(const uint8_t* yuv_data,
         tracked_points_flat.push_back(pt.y);
     }
 
-    // ── 9. Need ≥ 8 matched pairs for essential matrix ───────────────────────
+    // ── 9. Motion gate: skip pose update if mean flow < noise threshold ──────
+    // recoverPose always returns a unit translation — even 0.5px noise = "motion".
+    // Guard: if mean pixel displacement < MIN_FLOW_PX, the camera is stationary.
+    if (!prev_good.empty()) {
+        double sum_disp = 0.0;
+        for (size_t i = 0; i < prev_good.size(); ++i) {
+            double dx = next_good[i].x - prev_good[i].x;
+            double dy = next_good[i].y - prev_good[i].y;
+            sum_disp += std::sqrt(dx * dx + dy * dy);
+        }
+        double mean_disp = sum_disp / static_cast<double>(prev_good.size());
+        LOGD("Mean optical flow: %.2f px", mean_disp);
+        if (mean_disp < MIN_FLOW_PX) {
+            // Stationary — update tracking state but do NOT update pose
+            prev_gray_ = gray.clone();
+            prev_pts_  = next_good;
+            prev_timestamp_ns_ = timestamp_ns;
+            out.trackedCount  = tracked;
+            out.totalCount    = total;
+            out.quality       = quality;
+            out.trackedPoints = tracked_points_flat;
+            return out;
+        }
+    }
+
+    // ── 10. Need ≥ 8 matched pairs for essential matrix ──────────────────────
     // NOTE: replenishment happens AFTER pose estimation so prev/next stay aligned
     if (static_cast<int>(prev_good.size()) < 8) {
         // Replenish before storing next frame's points
