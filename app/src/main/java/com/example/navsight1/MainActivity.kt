@@ -56,6 +56,7 @@ import com.otaliastudios.cameraview.CameraView
 import com.otaliastudios.cameraview.controls.Audio
 import com.otaliastudios.cameraview.frame.Frame
 import com.otaliastudios.cameraview.frame.FrameProcessor
+import androidx.annotation.MainThread
 import kotlinx.coroutines.Dispatchers
 import kotlinx.coroutines.delay
 import kotlinx.coroutines.launch
@@ -242,6 +243,7 @@ class MainActivity : ComponentActivity(), SensorEventListener {
         }
 
         // עדכון אוריינטציה — throttled to 20Hz
+        // Thread-safe: registerListener called without a Handler → onSensorChanged runs on main Looper
         val nowNs = event.timestamp
         if (nowNs - lastOrientationUpdateNs >= 50_000_000L) {
             lastOrientationUpdateNs = nowNs
@@ -369,6 +371,7 @@ class MainActivity : ComponentActivity(), SensorEventListener {
         }
     }
 
+    @MainThread
     fun resetPath() {
         resetVIO()
         pathHistory.clear()
@@ -1093,9 +1096,14 @@ class MainActivity : ComponentActivity(), SensorEventListener {
                 .build()
         }
         
-        // Update camera to follow position — debounced to max 2 updates/sec
+        // Update camera to follow position — throttled to max 2 updates/sec.
+        // Uses a throttle (not debounce): fires immediately on first change, then at most
+        // every 500ms during continuous movement, so the map follows movement in real-time.
+        var lastMapAnimMs by remember { mutableLongStateOf(0L) }
         LaunchedEffect(currentPos, azimuth) {
-            delay(500)
+            val elapsed = System.currentTimeMillis() - lastMapAnimMs
+            if (elapsed < 500L) delay(500L - elapsed)
+            lastMapAnimMs = System.currentTimeMillis()
             cameraState.animate(
                 com.google.android.gms.maps.CameraUpdateFactory.newCameraPosition(
                     CameraPosition.Builder()
