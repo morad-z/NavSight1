@@ -142,7 +142,7 @@ Java_com_example_navsight1_MainActivity_processCameraFrame(
     // trackedFeatures(I) totalFeatures(I) estimatedScale(D)
     // isInitialized(Z) trackedPoints([F)
     // accelX(F) accelY(F) accelZ(F) gyroX(F) gyroY(F) gyroZ(F)
-    jmethodID ctor = env->GetMethodID(cls, "<init>", "(DDDDDDDIIDZ[FFFFFFF)V");
+    jmethodID ctor = env->GetMethodID(cls, "<init>", "(DDDDDDDIIDZ[FFFFFF)V");
     if (!ctor) {
         LOGE("processCameraFrame: VioData constructor not found");
         return nullptr;
