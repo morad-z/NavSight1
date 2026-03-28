@@ -17,12 +17,12 @@
         android:icon="@mipmap/ic_launcher"
         android:label="@string/app_name"
         android:roundIcon="@mipmap/ic_launcher_round"
-        android.supportsRtl="true"
+        android:supportsRtl="true"
         android:theme="@style/Theme.NavSight1">
 
         <meta-data
             android:name="com.google.android.geo.API_KEY"
-            android:value="AIzaSyBh_oEKLnQpmX6XvLKwPZNiX3PehllpXtA" />
+            android:value="${GOOGLE_MAPS_API_KEY}" />
 
         <activity
             android:name=".MainActivity"
