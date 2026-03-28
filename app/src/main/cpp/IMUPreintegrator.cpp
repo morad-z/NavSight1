@@ -1,184 +1,228 @@
 #include "IMUPreintegrator.h"
-#include <opencv2/calib3d.hpp>
-#include <android/log.h>
 #include <algorithm>
-#include <cstdint>
+#include <cmath>
+#include <android/log.h>
+#include <opencv2/calib3d.hpp>
 
-#define TAG "IMUPreintegrator"
+#define TAG "NavSight-Native"
+#define LOGI(...) __android_log_print(ANDROID_LOG_INFO,  TAG, __VA_ARGS__)
+#define LOGE(...) __android_log_print(ANDROID_LOG_ERROR, TAG, __VA_ARGS__)
 
-namespace navsight {
+// ── Constructor ───────────────────────────────────────────────────────────────
 
-// ============================================================================
-// Constructor & Destructor
-// ============================================================================
-
-IMUPreintegrator::IMUPreintegrator(double gravity_magnitude)
-    : gravity_magnitude_(gravity_magnitude)
-    , gravity_direction_(0, 0, 1)  // Default: points down in Z
-{
-    measurements_.reserve(MAX_BUFFER_SIZE);
+IMUPreintegrator::IMUPreintegrator() {
+    gyro_buf_.reserve(MAX_BUF);
+    accel_buf_.reserve(MAX_BUF);
 }
 
-// ============================================================================
-// Public Methods
-// ============================================================================
+// ── Helpers ───────────────────────────────────────────────────────────────────
 
-void IMUPreintegrator::addMeasurement(long timestamp_ns,
-                                     const cv::Vec3d& accel,
-                                     const cv::Vec3d& gyro) {
-    std::lock_guard<std::mutex> lock(mutex_);
-
-    // Add new measurement
-    measurements_.emplace_back(timestamp_ns, accel, gyro);
-
-    // Maintain circular buffer (remove oldest if exceeded)
-    if (measurements_.size() > MAX_BUFFER_SIZE) {
-        measurements_.erase(measurements_.begin());
-    }
+static inline bool isValidSensorFloat(float v) {
+    return !std::isnan(v) && !std::isinf(v);
 }
 
-PreintegratedIMU IMUPreintegrator::integrate(long start_ns, long end_ns) {
+// ── addGyroReading ────────────────────────────────────────────────────────────
+
+void IMUPreintegrator::addGyroReading(int64_t timestamp_ns, float x, float y, float z) {
+    if (!isValidSensorFloat(x) || !isValidSensorFloat(y) || !isValidSensorFloat(z)) {
+        LOGE("addGyroReading: NaN/Inf value, dropping sample");
+        return;
+    }
     std::lock_guard<std::mutex> lock(mutex_);
+    last_gx = x; last_gy = y; last_gz = z;
+    if (gyro_buf_.size() >= MAX_BUF) {
+        // Erase oldest half in one shot to amortise O(n) cost
+        gyro_buf_.erase(gyro_buf_.begin(),
+                        gyro_buf_.begin() + static_cast<ptrdiff_t>(MAX_BUF / 2));
+    }
+    gyro_buf_.push_back({timestamp_ns, x, y, z});
+}
 
-    PreintegratedIMU result;
-    result.start_timestamp_ns = start_ns;
-    result.end_timestamp_ns = end_ns;
+// ── addAccelReading ───────────────────────────────────────────────────────────
 
-    // Check if we have any measurements
-    if (measurements_.empty()) {
-        __android_log_print(ANDROID_LOG_DEBUG, TAG,
-            "No IMU measurements available for integration");
-        return result;  // Return identity (no change)
+void IMUPreintegrator::addAccelReading(int64_t timestamp_ns, float x, float y, float z) {
+    if (!isValidSensorFloat(x) || !isValidSensorFloat(y) || !isValidSensorFloat(z)) {
+        LOGE("addAccelReading: NaN/Inf value, dropping sample");
+        return;
+    }
+    std::lock_guard<std::mutex> lock(mutex_);
+    last_ax = x; last_ay = y; last_az = z;
+    if (accel_buf_.size() >= MAX_BUF) {
+        accel_buf_.erase(accel_buf_.begin(),
+                         accel_buf_.begin() + static_cast<ptrdiff_t>(MAX_BUF / 2));
+    }
+    accel_buf_.push_back({timestamp_ns, x, y, z});
+}
+
+// ── integrateGyro ─────────────────────────────────────────────────────────────
+
+cv::Mat IMUPreintegrator::integrateGyro(int64_t start_ns, int64_t end_ns) {
+    cv::Mat result = cv::Mat::eye(3, 3, CV_64F);
+
+    if (start_ns >= end_ns) {
+        LOGE("integrateGyro: start_ns (%lld) >= end_ns (%lld), returning identity",
+             (long long)start_ns, (long long)end_ns);
+        return result;
     }
 
-    // State variables for integration
-    cv::Mat R = cv::Mat::eye(3, 3, CV_64F);     // Current rotation
-    cv::Vec3d velocity(0, 0, 0);                 // Current velocity
-    cv::Vec3d position(0, 0, 0);                 // Current position
-    int64_t last_timestamp = start_ns;           // Use 64-bit to prevent overflow
-
-    // Integrate all measurements in the time range
-    for (const auto& m : measurements_) {
-        // Skip measurements outside time range
-        if (m.timestamp_ns <= start_ns) continue;
-        if (m.timestamp_ns > end_ns) break;
-
-        // Calculate time step
-        double dt = (m.timestamp_ns - last_timestamp) / 1e9;  // ns to seconds
-
-        // Sanity check on dt
-        if (dt <= 0 || dt > 0.5) {  // Reject if > 500ms (likely error)
-            __android_log_print(ANDROID_LOG_WARN, TAG,
-                "Invalid dt: %.3f seconds, skipping measurement", dt);
-            continue;
+    // Collect samples in the time window
+    std::vector<GyroSample> samples;
+    {
+        std::lock_guard<std::mutex> lock(mutex_);
+        for (const auto& s : gyro_buf_) {
+            if (s.timestamp_ns >= start_ns && s.timestamp_ns <= end_ns) {
+                samples.push_back(s);
+            }
         }
-
-        // 1. Integrate gyroscope → Update rotation
-        integrateGyro(m.gyro, dt, R);
-
-        // 2. Integrate accelerometer → Update velocity and position
-        integrateAccel(m.accel, dt, R, velocity, position);
-
-        last_timestamp = m.timestamp_ns;
-        result.num_measurements++;
     }
 
-    // Store results
-    result.delta_R = R.clone();
-    result.delta_v = velocity;
-    result.delta_p = position;
-    result.dt = (end_ns - start_ns) / 1e9;  // Total time in seconds
+    if (samples.empty()) {
+        return result;
+    }
 
-    __android_log_print(ANDROID_LOG_DEBUG, TAG,
-        "Preintegrated %d measurements over %.3f seconds: "
-        "p=(%.3f, %.3f, %.3f), v=(%.3f, %.3f, %.3f)",
-        result.num_measurements, result.dt,
-        position[0], position[1], position[2],
-        velocity[0], velocity[1], velocity[2]);
+    // Sort by timestamp to handle out-of-order arrivals
+    std::sort(samples.begin(), samples.end(),
+              [](const GyroSample& a, const GyroSample& b) {
+                  return a.timestamp_ns < b.timestamp_ns;
+              });
+
+    // Integrate consecutive pairs via Rodrigues formula
+    for (size_t i = 0; i + 1 < samples.size(); ++i) {
+        double dt = static_cast<double>(samples[i + 1].timestamp_ns - samples[i].timestamp_ns) * 1e-9;
+        if (dt <= 0.0) continue;
+
+        cv::Mat rvec = (cv::Mat_<double>(3, 1)
+                        << static_cast<double>(samples[i].x) * dt,
+                           static_cast<double>(samples[i].y) * dt,
+                           static_cast<double>(samples[i].z) * dt);
+        cv::Mat R_delta;
+        cv::Rodrigues(rvec, R_delta);
+        result = R_delta * result;
+    }
+
+    // Handle single-sample case: integrate from sample to end_ns
+    if (samples.size() == 1) {
+        double dt = static_cast<double>(end_ns - samples[0].timestamp_ns) * 1e-9;
+        if (dt > 0.0) {
+            cv::Mat rvec = (cv::Mat_<double>(3, 1)
+                            << static_cast<double>(samples[0].x) * dt,
+                               static_cast<double>(samples[0].y) * dt,
+                               static_cast<double>(samples[0].z) * dt);
+            cv::Mat R_delta;
+            cv::Rodrigues(rvec, R_delta);
+            result = R_delta * result;
+        }
+    }
 
     return result;
 }
 
-void IMUPreintegrator::reset() {
-    std::lock_guard<std::mutex> lock(mutex_);
-    measurements_.clear();
-    __android_log_print(ANDROID_LOG_INFO, TAG, "IMU preintegrator reset");
+// ── integrate ─────────────────────────────────────────────────────────────────
+
+cv::Mat IMUPreintegrator::integrate(int64_t start_ns, int64_t end_ns) {
+    if (start_ns >= end_ns) {
+        LOGE("integrate: start_ns (%lld) >= end_ns (%lld), returning identity",
+             (long long)start_ns, (long long)end_ns);
+        return cv::Mat::eye(3, 3, CV_64F);
+    }
+    return integrateGyro(start_ns, end_ns);
 }
 
-void IMUPreintegrator::setGravity(const cv::Vec3d& gravity_dir, double gravity_mag) {
-    std::lock_guard<std::mutex> lock(mutex_);
+// ── initializeFromGravity ─────────────────────────────────────────────────────
 
-    // Normalize direction
-    double norm = cv::norm(gravity_dir);
-    if (norm > 1e-6) {
-        gravity_direction_ = gravity_dir / norm;
-    } else {
-        __android_log_print(ANDROID_LOG_WARN, TAG,
-            "Invalid gravity direction (zero vector), using default");
-        gravity_direction_ = cv::Vec3d(0, 0, 1);
+void IMUPreintegrator::initializeFromGravity(const std::vector<cv::Point3f>& accel_samples) {
+    if (accel_samples.empty()) {
+        LOGE("initializeFromGravity: empty sample set, skipping");
+        return;
     }
 
-    gravity_magnitude_ = gravity_mag;
+    // Compute average acceleration
+    float sum_x = 0.f, sum_y = 0.f, sum_z = 0.f;
+    for (const auto& s : accel_samples) {
+        sum_x += s.x;
+        sum_y += s.y;
+        sum_z += s.z;
+    }
+    float n = static_cast<float>(accel_samples.size());
+    float avg_x = sum_x / n;
+    float avg_y = sum_y / n;
+    float avg_z = sum_z / n;
 
-    __android_log_print(ANDROID_LOG_INFO, TAG,
-        "Gravity set: direction=(%.3f, %.3f, %.3f), magnitude=%.3f m/s²",
-        gravity_direction_[0], gravity_direction_[1], gravity_direction_[2],
-        gravity_magnitude_);
+    float mag = std::sqrt(avg_x * avg_x + avg_y * avg_y + avg_z * avg_z);
+    if (mag <= 0.f) {
+        LOGE("initializeFromGravity: zero magnitude, skipping");
+        return;
+    }
+
+    // Only initialize once — use compare_exchange_strong to prevent concurrent double-init
+    bool expected = false;
+    if (!gravity_initialized_.compare_exchange_strong(expected, true)) {
+        // Another call already completed initialization
+        return;
+    }
+
+    // Normalize and scale to 9.81 m/s²
+    float inv_mag = 9.81f / mag;
+    // gravity_vec_ and roll_/pitch_ are written once here after CAS succeeds;
+    // no additional lock needed since only one thread can win the CAS.
+    gravity_vec_ = cv::Point3f(avg_x * inv_mag, avg_y * inv_mag, avg_z * inv_mag);
+
+    float gx = gravity_vec_.x;
+    float gy = gravity_vec_.y;
+    float gz = gravity_vec_.z;
+    roll_  = std::atan2(gy, gz);
+    pitch_ = std::atan2(-gx, std::sqrt(gy * gy + gz * gz));
+
+    LOGI("initializeFromGravity: gravity=(%.3f,%.3f,%.3f) roll=%.3f pitch=%.3f",
+         gravity_vec_.x, gravity_vec_.y, gravity_vec_.z, roll_, pitch_);
 }
 
-cv::Vec3d IMUPreintegrator::getGravity() const {
+// ── setGravity ────────────────────────────────────────────────────────────────
+
+void IMUPreintegrator::setGravity(float gx, float gy, float gz) {
+    float mag = std::sqrt(gx * gx + gy * gy + gz * gz);
+    if (mag <= 0.f) {
+        LOGE("setGravity: zero magnitude, ignoring");
+        return;
+    }
     std::lock_guard<std::mutex> lock(mutex_);
-    return gravity_direction_ * gravity_magnitude_;
+    gravity_vec_ = cv::Point3f(gx, gy, gz);
+    roll_  = std::atan2(gy, gz);
+    pitch_ = std::atan2(-gx, std::sqrt(gy * gy + gz * gz));
+    gravity_initialized_.store(true);
 }
 
-size_t IMUPreintegrator::getBufferSize() const {
+// ── accessors ─────────────────────────────────────────────────────────────────
+
+cv::Point3f IMUPreintegrator::getGravityVector() const {
     std::lock_guard<std::mutex> lock(mutex_);
-    return measurements_.size();
+    return gravity_vec_;
 }
 
-// ============================================================================
-// Private Helper Methods
-// ============================================================================
-
-void IMUPreintegrator::integrateGyro(const cv::Vec3d& gyro, double dt, cv::Mat& R) {
-    // Create rotation vector (angle-axis representation)
-    // Rotation angle = angular_velocity * time
-    cv::Vec3d rotation_vector = gyro * dt;
-
-    // Convert to rotation matrix using Rodrigues formula
-    cv::Mat delta_R;
-    cv::Rodrigues(rotation_vector, delta_R);
-
-    // Accumulate rotation: R_new = delta_R * R_old
-    // (Right-multiply because we're rotating the body frame)
-    R = delta_R * R;
+float IMUPreintegrator::getRoll() const {
+    std::lock_guard<std::mutex> lock(mutex_);
+    return roll_;
 }
 
-void IMUPreintegrator::integrateAccel(const cv::Vec3d& accel, double dt,
-                                     const cv::Mat& R,
-                                     cv::Vec3d& velocity,
-                                     cv::Vec3d& position) {
-    // Step 1: Rotate acceleration from body frame to world frame
-    // a_world = R * a_body
-    cv::Mat accel_mat = (cv::Mat_<double>(3, 1) << accel[0], accel[1], accel[2]);
-    cv::Mat accel_world_mat = R * accel_mat;
-    cv::Vec3d accel_world(accel_world_mat.at<double>(0),
-                         accel_world_mat.at<double>(1),
-                         accel_world_mat.at<double>(2));
-
-    // Step 2: Remove gravity
-    // The accelerometer measures: a_measured = a_true + g
-    // So: a_true = a_measured - g
-    cv::Vec3d gravity = gravity_direction_ * gravity_magnitude_;
-    cv::Vec3d accel_corrected = accel_world - gravity;
-
-    // Step 3: Integrate velocity
-    // v(t+dt) = v(t) + a * dt
-    velocity = velocity + accel_corrected * dt;
-
-    // Step 4: Integrate position (using midpoint rule for better accuracy)
-    // p(t+dt) = p(t) + v(t) * dt + 0.5 * a * dt²
-    position = position + velocity * dt + 0.5 * accel_corrected * dt * dt;
+float IMUPreintegrator::getPitch() const {
+    std::lock_guard<std::mutex> lock(mutex_);
+    return pitch_;
 }
 
-} // namespace navsight
+bool IMUPreintegrator::isInitialized() const {
+    return gravity_initialized_.load();
+}
+
+// ── reset ─────────────────────────────────────────────────────────────────────
+
+void IMUPreintegrator::reset() {
+    std::lock_guard<std::mutex> lock(mutex_);
+    gyro_buf_.clear();
+    accel_buf_.clear();
+    gravity_initialized_.store(false);
+    gravity_vec_ = cv::Point3f(0.f, 0.f, 9.81f);
+    roll_  = 0.f;
+    pitch_ = 0.f;
+    last_ax = last_ay = last_az = 0.f;
+    last_gx = last_gy = last_gz = 0.f;
+}

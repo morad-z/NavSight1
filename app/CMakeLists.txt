@@ -30,6 +30,4 @@ target_link_libraries(
         android
         ${log-lib}
         ${OpenCV_LIBS}
-        c++_static   
-        c++abi  
 )

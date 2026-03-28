@@ -80,8 +80,8 @@ fun SplashScreen(onSplashFinished: () -> Unit) {
             )
         }
 
-        // הארכנו את הזמן הכולל של מסך הפתיחה ל-4 שניות כדי שיהיה זמן לראות הכל
-        delay(4000) 
+        // Wait exactly as long as the progress bar animation (2500ms) so both complete together
+        delay(2500)
         onSplashFinished()
     }
 

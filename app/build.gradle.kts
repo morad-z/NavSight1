@@ -21,7 +21,7 @@ android {
         externalNativeBuild {
             cmake {
                 cppFlags.add("-std=c++17")
-                arguments.add("-DANDROID_STL=c++_shared")
+                arguments.add("-DANDROID_STL=c++_static")
             }
         }
     }
@@ -57,7 +57,6 @@ android {
         }
     }
     
-    // אין צורך יותר ב-packagingOptions עבור libc++_shared כי עברנו לסטטי
 }
 
 kotlin
@@ -80,8 +79,7 @@ dependencies {
     implementation("com.google.maps.android:maps-compose:2.11.4")
     implementation("com.google.android.gms:play-services-maps:18.2.0")
     implementation("com.google.android.gms:play-services-location:21.0.1")
-    implementation("com.google.android.libraries.places:places:3.3.0")
-    implementation("com.google.android.gms:play-services-tasks:18.1.0") // <-- ADD THIS LINE
+    implementation("com.google.android.gms:play-services-tasks:18.1.0")
 
     // Permissions
     implementation("com.google.accompanist:accompanist-permissions:0.32.0")
