@@ -68,6 +68,10 @@ class NavSightViewModel(application: Application) : AndroidViewModel(application
     var showCameraBlocked by mutableStateOf(false)
         private set
 
+    /** Initial heading in degrees from SensorRepository (captured at VIO init from magnetometer) */
+    val vioInitAzimuth: Float
+        get() = sensorRepository.vioInitAzimuth
+
     private var lastVioForSpeed: VioData? = null
     private var lastSpeedTimeMs = 0L
     private var lastSnapTimeMs = 0L

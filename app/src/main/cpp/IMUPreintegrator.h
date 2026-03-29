@@ -20,6 +20,7 @@ struct PreintegratedDelta {
     cv::Mat deltaV; // 3x1 velocity
     cv::Mat deltaP; // 3x1 position
     double dt;
+    int sample_count;
 };
 
 class IMUPreintegrator {

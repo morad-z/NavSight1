@@ -80,13 +80,59 @@ class SensorRepository(private val context: Context) : SensorEventListener {
             sensorManager.registerListener(this, it, SensorManager.SENSOR_DELAY_GAME)
         }
         NativeBridge.startVIO()
-        NativeBridge.setIntrinsics(0.0, 0.0, 0.0, 0.0)
+    }
+
+    private var intrinsicsInitialized = false
+
+    private fun getCameraIntrinsics(targetWidth: Int, targetHeight: Int): FloatArray {
+        try {
+            val cameraManager = context.getSystemService(Context.CAMERA_SERVICE) as android.hardware.camera2.CameraManager
+            val cameraId = cameraManager.cameraIdList.firstOrNull { id ->
+                val chars = cameraManager.getCameraCharacteristics(id)
+                chars.get(android.hardware.camera2.CameraCharacteristics.LENS_FACING) == android.hardware.camera2.CameraCharacteristics.LENS_FACING_BACK
+            } ?: cameraManager.cameraIdList[0]
+
+            val characteristics = cameraManager.getCameraCharacteristics(cameraId)
+            val focalLengths = characteristics.get(android.hardware.camera2.CameraCharacteristics.LENS_INFO_AVAILABLE_FOCAL_LENGTHS)
+            val sensorSize = characteristics.get(android.hardware.camera2.CameraCharacteristics.SENSOR_INFO_PHYSICAL_SIZE)
+            val pixelArraySize = characteristics.get(android.hardware.camera2.CameraCharacteristics.SENSOR_INFO_PIXEL_ARRAY_SIZE)
+
+            if (focalLengths != null && focalLengths.isNotEmpty() && sensorSize != null && pixelArraySize != null) {
+                val focalLengthMm = focalLengths[0]
+                val sensorWidthMm = sensorSize.width
+                val sensorHeightMm = sensorSize.height
+                val fullPixelWidth = pixelArraySize.width.toFloat()
+                val fullPixelHeight = pixelArraySize.height.toFloat()
+
+                // Calculate intrinsics for full sensor resolution
+                val fxFull = (focalLengthMm / sensorWidthMm) * fullPixelWidth
+                val fyFull = (focalLengthMm / sensorHeightMm) * fullPixelHeight
+                val cxFull = fullPixelWidth / 2f
+                val cyFull = fullPixelHeight / 2f
+
+                // Scale to target (preview) resolution
+                val scaleX = targetWidth.toFloat() / fullPixelWidth
+                val scaleY = targetHeight.toFloat() / fullPixelHeight
+
+                val fx = fxFull * scaleX
+                val fy = fyFull * scaleY
+                val cx = cxFull * scaleX
+                val cy = cyFull * scaleY
+
+                Log.d(TAG, "Camera intrinsics scaled: fx=$fx fy=$fy cx=$cx cy=$cy (target=${targetWidth}x${targetHeight})")
+                return floatArrayOf(fx, fy, cx, cy)
+            }
+        } catch (e: Exception) {
+            Log.e(TAG, "Failed to get camera intrinsics: ${e.message}")
+        }
+        return floatArrayOf(0f, 0f, 0f, 0f)
     }
 
     fun stopSensors() {
         sensorManager.unregisterListener(this)
         NativeBridge.stopVIO()
         locationTokenSource?.cancel()
+        intrinsicsInitialized = false
     }
 
     override fun onSensorChanged(event: SensorEvent) {
@@ -134,11 +180,26 @@ class SensorRepository(private val context: Context) : SensorEventListener {
     fun processCameraFrame(frame: Frame) {
         val data = frame.getData<ByteArray>() ?: return
 
+        // FR1: Initialize intrinsics for the actual preview dimensions
+        if (!intrinsicsInitialized) {
+            val intrinsics = getCameraIntrinsics(frame.size.width, frame.size.height)
+            NativeBridge.setIntrinsics(
+                intrinsics[0].toDouble(), intrinsics[1].toDouble(),
+                intrinsics[2].toDouble(), intrinsics[3].toDouble()
+            )
+            intrinsicsInitialized = true
+        }
+
+        // FR1: Use the same time base as sensor events (nanoseconds since boot)
+        val timestampNs = android.os.SystemClock.elapsedRealtimeNanos()
+
+        Log.d(TAG, "TIMESTAMP_CHECK camera_frame_time=${frame.time} sensor_last_ts=${System.nanoTime()} elapsed_rt=$timestampNs")
+
         val vio = NativeBridge.processCameraFrame(
             frameData = data,
             width = frame.size.width,
             height = frame.size.height,
-            timestamp = frame.time
+            timestamp = timestampNs
         )
 
         val flowResult = opticalFlowProcessor.processFrame(

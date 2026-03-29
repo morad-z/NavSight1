@@ -151,9 +151,11 @@ class MainActivity : ComponentActivity() {
 
         // Heading fusion
         val fusedHeading: Float = if (vio.isInitialized) {
-            // This logic is simplified for the example; normally you'd use the offset captured at init
-            val vioYawDeg = Math.toDegrees(-vio.yaw).toDouble()
-            ((azimuth + vioYawDeg).toFloat() % 360 + 360) % 360
+            // vioInitAzimuth is the magnetometer azimuth captured at VIO init time
+            // vio.yaw is the accumulated yaw from VIO (in radians)
+            // FR3: If rotation is inverted, we flip the sign here
+            val vioYawDeg = Math.toDegrees(vio.yaw).toFloat()
+            (viewModel.vioInitAzimuth - vioYawDeg + 360f) % 360f
         } else {
             azimuth
         }
