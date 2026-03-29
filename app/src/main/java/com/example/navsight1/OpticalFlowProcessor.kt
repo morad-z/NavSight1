@@ -32,6 +32,9 @@ class OpticalFlowProcessor {
     private var previousFrame: IntArray? = null
     private var previousWidth = 0
     private var previousHeight = 0
+
+    // Reusable grayscale buffer — allocated once per resolution to avoid per-frame GC pressure
+    private var grayscaleBuffer: IntArray? = null
     
     // תנועה מוחלקת
     private var smoothedDx = 0f
@@ -190,31 +193,33 @@ class OpticalFlowProcessor {
      * קביעת כיוון התנועה
      */
     private fun determineDirection(dx: Float, dy: Float, magnitude: Float, minMovement: Float): MovementDirection {
-        if (magnitude < minMovement) {
-            return MovementDirection.STOPPED
-        }
-        
+        if (magnitude.isNaN() || dx.isNaN() || dy.isNaN()) return MovementDirection.STOPPED
+        if (magnitude < minMovement) return MovementDirection.STOPPED
+
         val absDx = abs(dx)
         val absDy = abs(dy)
+
+        if (absDx == 0f && absDy == 0f) return MovementDirection.STOPPED
         
-        // כשהמצלמה מכוונת לרצפה:
-        // dy חיובי (רצפה זזה למטה) = קדימה
-        // dy שלילי (רצפה זזה למעלה) = אחורה
-        // dx חיובי (רצפה זזה ימינה) = שמאלה
-        // dx שלילי (רצפה זזה שמאלה) = ימינה
-        
-        return if (absDy > absDx * 0.7f) {
-            // תנועה אנכית דומיננטית
-            if (dy > 0) MovementDirection.FORWARD else MovementDirection.BACKWARD
-        } else if (absDx > absDy * 0.7f) {
-            // תנועה אופקית דומיננטית
-            if (dx > 0) MovementDirection.LEFT else MovementDirection.RIGHT
+        // Camera mounted face-down on vehicle — x-axis aligns with vehicle forward direction:
+        // dx positive (floor moves right in image) = FORWARD
+        // dx negative (floor moves left in image)  = BACKWARD
+        // dy positive (floor moves down in image)  = RIGHT
+        // dy negative (floor moves up in image)    = LEFT
+        // Note: verify dy sign for LEFT/RIGHT on device if badge still wrong after this fix.
+
+        return if (absDx > absDy * 0.7f) {
+            // תנועה קדימה/אחורה דומיננטית
+            if (dx > 0) MovementDirection.FORWARD else MovementDirection.BACKWARD
+        } else if (absDy > absDx * 0.7f) {
+            // תנועה שמאל/ימין דומיננטית
+            if (dy < 0) MovementDirection.LEFT else MovementDirection.RIGHT
         } else {
             // אלכסון - בוחרים את הגדול יותר
-            if (absDy >= absDx) {
-                if (dy > 0) MovementDirection.FORWARD else MovementDirection.BACKWARD
+            if (absDx >= absDy) {
+                if (dx > 0) MovementDirection.FORWARD else MovementDirection.BACKWARD
             } else {
-                if (dx > 0) MovementDirection.LEFT else MovementDirection.RIGHT
+                if (dy < 0) MovementDirection.LEFT else MovementDirection.RIGHT
             }
         }
     }
@@ -224,14 +229,21 @@ class OpticalFlowProcessor {
      */
     private fun calculateRobustAverage(flowVectors: List<Pair<Float, Float>>): Triple<Float, Float, Int> {
         if (flowVectors.isEmpty()) return Triple(0f, 0f, 0)
-        
+
+        // Need at least 4 points for meaningful IQR; fall back to plain median otherwise
+        if (flowVectors.size < 4) {
+            val dx = flowVectors.map { it.first }.sorted()[flowVectors.size / 2]
+            val dy = flowVectors.map { it.second }.sorted()[flowVectors.size / 2]
+            return Triple(dx, dy, flowVectors.size)
+        }
+
         // מיון לחישוב median
         val sortedDx = flowVectors.map { it.first }.sorted()
         val sortedDy = flowVectors.map { it.second }.sorted()
-        
+
         val medianDx = sortedDx[sortedDx.size / 2]
         val medianDy = sortedDy[sortedDy.size / 2]
-        
+
         // IQR לסינון
         val q1Dx = sortedDx[sortedDx.size / 4]
         val q3Dx = sortedDx[3 * sortedDx.size / 4]
@@ -262,11 +274,18 @@ class OpticalFlowProcessor {
     
     /**
      * YUV לגריי-סקייל
+     * Reuses a pre-allocated buffer to avoid per-frame GC pressure.
      */
     private fun yuvToGrayscale(yuv: ByteArray, width: Int, height: Int): IntArray {
         val size = width * height
-        val grayscale = IntArray(size)
-        for (i in 0 until minOf(size, yuv.size)) {
+        val grayscale = if (grayscaleBuffer?.size == size) {
+            grayscaleBuffer!!.fill(0)  // zero-fill so truncated frames leave unused pixels at 0
+            grayscaleBuffer!!
+        } else {
+            IntArray(size).also { grayscaleBuffer = it }
+        }
+        val limit = minOf(size, yuv.size)
+        for (i in 0 until limit) {
             grayscale[i] = yuv[i].toInt() and 0xFF
         }
         return grayscale
@@ -313,7 +332,10 @@ class OpticalFlowProcessor {
         
         val stepX = (endX - startX) / GRID_SIZE
         val stepY = (endY - startY) / GRID_SIZE
-        
+
+        // Image too small to form a valid grid
+        if (stepX <= 0 || stepY <= 0) return flowVectors
+
         for (gridY in 0 until GRID_SIZE) {
             for (gridX in 0 until GRID_SIZE) {
                 val x = startX + gridX * stepX
@@ -403,6 +425,7 @@ class OpticalFlowProcessor {
      */
     fun reset() {
         previousFrame = null
+        grayscaleBuffer = null
         smoothedDx = 0f
         smoothedDy = 0f
         dxHistory.clear()
