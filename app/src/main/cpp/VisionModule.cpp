@@ -232,13 +232,28 @@ VisionOutput VisionModule::processFrame(const uint8_t* yuv_data,
 
         if (!E.empty() && E.rows == 3 && E.cols == 3) {
             if (cv::recoverPose(E, prev_good_buf_, next_good_buf_, K, R_vo, t_vo, mask) > 0) {
-                // ── 14-15. Complementary filter fusion ──────────────────────
+                // ── 14-15. Adaptive fusion based on tracking quality ───────────────────
                 cv::Mat rot_vec_vo, rot_vec_gyro;
                 cv::Rodrigues(R_vo, rot_vec_vo);
                 cv::Rodrigues(imu_delta.deltaR, rot_vec_gyro);
 
-                cv::Mat rot_vec_fused = ALPHA_FUSION * rot_vec_gyro
-                                      + (1.0 - ALPHA_FUSION) * rot_vec_vo;
+                // FR4: Dynamic Alpha. High quality = camera more main (lower alpha). 
+                // Low quality = sensors more main (higher alpha).
+                double adaptive_alpha = 0.98; // Default
+                if (quality > 0.7) {
+                    adaptive_alpha = 0.85; // Camera is strong, let it correct gyro faster
+                } else if (quality < 0.3) {
+                    adaptive_alpha = 0.995; // Camera is weak (dark/blurry), trust sensors almost entirely
+                } else {
+                    // Linear interpolation between 0.3 and 0.7 quality
+                    double t = (quality - 0.3) / 0.4;
+                    adaptive_alpha = 0.995 - t * (0.995 - 0.85);
+                }
+
+                LOGI("FUSION: quality=%.2f adaptive_alpha=%.3f", quality, adaptive_alpha);
+
+                cv::Mat rot_vec_fused = adaptive_alpha * rot_vec_gyro
+                                      + (1.0 - adaptive_alpha) * rot_vec_vo;
                 cv::Rodrigues(rot_vec_fused, R_fused);
 
                 // ── 16. Scale estimation ────────────────────────────────────
