@@ -1,0 +1,40 @@
+<vector xmlns:android="http://schemas.android.com/apk/res/android"
+    android:width="48dp"
+    android:height="48dp"
+    android:viewportWidth="48"
+    android:viewportHeight="48">
+
+    <!-- Drop shadow circle for visibility -->
+    <path
+        android:fillColor="#33000000"
+        android:pathData="M24,25 m-20,0 a20,20 0,1,1 40,0 a20,20 0,1,1 -40,0" />
+
+    <!-- Main circular background (cyan) -->
+    <path
+        android:fillColor="#00D9FF"
+        android:pathData="M24,24 m-16,0 a16,16 0,1,1 32,0 a16,16 0,1,1 -32,0" />
+
+    <!-- White border ring -->
+    <path
+        android:fillColor="#00000000"
+        android:strokeColor="#FFFFFF"
+        android:strokeWidth="2"
+        android:pathData="M24,24 m-16,0 a16,16 0,1,1 32,0 a16,16 0,1,1 -32,0" />
+
+    <!-- Main arrow pointing up (0° = North) -->
+    <path
+        android:fillColor="#FFFFFF"
+        android:pathData="M24,10 L30,28 L24,25 L18,28 Z" />
+
+    <!-- Inner arrow highlight for 3D effect -->
+    <path
+        android:fillColor="#E0F7FF"
+        android:pathData="M24,14 L27,26 L24,24.5 L21,26 Z" />
+
+    <!-- Arrow outline for definition -->
+    <path
+        android:fillColor="#00000000"
+        android:strokeColor="#0088AA"
+        android:strokeWidth="1"
+        android:pathData="M24,10 L30,28 L24,25 L18,28 Z" />
+</vector>

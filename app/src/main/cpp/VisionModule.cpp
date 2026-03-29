@@ -20,6 +20,16 @@ VisionModule::VisionModule()
 {
     global_R_ = cv::Mat::eye(3, 3, CV_64F);
     global_t_ = cv::Mat::zeros(3, 1, CV_64F);
+    
+    // Pre-reserve buffers to minimize re-allocations
+    current_prev_pts_buf_.reserve(MAX_FEATURES);
+    next_pts_buf_.reserve(MAX_FEATURES);
+    status_buf_.reserve(MAX_FEATURES);
+    err_buf_.reserve(MAX_FEATURES);
+    prev_good_buf_.reserve(MAX_FEATURES);
+    next_good_buf_.reserve(MAX_FEATURES);
+    new_pts_buf_.reserve(MAX_FEATURES);
+    
     LOGI("VisionModule created");
 }
 
@@ -112,11 +122,10 @@ VisionOutput VisionModule::processFrame(const uint8_t* yuv_data,
         return out;
     }
 
-    // ── 2. YUV NV21 → grayscale ───────────────────────────────────────────────
+    // ── 2. YUV NV21 → grayscale (Reuse gray_buf_) ────────────────────────────
     cv::Mat yuv(height + height / 2, width, CV_8UC1,
                 const_cast<uint8_t*>(yuv_data));
-    cv::Mat gray;
-    cv::cvtColor(yuv, gray, cv::COLOR_YUV2GRAY_NV21);
+    cv::cvtColor(yuv, gray_buf_, cv::COLOR_YUV2GRAY_NV21);
 
     // ── 3. Compute camera intrinsics ──────────────────────────────────────────
     double fx_use = (fx_ > 0.0) ? fx_ : 0.7 * width;
@@ -129,149 +138,174 @@ VisionOutput VisionModule::processFrame(const uint8_t* yuv_data,
                     0.0,    fy_use, cy_use,
                     0.0,    0.0,    1.0);
 
-    std::lock_guard<std::mutex> lock(mutex_);
+    // Context for compute (captured under lock then processed outside)
+    cv::Mat current_prev_gray;
+    int64_t current_prev_ts = 0;
+    bool was_initialized = false;
 
-    // ── 4. Initialise on first frame (or if no features remain) ───────────────
-    if (!initialized_ || prev_pts_.empty()) {
-        cv::goodFeaturesToTrack(gray, prev_pts_, MAX_FEATURES, QUALITY_LEVEL, MIN_DIST);
-        prev_gray_ = gray.clone();
-        prev_timestamp_ns_ = timestamp_ns;
-        initialized_ = true;
-        LOGI("processFrame: first frame, detected %zu features", prev_pts_.size());
-        return out; // need two frames
+    {
+        std::lock_guard<std::mutex> lock(mutex_);
+        was_initialized = initialized_;
+        if (!was_initialized || prev_pts_.empty()) {
+            cv::goodFeaturesToTrack(gray_buf_, prev_pts_, MAX_FEATURES, QUALITY_LEVEL, MIN_DIST);
+            gray_buf_.copyTo(prev_gray_);
+            prev_timestamp_ns_ = timestamp_ns;
+            initialized_ = true;
+            
+            // FR15: Auto-initialize gravity vector if not already done
+            if (!imu_.isInitialized()) {
+                // Initialize with current static reading if available
+                imu_.setGravity(imu_.lastAccelX(), imu_.lastAccelY(), imu_.lastAccelZ());
+            }
+            
+            LOGI("processFrame: first frame, detected %zu features", prev_pts_.size());
+            return out;
+        }
+        current_prev_gray = prev_gray_; // Shallow copy (ref-counted)
+        current_prev_pts_buf_  = prev_pts_; // Copy into member buffer (reuses capacity)
+        current_prev_ts   = prev_timestamp_ns_;
     }
 
-    // ── 5. Integrate gyro between frames ─────────────────────────────────────
-    cv::Mat delta_R_gyro = imu_.integrateGyro(prev_timestamp_ns_, timestamp_ns);
+    // ── 5. Integrate IMU (HEAVY COMPUTE - OUTSIDE MAIN LOCK) ────────────────
+    PreintegratedDelta imu_delta = imu_.integrate(current_prev_ts, timestamp_ns);
 
-    // ── 6. Lucas-Kanade optical flow ──────────────────────────────────────────
-    std::vector<cv::Point2f> next_pts;
-    std::vector<uchar> status;
-    std::vector<float> err;
-    cv::calcOpticalFlowPyrLK(prev_gray_, gray, prev_pts_, next_pts, status, err);
+    // ── Drift-Kill detection ────────────────────────────────────────────────
+    double gyro_norm = 0.0;
+    {
+        // Calculate average gyro magnitude from preintegrated interval
+        cv::Mat rot_vec;
+        cv::Rodrigues(imu_delta.deltaR, rot_vec);
+        if (imu_delta.dt > 0) gyro_norm = cv::norm(rot_vec) / imu_delta.dt;
+    }
+
+    bool is_pure_rotation = (gyro_norm > GYRO_ROT_ONLY_THRESH);
+    
+    // ZUPT: If accel is near gravity and gyro is very small, we are static
+    bool is_static = false;
+    double accel_dev = std::abs(cv::norm(imu_delta.deltaV) / std::max(0.001, imu_delta.dt));
+    if (accel_dev < ZUPT_ACCEL_THRESH && gyro_norm < ZUPT_GYRO_THRESH) {
+        is_static = true;
+        imu_delta.deltaP = cv::Mat::zeros(3, 1, CV_64F);
+        imu_delta.deltaV = cv::Mat::zeros(3, 1, CV_64F);
+    }
+
+    // ── 6. Optical Flow (HEAVY COMPUTE - OUTSIDE MAIN LOCK) ─────────────────
+    // Reuse buffers and set explicit TermCriteria
+    next_pts_buf_.clear();
+    status_buf_.clear();
+    err_buf_.clear();
+    
+    cv::TermCriteria criteria(cv::TermCriteria::COUNT + cv::TermCriteria::EPS, 30, 0.01);
+    cv::calcOpticalFlowPyrLK(current_prev_gray, gray_buf_, current_prev_pts_buf_, next_pts_buf_, status_buf_, err_buf_, 
+                             cv::Size(21, 21), 3, criteria);
 
     // ── 7. Filter valid points ────────────────────────────────────────────────
-    std::vector<cv::Point2f> prev_good, next_good;
-    for (size_t i = 0; i < status.size(); ++i) {
-        if (status[i]) {
-            prev_good.push_back(prev_pts_[i]);
-            next_good.push_back(next_pts[i]);
+    prev_good_buf_.clear();
+    next_good_buf_.clear();
+    for (size_t i = 0; i < status_buf_.size(); ++i) {
+        if (status_buf_[i]) {
+            prev_good_buf_.push_back(current_prev_pts_buf_[i]);
+            next_good_buf_.push_back(next_pts_buf_[i]);
         }
     }
 
-    int tracked = static_cast<int>(next_good.size());
-    int total   = static_cast<int>(prev_pts_.size());
-    double quality = calculateTrackingQuality(status);
+    int tracked = static_cast<int>(next_good_buf_.size());
+    int total   = static_cast<int>(current_prev_pts_buf_.size());
+    double quality = calculateTrackingQuality(status_buf_);
 
-    LOGD("VIO Thread: Features tracked: %d / %d", tracked, total);
-
-    // ── 8. Build trackedPoints flat array [x0,y0,x1,y1,...] ─────────────────
     std::vector<float> tracked_points_flat;
-    tracked_points_flat.reserve(next_good.size() * 2);
-    for (const auto& pt : next_good) {
+    tracked_points_flat.reserve(next_good_buf_.size() * 2);
+    for (const auto& pt : next_good_buf_) {
         tracked_points_flat.push_back(pt.x);
         tracked_points_flat.push_back(pt.y);
     }
 
-    // ── 9. Need ≥ 8 matched pairs for essential matrix ───────────────────────
-    // NOTE: replenishment happens AFTER pose estimation so prev/next stay aligned
-    if (static_cast<int>(prev_good.size()) < 8) {
-        // Replenish before storing next frame's points
-        if (tracked < MIN_FEATURES) {
-            std::vector<cv::Point2f> new_pts;
-            cv::goodFeaturesToTrack(gray, new_pts, MAX_FEATURES, QUALITY_LEVEL, MIN_DIST);
-            next_good.insert(next_good.end(), new_pts.begin(), new_pts.end());
+    // ── 9. Essential Matrix Logic (OUTSIDE MAIN LOCK) ──────────────────────
+    bool pose_valid = false;
+    cv::Mat R_vo, t_vo, R_fused;
+    double estimatedScale = 1.0;
+
+    if (static_cast<int>(prev_good_buf_.size()) >= 8) {
+        cv::Mat mask;
+        cv::Mat E = cv::findEssentialMat(prev_good_buf_, next_good_buf_, K,
+                                         cv::RANSAC, RANSAC_CONF, RANSAC_THRESH, mask);
+
+        if (!E.empty() && E.rows == 3 && E.cols == 3) {
+            if (cv::recoverPose(E, prev_good_buf_, next_good_buf_, K, R_vo, t_vo, mask) > 0) {
+                // ── 14-15. Complementary filter fusion ──────────────────────
+                cv::Mat rot_vec_vo, rot_vec_gyro;
+                cv::Rodrigues(R_vo, rot_vec_vo);
+                cv::Rodrigues(imu_delta.deltaR, rot_vec_gyro);
+
+                cv::Mat rot_vec_fused = ALPHA_FUSION * rot_vec_gyro
+                                      + (1.0 - ALPHA_FUSION) * rot_vec_vo;
+                cv::Rodrigues(rot_vec_fused, R_fused);
+
+                // ── 16. Scale estimation ────────────────────────────────────
+                double imu_dist = cv::norm(imu_delta.deltaP);
+                double vo_dist = cv::norm(t_vo);
+                if (vo_dist > 1e-5) {
+                    double obs_scale = imu_dist / vo_dist;
+                    // Update class member with smoothing
+                    {
+                        std::lock_guard<std::mutex> lock(pose_mutex_);
+                        smooth_scale_ = 0.9 * smooth_scale_ + 0.1 * obs_scale;
+                        smooth_scale_ = std::max(0.1, std::min(10.0, smooth_scale_));
+                        estimatedScale = smooth_scale_;
+                    }
+                }
+                pose_valid = true;
+            }
         }
-        prev_gray_ = gray.clone();
-        prev_pts_  = next_good;
+    }
+
+    // ── 17. Global pose update (GRANULAR LOCK) ──────────────────────────────
+    {
+        std::lock_guard<std::mutex> lock(pose_mutex_);
+        
+        if (pose_valid) {
+            // Camera + IMU fusion
+            cv::Mat final_t = global_R_ * (estimatedScale * t_vo);
+            
+            // If we are rotating fast, ignore camera's noisy translation (it's degenerate)
+            if (is_pure_rotation) {
+                global_t_ += (global_R_ * imu_delta.deltaP);
+            } else {
+                global_t_ += 0.7 * (global_R_ * imu_delta.deltaP) + 0.3 * final_t;
+            }
+            global_R_  = R_fused * global_R_;
+        } else {
+            // Pure IMU dead reckoning if VO fails (or if static - imu_delta is zeroed by ZUPT)
+            global_t_ += (global_R_ * imu_delta.deltaP);
+            global_R_  = imu_delta.deltaR * global_R_;
+        }
+    }
+
+    // ── 18. Update internal state for next frame (SHORT LOCK) ───────────────
+    {
+        std::lock_guard<std::mutex> lock(mutex_);
+        if (tracked < MIN_FEATURES) {
+            new_pts_buf_.clear();
+            cv::goodFeaturesToTrack(gray_buf_, new_pts_buf_, MAX_FEATURES, QUALITY_LEVEL, MIN_DIST);
+            next_good_buf_.insert(next_good_buf_.end(), new_pts_buf_.begin(), new_pts_buf_.end());
+        }
+        gray_buf_.copyTo(prev_gray_);
+        prev_pts_  = next_good_buf_; // Vector copy (still necessary if not swapping)
         prev_timestamp_ns_ = timestamp_ns;
-        out.trackedCount  = tracked;
-        out.totalCount    = total;
-        out.quality       = quality;
-        out.trackedPoints = tracked_points_flat;
-        return out;
     }
 
-    // ── 11. Essential matrix via RANSAC ───────────────────────────────────────
-    cv::Mat mask;
-    cv::Mat E = cv::findEssentialMat(prev_good, next_good, K,
-                                     cv::RANSAC, RANSAC_CONF, RANSAC_THRESH, mask);
-
-    // ── 12. Validate E is exactly 3×3 ────────────────────────────────────────
-    if (E.empty() || E.rows != 3 || E.cols != 3) {
-        LOGE("processFrame: Essential Matrix invalid (empty=%d size=%dx%d)",
-             E.empty(), E.rows, E.cols);
-        prev_gray_ = gray.clone();
-        prev_pts_  = next_good;
-        prev_timestamp_ns_ = timestamp_ns;
-        out.trackedCount  = tracked;
-        out.totalCount    = total;
-        out.trackedPoints = tracked_points_flat;
-        return out;
+    // Read state for output
+    {
+        std::lock_guard<std::mutex> lock(pose_mutex_);
+        out.R = global_R_.clone(); // Return global orientation
+        out.t = global_t_.clone(); // Return global position
     }
-
-    // ── 13. recoverPose ───────────────────────────────────────────────────────
-    cv::Mat R_vo, t_vo;
-    cv::recoverPose(E, prev_good, next_good, K, R_vo, t_vo, mask);
-    LOGI("Essential Matrix found!");
-
-    // ── 14-15. Complementary filter fusion ───────────────────────────────────
-    cv::Mat rot_vec_vo, rot_vec_gyro;
-    cv::Rodrigues(R_vo, rot_vec_vo);
-    cv::Rodrigues(delta_R_gyro, rot_vec_gyro);
-
-    cv::Mat rot_vec_fused = ALPHA_FUSION * rot_vec_gyro
-                          + (1.0 - ALPHA_FUSION) * rot_vec_vo;
-
-    cv::Mat R_fused;
-    cv::Rodrigues(rot_vec_fused, R_fused);
-
-    // ── 16. Validate dt ───────────────────────────────────────────────────────
-    int64_t dt_ns = timestamp_ns - prev_timestamp_ns_;
-    double estimatedScale = estimateScaleFromAccel(cv::norm(t_vo), dt_ns);
-
-    if (dt_ns <= 0 || dt_ns >= MAX_DT_NS) {
-        LOGE("processFrame: dt_ns out of range (%lld), skipping pose update",
-             (long long)dt_ns);
-        prev_gray_ = gray.clone();
-        prev_pts_  = next_good;
-        prev_timestamp_ns_ = timestamp_ns;
-        out.trackedCount  = tracked;
-        out.totalCount    = total;
-        out.quality       = quality;
-        out.trackedPoints = tracked_points_flat;
-        return out;
-    }
-
-    // ── 17. Global pose update ────────────────────────────────────────────────
-    global_t_ += estimatedScale * (global_R_ * t_vo);
-    global_R_  = R_fused * global_R_;
-
-    LOGD("Pose: x=%.3f y=%.3f z=%.3f",
-         global_t_.at<double>(0),
-         global_t_.at<double>(1),
-         global_t_.at<double>(2));
-
-    // ── 18. Update tracking state for next frame ──────────────────────────────
-    // Replenish features for next frame if needed (after pose est — no size mismatch risk)
-    if (tracked < MIN_FEATURES) {
-        std::vector<cv::Point2f> new_pts;
-        cv::goodFeaturesToTrack(gray, new_pts, MAX_FEATURES, QUALITY_LEVEL, MIN_DIST);
-        next_good.insert(next_good.end(), new_pts.begin(), new_pts.end());
-    }
-    prev_gray_ = gray.clone();
-    prev_pts_  = next_good;
-    prev_timestamp_ns_ = timestamp_ns;
-
-    // ── 19-20. Fill output ────────────────────────────────────────────────────
-    out.R             = R_fused;
-    out.t             = t_vo;
     out.quality       = quality;
     out.trackedCount  = tracked;
     out.totalCount    = total;
     out.estimatedScale = estimatedScale;
     out.valid         = true;
-    out.trackedPoints = tracked_points_flat;
+    out.trackedPoints = std::move(tracked_points_flat);
 
     return out;
 }
