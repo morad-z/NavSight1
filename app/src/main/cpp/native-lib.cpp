@@ -142,9 +142,10 @@ Java_com_example_navsight1_NativeBridge_processCameraFrame(
     // trackedFeatures(I) totalFeatures(I) estimatedScale(D)
     // isInitialized(Z) trackedPoints([F)
     // accelX(F) accelY(F) accelZ(F) gyroX(F) gyroY(F) gyroZ(F)
-    jmethodID ctor = env->GetMethodID(cls, "<init>", "(DDDDDDDIIDZ[FFFFFFF)V");
+    const char* vio_sig = "(DDDDDDDIIDZ[FFFFFFF)V";
+    jmethodID ctor = env->GetMethodID(cls, "<init>", vio_sig);
     if (!ctor) {
-        LOGE("processCameraFrame: VioData constructor not found");
+        LOGE("processCameraFrame: VioData constructor not found with sig %s", vio_sig);
         return nullptr;
     }
 
