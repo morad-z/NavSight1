@@ -125,6 +125,7 @@ PreintegratedDelta IMUPreintegrator::integrate(int64_t start_ns, int64_t end_ns)
     out.deltaV = cv::Mat::zeros(3, 1, CV_64F);
     out.deltaP = cv::Mat::zeros(3, 1, CV_64F);
     out.dt = 0.0;
+    out.sample_count = 0;
 
     if (start_ns >= end_ns) {
         LOGE("integrate: invalid time window");
@@ -148,6 +149,7 @@ PreintegratedDelta IMUPreintegrator::integrate(int64_t start_ns, int64_t end_ns)
     if (g_samples.empty() || a_samples.empty()) {
         out.deltaR = integrateGyro(start_ns, end_ns);
         out.dt = (end_ns - start_ns) * 1e-9;
+        out.sample_count = (int)g_samples.size();
         return out;
     }
 
