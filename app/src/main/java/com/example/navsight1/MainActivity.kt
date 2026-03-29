@@ -56,6 +56,8 @@ import com.otaliastudios.cameraview.CameraView
 import com.otaliastudios.cameraview.controls.Audio
 import com.otaliastudios.cameraview.frame.Frame
 import com.otaliastudios.cameraview.frame.FrameProcessor
+import androidx.annotation.MainThread
+import kotlinx.coroutines.Dispatchers
 import kotlinx.coroutines.delay
 import kotlinx.coroutines.launch
 import kotlin.math.*
@@ -76,7 +78,23 @@ class MainActivity : ComponentActivity(), SensorEventListener {
 
     companion object {
         private const val TAG = "NavSight"
+
+        init {
+            System.loadLibrary("navsight")
+        }
     }
+
+    // ── JNI declarations ──────────────────────────────────────────────────────
+    external fun startVIO()
+    external fun stopVIO()
+    external fun processCameraFrame(
+        frameData: ByteArray, width: Int, height: Int, timestamp: Long
+    ): VioData
+    external fun processGyroscope(timestamp: Long, x: Float, y: Float, z: Float)
+    external fun processAccelerometer(timestamp: Long, x: Float, y: Float, z: Float)
+    external fun resetVIO()
+    external fun setScale(scale: Double)
+    external fun setIntrinsics(fx: Double, fy: Double, cx: Double, cy: Double)
 
     // Sensor Manager
     private lateinit var sensorManager: SensorManager
@@ -103,16 +121,46 @@ class MainActivity : ComponentActivity(), SensorEventListener {
     ))
     
     // מיקום וירטואלי (במטרים) עבור הרדאר
-    private var virtualX = 0.0
-    private var virtualZ = 0.0
+    // mutableStateOf makes writes from the camera thread visible to Compose on the UI thread
+    private var virtualX by mutableStateOf(0.0)
+    private var virtualZ by mutableStateOf(0.0)
     val pathHistory = mutableStateListOf<Pair<Float, Float>>()
     
     // GPS Start Location
     val startLocation = mutableStateOf<LatLng?>(null)
-    
+
+    // C++ VIO output state (updated on every camera frame)
+    val vioState = mutableStateOf(VioData())
+
+    // Kept so we can cancel the in-flight location request on destroy
+    private var locationTokenSource: CancellationTokenSource? = null
+
+    // Heading fusion (FR17): azimuth at the moment VIO first initializes
+    private var vioInitAzimuth = 0f
+    private var wasVioInitialized = false
+
+    // Speed display (FR19)
+    private var currentSpeedKmh by mutableStateOf(0f)
+    private var lastVioForSpeed: VioData? = null
+    private var lastSpeedTimeMs = 0L
+
+    // Camera-blocked detection (FR26): count consecutive frames with no tracking
+    private var consecutiveVioFailures = 0
+    private var showCameraBlocked by mutableStateOf(false)
+
+    // Shake detection for auto-reset (FR28)
+    private val accelMagnitudeHistory = ArrayDeque<Float>(20)
+    private var lastShakeCheckMs = 0L
+
+    // Scale slider (FR15): user-adjustable translation scale, 0.1–5.0, default 1.0
+    private var scaleValue by mutableStateOf(1.0f)
+
     // מהירות לפי Optical Flow
     private var lastFlowTime = 0L
     private val velocityScale = 0.01f // קנה מידה להמרת pixels למטרים
+
+    // Orientation throttle: update at most 20Hz (50ms between updates)
+    private var lastOrientationUpdateNs = 0L
 
     override fun onCreate(savedInstanceState: Bundle?) {
         super.onCreate(savedInstanceState)
@@ -139,12 +187,14 @@ class MainActivity : ComponentActivity(), SensorEventListener {
 
     override fun onResume() {
         super.onResume()
-        // רישום לחיישנים
-        accelerometer?.let { 
-            sensorManager.registerListener(this, it, SensorManager.SENSOR_DELAY_GAME) 
+        startVIO()
+        // Pass 0s to use auto focal-length (0.7*width); replace with measured values for accuracy
+        setIntrinsics(0.0, 0.0, 0.0, 0.0)
+        accelerometer?.let {
+            sensorManager.registerListener(this, it, SensorManager.SENSOR_DELAY_GAME)
         }
-        magnetometer?.let { 
-            sensorManager.registerListener(this, it, SensorManager.SENSOR_DELAY_GAME) 
+        magnetometer?.let {
+            sensorManager.registerListener(this, it, SensorManager.SENSOR_DELAY_GAME)
         }
         gyroscope?.let {
             sensorManager.registerListener(this, it, SensorManager.SENSOR_DELAY_GAME)
@@ -154,20 +204,51 @@ class MainActivity : ComponentActivity(), SensorEventListener {
     override fun onPause() {
         super.onPause()
         sensorManager.unregisterListener(this)
+        stopVIO()
     }
 
     override fun onSensorChanged(event: SensorEvent) {
+        val ts = event.timestamp  // nanoseconds from Android sensor
         when (event.sensor.type) {
             Sensor.TYPE_ACCELEROMETER -> {
                 orientationTracker.updateAccelerometer(event.values)
+                processAccelerometer(ts, event.values[0], event.values[1], event.values[2])
+
+                // FR28: detect high IMU variance (shaking) and auto-reset VIO
+                val mag = sqrt(
+                    event.values[0] * event.values[0] +
+                    event.values[1] * event.values[1] +
+                    event.values[2] * event.values[2]
+                )
+                if (accelMagnitudeHistory.size >= 20) accelMagnitudeHistory.removeFirst()
+                accelMagnitudeHistory.addLast(mag)
+                val nowMs2 = System.currentTimeMillis()
+                if (nowMs2 - lastShakeCheckMs > 500 && accelMagnitudeHistory.size >= 10) {
+                    lastShakeCheckMs = nowMs2
+                    val mean = accelMagnitudeHistory.average()
+                    val variance = accelMagnitudeHistory.sumOf { v ->
+                        (v - mean) * (v - mean)
+                    } / accelMagnitudeHistory.size
+                    if (variance > 30.0) {
+                        lifecycleScope.launch(Dispatchers.Main) { resetPath() }
+                    }
+                }
             }
             Sensor.TYPE_MAGNETIC_FIELD -> {
                 orientationTracker.updateMagnetometer(event.values)
             }
+            Sensor.TYPE_GYROSCOPE -> {
+                processGyroscope(ts, event.values[0], event.values[1], event.values[2])
+            }
         }
-        
-        // עדכון אוריינטציה
-        orientationState.value = orientationTracker.getOrientation()
+
+        // עדכון אוריינטציה — throttled to 20Hz
+        // Thread-safe: registerListener called without a Handler → onSensorChanged runs on main Looper
+        val nowNs = event.timestamp
+        if (nowNs - lastOrientationUpdateNs >= 50_000_000L) {
+            lastOrientationUpdateNs = nowNs
+            orientationState.value = orientationTracker.getOrientation()
+        }
     }
 
     override fun onAccuracyChanged(sensor: Sensor?, accuracy: Int) {}
@@ -177,67 +258,135 @@ class MainActivity : ComponentActivity(), SensorEventListener {
      */
     fun processCameraFrame(frame: Frame) {
         val data = frame.getData<ByteArray>() ?: return
-        
-        // עיבוד Optical Flow
-        val flowResult = opticalFlowProcessor.processFrame(
-            frame = data,
-            width = frame.size.width,
-            height = frame.size.height,
-            isYuv = true
+
+        // ── C++ VIO pipeline (primary) ────────────────────────────────────────
+        val vio = processCameraFrame(
+            frameData = data,
+            width     = frame.size.width,
+            height    = frame.size.height,
+            timestamp = frame.time
         )
-        
-        // עדכון state
-        flowResultState.value = flowResult
-        
-        // עדכון מיקום וירטואלי אם יש תנועה ואם הטלפון אופקי
-        if (flowResult.direction != OpticalFlowProcessor.MovementDirection.STOPPED &&
-            orientationState.value.isHorizontal) {
-            
-            val currentTime = System.currentTimeMillis()
-            val deltaTime = if (lastFlowTime > 0) (currentTime - lastFlowTime) / 1000.0 else 0.0
-            lastFlowTime = currentTime
-            
-            if (deltaTime > 0 && deltaTime < 0.5) {
-                // חישוב תזוזה בהתאם לכיוון המצפן
-                val azimuthRad = Math.toRadians(orientationState.value.azimuth.toDouble())
-                
-                // המרת תנועת Optical Flow לתנועה בעולם
-                // שים לב: dy חיובי = רצפה זזה למטה = אנחנו זזים קדימה
-                val forwardSpeed = flowResult.dy * velocityScale
-                val lateralSpeed = flowResult.dx * velocityScale
-                
-                // סיבוב לפי המצפן
-                val dx = forwardSpeed * sin(azimuthRad) + lateralSpeed * cos(azimuthRad)
-                val dz = forwardSpeed * cos(azimuthRad) - lateralSpeed * sin(azimuthRad)
-                
-                virtualX += dx
-                virtualZ += dz
-                
-                // הוספה להיסטוריה
-                pathHistory.add(Pair(virtualX.toFloat(), virtualZ.toFloat()))
+
+        // ── Kotlin Optical Flow (drives AR direction overlay only) ────────────
+        val flowResult = opticalFlowProcessor.processFrame(
+            frame  = data,
+            width  = frame.size.width,
+            height = frame.size.height,
+            isYuv  = true
+        )
+
+        // Dispatch all UI state writes to the main thread (camera callback is on a bg thread)
+        lifecycleScope.launch(Dispatchers.Main) {
+            vioState.value = vio
+            // Capture the compass azimuth at the moment VIO first initializes (for heading fusion)
+            if (vio.isInitialized && !wasVioInitialized) {
+                wasVioInitialized = true
+                vioInitAzimuth = orientationState.value.azimuth
+            }
+            if (vio.isInitialized) {
+                virtualX = vio.x
+                virtualZ = vio.z
+                pathHistory.add(Pair(vio.x.toFloat(), vio.z.toFloat()))
                 if (pathHistory.size > 500) pathHistory.removeAt(0)
+            }
+            flowResultState.value = flowResult
+
+            // FR19: Speed computation from consecutive VIO positions
+            val nowMs = System.currentTimeMillis()
+            val prev = lastVioForSpeed
+            if (prev != null && vio.isInitialized) {
+                val dtMs = nowMs - lastSpeedTimeMs
+                if (dtMs >= 200) {
+                    val dx = vio.x - prev.x
+                    val dz = vio.z - prev.z
+                    val distM = sqrt(dx * dx + dz * dz)
+                    currentSpeedKmh = (distM / (dtMs / 1000.0) * 3.6).toFloat()
+                    lastVioForSpeed = vio
+                    lastSpeedTimeMs = nowMs
+                }
+            } else {
+                lastVioForSpeed = vio
+                lastSpeedTimeMs = nowMs
+            }
+
+            // FR26: Camera-blocked detection (30 consecutive frames with < 5 tracked points)
+            if (vio.isInitialized && vio.trackedFeatures < 5) {
+                consecutiveVioFailures++
+                if (consecutiveVioFailures > 30) showCameraBlocked = true
+            } else {
+                consecutiveVioFailures = 0
+                showCameraBlocked = false
             }
         }
     }
 
     @SuppressLint("MissingPermission")
     fun requestInitialLocation() {
+        locationTokenSource?.cancel()
         val tokenSource = CancellationTokenSource()
+        locationTokenSource = tokenSource
         fusedLocationClient.getCurrentLocation(Priority.PRIORITY_HIGH_ACCURACY, tokenSource.token)
             .addOnSuccessListener { location ->
                 if (location != null) {
                     startLocation.value = LatLng(location.latitude, location.longitude)
                     Log.d(TAG, "Got initial location: ${location.latitude}, ${location.longitude}")
                 }
+                locationTokenSource = null
             }
     }
 
+    override fun onDestroy() {
+        super.onDestroy()
+        locationTokenSource?.cancel()
+        locationTokenSource = null
+    }
+
+    // FR21: Export tracked path as JSON to the app's external files directory
+    fun exportPath() {
+        val path = pathHistory.toList()
+        if (path.isEmpty()) return
+        val start = startLocation.value
+        val sb = StringBuilder()
+        sb.append("{\"type\":\"navsight_path\",\"points\":[")
+        path.forEachIndexed { idx, (x, z) ->
+            if (idx > 0) sb.append(",")
+            if (start != null) {
+                // Convert to lat/lng if we have a GPS anchor
+                val lat = start.latitude + z / 111111.0
+                val cosLat = cos(Math.toRadians(start.latitude))
+                val lng = start.longitude + if (cosLat > 1e-10) x / (111111.0 * cosLat) else 0.0
+                sb.append("{\"lat\":$lat,\"lng\":$lng,\"x\":$x,\"z\":$z}")
+            } else {
+                sb.append("{\"x\":$x,\"z\":$z}")
+            }
+        }
+        sb.append("]}")
+        try {
+            val dir = getExternalFilesDir(null) ?: filesDir
+            val file = java.io.File(dir, "navsight_path_${System.currentTimeMillis()}.json")
+            file.writeText(sb.toString())
+            Log.d(TAG, "Path exported to ${file.absolutePath}")
+        } catch (e: Exception) {
+            Log.e(TAG, "Export failed: ${e.message}")
+        }
+    }
+
+    @MainThread
     fun resetPath() {
+        resetVIO()
         pathHistory.clear()
         virtualX = 0.0
         virtualZ = 0.0
+        vioState.value = VioData()
         opticalFlowProcessor.reset()
         orientationTracker.reset()
+        wasVioInitialized = false
+        vioInitAzimuth = 0f
+        currentSpeedKmh = 0f
+        lastVioForSpeed = null
+        consecutiveVioFailures = 0
+        showCameraBlocked = false
+        accelMagnitudeHistory.clear()
     }
 
     /* ===================== UI COMPOSABLES ===================== */
@@ -298,7 +447,33 @@ class MainActivity : ComponentActivity(), SensorEventListener {
     fun MainScreen() {
         val orientation = orientationState.value
         val flowResult = flowResultState.value
+        val vio = vioState.value
         val azimuth = orientation.azimuth
+
+        // FR17: Fuse VIO yaw (80%) with magnetometer azimuth (20%) once VIO is initialized.
+        // VIO yaw is cumulative radians CCW+; compass is degrees CW+.
+        // We compute an absolute VIO heading by adding the yaw delta to the azimuth captured
+        // at initialization, then blend the two.
+        val fusedHeading: Float = if (vio.isInitialized && wasVioInitialized) {
+            val vioYawDeg = Math.toDegrees(-vio.yaw).toFloat()   // negate: CCW+ → CW+
+            val vioAbsDeg = ((vioInitAzimuth + vioYawDeg) % 360 + 360) % 360
+            // Circular weighted blend (handles the 0°/360° wraparound)
+            val diff = ((azimuth - vioAbsDeg + 540) % 360) - 180
+            ((vioAbsDeg + 0.2f * diff) % 360 + 360) % 360
+        } else {
+            azimuth
+        }
+
+        // FR20: Total distance traveled (sum of consecutive pathHistory segment lengths)
+        val totalDistanceM = remember(pathHistory.size) {
+            val h = pathHistory.toList()
+            if (h.size < 2) 0.0
+            else h.zipWithNext().sumOf { (a, b) ->
+                val dx = (b.first - a.first).toDouble()
+                val dz = (b.second - a.second).toDouble()
+                sqrt(dx * dx + dz * dz)
+            }
+        }
         
         Box(Modifier.fillMaxSize().background(LuxuryBlack)) {
             Column(Modifier.fillMaxSize()) {
@@ -326,15 +501,40 @@ class MainActivity : ComponentActivity(), SensorEventListener {
                     Box(Modifier.align(Alignment.TopEnd).padding(12.dp)) {
                         SensorRadar(
                             history = pathHistory.toList(),
-                            currentAzimuth = azimuth
+                            currentAzimuth = fusedHeading
                         )
                     }
                     
-                    // Direction indicator at top left
+                    // Direction indicator at top left (FR23: shows LOW QUALITY when quality < 0.3)
                     Box(Modifier.align(Alignment.TopStart).padding(12.dp)) {
-                        DirectionBadge(direction = flowResult.direction, mode = flowResult.mode)
+                        DirectionBadge(
+                            direction = flowResult.direction,
+                            mode = flowResult.mode,
+                            trackingQuality = vio.trackingQuality.toFloat()
+                        )
                     }
-                    
+
+                    // FR24: Initialization progress — shown until VIO is initialized
+                    if (!vio.isInitialized) {
+                        Box(Modifier.align(Alignment.Center).padding(8.dp)) {
+                            VioInitializingBadge()
+                        }
+                    }
+
+                    // FR26: Camera blocked warning
+                    if (showCameraBlocked) {
+                        Box(Modifier.align(Alignment.Center).padding(8.dp)) {
+                            CameraBlockedWarning()
+                        }
+                    }
+
+                    // FR29: No-texture warning (initialized but very few features)
+                    if (vio.isInitialized && !showCameraBlocked && vio.trackedFeatures < 30) {
+                        Box(Modifier.align(Alignment.BottomStart).padding(12.dp)) {
+                            NoTextureWarning()
+                        }
+                    }
+
                     // Phone orientation warning - show when NOT horizontal
                     if (!orientation.isHorizontal) {
                         Box(
@@ -345,7 +545,7 @@ class MainActivity : ComponentActivity(), SensorEventListener {
                             PhoneOrientationWarning(deviation = orientation.deviationFromHorizontal)
                         }
                     }
-                    
+
                     // Stability indicator
                     Box(Modifier.align(Alignment.BottomEnd).padding(12.dp)) {
                         StabilityIndicator(
@@ -369,21 +569,54 @@ class MainActivity : ComponentActivity(), SensorEventListener {
                     
                     GoogleMapWrapper(
                         start = mapStartLocation,
-                        azimuth = azimuth,
+                        azimuth = fusedHeading,
                         pathHistory = pathHistory.toList()
                     )
                     
-                    // Reset button
-                    FloatingActionButton(
-                        onClick = { resetPath() },
-                        containerColor = LuxuryGreen,
-                        modifier = Modifier
+                    // Buttons: Export (FR21) and Reset
+                    Column(
+                        Modifier
                             .align(Alignment.BottomEnd)
-                            .padding(16.dp)
+                            .padding(16.dp),
+                        verticalArrangement = Arrangement.spacedBy(8.dp)
                     ) {
-                        Icon(Icons.Default.Refresh, "Reset", tint = LuxuryBlack)
+                        SmallFloatingActionButton(
+                            onClick = { exportPath() },
+                            containerColor = LuxuryCyan
+                        ) {
+                            Icon(Icons.Default.ArrowForward, "Export", tint = LuxuryBlack)
+                        }
+                        FloatingActionButton(
+                            onClick = { resetPath() },
+                            containerColor = LuxuryGreen
+                        ) {
+                            Icon(Icons.Default.Refresh, "Reset", tint = LuxuryBlack)
+                        }
                     }
                     
+                    // FR19/FR20: Speed and distance display
+                    Box(
+                        Modifier
+                            .align(Alignment.TopEnd)
+                            .padding(8.dp)
+                            .background(Color.Black.copy(alpha = 0.7f), RoundedCornerShape(8.dp))
+                            .padding(horizontal = 10.dp, vertical = 6.dp)
+                    ) {
+                        Column(horizontalAlignment = Alignment.End) {
+                            Text(
+                                "${"%.1f".format(currentSpeedKmh)} km/h",
+                                color = LuxuryCyan,
+                                fontWeight = FontWeight.Bold,
+                                fontSize = 16.sp
+                            )
+                            Text(
+                                "${"%.0f".format(totalDistanceM)} m",
+                                color = LuxuryGreen,
+                                fontSize = 12.sp
+                            )
+                        }
+                    }
+
                     // Debug info
                     Box(
                         Modifier
@@ -394,16 +627,54 @@ class MainActivity : ComponentActivity(), SensorEventListener {
                     ) {
                         Column {
                             Text(
-                                "X: ${"%.1f".format(virtualX)}m  Z: ${"%.1f".format(virtualZ)}m",
+                                "X: ${"%.1f".format(vio.x)}m  Z: ${"%.1f".format(vio.z)}m",
                                 color = LuxuryCyan,
                                 fontSize = 12.sp
                             )
                             Text(
-                                "Flow: ${"%.1f".format(flowResult.magnitude)}",
+                                "Yaw: ${"%.1f".format(Math.toDegrees(vio.yaw))}°  " +
+                                "Q: ${"%.0f".format(vio.trackingQuality * 100)}%",
                                 color = LuxuryGreen,
                                 fontSize = 10.sp
                             )
+                            Text(
+                                "Pts: ${vio.trackedFeatures}/${vio.totalFeatures}  " +
+                                if (vio.isInitialized) "VIO ✓" else "Initializing…",
+                                color = if (vio.isInitialized) LuxuryGreen else LuxuryYellow,
+                                fontSize = 10.sp
+                            )
                         }
+                    }
+
+                    // FR15: Scale slider — adjusts VIO translation scale (0.1–5.0)
+                    Row(
+                        Modifier
+                            .align(Alignment.BottomStart)
+                            .fillMaxWidth()
+                            .padding(horizontal = 12.dp, vertical = 4.dp)
+                            .background(Color.Black.copy(alpha = 0.6f), RoundedCornerShape(8.dp))
+                            .padding(horizontal = 10.dp, vertical = 2.dp),
+                        verticalAlignment = Alignment.CenterVertically
+                    ) {
+                        Text(
+                            "Scale: ${"%.1f".format(scaleValue)}×",
+                            color = LuxuryCyan,
+                            fontSize = 11.sp,
+                            modifier = Modifier.width(72.dp)
+                        )
+                        Slider(
+                            value = scaleValue,
+                            onValueChange = { v ->
+                                scaleValue = v
+                                setScale(v.toDouble())
+                            },
+                            valueRange = 0.1f..5.0f,
+                            modifier = Modifier.weight(1f),
+                            colors = SliderDefaults.colors(
+                                thumbColor = LuxuryCyan,
+                                activeTrackColor = LuxuryCyan
+                            )
+                        )
                     }
                 }
             }
@@ -505,12 +776,21 @@ class MainActivity : ComponentActivity(), SensorEventListener {
     }
 
     @Composable
-    fun DirectionBadge(direction: OpticalFlowProcessor.MovementDirection, mode: OpticalFlowProcessor.MovementMode = OpticalFlowProcessor.MovementMode.WALKING) {
-        val (text, color, icon) = when (direction) {
-            OpticalFlowProcessor.MovementDirection.FORWARD -> Triple("שמאלה", LuxuryGreen, Icons.Default.KeyboardArrowUp)
-            OpticalFlowProcessor.MovementDirection.BACKWARD -> Triple("ימינה", LuxuryRed, Icons.Default.KeyboardArrowDown)
-            OpticalFlowProcessor.MovementDirection.LEFT -> Triple("קדימה", LuxuryCyan, Icons.Default.ArrowBack)
-            OpticalFlowProcessor.MovementDirection.RIGHT -> Triple("אחורה", LuxuryCyan, Icons.Default.ArrowForward)
+    fun DirectionBadge(
+        direction: OpticalFlowProcessor.MovementDirection,
+        mode: OpticalFlowProcessor.MovementMode = OpticalFlowProcessor.MovementMode.WALKING,
+        trackingQuality: Float = 1f
+    ) {
+        // FR23/UX-DR1: Replace direction with LOW QUALITY warning when tracking quality < 0.3
+        val lowQuality = trackingQuality < 0.3f && trackingQuality > 0f
+
+        val (text, color, icon) = if (lowQuality) {
+            Triple("LOW QUALITY", LuxuryRed, Icons.Default.Place)
+        } else when (direction) {
+            OpticalFlowProcessor.MovementDirection.FORWARD -> Triple("קדימה", LuxuryGreen, Icons.Default.KeyboardArrowUp)
+            OpticalFlowProcessor.MovementDirection.BACKWARD -> Triple("אחורה", LuxuryRed, Icons.Default.KeyboardArrowDown)
+            OpticalFlowProcessor.MovementDirection.LEFT -> Triple("שמאלה", LuxuryCyan, Icons.Default.ArrowBack)
+            OpticalFlowProcessor.MovementDirection.RIGHT -> Triple("ימינה", LuxuryCyan, Icons.Default.ArrowForward)
             OpticalFlowProcessor.MovementDirection.STOPPED -> Triple("עומד", LuxuryYellow, Icons.Default.Place)
         }
         
@@ -585,6 +865,76 @@ class MainActivity : ComponentActivity(), SensorEventListener {
         }
     }
 
+    // FR24/UX-DR2: Shown while VIO is collecting gravity samples before initialization
+    @Composable
+    fun VioInitializingBadge() {
+        val infiniteTransition = rememberInfiniteTransition(label = "init_pulse")
+        val alpha by infiniteTransition.animateFloat(
+            initialValue = 0.5f, targetValue = 1f,
+            animationSpec = infiniteRepeatable(tween(600), RepeatMode.Reverse),
+            label = "init_alpha"
+        )
+        Surface(
+            color = Color.Black.copy(0.85f),
+            shape = RoundedCornerShape(12.dp),
+            border = BorderStroke(1.dp, LuxuryYellow.copy(alpha = alpha))
+        ) {
+            Row(
+                Modifier.padding(horizontal = 14.dp, vertical = 10.dp),
+                verticalAlignment = Alignment.CenterVertically
+            ) {
+                Icon(Icons.Default.Refresh, null, tint = LuxuryYellow, modifier = Modifier.size(18.dp))
+                Spacer(Modifier.width(8.dp))
+                Column {
+                    Text("מכייל…", color = LuxuryYellow, fontWeight = FontWeight.Bold, fontSize = 13.sp)
+                    Text("החזק את הטלפון שטוח", color = LuxuryYellow.copy(0.8f), fontSize = 11.sp)
+                }
+            }
+        }
+    }
+
+    // FR26: Shown when VIO has produced no features for 30+ consecutive frames
+    @Composable
+    fun CameraBlockedWarning() {
+        val infiniteTransition = rememberInfiniteTransition(label = "blocked_blink")
+        val alpha by infiniteTransition.animateFloat(
+            initialValue = 0.6f, targetValue = 1f,
+            animationSpec = infiniteRepeatable(tween(400), RepeatMode.Reverse),
+            label = "blocked_alpha"
+        )
+        Surface(
+            color = LuxuryRed.copy(0.2f),
+            shape = RoundedCornerShape(12.dp),
+            border = BorderStroke(2.dp, LuxuryRed.copy(alpha = alpha))
+        ) {
+            Row(
+                Modifier.padding(horizontal = 14.dp, vertical = 10.dp),
+                verticalAlignment = Alignment.CenterVertically
+            ) {
+                Icon(Icons.Default.Place, null, tint = LuxuryRed, modifier = Modifier.size(20.dp))
+                Spacer(Modifier.width(8.dp))
+                Text("מצלמה חסומה", color = LuxuryRed, fontWeight = FontWeight.Bold, fontSize = 13.sp)
+            }
+        }
+    }
+
+    // FR29: Shown when active but too few texture features are found
+    @Composable
+    fun NoTextureWarning() {
+        Surface(
+            color = Color.Black.copy(0.75f),
+            shape = RoundedCornerShape(10.dp),
+            border = BorderStroke(1.dp, LuxuryYellow)
+        ) {
+            Text(
+                "אין מרקם — עבור לאזור מרוצף",
+                color = LuxuryYellow,
+                fontSize = 11.sp,
+                modifier = Modifier.padding(horizontal = 10.dp, vertical = 6.dp)
+            )
+        }
+    }
+
     @Composable
     fun StabilityIndicator(stability: Float, confidence: Float) {
         Surface(
@@ -656,7 +1006,15 @@ class MainActivity : ComponentActivity(), SensorEventListener {
                     // Draw path
                     if (history.isNotEmpty()) {
                         val path = Path()
-                        val scale = 3f  // 3 pixels per meter
+                        // FR22/UX-DR3: Auto-scale to fit the entire path bounding box inside the radar circle
+                        val scale = if (history.size > 1) {
+                            val minX = history.minOf { it.first }
+                            val maxX = history.maxOf { it.first }
+                            val minZ = history.minOf { it.second }
+                            val maxZ = history.maxOf { it.second }
+                            val span = maxOf(maxX - minX, maxZ - minZ, 1f)
+                            (radius * 0.8f) / (span / 2f)
+                        } else 3f
                         
                         val rad = Math.toRadians((-currentAzimuth).toDouble())
                         val cosA = cos(rad).toFloat()
@@ -738,8 +1096,14 @@ class MainActivity : ComponentActivity(), SensorEventListener {
                 .build()
         }
         
-        // Update camera to follow position
+        // Update camera to follow position — throttled to max 2 updates/sec.
+        // Uses a throttle (not debounce): fires immediately on first change, then at most
+        // every 500ms during continuous movement, so the map follows movement in real-time.
+        var lastMapAnimMs by remember { mutableLongStateOf(0L) }
         LaunchedEffect(currentPos, azimuth) {
+            val elapsed = System.currentTimeMillis() - lastMapAnimMs
+            if (elapsed < 500L) delay(500L - elapsed)
+            lastMapAnimMs = System.currentTimeMillis()
             cameraState.animate(
                 com.google.android.gms.maps.CameraUpdateFactory.newCameraPosition(
                     CameraPosition.Builder()
@@ -799,7 +1163,8 @@ class MainActivity : ComponentActivity(), SensorEventListener {
     private fun metersToLatLng(start: LatLng, dx: Double, dz: Double): LatLng {
         val metersPerDegree = 111111.0
         val lat = start.latitude + (dz / metersPerDegree)
-        val lng = start.longitude + (dx / (metersPerDegree * cos(Math.toRadians(start.latitude))))
-        return LatLng(lat, lng)
+        val cosLat = cos(Math.toRadians(start.latitude))
+        val lngOffset = if (cosLat > 1e-10) dx / (metersPerDegree * cosLat) else 0.0
+        return LatLng(lat, start.longitude + lngOffset)
     }
 }
