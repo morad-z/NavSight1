@@ -70,4 +70,31 @@ private:
     // Last sensor values for passthrough
     float last_ax{0.f}, last_ay{0.f}, last_az{0.f};
     float last_gx{0.f}, last_gy{0.f}, last_gz{0.f};
+
+    // ── Step detection ──────────────────────────────────────────────────────
+public:
+    struct StepInfo {
+        int step_count;           // Total steps since reset
+        double stride_length_m;   // Estimated stride length in meters
+        double speed_mps;         // Estimated walking speed in m/s
+        int64_t last_step_ns;     // Timestamp of last detected step
+    };
+
+    StepInfo getStepInfo() const;
+
+private:
+    // Step detector state
+    int step_count_{0};
+    int64_t last_step_ns_{0};
+    double step_period_s_{0.0};       // Time between last two steps
+    float accel_mag_filtered_{9.81f}; // Low-pass filtered accel magnitude
+    float accel_mag_prev_{9.81f};     // Previous filtered value for peak detection
+    bool was_above_thresh_{false};    // For peak detection hysteresis
+    static constexpr float STEP_ACCEL_THRESH_HIGH = 10.1f; // m/s² peak threshold (lowered for sensitivity)
+    static constexpr float STEP_ACCEL_THRESH_LOW  = 9.3f;  // m/s² valley threshold (tightened hysteresis)
+    static constexpr double MIN_STEP_PERIOD_S = 0.25;      // Max 4 steps/s (running)
+    static constexpr double MAX_STEP_PERIOD_S = 1.5;       // Min ~0.67 steps/s (slow walk)
+    static constexpr double DEFAULT_STRIDE_M  = 0.65;      // Average human stride
+
+    void detectStep(int64_t timestamp_ns, float ax, float ay, float az);
 };
