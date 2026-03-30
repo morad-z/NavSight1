@@ -52,6 +52,7 @@ void IMUPreintegrator::addAccelReading(int64_t timestamp_ns, float x, float y, f
                          accel_buf_.begin() + static_cast<ptrdiff_t>(MAX_BUF / 2));
     }
     accel_buf_.push_back({timestamp_ns, x, y, z});
+    detectStep(timestamp_ns, x, y, z);
 }
 
 // ── integrateGyro ─────────────────────────────────────────────────────────────
@@ -300,6 +301,69 @@ bool IMUPreintegrator::isInitialized() const {
     return gravity_initialized_.load();
 }
 
+// ── Step detection ────────────────────────────────────────────────────────────
+
+void IMUPreintegrator::detectStep(int64_t timestamp_ns, float ax, float ay, float az) {
+    // Must be called under mutex_ lock
+    float mag = std::sqrt(ax * ax + ay * ay + az * az);
+
+    // Low-pass filter (alpha ~0.15 at 100Hz)
+    constexpr float LP_ALPHA = 0.20f;
+    accel_mag_filtered_ = (1.0f - LP_ALPHA) * accel_mag_filtered_ + LP_ALPHA * mag;
+
+    // Peak detection with hysteresis
+    if (!was_above_thresh_ && accel_mag_filtered_ > STEP_ACCEL_THRESH_HIGH) {
+        was_above_thresh_ = true;
+
+        // Check timing constraint
+        if (last_step_ns_ > 0) {
+            double period = (timestamp_ns - last_step_ns_) * 1e-9;
+            if (period >= MIN_STEP_PERIOD_S && period <= MAX_STEP_PERIOD_S) {
+                step_count_++;
+                step_period_s_ = period;
+                last_step_ns_ = timestamp_ns;
+                LOGI("STEP: count=%d freq=%.2f Hz", step_count_, 1.0 / period);
+            } else if (period > MAX_STEP_PERIOD_S) {
+                // Too long since last step — accept as new walking start
+                step_count_++;
+                step_period_s_ = 0.0;
+                last_step_ns_ = timestamp_ns;
+                LOGI("STEP: new start count=%d", step_count_);
+            }
+            // else: too fast, ignore (bounce/noise)
+        } else {
+            // First step ever
+            step_count_++;
+            last_step_ns_ = timestamp_ns;
+        }
+    } else if (was_above_thresh_ && accel_mag_filtered_ < STEP_ACCEL_THRESH_LOW) {
+        was_above_thresh_ = false;
+    }
+
+    accel_mag_prev_ = accel_mag_filtered_;
+}
+
+IMUPreintegrator::StepInfo IMUPreintegrator::getStepInfo() const {
+    std::lock_guard<std::mutex> lock(mutex_);
+    StepInfo info{};
+    info.step_count = step_count_;
+    info.stride_length_m = DEFAULT_STRIDE_M;
+    info.last_step_ns = last_step_ns_;
+
+    // Estimate speed from step frequency
+    if (step_period_s_ > 0.0) {
+        // Stride length scales with step frequency: faster steps = longer strides
+        // Refined model: 0.4m base + 0.3 * freq to avoid underestimating slow walkers
+        double freq = 1.0 / step_period_s_;
+        info.stride_length_m = std::max(0.4, std::min(1.2, 0.4 + 0.3 * freq));
+        info.speed_mps = info.stride_length_m * freq;
+    } else {
+        info.speed_mps = 0.0;
+    }
+
+    return info;
+}
+
 // ── reset ─────────────────────────────────────────────────────────────────────
 
 void IMUPreintegrator::reset() {
@@ -312,4 +376,10 @@ void IMUPreintegrator::reset() {
     pitch_ = 0.f;
     last_ax = last_ay = last_az = 0.f;
     last_gx = last_gy = last_gz = 0.f;
+    step_count_ = 0;
+    last_step_ns_ = 0;
+    step_period_s_ = 0.0;
+    accel_mag_filtered_ = 9.81f;
+    accel_mag_prev_ = 9.81f;
+    was_above_thresh_ = false;
 }
