@@ -50,6 +50,8 @@ import com.otaliastudios.cameraview.CameraView
 import com.otaliastudios.cameraview.controls.Audio
 import com.otaliastudios.cameraview.frame.Frame
 import com.otaliastudios.cameraview.frame.FrameProcessor
+import androidx.annotation.MainThread
+import kotlinx.coroutines.Dispatchers
 import kotlinx.coroutines.delay
 import kotlinx.coroutines.launch
 import kotlin.math.*
