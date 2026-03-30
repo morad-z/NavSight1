@@ -84,8 +84,7 @@ void VisionModule::reset() {
     accel_bias_count_ = 0;
     gyro_bias_ = cv::Mat::zeros(3, 1, CV_64F);
     gyro_bias_count_ = 0;
-    last_imu_disp_ = 0.0;
-    smooth_scale_ = 0.05;
+    smooth_scale_ = 0.20;
     scale_obs_count_ = 0;
     frames_since_keyframe_ = 0;
     imu_.reset();
@@ -109,25 +108,30 @@ double VisionModule::calculateTrackingQuality(const std::vector<uchar>& status) 
     return static_cast<double>(good) / static_cast<double>(status.size());
 }
 
-// ── estimateScaleFromAccel ────────────────────────────────────────────────────
+// ── estimateScaleFromSteps ────────────────────────────────────────────────────
 
-double VisionModule::estimateScaleFromAccel(double vision_disp, int64_t dt_ns) {
+double VisionModule::estimateScaleFromSteps(double vision_disp, int64_t dt_ns) {
+    // Uses step detection for robust scale estimation instead of broken IMU deltaP.
     // Returns a candidate scale observation, or -1.0 if guards reject it.
     if (vision_disp < 1e-5) return -1.0;
 
     double dt = dt_ns * 1e-9;
-    if (dt <= 0.0 || dt > 0.1) return -1.0; // only trust short intervals (<100ms)
+    if (dt <= 0.0 || dt > 0.2) return -1.0;
 
-    double imu_disp = last_imu_disp_;
-    if (imu_disp < 1e-4) return -1.0;
+    auto step_info = imu_.getStepInfo();
+    if (step_info.speed_mps < 0.2) return -1.0; // Not walking (< 0.2 m/s)
 
-    double obs_scale = imu_disp / vision_disp;
+    // Expected real-world displacement this frame = speed * dt
+    double real_disp = step_info.speed_mps * dt;
+    if (real_disp < 1e-4) return -1.0;
 
-    // Clamp to physically plausible range first
-    obs_scale = std::max(0.001, std::min(20.0, obs_scale));
+    double obs_scale = real_disp / vision_disp;
+
+    // Clamp to physically plausible range
+    obs_scale = std::max(0.005, std::min(10.0, obs_scale));
 
     // Sanity: reject if more than 3x away from current smooth estimate
-    // BUT allow the first 10 observations through unconditionally for bootstrap
+    // BUT allow the first 30 observations through unconditionally for bootstrap
     double current_smooth;
     int obs_count;
     {
@@ -135,9 +139,9 @@ double VisionModule::estimateScaleFromAccel(double vision_disp, int64_t dt_ns) {
         current_smooth = smooth_scale_;
         obs_count = scale_obs_count_;
     }
-    if (obs_count >= 10) {
+    if (obs_count >= 30) {
         if (obs_scale > 3.0 * current_smooth || obs_scale < current_smooth / 3.0) {
-            LOGD("estimateScaleFromAccel: outlier rejected obs=%.4f smooth=%.4f", obs_scale, current_smooth);
+            LOGD("estimateScale: outlier rejected obs=%.4f smooth=%.4f", obs_scale, current_smooth);
             return -1.0;
         }
     }
@@ -156,6 +160,13 @@ VisionOutput VisionModule::processFrame(const uint8_t* yuv_data,
     out.totalCount = 0;
     out.estimatedScale = 1.0;
     out.valid = false;
+    out.meanFlow = 0.0;
+    out.inlierCount = 0;
+    out.stepCount = 0;
+    out.stepFreq = 0.0;
+    out.strideLength = 0.0;
+    out.poseFlags = 0;
+    out.heading = 0.0;
 
     // ── 1. Guard invalid inputs ───────────────────────────────────────────────
     if (!yuv_data || width <= 0 || height <= 0) {
@@ -284,10 +295,30 @@ VisionOutput VisionModule::processFrame(const uint8_t* yuv_data,
     if (mean_flow >= 0.5) is_static = false;  // any visible flow = not static
     if (mean_flow < 0.5 && gyro_norm < ZUPT_GYRO_THRESH) is_static = true; // sub-pixel flow + low gyro = static
 
+    // Cross-check: step detector override to prevent false ZUPT while walking
+    if (is_static) {
+        auto zupt_step_info = imu_.getStepInfo();
+        int64_t ns_since_step = timestamp_ns - zupt_step_info.last_step_ns;
+        if (ns_since_step < 2'000'000'000LL && zupt_step_info.speed_mps > 0.2) {
+            is_static = false; // Step detector says we're walking, override visual ZUPT
+        }
+    }
+
     // ── 9. Essential Matrix with strict validation ──────────────────────────
     bool pose_valid = false;
+    bool used_fallback = false;
+    int inlier_count_out = 0;
     cv::Mat R_vo, t_vo, R_fused;
     double estimatedScale = 1.0;
+
+    // Diagnostic: log gate results every 30th frame to avoid spam
+    static int frame_counter = 0;
+    frame_counter++;
+    if (frame_counter % 30 == 0) {
+        LOGI("GATES: flow=%.2f sufficient=%d parallax=%d static=%d pure_rot=%d pts=%d gyro=%.3f",
+             mean_flow, sufficient_motion, has_parallax, is_static, is_pure_rotation,
+             (int)prev_good_buf_.size(), gyro_norm);
+    }
 
     if (sufficient_motion && has_parallax && !is_static
         && static_cast<int>(prev_good_buf_.size()) >= 8) {
@@ -297,6 +328,7 @@ VisionOutput VisionModule::processFrame(const uint8_t* yuv_data,
 
         if (!E.empty() && E.rows == 3 && E.cols == 3) {
             int inliers = cv::recoverPose(E, prev_good_buf_, next_good_buf_, K, R_vo, t_vo, mask);
+            inlier_count_out = inliers;
             double inlier_ratio = static_cast<double>(inliers) / static_cast<double>(prev_good_buf_.size());
 
             if (inliers >= MIN_INLIERS && inlier_ratio >= MIN_INLIER_RATIO) {
@@ -332,27 +364,35 @@ VisionOutput VisionModule::processFrame(const uint8_t* yuv_data,
                                       + (1.0 - adaptive_alpha) * rot_vec_vo;
                 cv::Rodrigues(rot_vec_fused, R_fused);
 
-                // ── Scale estimation (GUARDED) ──────────────────────────────
-                {
-                    std::lock_guard<std::mutex> slock(pose_mutex_);
-                    last_imu_disp_ = cv::norm(imu_delta.deltaP);
-                }
+                // ── Scale estimation (STEP-BASED) ────────────────────────────
                 double vo_dist = cv::norm(t_vo);
                 int64_t dt_ns_frame = timestamp_ns - current_prev_ts;
 
-                bool scale_ok = (quality > 0.5) && (!is_pure_rotation) && (!is_static)
-                             && (dt_ns_frame > 0) && (dt_ns_frame < 100'000'000LL);
+                // Relaxed quality gate (0.35) and dt (up to 250ms)
+                bool scale_ok = (quality > 0.15) && (!is_pure_rotation) && (!is_static)
+                             && (dt_ns_frame > 0) && (dt_ns_frame < 500'000'000LL);
 
                 if (scale_ok) {
-                    double candidate = estimateScaleFromAccel(vo_dist, dt_ns_frame);
+                    double candidate = estimateScaleFromSteps(vo_dist, dt_ns_frame);
                     if (candidate > 0.0) {
                         std::lock_guard<std::mutex> slock(pose_mutex_);
-                        smooth_scale_ = 0.95 * smooth_scale_ + 0.05 * candidate;
+                        // Faster convergence during bootstrap: 0.5 for first 10 (snap), 0.1 for next 20 (tune)
+                        double alpha = 0.05;
+                        if (scale_obs_count_ < 10) alpha = 0.50;
+                        else if (scale_obs_count_ < 30) alpha = 0.10;
+
+                        smooth_scale_ = (1.0 - alpha) * smooth_scale_ + alpha * candidate;
                         smooth_scale_ = std::max(0.005, std::min(20.0, smooth_scale_));
                         scale_obs_count_++;
                         estimatedScale = smooth_scale_;
-                        LOGI("SCALE: candidate=%.4f smooth=%.4f quality=%.2f obs=%d",
-                             candidate, smooth_scale_, quality, scale_obs_count_);
+
+                        if (scale_obs_count_ <= 30) {
+                            LOGI("BOOTSTRAP SCALE [%d/30]: candidate=%.4f smooth=%.4f alpha=%.2f quality=%.2f",
+                                 scale_obs_count_, candidate, smooth_scale_, alpha, quality);
+                        } else {
+                            LOGI("SCALE: candidate=%.4f smooth=%.4f alpha=%.2f quality=%.2f obs=%d",
+                                 candidate, smooth_scale_, alpha, quality, scale_obs_count_);
+                        }
                     } else {
                         std::lock_guard<std::mutex> slock(pose_mutex_);
                         estimatedScale = smooth_scale_;
@@ -367,24 +407,60 @@ VisionOutput VisionModule::processFrame(const uint8_t* yuv_data,
         }
     }
 
-    // ── 10. Global pose update — CAMERA PRIMARY, IMU rotation only ──────────
+    // ── 10. Global pose update — 2D HEADING-BASED for horizontal motion ────
+    //
+    // KEY INSIGHT: When the phone is tilted, a physical turn around the world's
+    // vertical axis maps to rotation around device Z in the gyro data. But
+    // global_R_ * (0,0,-1) is UNCHANGED by Rz rotation, so the 3D approach
+    // fails to reverse direction after turns.
+    //
+    // FIX: Extract heading (yaw) from global_R_ — which correctly tracks turns
+    // — and use it for 2D position updates. This is robust to phone tilt.
     {
         std::lock_guard<std::mutex> lock(pose_mutex_);
 
+        // Always update rotation from the best available source
+        if (pose_valid) {
+            global_R_ = global_R_ * R_fused;
+        } else if (!is_static) {
+            global_R_ = global_R_ * imu_delta.deltaR;
+        }
+
+        // Extract heading from rotation matrix (ZYX Euler convention)
+        // This gives the physical heading direction in the world frame
+        double heading = std::atan2(global_R_.at<double>(1, 0),
+                                     global_R_.at<double>(1, 1));
+
         if (is_static) {
             // ZUPT: freeze pose completely — no drift
-        } else if (pose_valid && !is_pure_rotation) {
-            // Full VIO: camera translation * scale, fused rotation
-            // NEVER use imu_delta.deltaP for position
-            cv::Mat final_t = global_R_ * (estimatedScale * t_vo);
-            global_t_ += final_t;
-            global_R_  = R_fused * global_R_;
-        } else if (pose_valid && is_pure_rotation) {
-            // Pure rotation: update rotation only, hold position
-            global_R_ = R_fused * global_R_;
-        } else {
-            // VO failed: rotation from gyro only, HOLD position
-            global_R_ = imu_delta.deltaR * global_R_;
+        } else if (pose_valid && !is_pure_rotation && quality >= 0.15) {
+            // Full VIO: use VO displacement magnitude + heading for direction
+            double displacement = estimatedScale * cv::norm(t_vo);
+
+            // 2D position update using heading
+            double dx =  displacement * std::sin(heading);
+            double dz = -displacement * std::cos(heading);
+
+            global_t_.at<double>(0) += dx;
+            global_t_.at<double>(2) += dz;
+            // Y (vertical) from VO if available
+            if (!t_vo.empty()) {
+                global_t_.at<double>(1) += estimatedScale * t_vo.at<double>(1);
+            }
+        } else if (!is_static) {
+            // Fallback: step-based translation using heading
+            used_fallback = true;
+            auto step_info = imu_.getStepInfo();
+            if (step_info.speed_mps > 0.1) {
+                double dt_s = (timestamp_ns - current_prev_ts) * 1e-9;
+                double displacement = step_info.speed_mps * dt_s;
+                displacement = std::min(displacement, 0.5); // cap at 0.5m per frame
+                double dx =  displacement * std::sin(heading);
+                double dz = -displacement * std::cos(heading);
+
+                global_t_.at<double>(0) += dx;
+                global_t_.at<double>(2) += dz;
+            }
         }
     }
 
@@ -413,6 +489,8 @@ VisionOutput VisionModule::processFrame(const uint8_t* yuv_data,
         std::lock_guard<std::mutex> lock(pose_mutex_);
         out.R = global_R_.clone(); // Return global orientation
         out.t = global_t_.clone(); // Return global position
+        out.rawR = R_vo.clone();   // RAW Camera Rotation
+        out.rawT = t_vo.clone();   // RAW Camera Translation
     }
     out.quality       = quality;
     out.trackedCount  = tracked;
@@ -420,6 +498,26 @@ VisionOutput VisionModule::processFrame(const uint8_t* yuv_data,
     out.estimatedScale = estimatedScale;
     out.valid         = true;
     out.trackedPoints = std::move(tracked_points_flat);
+
+    // Diagnostic fields
+    out.meanFlow     = mean_flow;
+    out.inlierCount  = inlier_count_out;
+    {
+        auto si = imu_.getStepInfo();
+        out.stepCount    = si.step_count;
+        out.stepFreq     = (si.speed_mps > 0 && si.stride_length_m > 0)
+                         ? si.speed_mps / si.stride_length_m : 0.0;
+        out.strideLength = si.stride_length_m;
+    }
+    out.poseFlags = (is_static ? 1 : 0)
+                  | (is_pure_rotation ? 2 : 0)
+                  | (pose_valid ? 4 : 0)
+                  | (used_fallback ? 8 : 0);
+    {
+        std::lock_guard<std::mutex> lock(pose_mutex_);
+        out.heading = std::atan2(global_R_.at<double>(1, 0),
+                                  global_R_.at<double>(1, 1));
+    }
 
     return out;
 }

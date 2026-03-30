@@ -67,6 +67,12 @@ class SensorRepository(private val context: Context) : SensorEventListener {
     private val _showCameraBlocked = MutableStateFlow(false)
     val showCameraBlocked = _showCameraBlocked.asStateFlow()
 
+    // ── FOR SIMULATION ────────────────────────────────────────────────────────
+    private val _currentLocation = MutableStateFlow<Location?>(null)
+    val currentLocation = _currentLocation.asStateFlow()
+    private var locationCallback: LocationCallback? = null
+    // ──────────────────────────────────────────────────────────────────────────
+
     private val repositoryScope = CoroutineScope(Dispatchers.Main + SupervisorJob())
 
     fun startSensors() {
@@ -81,6 +87,39 @@ class SensorRepository(private val context: Context) : SensorEventListener {
         }
         NativeBridge.startVIO()
     }
+
+    // ── FOR SIMULATION ────────────────────────────────────────────────────────
+    @SuppressLint("MissingPermission")
+    fun startGpsUpdates() {
+        val request = LocationRequest.Builder(Priority.PRIORITY_HIGH_ACCURACY, 1000L)
+            .setMinUpdateIntervalMillis(500L)
+            .build()
+        
+        locationCallback = object : LocationCallback() {
+            override fun onLocationResult(result: LocationResult) {
+                result.lastLocation?.let {
+                    _currentLocation.value = it
+                    // Also update start location if not set
+                    if (_startLocation.value == null) {
+                        _startLocation.value = LatLng(it.latitude, it.longitude)
+                    }
+                }
+            }
+        }
+        locationCallback?.let {
+            fusedLocationClient.requestLocationUpdates(request, it, android.os.Looper.getMainLooper())
+        }
+        Log.d(TAG, "GPS updates started for simulation")
+    }
+
+    fun stopGpsUpdates() {
+        locationCallback?.let {
+            fusedLocationClient.removeLocationUpdates(it)
+        }
+        locationCallback = null
+        Log.d(TAG, "GPS updates stopped")
+    }
+    // ──────────────────────────────────────────────────────────────────────────
 
     private var intrinsicsInitialized = false
 

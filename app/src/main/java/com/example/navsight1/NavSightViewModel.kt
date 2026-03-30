@@ -1,6 +1,8 @@
 package com.example.navsight1
 
 import android.app.Application
+import android.location.Location
+import android.util.Log
 import androidx.compose.runtime.mutableStateListOf
 import androidx.compose.runtime.mutableStateOf
 import androidx.compose.runtime.getValue
@@ -71,6 +73,50 @@ class NavSightViewModel(application: Application) : AndroidViewModel(application
     var showCameraBlocked by mutableStateOf(false)
         private set
 
+    // ── FOR SIMULATION ────────────────────────────────────────────────────────
+    var isRecordingSimulation by mutableStateOf(false)
+        private set
+    private val simulationDataPoints = mutableListOf<SimulationPoint>()
+    private var currentGpsLocation: Location? = null
+
+    data class SimulationPoint(
+        val timestamp: Long,
+        val vioX: Double,
+        val vioY: Double,
+        val vioZ: Double,
+        val vioYaw: Double,
+        val vioScale: Double,
+        val vioQuality: Double,
+        val rawX: Double,
+        val rawY: Double,
+        val rawZ: Double,
+        val rawYaw: Double,
+        val accelX: Float,
+        val accelY: Float,
+        val accelZ: Float,
+        val gyroX: Float,
+        val gyroY: Float,
+        val gyroZ: Float,
+        val gpsLat: Double?,
+        val gpsLng: Double?,
+        val gpsAlt: Double?,
+        val gpsAcc: Float?,
+        // Diagnostics
+        val meanFlow: Double,
+        val inlierCount: Int,
+        val stepCount: Int,
+        val stepFreq: Double,
+        val strideLength: Double,
+        val poseFlags: Int,
+        val heading: Double
+    )
+
+    data class SimulationData(
+        val startTime: Long,
+        val points: List<SimulationPoint>
+    )
+    // ──────────────────────────────────────────────────────────────────────────
+
     /** Initial heading in degrees from SensorRepository (captured at VIO init from magnetometer) */
     val vioInitAzimuth: Float
         get() = sensorRepository.vioInitAzimuth
@@ -111,6 +157,12 @@ class NavSightViewModel(application: Application) : AndroidViewModel(application
             sensorRepository.showCameraBlocked.collect { showCameraBlocked = it }
         }
 
+        // ── FOR SIMULATION ────────────────────────────────────────────────────────
+        viewModelScope.launch {
+            sensorRepository.currentLocation.collect { currentGpsLocation = it }
+        }
+        // ──────────────────────────────────────────────────────────────────────────
+
         // Observe Navigation states
         viewModelScope.launch {
             navigationManager.navigationState.collect { navigationState = it }
@@ -127,6 +179,34 @@ class NavSightViewModel(application: Application) : AndroidViewModel(application
             virtualZ = vio.z
             pathHistory.add(Pair(vio.x.toFloat(), vio.z.toFloat()))
             if (pathHistory.size > 500) pathHistory.removeAt(0)
+
+            // ── FOR SIMULATION ────────────────────────────────────────────────────────
+            if (isRecordingSimulation) {
+                val gps = currentGpsLocation
+                simulationDataPoints.add(SimulationPoint(
+                    timestamp = System.currentTimeMillis(),
+                    vioX = vio.x, vioY = vio.y, vioZ = vio.z,
+                    vioYaw = vio.yaw,
+                    vioScale = vio.estimatedScale,
+                    vioQuality = vio.trackingQuality,
+                    rawX = vio.rawX, rawY = vio.rawY, rawZ = vio.rawZ,
+                    rawYaw = vio.rawYaw,
+                    accelX = vio.accelX, accelY = vio.accelY, accelZ = vio.accelZ,
+                    gyroX = vio.gyroX, gyroY = vio.gyroY, gyroZ = vio.gyroZ,
+                    gpsLat = gps?.latitude,
+                    gpsLng = gps?.longitude,
+                    gpsAlt = gps?.altitude,
+                    gpsAcc = gps?.accuracy,
+                    meanFlow = vio.meanFlow,
+                    inlierCount = vio.inlierCount,
+                    stepCount = vio.stepCount,
+                    stepFreq = vio.stepFreq,
+                    strideLength = vio.strideLength,
+                    poseFlags = vio.poseFlags,
+                    heading = vio.heading
+                ))
+            }
+            // ──────────────────────────────────────────────────────────────────────────
 
             // Distance accumulation (every frame)
             val prevDist = lastVioForDist
@@ -177,11 +257,75 @@ class NavSightViewModel(application: Application) : AndroidViewModel(application
         }
     }
 
+    // ── FOR SIMULATION ────────────────────────────────────────────────────────
+    fun toggleSimulationRecording(getExternalFilesDir: (String?) -> java.io.File?, filesDir: java.io.File) {
+        if (!isRecordingSimulation) {
+            // Start recording
+            simulationDataPoints.clear()
+            sensorRepository.startGpsUpdates()
+            isRecordingSimulation = true
+            Log.d("SIMULATION", "Started recording simulation")
+        } else {
+            // Stop and save
+            isRecordingSimulation = false
+            sensorRepository.stopGpsUpdates()
+            saveSimulationData(getExternalFilesDir, filesDir)
+            Log.d("SIMULATION", "Stopped recording simulation, points: ${simulationDataPoints.size}")
+        }
+    }
+
+    private fun saveSimulationData(getExternalFilesDir: (String?) -> java.io.File?, filesDir: java.io.File) {
+        if (simulationDataPoints.isEmpty()) return
+        
+        viewModelScope.launch(Dispatchers.IO) {
+            val data = SimulationData(
+                startTime = simulationDataPoints.first().timestamp,
+                points = simulationDataPoints.toList()
+            )
+            
+            // Simple manual JSON conversion to avoid adding heavy libraries
+            val sb = StringBuilder()
+            sb.append("{\"startTime\":${data.startTime},\"points\":[")
+            data.points.forEachIndexed { index, p ->
+                if (index > 0) sb.append(",")
+                sb.append("{")
+                sb.append("\"ts\":${p.timestamp},")
+                sb.append("\"vx\":${p.vioX},\"vy\":${p.vioY},\"vz\":${p.vioZ},")
+                sb.append("\"vyaw\":${p.vioYaw},\"vsc\":${p.vioScale},\"vql\":${p.vioQuality},")
+                sb.append("\"rx\":${p.rawX},\"ry\":${p.rawY},\"rz\":${p.rawZ},\"ryaw\":${p.rawYaw},")
+                sb.append("\"ax\":${p.accelX},\"ay\":${p.accelY},\"az\":${p.accelZ},")
+                sb.append("\"gx\":${p.gyroX},\"gy\":${p.gyroY},\"gz\":${p.gyroZ},")
+                sb.append("\"glat\":${p.gpsLat ?: "null"},\"glng\":${p.gpsLng ?: "null"},")
+                sb.append("\"galt\":${p.gpsAlt ?: "null"},\"gacc\":${p.gpsAcc ?: "null"},")
+                sb.append("\"mflow\":${p.meanFlow},\"inl\":${p.inlierCount},")
+                sb.append("\"steps\":${p.stepCount},\"sfreq\":${p.stepFreq},")
+                sb.append("\"stride\":${p.strideLength},\"pflags\":${p.poseFlags},")
+                sb.append("\"hdg\":${p.heading}")
+                sb.append("}")
+            }
+            sb.append("]}")
+
+            try {
+                val dir = getExternalFilesDir(null) ?: filesDir
+                val file = java.io.File(dir, "simulation_data_${System.currentTimeMillis()}.json")
+                file.writeText(sb.toString())
+                Log.d("SIMULATION", "Saved simulation data to: ${file.absolutePath}")
+            } catch (e: Exception) {
+                Log.e("SIMULATION", "Failed to save simulation data: ${e.message}")
+            }
+        }
+    }
+    // ──────────────────────────────────────────────────────────────────────────
+
     fun onResume() {
         sensorRepository.startSensors()
     }
 
     fun onPause() {
+        if (isRecordingSimulation) {
+            // Stop GPS updates if we leave the app
+            sensorRepository.stopGpsUpdates()
+        }
         sensorRepository.stopSensors()
     }
 

@@ -4,6 +4,7 @@
 #include <mutex>
 #include <cstdint>
 #include <cmath>
+#include <opencv2/calib3d.hpp>
 #include "VisionModule.h"
 
 #define TAG "NavSight-Native"
@@ -21,9 +22,21 @@ static double g_x = 0, g_y = 0, g_z = 0;
 static double g_roll = 0, g_pitch = 0, g_yaw = 0;
 static double g_scale = 1.0;
 
+// RAW VO for simulation
+static double g_raw_x = 0, g_raw_y = 0, g_raw_z = 0, g_raw_yaw = 0;
+
 // Last sensor values
 static float g_ax = 0, g_ay = 0, g_az = 0;
 static float g_gx = 0, g_gy = 0, g_gz = 0;
+
+// Diagnostic fields from VisionOutput
+static double g_mean_flow = 0;
+static int    g_inlier_count = 0;
+static int    g_step_count = 0;
+static double g_step_freq = 0;
+static double g_stride_length = 0;
+static int    g_pose_flags = 0;
+static double g_heading = 0;
 
 // ── resetPoseState ────────────────────────────────────────────────────────────
 // Must be called with state_mutex held.
@@ -31,8 +44,11 @@ static float g_gx = 0, g_gy = 0, g_gz = 0;
 static void resetPoseState() {
     g_x = g_y = g_z = 0;
     g_roll = g_pitch = g_yaw = 0;
+    g_raw_x = g_raw_y = g_raw_z = g_raw_yaw = 0;
     g_ax = g_ay = g_az = 0;
     g_gx = g_gy = g_gz = 0;
+    g_mean_flow = 0; g_inlier_count = 0; g_step_count = 0;
+    g_step_freq = 0; g_stride_length = 0; g_pose_flags = 0; g_heading = 0;
     // keep g_scale
 }
 
@@ -109,15 +125,33 @@ Java_com_example_navsight1_NativeBridge_processCameraFrame(
     {
         std::lock_guard<std::mutex> lock(state_mutex);
         if (output.valid && !output.R.empty() && !output.t.empty()) {
-            // VisionModule now returns GLOBAL pose, so we assign directly
             g_x = output.t.at<double>(0);
             g_y = output.t.at<double>(1);
             g_z = output.t.at<double>(2);
+            g_scale = output.estimatedScale; 
+            
+            // RAW VO
+            g_raw_x = output.rawT.empty() ? 0.0 : output.rawT.at<double>(0);
+            g_raw_y = output.rawT.empty() ? 0.0 : output.rawT.at<double>(1);
+            g_raw_z = output.rawT.empty() ? 0.0 : output.rawT.at<double>(2);
+            
+            if (!output.rawR.empty()) {
+                cv::Mat rv;
+                cv::Rodrigues(output.rawR, rv);
+                g_raw_yaw = rv.at<double>(1);
+            }
+
+            // Diagnostic fields
+            g_mean_flow = output.meanFlow;
+            g_inlier_count = output.inlierCount;
+            g_step_count = output.stepCount;
+            g_step_freq = output.stepFreq;
+            g_stride_length = output.strideLength;
+            g_pose_flags = output.poseFlags;
+            g_heading = output.heading;
 
             // Derive Euler angles from the GLOBAL rotation for display
             const cv::Mat& R = output.R;
-            // Standard decomposition for Rotation Matrix to Euler (Pitch, Roll, Yaw)
-            // Note: Axis mapping depends on device orientation; usually Y is UP
             g_pitch = std::asin(-R.at<double>(1, 2)); 
             if (std::abs(std::cos(g_pitch)) > 1e-6) {
                 g_roll = std::atan2(R.at<double>(0, 2), R.at<double>(2, 2));
@@ -137,15 +171,11 @@ Java_com_example_navsight1_NativeBridge_processCameraFrame(
         return nullptr;
     }
 
-    // Signature must match VioData primary constructor field order exactly:
-    // x(D) y(D) z(D) roll(D) pitch(D) yaw(D) trackingQuality(D)
-    // trackedFeatures(I) totalFeatures(I) estimatedScale(D)
-    // isInitialized(Z) trackedPoints([F)
-    // accelX(F) accelY(F) accelZ(F) gyroX(F) gyroY(F) gyroZ(F)
-    const char* vio_sig = "(DDDDDDDIIDZ[FFFFFFF)V";
+    // Signature: base fields + RAW VO + IMU + diagnostics (meanFlow,inlierCount,stepCount,stepFreq,strideLength,poseFlags,heading)
+    const char* vio_sig = "(DDDDDDDIIDZ[FDDDDFFFFFFDIIDDID)V";
     jmethodID ctor = env->GetMethodID(cls, "<init>", vio_sig);
     if (!ctor) {
-        LOGE("processCameraFrame: VioData constructor not found with sig %s", vio_sig);
+        LOGE("processCameraFrame: VioData constructor not found");
         return nullptr;
     }
 
@@ -162,39 +192,52 @@ Java_com_example_navsight1_NativeBridge_processCameraFrame(
                                  output.trackedPoints.data());
     }
 
-    // Read latest accumulated state under lock for the return value
+    // Snapshot state for return
     double ret_x, ret_y, ret_z, ret_roll, ret_pitch, ret_yaw;
     double ret_quality, ret_scale;
+    double ret_rx, ret_ry, ret_rz, ret_ryaw;
     int    ret_tracked, ret_total;
     jboolean ret_initialized;
     float  ret_ax, ret_ay, ret_az, ret_gx, ret_gy, ret_gz;
+    double ret_mean_flow, ret_step_freq, ret_stride_length, ret_heading;
+    int    ret_inlier_count, ret_step_count, ret_pose_flags;
     {
         std::lock_guard<std::mutex> lock(state_mutex);
-        ret_x    = g_x;   ret_y    = g_y;   ret_z    = g_z;
+        ret_x = g_x; ret_y = g_y; ret_z = g_z;
         ret_roll = g_roll; ret_pitch = g_pitch; ret_yaw = g_yaw;
         ret_scale = g_scale;
+        ret_rx = g_raw_x; ret_ry = g_raw_y; ret_rz = g_raw_z; ret_ryaw = g_raw_yaw;
         ret_ax = g_ax; ret_ay = g_ay; ret_az = g_az;
         ret_gx = g_gx; ret_gy = g_gy; ret_gz = g_gz;
+        ret_mean_flow = g_mean_flow;
+        ret_inlier_count = g_inlier_count;
+        ret_step_count = g_step_count;
+        ret_step_freq = g_step_freq;
+        ret_stride_length = g_stride_length;
+        ret_pose_flags = g_pose_flags;
+        ret_heading = g_heading;
     }
-    ret_quality     = output.quality;
-    ret_tracked     = output.trackedCount;
-    ret_total       = output.totalCount > 0 ? output.totalCount : 200;
+    ret_quality = output.quality;
+    ret_tracked = output.trackedCount;
+    ret_total = output.totalCount;
     ret_initialized = static_cast<jboolean>(output.valid);
-
-    LOGD("Pose: x=%.3f y=%.3f z=%.3f yaw=%.3f tracked=%d quality=%.2f",
-         ret_x, ret_y, ret_z, ret_yaw, ret_tracked, ret_quality);
 
     return env->NewObject(
             cls, ctor,
-            (jdouble)ret_x, (jdouble)ret_y, (jdouble)ret_z,
-            (jdouble)ret_roll, (jdouble)ret_pitch, (jdouble)ret_yaw,
-            (jdouble)ret_quality,
-            (jint)ret_tracked, (jint)ret_total,
-            (jdouble)ret_scale,
+            ret_x, ret_y, ret_z,
+            ret_roll, ret_pitch, ret_yaw,
+            ret_quality,
+            ret_tracked, ret_total,
+            ret_scale,
             ret_initialized,
             pointsArray,
-            (jfloat)ret_ax, (jfloat)ret_ay, (jfloat)ret_az,
-            (jfloat)ret_gx, (jfloat)ret_gy, (jfloat)ret_gz);
+            ret_rx, ret_ry, ret_rz, ret_ryaw,
+            ret_ax, ret_ay, ret_az,
+            ret_gx, ret_gy, ret_gz,
+            ret_mean_flow,
+            ret_inlier_count, ret_step_count,
+            ret_step_freq, ret_stride_length,
+            ret_pose_flags, ret_heading);
 }
 
 // ── processGyroscope ──────────────────────────────────────────────────────────
@@ -285,3 +328,4 @@ Java_com_example_navsight1_NativeBridge_setIntrinsics(
 }
 
 } // extern "C"
+
