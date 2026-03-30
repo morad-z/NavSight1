@@ -29,7 +29,12 @@ VisionModule::VisionModule()
     prev_good_buf_.reserve(MAX_FEATURES);
     next_good_buf_.reserve(MAX_FEATURES);
     new_pts_buf_.reserve(MAX_FEATURES);
-    
+    back_pts_buf_.reserve(MAX_FEATURES);
+    back_status_buf_.reserve(MAX_FEATURES);
+    back_err_buf_.reserve(MAX_FEATURES);
+    accel_bias_ = cv::Mat::zeros(3, 1, CV_64F);
+    gyro_bias_ = cv::Mat::zeros(3, 1, CV_64F);
+
     LOGI("VisionModule created");
 }
 
@@ -75,6 +80,14 @@ void VisionModule::reset() {
     initialized_ = false;
     global_R_ = cv::Mat::eye(3, 3, CV_64F);
     global_t_ = cv::Mat::zeros(3, 1, CV_64F);
+    accel_bias_ = cv::Mat::zeros(3, 1, CV_64F);
+    accel_bias_count_ = 0;
+    gyro_bias_ = cv::Mat::zeros(3, 1, CV_64F);
+    gyro_bias_count_ = 0;
+    last_imu_disp_ = 0.0;
+    smooth_scale_ = 0.05;
+    scale_obs_count_ = 0;
+    frames_since_keyframe_ = 0;
     imu_.reset();
     LOGI("VisionModule reset");
 }
@@ -98,10 +111,38 @@ double VisionModule::calculateTrackingQuality(const std::vector<uchar>& status) 
 
 // ── estimateScaleFromAccel ────────────────────────────────────────────────────
 
-double VisionModule::estimateScaleFromAccel(double /*vision_disp*/, int64_t /*dt_ns*/) {
-    // Placeholder: double-integration of accelerometer is noisy.
-    // Return baseline 1.0 (clamped to [0.1, 10.0]).
-    return 1.0;
+double VisionModule::estimateScaleFromAccel(double vision_disp, int64_t dt_ns) {
+    // Returns a candidate scale observation, or -1.0 if guards reject it.
+    if (vision_disp < 1e-5) return -1.0;
+
+    double dt = dt_ns * 1e-9;
+    if (dt <= 0.0 || dt > 0.1) return -1.0; // only trust short intervals (<100ms)
+
+    double imu_disp = last_imu_disp_;
+    if (imu_disp < 1e-4) return -1.0;
+
+    double obs_scale = imu_disp / vision_disp;
+
+    // Clamp to physically plausible range first
+    obs_scale = std::max(0.001, std::min(20.0, obs_scale));
+
+    // Sanity: reject if more than 3x away from current smooth estimate
+    // BUT allow the first 10 observations through unconditionally for bootstrap
+    double current_smooth;
+    int obs_count;
+    {
+        std::lock_guard<std::mutex> lock(pose_mutex_);
+        current_smooth = smooth_scale_;
+        obs_count = scale_obs_count_;
+    }
+    if (obs_count >= 10) {
+        if (obs_scale > 3.0 * current_smooth || obs_scale < current_smooth / 3.0) {
+            LOGD("estimateScaleFromAccel: outlier rejected obs=%.4f smooth=%.4f", obs_scale, current_smooth);
+            return -1.0;
+        }
+    }
+
+    return obs_scale;
 }
 
 // ── processFrame ─────────────────────────────────────────────────────────────
@@ -179,39 +220,43 @@ VisionOutput VisionModule::processFrame(const uint8_t* yuv_data,
     }
 
     bool is_pure_rotation = (gyro_norm > GYRO_ROT_ONLY_THRESH);
-    
-    // ZUPT: If accel is near gravity and gyro is very small, we are static
-    bool is_static = false;
-    double accel_dev = std::abs(cv::norm(imu_delta.deltaV) / std::max(0.001, imu_delta.dt));
-    if (accel_dev < ZUPT_ACCEL_THRESH && gyro_norm < ZUPT_GYRO_THRESH) {
-        is_static = true;
-        imu_delta.deltaP = cv::Mat::zeros(3, 1, CV_64F);
-        imu_delta.deltaV = cv::Mat::zeros(3, 1, CV_64F);
-    }
 
-    // ── 6. Optical Flow (HEAVY COMPUTE - OUTSIDE MAIN LOCK) ─────────────────
-    // Reuse buffers and set explicit TermCriteria
+    // ZUPT: tentatively static if gyro is very low (overridden by vision below)
+    bool is_static = (gyro_norm < ZUPT_GYRO_THRESH);
+
+    // ── 6. Optical Flow with Forward-Backward Check ─────────────────────────
     next_pts_buf_.clear();
     status_buf_.clear();
     err_buf_.clear();
-    
+
     cv::TermCriteria criteria(cv::TermCriteria::COUNT + cv::TermCriteria::EPS, 30, 0.01);
-    cv::calcOpticalFlowPyrLK(current_prev_gray, gray_buf_, current_prev_pts_buf_, next_pts_buf_, status_buf_, err_buf_, 
+    cv::calcOpticalFlowPyrLK(current_prev_gray, gray_buf_, current_prev_pts_buf_, next_pts_buf_, status_buf_, err_buf_,
                              cv::Size(21, 21), 3, criteria);
 
-    // ── 7. Filter valid points ────────────────────────────────────────────────
+    // Forward-backward consistency: track back from next to prev
+    back_pts_buf_.clear();
+    back_status_buf_.clear();
+    back_err_buf_.clear();
+    cv::calcOpticalFlowPyrLK(gray_buf_, current_prev_gray, next_pts_buf_, back_pts_buf_, back_status_buf_, back_err_buf_,
+                             cv::Size(21, 21), 3, criteria);
+
+    // ── 7. Filter valid points with FB check ────────────────────────────────
     prev_good_buf_.clear();
     next_good_buf_.clear();
     for (size_t i = 0; i < status_buf_.size(); ++i) {
-        if (status_buf_[i]) {
-            prev_good_buf_.push_back(current_prev_pts_buf_[i]);
-            next_good_buf_.push_back(next_pts_buf_[i]);
+        if (status_buf_[i] && i < back_status_buf_.size() && back_status_buf_[i]) {
+            float bx = current_prev_pts_buf_[i].x - back_pts_buf_[i].x;
+            float by = current_prev_pts_buf_[i].y - back_pts_buf_[i].y;
+            if ((bx * bx + by * by) < FB_CHECK_THRESH) {
+                prev_good_buf_.push_back(current_prev_pts_buf_[i]);
+                next_good_buf_.push_back(next_pts_buf_[i]);
+            }
         }
     }
 
     int tracked = static_cast<int>(next_good_buf_.size());
     int total   = static_cast<int>(current_prev_pts_buf_.size());
-    double quality = calculateTrackingQuality(status_buf_);
+    double quality = (total > 0) ? static_cast<double>(tracked) / static_cast<double>(total) : 0.0;
 
     std::vector<float> tracked_points_flat;
     tracked_points_flat.reserve(next_good_buf_.size() * 2);
@@ -220,80 +265,134 @@ VisionOutput VisionModule::processFrame(const uint8_t* yuv_data,
         tracked_points_flat.push_back(pt.y);
     }
 
-    // ── 9. Essential Matrix Logic (OUTSIDE MAIN LOCK) ──────────────────────
+    // ── 8. Minimum motion + parallax gate ───────────────────────────────────
+    double mean_flow = 0.0;
+    if (!prev_good_buf_.empty()) {
+        for (size_t i = 0; i < prev_good_buf_.size(); ++i) {
+            double fdx = next_good_buf_[i].x - prev_good_buf_[i].x;
+            double fdy = next_good_buf_[i].y - prev_good_buf_[i].y;
+            mean_flow += std::sqrt(fdx * fdx + fdy * fdy);
+        }
+        mean_flow /= static_cast<double>(prev_good_buf_.size());
+    }
+    bool sufficient_motion = (mean_flow >= MIN_FLOW_PX);
+    bool has_parallax = (mean_flow >= MIN_PARALLAX_PX);
+
+    // ZUPT requires BOTH low gyro AND low visual motion
+    // Walking forward with zero rotation has low gyro but high flow — NOT static
+    // Use 0.5px threshold to avoid dead zone between 0.5 and MIN_FLOW_PX
+    if (mean_flow >= 0.5) is_static = false;  // any visible flow = not static
+    if (mean_flow < 0.5 && gyro_norm < ZUPT_GYRO_THRESH) is_static = true; // sub-pixel flow + low gyro = static
+
+    // ── 9. Essential Matrix with strict validation ──────────────────────────
     bool pose_valid = false;
     cv::Mat R_vo, t_vo, R_fused;
     double estimatedScale = 1.0;
 
-    if (static_cast<int>(prev_good_buf_.size()) >= 8) {
+    if (sufficient_motion && has_parallax && !is_static
+        && static_cast<int>(prev_good_buf_.size()) >= 8) {
         cv::Mat mask;
         cv::Mat E = cv::findEssentialMat(prev_good_buf_, next_good_buf_, K,
                                          cv::RANSAC, RANSAC_CONF, RANSAC_THRESH, mask);
 
         if (!E.empty() && E.rows == 3 && E.cols == 3) {
-            if (cv::recoverPose(E, prev_good_buf_, next_good_buf_, K, R_vo, t_vo, mask) > 0) {
-                // ── 14-15. Adaptive fusion based on tracking quality ───────────────────
+            int inliers = cv::recoverPose(E, prev_good_buf_, next_good_buf_, K, R_vo, t_vo, mask);
+            double inlier_ratio = static_cast<double>(inliers) / static_cast<double>(prev_good_buf_.size());
+
+            if (inliers >= MIN_INLIERS && inlier_ratio >= MIN_INLIER_RATIO) {
+                // ── Adaptive rotation fusion ────────────────────────────────
                 cv::Mat rot_vec_vo, rot_vec_gyro;
                 cv::Rodrigues(R_vo, rot_vec_vo);
                 cv::Rodrigues(imu_delta.deltaR, rot_vec_gyro);
 
-                // FR4: Dynamic Alpha. High quality = camera more main (lower alpha). 
-                // Low quality = sensors more main (higher alpha).
-                double adaptive_alpha = 0.98; // Default
+                // Gyro bias estimation
+                if (gyro_bias_count_ < 200) {
+                    cv::Mat bias_sample = rot_vec_gyro - rot_vec_vo;
+                    double alpha_bias = (gyro_bias_count_ < 50) ? 0.05 : 0.01;
+                    gyro_bias_ = (1.0 - alpha_bias) * gyro_bias_ + alpha_bias * bias_sample;
+                    // Clamp bias magnitude to 0.02 rad/s (real phone bias is tiny)
+                    double bias_norm = cv::norm(gyro_bias_);
+                    if (bias_norm > 0.02) gyro_bias_ *= (0.02 / bias_norm);
+                    gyro_bias_count_++;
+                }
+                cv::Mat rot_vec_gyro_corrected = rot_vec_gyro - gyro_bias_;
+
+                // FR4: Adaptive alpha — camera primary when quality is high
+                double adaptive_alpha = 0.98;
                 if (quality > 0.7) {
-                    adaptive_alpha = 0.85; // Camera is strong, let it correct gyro faster
+                    adaptive_alpha = 0.85;
                 } else if (quality < 0.3) {
-                    adaptive_alpha = 0.995; // Camera is weak (dark/blurry), trust sensors almost entirely
+                    adaptive_alpha = 0.995;
                 } else {
-                    // Linear interpolation between 0.3 and 0.7 quality
                     double t = (quality - 0.3) / 0.4;
                     adaptive_alpha = 0.995 - t * (0.995 - 0.85);
                 }
 
-                LOGI("FUSION: quality=%.2f adaptive_alpha=%.3f", quality, adaptive_alpha);
-
-                cv::Mat rot_vec_fused = adaptive_alpha * rot_vec_gyro
+                cv::Mat rot_vec_fused = adaptive_alpha * rot_vec_gyro_corrected
                                       + (1.0 - adaptive_alpha) * rot_vec_vo;
                 cv::Rodrigues(rot_vec_fused, R_fused);
 
-                // ── 16. Scale estimation ────────────────────────────────────
-                double imu_dist = cv::norm(imu_delta.deltaP);
+                // ── Scale estimation (GUARDED) ──────────────────────────────
+                {
+                    std::lock_guard<std::mutex> slock(pose_mutex_);
+                    last_imu_disp_ = cv::norm(imu_delta.deltaP);
+                }
                 double vo_dist = cv::norm(t_vo);
-                if (vo_dist > 1e-5) {
-                    double obs_scale = imu_dist / vo_dist;
-                    // Update class member with smoothing
-                    {
-                        std::lock_guard<std::mutex> lock(pose_mutex_);
-                        smooth_scale_ = 0.9 * smooth_scale_ + 0.1 * obs_scale;
-                        smooth_scale_ = std::max(0.1, std::min(10.0, smooth_scale_));
+                int64_t dt_ns_frame = timestamp_ns - current_prev_ts;
+
+                bool scale_ok = (quality > 0.5) && (!is_pure_rotation) && (!is_static)
+                             && (dt_ns_frame > 0) && (dt_ns_frame < 100'000'000LL);
+
+                if (scale_ok) {
+                    double candidate = estimateScaleFromAccel(vo_dist, dt_ns_frame);
+                    if (candidate > 0.0) {
+                        std::lock_guard<std::mutex> slock(pose_mutex_);
+                        smooth_scale_ = 0.95 * smooth_scale_ + 0.05 * candidate;
+                        smooth_scale_ = std::max(0.005, std::min(20.0, smooth_scale_));
+                        scale_obs_count_++;
+                        estimatedScale = smooth_scale_;
+                        LOGI("SCALE: candidate=%.4f smooth=%.4f quality=%.2f obs=%d",
+                             candidate, smooth_scale_, quality, scale_obs_count_);
+                    } else {
+                        std::lock_guard<std::mutex> slock(pose_mutex_);
                         estimatedScale = smooth_scale_;
                     }
+                } else {
+                    std::lock_guard<std::mutex> slock(pose_mutex_);
+                    estimatedScale = smooth_scale_;
                 }
+
                 pose_valid = true;
             }
         }
     }
 
-    // ── 17. Global pose update (GRANULAR LOCK) ──────────────────────────────
+    // ── 10. Global pose update — CAMERA PRIMARY, IMU rotation only ──────────
     {
         std::lock_guard<std::mutex> lock(pose_mutex_);
-        
-        if (pose_valid) {
-            // Camera + IMU fusion
+
+        if (is_static) {
+            // ZUPT: freeze pose completely — no drift
+        } else if (pose_valid && !is_pure_rotation) {
+            // Full VIO: camera translation * scale, fused rotation
+            // NEVER use imu_delta.deltaP for position
             cv::Mat final_t = global_R_ * (estimatedScale * t_vo);
-            
-            // If we are rotating fast, ignore camera's noisy translation (it's degenerate)
-            if (is_pure_rotation) {
-                global_t_ += (global_R_ * imu_delta.deltaP);
-            } else {
-                global_t_ += 0.7 * (global_R_ * imu_delta.deltaP) + 0.3 * final_t;
-            }
+            global_t_ += final_t;
             global_R_  = R_fused * global_R_;
+        } else if (pose_valid && is_pure_rotation) {
+            // Pure rotation: update rotation only, hold position
+            global_R_ = R_fused * global_R_;
         } else {
-            // Pure IMU dead reckoning if VO fails (or if static - imu_delta is zeroed by ZUPT)
-            global_t_ += (global_R_ * imu_delta.deltaP);
-            global_R_  = imu_delta.deltaR * global_R_;
+            // VO failed: rotation from gyro only, HOLD position
+            global_R_ = imu_delta.deltaR * global_R_;
         }
+    }
+
+    // ── 11. Accel bias estimation (diagnostic, when static) ─────────────────
+    if (is_static && accel_bias_count_ < ACCEL_BIAS_WARMUP && imu_delta.dt > 0.001) {
+        cv::Mat bias_obs = imu_delta.deltaV / imu_delta.dt;
+        accel_bias_ = (1.0 - ACCEL_BIAS_ALPHA) * accel_bias_ + ACCEL_BIAS_ALPHA * bias_obs;
+        accel_bias_count_++;
     }
 
     // ── 18. Update internal state for next frame (SHORT LOCK) ───────────────

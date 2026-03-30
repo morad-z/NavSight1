@@ -58,21 +58,49 @@ private:
     // Intrinsics (0 = auto from width)
     double fx_{0.}, fy_{0.}, cx_{0.}, cy_{0.};
 
-    double smooth_scale_{1.0}; // Thread-safe class member for scale smoothing
+    double smooth_scale_{0.05}; // Initial estimate for walking (~0.03-0.08 m/unit)
+    int scale_obs_count_{0};     // Number of accepted scale observations (for bootstrap)
+
+    // Parallax gate
+    int frames_since_keyframe_{0};
+    static constexpr double MIN_PARALLAX_PX = 2.0; // min mean pixel displacement for VO
+
+    // Accelerometer bias estimation (diagnostic)
+    cv::Mat accel_bias_;       // 3x1 CV_64F running bias estimate
+    int     accel_bias_count_{0};
+    static constexpr int    ACCEL_BIAS_WARMUP = 150;
+    static constexpr double ACCEL_BIAS_ALPHA  = 0.005;
+
+    // Scale estimation helper
+    double last_imu_disp_{0.0};
+
+    // Forward-backward optical flow check buffers
+    std::vector<cv::Point2f> back_pts_buf_;
+    std::vector<uchar> back_status_buf_;
+    std::vector<float> back_err_buf_;
+
+    // Gyro bias estimation
+    cv::Mat gyro_bias_;
+    int gyro_bias_count_{0};
 
     bool initialized_{false};
 
     static constexpr int MAX_FEATURES    = 200;
     static constexpr int MIN_FEATURES    = 100;
-    static constexpr double QUALITY_LEVEL = 0.01;
+    static constexpr double QUALITY_LEVEL = 0.03;   // Raised from 0.01
     static constexpr double MIN_DIST      = 10.0;
-    static constexpr double RANSAC_CONF   = 0.999;
-    static constexpr double RANSAC_THRESH = 1.0;
-    static constexpr double ALPHA_FUSION  = 0.98;  // gyro weight
+    static constexpr double RANSAC_CONF   = 0.9999; // Raised from 0.999
+    static constexpr double RANSAC_THRESH = 0.5;    // Lowered from 1.0
+    static constexpr double ALPHA_FUSION  = 0.98;   // gyro weight (overridden by adaptive)
     static constexpr int64_t MAX_DT_NS   = 5'000'000'000LL; // 5 seconds
+
+    // Forward-backward check
+    static constexpr double FB_CHECK_THRESH  = 1.0;  // squared pixel distance
+    static constexpr double MIN_FLOW_PX      = 1.0;  // min mean flow for Essential Matrix
+    static constexpr int    MIN_INLIERS      = 12;
+    static constexpr double MIN_INLIER_RATIO = 0.4;
 
     // Drift-Kill Thresholds
     static constexpr double GYRO_ROT_ONLY_THRESH = 0.5; // rad/s - switch to rotation-only
-    static constexpr double ZUPT_ACCEL_THRESH = 0.2;    // m/s^2 deviation from gravity (raised from 0.1)
-    static constexpr double ZUPT_GYRO_THRESH = 0.1;     // rad/s - nearly static (raised from 0.05)
+    static constexpr double ZUPT_GYRO_THRESH = 0.05;    // rad/s - nearly static
 };

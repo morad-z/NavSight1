@@ -65,6 +65,9 @@ class NavSightViewModel(application: Application) : AndroidViewModel(application
     var currentSpeedKmh by mutableStateOf(0f)
         private set
 
+    var totalDistanceM by mutableStateOf(0.0)
+        private set
+
     var showCameraBlocked by mutableStateOf(false)
         private set
 
@@ -73,6 +76,7 @@ class NavSightViewModel(application: Application) : AndroidViewModel(application
         get() = sensorRepository.vioInitAzimuth
 
     private var lastVioForSpeed: VioData? = null
+    private var lastVioForDist: VioData? = null
     private var lastSpeedTimeMs = 0L
     private var lastSnapTimeMs = 0L
     
@@ -124,7 +128,16 @@ class NavSightViewModel(application: Application) : AndroidViewModel(application
             pathHistory.add(Pair(vio.x.toFloat(), vio.z.toFloat()))
             if (pathHistory.size > 500) pathHistory.removeAt(0)
 
-            // Speed computation
+            // Distance accumulation (every frame)
+            val prevDist = lastVioForDist
+            if (prevDist != null) {
+                val ddx = vio.x - prevDist.x
+                val ddz = vio.z - prevDist.z
+                totalDistanceM += sqrt(ddx * ddx + ddz * ddz)
+            }
+            lastVioForDist = vio
+
+            // Speed computation (throttled to 200ms)
             val nowMs = System.currentTimeMillis()
             val prev = lastVioForSpeed
             if (prev != null) {
@@ -186,7 +199,9 @@ class NavSightViewModel(application: Application) : AndroidViewModel(application
         virtualX = 0.0
         virtualZ = 0.0
         currentSpeedKmh = 0f
+        totalDistanceM = 0.0
         lastVioForSpeed = null
+        lastVioForDist = null
     }
 
     fun startNavigation(destination: LatLng) {
