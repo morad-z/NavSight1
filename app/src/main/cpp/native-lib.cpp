@@ -41,7 +41,7 @@ extern "C" {
 // ── startVIO ──────────────────────────────────────────────────────────────────
 
 JNIEXPORT void JNICALL
-Java_com_example_navsight1_MainActivity_startVIO(JNIEnv*, jobject) {
+Java_com_example_navsight1_NativeBridge_startVIO(JNIEnv*, jobject) {
     std::lock_guard<std::mutex> lock(state_mutex);
     if (g_vision) {
         delete g_vision;
@@ -55,7 +55,7 @@ Java_com_example_navsight1_MainActivity_startVIO(JNIEnv*, jobject) {
 // ── stopVIO ───────────────────────────────────────────────────────────────────
 
 JNIEXPORT void JNICALL
-Java_com_example_navsight1_MainActivity_stopVIO(JNIEnv*, jobject) {
+Java_com_example_navsight1_NativeBridge_stopVIO(JNIEnv*, jobject) {
     VisionModule* to_delete = nullptr;
     {
         std::lock_guard<std::mutex> lock(state_mutex);
@@ -74,7 +74,7 @@ Java_com_example_navsight1_MainActivity_stopVIO(JNIEnv*, jobject) {
 // ── processCameraFrame ────────────────────────────────────────────────────────
 
 JNIEXPORT jobject JNICALL
-Java_com_example_navsight1_MainActivity_processCameraFrame(
+Java_com_example_navsight1_NativeBridge_processCameraFrame(
         JNIEnv* env,
         jobject /* thiz */,
         jbyteArray frameData,
@@ -109,26 +109,26 @@ Java_com_example_navsight1_MainActivity_processCameraFrame(
     {
         std::lock_guard<std::mutex> lock(state_mutex);
         if (output.valid && !output.R.empty() && !output.t.empty()) {
-            g_x += output.t.at<double>(0);
-            g_y += output.t.at<double>(1);
-            g_z += output.t.at<double>(2);
+            // VisionModule now returns GLOBAL pose, so we assign directly
+            g_x = output.t.at<double>(0);
+            g_y = output.t.at<double>(1);
+            g_z = output.t.at<double>(2);
 
-            // Derive Euler angles from the incremental rotation for display
+            // Derive Euler angles from the GLOBAL rotation for display
             const cv::Mat& R = output.R;
-            double pitch = std::asin(-R.at<double>(2, 0));
-            double roll, yaw;
-            if (std::abs(std::cos(pitch)) > 1e-6) {
-                roll = std::atan2(R.at<double>(2, 1), R.at<double>(2, 2));
-                yaw  = std::atan2(R.at<double>(1, 0), R.at<double>(0, 0));
+            // Standard decomposition for Rotation Matrix to Euler (Pitch, Roll, Yaw)
+            // Note: Axis mapping depends on device orientation; usually Y is UP
+            g_pitch = std::asin(-R.at<double>(1, 2)); 
+            if (std::abs(std::cos(g_pitch)) > 1e-6) {
+                g_roll = std::atan2(R.at<double>(0, 2), R.at<double>(2, 2));
+                g_yaw  = std::atan2(R.at<double>(1, 0), R.at<double>(1, 1));
             } else {
-                roll = 0.0;
-                yaw  = std::atan2(-R.at<double>(0, 1), R.at<double>(1, 1));
+                g_roll = 0;
+                g_yaw  = std::atan2(-R.at<double>(2, 0), R.at<double>(0, 0));
             }
-            g_roll  = roll;
-            g_pitch = pitch;
-            g_yaw   = yaw;
         }
     }
+
 
     // ── Build VioData Java object ──────────────────────────────────────────────
     jclass cls = env->FindClass("com/example/navsight1/VioData");
@@ -142,9 +142,10 @@ Java_com_example_navsight1_MainActivity_processCameraFrame(
     // trackedFeatures(I) totalFeatures(I) estimatedScale(D)
     // isInitialized(Z) trackedPoints([F)
     // accelX(F) accelY(F) accelZ(F) gyroX(F) gyroY(F) gyroZ(F)
-    jmethodID ctor = env->GetMethodID(cls, "<init>", "(DDDDDDDIIDZ[FFFFFFF)V");
+    const char* vio_sig = "(DDDDDDDIIDZ[FFFFFFF)V";
+    jmethodID ctor = env->GetMethodID(cls, "<init>", vio_sig);
     if (!ctor) {
-        LOGE("processCameraFrame: VioData constructor not found");
+        LOGE("processCameraFrame: VioData constructor not found with sig %s", vio_sig);
         return nullptr;
     }
 
@@ -199,7 +200,7 @@ Java_com_example_navsight1_MainActivity_processCameraFrame(
 // ── processGyroscope ──────────────────────────────────────────────────────────
 
 JNIEXPORT void JNICALL
-Java_com_example_navsight1_MainActivity_processGyroscope(
+Java_com_example_navsight1_NativeBridge_processGyroscope(
         JNIEnv*, jobject /* thiz */,
         jlong timestamp, jfloat x, jfloat y, jfloat z) {
 
@@ -222,7 +223,7 @@ Java_com_example_navsight1_MainActivity_processGyroscope(
 // ── processAccelerometer ─────────────────────────────────────────────────────
 
 JNIEXPORT void JNICALL
-Java_com_example_navsight1_MainActivity_processAccelerometer(
+Java_com_example_navsight1_NativeBridge_processAccelerometer(
         JNIEnv*, jobject /* thiz */,
         jlong timestamp, jfloat x, jfloat y, jfloat z) {
 
@@ -245,7 +246,7 @@ Java_com_example_navsight1_MainActivity_processAccelerometer(
 // ── resetVIO ──────────────────────────────────────────────────────────────────
 
 JNIEXPORT void JNICALL
-Java_com_example_navsight1_MainActivity_resetVIO(JNIEnv*, jobject) {
+Java_com_example_navsight1_NativeBridge_resetVIO(JNIEnv*, jobject) {
     VisionModule* vision = nullptr;
     {
         std::lock_guard<std::mutex> lock(state_mutex);
@@ -261,7 +262,7 @@ Java_com_example_navsight1_MainActivity_resetVIO(JNIEnv*, jobject) {
 // ── setScale ──────────────────────────────────────────────────────────────────
 
 JNIEXPORT void JNICALL
-Java_com_example_navsight1_MainActivity_setScale(
+Java_com_example_navsight1_NativeBridge_setScale(
         JNIEnv*, jobject /* thiz */, jdouble scale) {
     std::lock_guard<std::mutex> lock(state_mutex);
     g_scale = scale;
@@ -270,7 +271,7 @@ Java_com_example_navsight1_MainActivity_setScale(
 // ── setIntrinsics ─────────────────────────────────────────────────────────────
 
 JNIEXPORT void JNICALL
-Java_com_example_navsight1_MainActivity_setIntrinsics(
+Java_com_example_navsight1_NativeBridge_setIntrinsics(
         JNIEnv*, jobject /* thiz */,
         jdouble fx, jdouble fy, jdouble cx, jdouble cy) {
     VisionModule* vision = nullptr;

@@ -119,13 +119,95 @@ cv::Mat IMUPreintegrator::integrateGyro(int64_t start_ns, int64_t end_ns) {
 
 // ── integrate ─────────────────────────────────────────────────────────────────
 
-cv::Mat IMUPreintegrator::integrate(int64_t start_ns, int64_t end_ns) {
+PreintegratedDelta IMUPreintegrator::integrate(int64_t start_ns, int64_t end_ns) {
+    PreintegratedDelta out;
+    out.deltaR = cv::Mat::eye(3, 3, CV_64F);
+    out.deltaV = cv::Mat::zeros(3, 1, CV_64F);
+    out.deltaP = cv::Mat::zeros(3, 1, CV_64F);
+    out.dt = 0.0;
+    out.sample_count = 0;
+
     if (start_ns >= end_ns) {
-        LOGE("integrate: start_ns (%lld) >= end_ns (%lld), returning identity",
-             (long long)start_ns, (long long)end_ns);
-        return cv::Mat::eye(3, 3, CV_64F);
+        LOGE("integrate: invalid time window");
+        return out;
     }
-    return integrateGyro(start_ns, end_ns);
+
+    std::vector<GyroSample> g_samples;
+    std::vector<AccelSample> a_samples;
+    {
+        std::lock_guard<std::mutex> lock(mutex_);
+        g_samples.reserve(gyro_buf_.size()); // Conservative estimate
+        a_samples.reserve(accel_buf_.size());
+        for (const auto& s : gyro_buf_) {
+            if (s.timestamp_ns >= start_ns && s.timestamp_ns <= end_ns) g_samples.push_back(s);
+        }
+        for (const auto& s : accel_buf_) {
+            if (s.timestamp_ns >= start_ns && s.timestamp_ns <= end_ns) a_samples.push_back(s);
+        }
+    }
+
+    if (g_samples.empty() || a_samples.empty()) {
+        out.deltaR = integrateGyro(start_ns, end_ns);
+        out.dt = (end_ns - start_ns) * 1e-9;
+        out.sample_count = (int)g_samples.size();
+        return out;
+    }
+
+    // Sort both
+    auto sort_fn = [](const auto& a, const auto& b) { return a.timestamp_ns < b.timestamp_ns; };
+    std::sort(g_samples.begin(), g_samples.end(), sort_fn);
+    std::sort(a_samples.begin(), a_samples.end(), sort_fn);
+
+    cv::Mat current_R = cv::Mat::eye(3, 3, CV_64F);
+    cv::Mat current_V = cv::Mat::zeros(3, 1, CV_64F);
+    cv::Mat current_P = cv::Mat::zeros(3, 1, CV_64F);
+
+    // Mid-point integration
+    size_t gi = 0, ai = 0;
+    int64_t t_current = start_ns;
+    
+    cv::Mat gravity = (cv::Mat_<double>(3, 1) << (double)gravity_vec_.x, (double)gravity_vec_.y, (double)gravity_vec_.z);
+
+    while (t_current < end_ns) {
+        int64_t t_next = end_ns;
+        if (gi < g_samples.size()) t_next = std::min(t_next, g_samples[gi].timestamp_ns);
+        if (ai < a_samples.size()) t_next = std::min(t_next, a_samples[ai].timestamp_ns);
+        
+        if (t_next <= t_current) {
+            if (gi < g_samples.size() && g_samples[gi].timestamp_ns <= t_current) gi++;
+            if (ai < a_samples.size() && a_samples[ai].timestamp_ns <= t_current) ai++;
+            continue;
+        }
+
+        double dt = (t_next - t_current) * 1e-9;
+        
+        // Get sensors at current (or nearest)
+        cv::Point3d g_vec(0,0,0), a_vec(0,0,0);
+        if (gi > 0) g_vec = cv::Point3d(g_samples[gi-1].x, g_samples[gi-1].y, g_samples[gi-1].z);
+        if (ai > 0) a_vec = cv::Point3d(a_samples[ai-1].x, a_samples[ai-1].y, a_samples[ai-1].z);
+
+        // 1. Rotation update
+        cv::Mat r_vec = (cv::Mat_<double>(3, 1) << g_vec.x * dt, g_vec.y * dt, g_vec.z * dt);
+        cv::Mat dR;
+        cv::Rodrigues(r_vec, dR);
+        
+        // 2. Position and velocity update (Delta P = V*dt + 0.5*a*dt^2)
+        // a_global = R * a_local - gravity
+        cv::Mat a_local = (cv::Mat_<double>(3, 1) << a_vec.x, a_vec.y, a_vec.z);
+        cv::Mat a_global = current_R * a_local - gravity;
+        
+        current_P += current_V * dt + 0.5 * a_global * dt * dt;
+        current_V += a_global * dt;
+        current_R = current_R * dR;
+
+        t_current = t_next;
+    }
+
+    out.deltaR = current_R;
+    out.deltaV = current_V;
+    out.deltaP = current_P;
+    out.dt = (end_ns - start_ns) * 1e-9;
+    return out;
 }
 
 // ── initializeFromGravity ─────────────────────────────────────────────────────
@@ -193,6 +275,11 @@ void IMUPreintegrator::setGravity(float gx, float gy, float gz) {
 }
 
 // ── accessors ─────────────────────────────────────────────────────────────────
+
+std::vector<AccelSample> IMUPreintegrator::getAccelBuffer() const {
+    std::lock_guard<std::mutex> lock(mutex_);
+    return accel_buf_;
+}
 
 cv::Point3f IMUPreintegrator::getGravityVector() const {
     std::lock_guard<std::mutex> lock(mutex_);
