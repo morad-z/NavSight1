@@ -193,31 +193,33 @@ class OpticalFlowProcessor {
      * קביעת כיוון התנועה
      */
     private fun determineDirection(dx: Float, dy: Float, magnitude: Float, minMovement: Float): MovementDirection {
-        if (magnitude < minMovement) {
-            return MovementDirection.STOPPED
-        }
-        
+        if (magnitude.isNaN() || dx.isNaN() || dy.isNaN()) return MovementDirection.STOPPED
+        if (magnitude < minMovement) return MovementDirection.STOPPED
+
         val absDx = abs(dx)
         val absDy = abs(dy)
+
+        if (absDx == 0f && absDy == 0f) return MovementDirection.STOPPED
         
-        // כשהמצלמה מכוונת לרצפה:
-        // dy חיובי (רצפה זזה למטה) = קדימה
-        // dy שלילי (רצפה זזה למעלה) = אחורה
-        // dx חיובי (רצפה זזה ימינה) = שמאלה
-        // dx שלילי (רצפה זזה שמאלה) = ימינה
-        
-        return if (absDy > absDx * 0.7f) {
-            // תנועה אנכית דומיננטית
-            if (dy > 0) MovementDirection.FORWARD else MovementDirection.BACKWARD
-        } else if (absDx > absDy * 0.7f) {
-            // תנועה אופקית דומיננטית
-            if (dx > 0) MovementDirection.LEFT else MovementDirection.RIGHT
+        // Camera mounted face-down on vehicle — x-axis aligns with vehicle forward direction:
+        // dx positive (floor moves right in image) = FORWARD
+        // dx negative (floor moves left in image)  = BACKWARD
+        // dy positive (floor moves down in image)  = RIGHT
+        // dy negative (floor moves up in image)    = LEFT
+        // Note: verify dy sign for LEFT/RIGHT on device if badge still wrong after this fix.
+
+        return if (absDx > absDy * 0.7f) {
+            // תנועה קדימה/אחורה דומיננטית
+            if (dx > 0) MovementDirection.FORWARD else MovementDirection.BACKWARD
+        } else if (absDy > absDx * 0.7f) {
+            // תנועה שמאל/ימין דומיננטית
+            if (dy < 0) MovementDirection.LEFT else MovementDirection.RIGHT
         } else {
             // אלכסון - בוחרים את הגדול יותר
-            if (absDy >= absDx) {
-                if (dy > 0) MovementDirection.FORWARD else MovementDirection.BACKWARD
+            if (absDx >= absDy) {
+                if (dx > 0) MovementDirection.FORWARD else MovementDirection.BACKWARD
             } else {
-                if (dx > 0) MovementDirection.LEFT else MovementDirection.RIGHT
+                if (dy < 0) MovementDirection.LEFT else MovementDirection.RIGHT
             }
         }
     }
