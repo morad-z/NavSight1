@@ -668,6 +668,27 @@ class MainActivity : ComponentActivity() {
                     letterSpacing = 1.5.sp
                 )
                 Divider(color = LuxuryCyan.copy(0.25f), thickness = 0.5.dp)
+
+                // ── FOR SIMULATION ────────────────────────────────────────────────
+                Button(
+                    onClick = { viewModel.toggleSimulationRecording(::getExternalFilesDir, filesDir) },
+                    modifier = Modifier.fillMaxWidth().height(24.dp),
+                    contentPadding = PaddingValues(0.dp),
+                    colors = ButtonDefaults.buttonColors(
+                        containerColor = if (viewModel.isRecordingSimulation) LuxuryRed else LuxuryGreen.copy(alpha = 0.2f)
+                    ),
+                    shape = RoundedCornerShape(4.dp)
+                ) {
+                    Text(
+                        if (viewModel.isRecordingSimulation) "STOP RECORDING" else "START RECORDING",
+                        fontSize = 8.sp,
+                        fontWeight = FontWeight.Bold,
+                        color = if (viewModel.isRecordingSimulation) Color.White else LuxuryGreen
+                    )
+                }
+                Divider(color = LuxuryCyan.copy(0.1f), thickness = 0.5.dp)
+                // ──────────────────────────────────────────────────────────────────
+
                 DebugRow("Dist", "${"%.2f".format(totalDistanceM)} m", LuxuryGreen)
                 DebugRow("Speed", "${"%.2f".format(speedMs)} m/s", LuxuryGreen)
                 DebugRow("Quality", "${"%.0f".format(qualityPct)}%",

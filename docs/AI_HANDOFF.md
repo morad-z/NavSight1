@@ -10,12 +10,12 @@
 ## META
 
 ```yaml
-last_updated: "2026-03-30"
+last_updated: "2026-03-31"
 last_agent: "Claude-Opus-4-6"
 last_developer: "morad"
 branch: "morad"
 base_branch: "master"
-head_commit: "b10009b"
+head_commit: "pending-commit"
 pr_merged: "#9 (morad → master, 2026-03-30)"
 ```
 
@@ -116,15 +116,16 @@ feature/ui-redesign: "merged via PR #7"
 
 - id: "BUG-004"
   title: "Post-rotation translation recovery failure"
-  status: "OPEN"
+  status: "FIXED_UNTESTED"
   severity: "P1"
-  owner: "UNASSIGNED"
+  owner: "morad"
   file: "app/src/main/cpp/VisionModule.cpp"
   description: >
-    After a pure rotation period (is_pure_rotation=true), the VIO engine
-    cannot transition back to producing translation updates. The TurnThenWalk
-    test exposes this: WalkAfterReset passes, TurnThenWalk fails. Likely
-    the rotation phase corrupts tracker feature state for subsequent frames.
+    FIXED (2026-03-31): Root cause identified — phone tilt causes 180° turn to
+    accumulate as Rz rotation, but global_R_ * (0,0,-1) is invariant under Rz.
+    Fix: replaced 3D forward vector with 2D heading-based position updates using
+    atan2(R[1][0], R[1][1]). Also added step detector cross-check to prevent
+    false ZUPT during walking, and smooth speed*dt fallback instead of full stride jumps.
   test: "tests/cpp/test_drift_scenarios.cpp::TurnThenWalk_PositionInRotatedDirection"
 
 - id: "BUG-005"
@@ -188,16 +189,16 @@ feature/ui-redesign: "merged via PR #7"
 
 - id: "TASK-006"
   title: "Fix post-rotation translation recovery (BUG-004)"
-  status: "TODO"
-  owner: "UNASSIGNED"
+  status: "DONE"
+  owner: "morad"
   priority: "P1"
+  completed: "2026-03-31"
   files:
     - "app/src/main/cpp/VisionModule.cpp"
   notes: >
-    After pure rotation period, VIO can't produce translation. Test:
-    tests/cpp/test_drift_scenarios.cpp::TurnThenWalk_PositionInRotatedDirection.
-    WalkAfterReset passes, so it's not a fundamental issue. Investigate how
-    is_pure_rotation affects feature tracking continuity.
+    2D heading-based position update replaces 3D forward vector approach.
+    Heading from atan2(R[1][0], R[1][1]) correctly tracks through turns.
+    Step detector cross-check prevents false ZUPT. Smooth speed*dt fallback.
 
 - id: "TASK-007"
   title: "Fix IMU preintegrator sample_count bug (BUG-005)"
@@ -220,11 +221,44 @@ feature/ui-redesign: "merged via PR #7"
 
 - id: "TASK-009"
   title: "Simulation engine for AI-driven tuning"
-  status: "TODO"
-  owner: "UNASSIGNED"
-  priority: "P3"
+  status: "IN_PROGRESS:morad"
+  owner: "morad"
+  priority: "P2"
   plan_ref: "docs/simulation_plan.md"
-  notes: "Depends on NavSight-Recorder app. Golden dataset not yet captured."
+  notes: >
+    Simulation recording now captures 7 diagnostic fields (meanFlow, inlierCount,
+    stepCount, stepFreq, strideLength, poseFlags, heading). Full pipeline:
+    VisionOutput → native-lib.cpp JNI → VioData.kt → NavSightViewModel JSON.
+    Analysis scripts: simulator/analyze_direction.py, simulator/analyze_light.py.
+    Two test recordings exist. Needs re-recording with current code.
+
+- id: "TASK-010"
+  title: "VIO accuracy improvements from simulation analysis"
+  status: "DONE"
+  owner: "morad"
+  priority: "P0"
+  completed: "2026-03-31"
+  notes: >
+    Applied 7 fixes from QA analysis of simulation data vs GPS ground truth:
+    1. 2D heading-based position (replaces broken 3D forward vector)
+    2. Step-based scale estimation (replaces broken accel double-integration)
+    3. Scale quality gate 0.35→0.15, dt gate 250ms→500ms
+    4. Step thresholds softened (THRESH_HIGH 10.5→10.1, LP_ALPHA 0.15→0.20)
+    5. FB check relaxed 4.0→9.0, position quality gate 0.25→0.15
+    6. Initial scale 0.05→0.20, smooth fallback speed*dt (replaces full stride)
+    7. Anti-false-ZUPT: step detector cross-check overrides visual ZUPT
+
+- id: "TASK-011"
+  title: "Diagnostic recording fields in simulation JSON"
+  status: "DONE"
+  owner: "morad"
+  priority: "P1"
+  completed: "2026-03-31"
+  notes: >
+    Added 7 diagnostic fields through full pipeline: VisionOutput struct →
+    native-lib.cpp JNI bridge → VioData.kt → SimulationPoint → JSON.
+    Fields: mflow, inl, steps, sfreq, stride, pflags, hdg.
+    JNI signature updated to (DDDDDDDIIDZ[FDDDDFFFFFFDIIDDID)V.
 ```
 
 ---
@@ -232,6 +266,30 @@ feature/ui-redesign: "merged via PR #7"
 ## RECENT CHANGES (last 5 sessions)
 
 ```yaml
+- session: 0
+  date: "2026-03-31"
+  developer: "morad"
+  agent: "Claude-Opus-4-6"
+  branch: "morad"
+  summary: >
+    Major VIO accuracy overhaul based on real-world test (15m walk showed 1.3-4m).
+    Root cause analysis: 3D forward vector invariant under Rz rotation, scale never
+    converging due to broken accel-based estimation, quality gates too strict.
+    Applied 7 fixes: 2D heading-based position, step-based scale, relaxed thresholds,
+    anti-false-ZUPT, smooth fallback. Added 7 diagnostic fields to simulation recording
+    pipeline (C++ → JNI → Kotlin → JSON). QA analysis of simulation data vs GPS
+    ground truth drove all changes.
+  files_changed:
+    - "app/src/main/cpp/VisionModule.cpp (2D heading, scale gates, ZUPT cross-check)"
+    - "app/src/main/cpp/VisionModule.h (thresholds: FB=9.0, scale=0.20, features=500)"
+    - "app/src/main/cpp/IMUPreintegrator.cpp (step detection, LP_ALPHA=0.20)"
+    - "app/src/main/cpp/IMUPreintegrator.h (step thresholds softened)"
+    - "app/src/main/cpp/native-lib.cpp (7 diagnostic fields in JNI bridge)"
+    - "app/src/main/java/.../VioData.kt (7 new diagnostic fields)"
+    - "app/src/main/java/.../NavSightViewModel.kt (diagnostic fields in SimulationPoint+JSON)"
+    - "simulator/analyze_direction.py (NEW: VIO vs GPS direction analysis)"
+  impact: "Expected 4-10x distance accuracy improvement. Needs re-recording to verify."
+
 - session: 1
   date: "2026-03-30"
   developer: "morad"
@@ -294,17 +352,6 @@ feature/ui-redesign: "merged via PR #7"
     - "app/src/main/java/com/example/navsight1/MainActivity.kt"
   impact: "P0/P1 rotation bugs fixed in code, but NOT verified on device."
 
-- session: 4
-  date: "2026-03-29"
-  developer: "morad"
-  agent: "Claude-Code"
-  branch: "morad"
-  commit: "9db0a19"
-  summary: "MVVM refactor, optimized VIO engine, GPS-denied mode"
-  files_changed:
-    - "Major refactor across all Kotlin and C++ files"
-  impact: "Architecture changed to MVVM. SensorRepository, ViewModel, MainActivity restructured."
-
 ```
 
 ---
@@ -314,30 +361,31 @@ feature/ui-redesign: "merged via PR #7"
 <!-- When an AI stops mid-task, describe exactly where it left off so the next AI can resume. -->
 
 ```yaml
-current_task: "NONE - session completed"
-stopped_at: "All changes committed and merged to master via PR #9"
+current_task: "NONE - session completed, pending merge to master"
+stopped_at: "All VIO accuracy fixes applied and build passes on morad branch"
 next_action: >
   Priority order:
-  1. TASK-006: Fix post-rotation translation recovery (BUG-004) — a real bug
-  2. TASK-007: Fix IMU sample_count bug — 2 pre-existing test failures
-  3. TASK-009: Simulation engine (future)
+  1. Re-record simulation data with current code to verify fixes
+  2. TASK-007: Fix IMU sample_count bug (BUG-005) — 2 pre-existing test failures
+  3. Gravity-aligned heading extraction (improvement 8 from analysis)
 resume_context: >
-  All VIO fixes committed (660db3f) and merged to master via PR #9 (2026-03-30).
-  Key changes on master:
-  - Camera-primary position (no IMU deltaP for position)
-  - Scale bootstrap with 10-observation bypass
-  - ZUPT dead zone eliminated (0.5px threshold)
-  - MIN_FLOW_PX=1.0, MIN_PARALLAX_PX=2.0
-  - Enhanced radar with distance rings, cardinal labels, heading arrow
-  - Debug panel with toggle FAB
-  - Full test suite: 13 Kotlin on-device + 36 C++ tests (cross-compiled via NDK)
-  - C++ tests run on device via: adb push build_android/navsight_tests /data/local/tmp/
-  Merge conflicts with tamir-v2 resolved: kept morad's VIO overhaul, added tamir's imports.
+  Major VIO accuracy session (2026-03-31). Real-world test revealed 15m walk
+  showing only 1.3-4m. Root causes identified and fixed:
+  - 2D heading-based position (replaces 3D forward vector broken by phone tilt)
+  - Step-based scale estimation (replaces broken accel double-integration)
+  - Relaxed quality gates, FB check, step thresholds
+  - Anti-false-ZUPT with step detector cross-check
+  - Smooth speed*dt fallback (replaces jerky full-stride jumps)
+  - 7 diagnostic fields added to simulation recording pipeline
+  Key current values: smooth_scale_=0.20, FB_CHECK_THRESH=9.0, MAX_FEATURES=500,
+  MIN_FEATURES=150, QUALITY_LEVEL=0.01, STEP_ACCEL_THRESH_HIGH=10.1,
+  position quality gate=0.15, scale quality gate=0.15, dt gate=500ms.
+  RULE: No magnetometer during VIO tracking — only at startup for initial heading.
 partial_state: "NONE"
 warnings:
   - "MainActivity.kt is 805+ lines — consider splitting"
-  - "tests/cpp/build_android/ directory contains cross-compiled binaries, add to .gitignore"
-  - "TurnThenWalk test exposes real post-rotation recovery bug (BUG-004)"
+  - "Simulation recordings are from BEFORE the 2D heading fix — must re-record"
+  - "BUG-004 fix is UNTESTED on device — need walking test with turnaround"
 ```
 
 ---
@@ -346,18 +394,18 @@ warnings:
 
 ```yaml
 # C++ VIO Engine
-"app/src/main/cpp/VisionModule.h":       "VIO constants, thresholds, class definition (106 lines)"
-"app/src/main/cpp/VisionModule.cpp":     "Core VIO: optical flow + IMU fusion, global pose (425 lines)"
-"app/src/main/cpp/IMUPreintegrator.h":   "IMU preintegration header (73 lines)"
-"app/src/main/cpp/IMUPreintegrator.cpp": "Gyro/accel buffering, rotation/position integration (315 lines)"
-"app/src/main/cpp/native-lib.cpp":       "JNI bridge: calls VisionModule, extracts Euler angles (287 lines)"
+"app/src/main/cpp/VisionModule.h":       "VIO constants, thresholds, class definition (114 lines)"
+"app/src/main/cpp/VisionModule.cpp":     "Core VIO: 2D heading position, step-based scale, ZUPT cross-check (~500 lines)"
+"app/src/main/cpp/IMUPreintegrator.h":   "IMU preintegration + step detection header (~100 lines)"
+"app/src/main/cpp/IMUPreintegrator.cpp": "Gyro/accel buffering, rotation integration, step detector (~350 lines)"
+"app/src/main/cpp/native-lib.cpp":       "JNI bridge: 29-field VioData, diagnostic passthrough (~310 lines)"
 
 # Kotlin App Layer
 "app/src/main/java/.../MainActivity.kt":         "Compose UI, map, radar, AR overlay (805 lines)"
 "app/src/main/java/.../NavSightViewModel.kt":    "MVVM state, meters-to-LatLng (249 lines)"
 "app/src/main/java/.../SensorRepository.kt":     "Sensor registration, camera dispatch, VIO init (274 lines)"
 "app/src/main/java/.../NativeBridge.kt":          "JNI declarations (20 lines)"
-"app/src/main/java/.../VioData.kt":               "VIO data class + JNI signature (88 lines)"
+"app/src/main/java/.../VioData.kt":               "VIO data class: 29 fields + JNI sig (~105 lines)"
 "app/src/main/java/.../OpticalFlowProcessor.kt":  "Kotlin-side optical flow (439 lines)"
 "app/src/main/java/.../NavigationManager.kt":     "Turn-by-turn nav (495 lines, out-of-scope extension)"
 "app/src/main/java/.../DeviceOrientationTracker.kt": "Accel+mag orientation for UI (219 lines)"
@@ -383,16 +431,22 @@ warnings:
 
 ```yaml
 ALPHA_FUSION:        0.98    # gyro weight (overridden by adaptive fusion)
-ZUPT_GYRO_THRESH:    0.05    # rad/s, static detection
-GYRO_ROT_ONLY_THRESH: 0.5   # rad/s, pure rotation mode
-MIN_FLOW_PX:         1.0    # min mean optical flow pixels (was 2.0, lowered 2026-03-30)
-MIN_PARALLAX_PX:     2.0    # min parallax for VO acceptance (was 5.0, lowered 2026-03-30)
+ZUPT_GYRO_THRESH:    0.04   # rad/s, static detection (tightened 2026-03-31)
+GYRO_ROT_ONLY_THRESH: 2.0   # rad/s, pure rotation mode (raised for arm swings)
+MIN_FLOW_PX:         0.4    # min mean optical flow pixels (lowered 2026-03-31)
+MIN_PARALLAX_PX:     0.8    # min parallax for VO acceptance (lowered 2026-03-31)
 RANSAC_CONF:         0.9999
 RANSAC_THRESH:       0.5    # px
-FB_CHECK_THRESH:     1.0    # squared px, forward-backward check
-MAX_FEATURES:        200
-MIN_FEATURES:        100
-smooth_scale_:       0.05   # initial scale estimate (walking)
+FB_CHECK_THRESH:     9.0    # squared px, forward-backward check (was 4.0, relaxed 2026-03-31)
+MAX_FEATURES:        500    # (was 200, increased 2026-03-31)
+MIN_FEATURES:        150    # (was 100)
+QUALITY_LEVEL:       0.01   # (was 0.03, lowered 2026-03-31)
+smooth_scale_:       0.20   # initial scale estimate (was 0.05, raised 2026-03-31)
+MIN_INLIERS:         8      # (was 10)
+MIN_INLIER_RATIO:    0.25   # (was 0.35)
+STEP_ACCEL_THRESH_HIGH: 10.1  # m/s^2 (was 10.5, softened 2026-03-31)
+STEP_ACCEL_THRESH_LOW:  9.3   # m/s^2 (was 9.1, narrowed hysteresis)
+LP_ALPHA:            0.20   # step detection filter (was 0.15)
 ```
 
 ---

@@ -27,6 +27,12 @@ data class VioData(
     
     // Tracked points for visualization
     val trackedPoints: FloatArray = floatArrayOf(),
+
+    // RAW VO (Unfused Camera Result) - FOR SIMULATION
+    val rawX: Double = 0.0,
+    val rawY: Double = 0.0,
+    val rawZ: Double = 0.0,
+    val rawYaw: Double = 0.0,
     
     // IMU data
     val accelX: Float = 0f,
@@ -34,7 +40,16 @@ data class VioData(
     val accelZ: Float = 0f,
     val gyroX: Float = 0f,
     val gyroY: Float = 0f,
-    val gyroZ: Float = 0f
+    val gyroZ: Float = 0f,
+
+    // Diagnostics
+    val meanFlow: Double = 0.0,
+    val inlierCount: Int = 0,
+    val stepCount: Int = 0,
+    val stepFreq: Double = 0.0,
+    val strideLength: Double = 0.0,
+    val poseFlags: Int = 0,
+    val heading: Double = 0.0
 ) {
     override fun equals(other: Any?): Boolean {
         if (this === other) return true
@@ -60,6 +75,13 @@ data class VioData(
         if (gyroX != other.gyroX) return false
         if (gyroY != other.gyroY) return false
         if (gyroZ != other.gyroZ) return false
+        if (meanFlow != other.meanFlow) return false
+        if (inlierCount != other.inlierCount) return false
+        if (stepCount != other.stepCount) return false
+        if (stepFreq != other.stepFreq) return false
+        if (strideLength != other.strideLength) return false
+        if (poseFlags != other.poseFlags) return false
+        if (heading != other.heading) return false
 
         return true
     }
@@ -83,6 +105,13 @@ data class VioData(
         result = 31 * result + gyroX.hashCode()
         result = 31 * result + gyroY.hashCode()
         result = 31 * result + gyroZ.hashCode()
+        result = 31 * result + meanFlow.hashCode()
+        result = 31 * result + inlierCount
+        result = 31 * result + stepCount
+        result = 31 * result + stepFreq.hashCode()
+        result = 31 * result + strideLength.hashCode()
+        result = 31 * result + poseFlags
+        result = 31 * result + heading.hashCode()
         return result
     }
 }
