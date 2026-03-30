@@ -15,7 +15,8 @@ last_agent: "Claude-Opus-4-6"
 last_developer: "morad"
 branch: "morad"
 base_branch: "master"
-head_commit: "f3bd9e6"
+head_commit: "b10009b"
+pr_merged: "#9 (morad → master, 2026-03-30)"
 ```
 
 ---
@@ -63,8 +64,8 @@ failing_tests:
 ### Key Branches
 
 ```yaml
-master: "stable baseline, behind morad by ~6 commits"
-morad: "active development, HEAD=f3bd9e6, all P0/P1 VIO fixes applied"
+master: "up-to-date, merged morad via PR #9 (2026-03-30)"
+morad: "merged to master, HEAD=b10009b, all P0/P1 VIO fixes applied"
 tamir-v2: "merged into morad at 746b5e3"
 tamir-dev: "stale, superseded by tamir-v2"
 feature/ui-redesign: "merged via PR #7"
@@ -87,7 +88,7 @@ feature/ui-redesign: "merged via PR #7"
     FIXED: Position update now uses camera-only translation (global_R_ * scale * t_vo).
     imu_delta.deltaP is NEVER used for position. ZUPT freezes pose when static.
     Adaptive alpha fusion adjusts camera/IMU weight based on tracking quality.
-  resolved_in: "Current uncommitted changes on morad branch"
+  resolved_in: "Committed 660db3f, merged to master via PR #9"
 
 - id: "BUG-002"
   title: "Scale estimation bootstrap broken"
@@ -99,7 +100,7 @@ feature/ui-redesign: "merged via PR #7"
     FIXED: smooth_scale_ initial changed from 1.0 to 0.05. scale_obs_count_ tracks
     accepted observations. First 10 observations bypass 3x outlier rejection
     to allow bootstrap convergence. scale_obs_count_ resets in reset().
-  resolved_in: "Current uncommitted changes on morad branch"
+  resolved_in: "Committed 660db3f, merged to master via PR #9"
 
 - id: "BUG-003"
   title: "ZUPT dead zone between 0.5px and 2.0px flow"
@@ -111,7 +112,7 @@ feature/ui-redesign: "merged via PR #7"
     FIXED: ZUPT override now uses 0.5px threshold (was 2.0). Any visible flow
     overrides gyro-only static detection. MIN_FLOW_PX lowered to 1.0,
     MIN_PARALLAX_PX lowered to 2.0.
-  resolved_in: "Current uncommitted changes on morad branch"
+  resolved_in: "Committed 660db3f, merged to master via PR #9"
 
 - id: "BUG-004"
   title: "Post-rotation translation recovery failure"
@@ -209,13 +210,13 @@ feature/ui-redesign: "merged via PR #7"
 
 - id: "TASK-008"
   title: "Commit and push all uncommitted VIO changes"
-  status: "TODO"
+  status: "DONE"
   owner: "morad"
   priority: "P0"
+  completed: "2026-03-30"
   notes: >
-    Many changes are uncommitted on morad branch: ZUPT fix, scale bootstrap,
-    enhanced radar, debug panel, test suite, threshold tuning. Need to stage
-    and commit before other devs can use them.
+    Committed as 660db3f, merged to master via PR #9 (b10009b).
+    All VIO fixes, tests, and AI handoff are now on master.
 
 - id: "TASK-009"
   title: "Simulation engine for AI-driven tuning"
@@ -236,6 +237,28 @@ feature/ui-redesign: "merged via PR #7"
   developer: "morad"
   agent: "Claude-Opus-4-6"
   branch: "morad"
+  commits: "660db3f, b10009b"
+  pr: "#9 (merged to master)"
+  summary: >
+    VIO engine overhaul: scale bootstrap fix, ZUPT dead zone fix, threshold tuning,
+    C++ test suite (8 tests), AI handoff protocol. Resolved merge conflicts with
+    tamir-v2. Committed, pushed, and merged to master via PR #9.
+  files_changed:
+    - "app/src/main/cpp/VisionModule.cpp"
+    - "app/src/main/cpp/VisionModule.h"
+    - "app/src/main/java/.../MainActivity.kt"
+    - "tests/cpp/test_vision_module.cpp (NEW)"
+    - "tests/cpp/test_drift_scenarios.cpp (NEW)"
+    - "tests/cpp/test_utils.h (UPDATED)"
+    - "tests/cpp/CMakeLists.txt (UPDATED)"
+    - "docs/AI_HANDOFF.md (NEW)"
+  impact: "All P0/P1 VIO fixes on master. 2 known bugs remain (BUG-004, BUG-005)."
+
+- session: 2
+  date: "2026-03-30"
+  developer: "morad"
+  agent: "Claude-Opus-4-6"
+  branch: "morad"
   commit: "f3bd9e6"
   summary: "Restored 7-float JNI signature; wrote VIO audit plan (gemini_plan2.md)"
   files_changed:
@@ -243,7 +266,7 @@ feature/ui-redesign: "merged via PR #7"
     - "docs/gemini_plan2.md (NEW)"
   impact: "JNI bridge stable. Drift fix plan documented but NOT implemented."
 
-- session: 2
+- session: 3
   date: "2026-03-29"
   developer: "morad"
   agent: "Claude-Code"
@@ -282,16 +305,6 @@ feature/ui-redesign: "merged via PR #7"
     - "Major refactor across all Kotlin and C++ files"
   impact: "Architecture changed to MVVM. SensorRepository, ViewModel, MainActivity restructured."
 
-- session: 5
-  date: "2026-03-29"
-  developer: "morad"
-  agent: "Claude-Code"
-  branch: "morad"
-  commit: "746b5e3"
-  summary: "Merged tamir-v2 branch (UI fixes, JNI signature, scale slider)"
-  files_changed:
-    - "Merge commit"
-  impact: "Incorporated Tamir's camera pipeline and UI work."
 ```
 
 ---
@@ -302,15 +315,15 @@ feature/ui-redesign: "merged via PR #7"
 
 ```yaml
 current_task: "NONE - session completed"
-stopped_at: "All VIO engine fixes applied, tests written and run"
+stopped_at: "All changes committed and merged to master via PR #9"
 next_action: >
   Priority order:
-  1. TASK-008: Commit all uncommitted changes (major VIO overhaul sitting in working tree)
-  2. TASK-006: Fix post-rotation translation recovery (BUG-004) — a real bug
-  3. TASK-007: Fix IMU sample_count bug — 2 pre-existing test failures
-  4. TASK-009: Simulation engine (future)
+  1. TASK-006: Fix post-rotation translation recovery (BUG-004) — a real bug
+  2. TASK-007: Fix IMU sample_count bug — 2 pre-existing test failures
+  3. TASK-009: Simulation engine (future)
 resume_context: >
-  This session completed gemini_plan2.md steps 1-12. All major VIO fixes applied:
+  All VIO fixes committed (660db3f) and merged to master via PR #9 (2026-03-30).
+  Key changes on master:
   - Camera-primary position (no IMU deltaP for position)
   - Scale bootstrap with 10-observation bypass
   - ZUPT dead zone eliminated (0.5px threshold)
@@ -319,10 +332,9 @@ resume_context: >
   - Debug panel with toggle FAB
   - Full test suite: 13 Kotlin on-device + 36 C++ tests (cross-compiled via NDK)
   - C++ tests run on device via: adb push build_android/navsight_tests /data/local/tmp/
-  ALL CHANGES ARE UNCOMMITTED. Must commit before switching branches.
+  Merge conflicts with tamir-v2 resolved: kept morad's VIO overhaul, added tamir's imports.
 partial_state: "NONE"
 warnings:
-  - "ALL VIO CHANGES ARE UNCOMMITTED on morad branch — commit before any branch switches"
   - "MainActivity.kt is 805+ lines — consider splitting"
   - "tests/cpp/build_android/ directory contains cross-compiled binaries, add to .gitignore"
   - "TurnThenWalk test exposes real post-rotation recovery bug (BUG-004)"
