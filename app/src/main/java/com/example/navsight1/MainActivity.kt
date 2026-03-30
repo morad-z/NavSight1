@@ -160,15 +160,7 @@ class MainActivity : ComponentActivity() {
             azimuth
         }
 
-        val totalDistanceM = remember(viewModel.pathHistory.size) {
-            val h = viewModel.pathHistory.toList()
-            if (h.size < 2) 0.0
-            else h.zipWithNext().sumOf { (a, b) ->
-                val dx = (b.first - a.first).toDouble()
-                val dz = (b.second - a.second).toDouble()
-                sqrt(dx * dx + dz * dz)
-            }
-        }
+        var debugPanelVisible by remember { mutableStateOf(false) }
 
         Box(Modifier.fillMaxSize().background(LuxuryBlack)) {
             Column(Modifier.fillMaxSize()) {
@@ -231,6 +223,38 @@ class MainActivity : ComponentActivity() {
                             stability = orientation.stabilityScore,
                             confidence = flowResult.confidence
                         )
+                    }
+
+                    // Debug panel + toggle
+                    Box(Modifier.align(Alignment.BottomStart).padding(start = 10.dp, bottom = 40.dp)) {
+                        Column(verticalArrangement = Arrangement.spacedBy(6.dp)) {
+                            DebugPanel(
+                                isVisible = debugPanelVisible,
+                                totalDistanceM = viewModel.totalDistanceM,
+                                speedMs = viewModel.currentSpeedKmh / 3.6f,
+                                qualityPct = (vio.trackingQuality * 100).toFloat(),
+                                fusionMode = when {
+                                    !vio.isInitialized -> "INIT"
+                                    vio.trackingQuality < 0.3 -> "IMU"
+                                    vio.trackingQuality > 0.7 -> "CAMERA"
+                                    else -> "HYBRID"
+                                },
+                                scaleFactor = vio.estimatedScale,
+                                headingDeg = fusedHeading
+                            )
+                            SmallFloatingActionButton(
+                                onClick = { debugPanelVisible = !debugPanelVisible },
+                                containerColor = if (debugPanelVisible) LuxuryCyan else LuxuryDarkGrey,
+                                modifier = Modifier.size(32.dp)
+                            ) {
+                                Text(
+                                    if (debugPanelVisible) "x" else "D",
+                                    color = if (debugPanelVisible) LuxuryBlack else LuxuryTextGrey,
+                                    fontSize = 12.sp,
+                                    fontWeight = FontWeight.Bold
+                                )
+                            }
+                        }
                     }
                 }
 
@@ -318,7 +342,7 @@ class MainActivity : ComponentActivity() {
                     ) {
                         Column(horizontalAlignment = Alignment.End) {
                             Text("${"%.1f".format(viewModel.currentSpeedKmh)} km/h", color = LuxuryCyan, fontWeight = FontWeight.Bold, fontSize = 16.sp)
-                            Text("${"%.0f".format(totalDistanceM)} m", color = LuxuryGreen, fontSize = 12.sp)
+                            Text("${"%.0f".format(viewModel.totalDistanceM)} m", color = LuxuryGreen, fontSize = 12.sp)
                         }
                     }
                 }
@@ -459,45 +483,206 @@ class MainActivity : ComponentActivity() {
 
     @Composable
     fun SensorRadar(history: List<Pair<Float, Float>>, currentAzimuth: Float) {
-        Card(shape = RoundedCornerShape(12.dp), colors = CardDefaults.cardColors(containerColor = Color.Black.copy(0.85f)), border = BorderStroke(1.dp, LuxuryGreen), modifier = Modifier.size(110.dp)) {
+        // Straight-line distance from origin (0,0) — VIO always starts at origin
+        val distFromStart = if (history.isEmpty()) 0f
+        else {
+            val lx = history.last().first.toDouble()
+            val lz = history.last().second.toDouble()
+            sqrt(lx * lx + lz * lz).toFloat()
+        }
+
+        Card(
+            shape = RoundedCornerShape(12.dp),
+            colors = CardDefaults.cardColors(containerColor = Color.Black.copy(0.88f)),
+            border = BorderStroke(1.dp, LuxuryGreen),
+            modifier = Modifier.size(150.dp)
+        ) {
             Box(Modifier.fillMaxSize()) {
                 Canvas(Modifier.fillMaxSize().padding(8.dp)) {
-                    val cx = size.width / 2
-                    val cy = size.height / 2
-                    val radius = minOf(cx, cy)
-                    for (i in 1..3) drawCircle(color = LuxuryGreen.copy(0.15f), radius = radius * i / 3, style = Stroke(1f))
-                    drawLine(LuxuryGreen.copy(0.2f), Offset(cx, 0f), Offset(cx, size.height))
-                    drawLine(LuxuryGreen.copy(0.2f), Offset(0f, cy), Offset(size.width, cy))
-                    if (history.isNotEmpty()) {
-                        val path = Path()
-                        val scale = if (history.size > 1) {
-                            val span = maxOf(history.maxOf { it.first } - history.minOf { it.first }, history.maxOf { it.second } - history.minOf { it.second }, 1f)
-                            (radius * 0.8f) / (span / 2f)
-                        } else 3f
+                    val cx = size.width / 2f
+                    val cy = size.height / 2f
+                    val maxRadius = minOf(cx, cy)
+                    val metersToPixels = maxRadius / 5f
+
+                    // Distance rings (1m, 2m, 5m)
+                    listOf(1f to "1m", 2f to "2m", 5f to "5m").forEach { (distM, label) ->
+                        val ringR = distM * metersToPixels
+                        drawCircle(
+                            color = LuxuryGreen.copy(alpha = 0.15f),
+                            radius = ringR,
+                            center = Offset(cx, cy),
+                            style = Stroke(width = 1f)
+                        )
+                        drawContext.canvas.nativeCanvas.drawText(
+                            label,
+                            cx + ringR * 0.72f,
+                            cy - ringR * 0.72f + 10f,
+                            android.graphics.Paint().apply {
+                                color = android.graphics.Color.argb(150, 0, 230, 118)
+                                textSize = 16f
+                                textAlign = android.graphics.Paint.Align.CENTER
+                            }
+                        )
+                    }
+
+                    // Cardinal labels (N/S/E/W)
+                    val cardPaint = android.graphics.Paint().apply {
+                        color = android.graphics.Color.argb(130, 142, 142, 147)
+                        textSize = 20f
+                        textAlign = android.graphics.Paint.Align.CENTER
+                        isFakeBoldText = true
+                    }
+                    val cr = maxRadius + 1f
+                    drawContext.canvas.nativeCanvas.apply {
+                        drawText("N", cx, cy - cr + 14f, cardPaint)
+                        drawText("S", cx, cy + cr, cardPaint)
+                        drawText("E", cx + cr, cy + 5f, cardPaint)
+                        drawText("W", cx - cr, cy + 5f, cardPaint)
+                    }
+
+                    // Crosshair
+                    drawLine(LuxuryGreen.copy(0.12f), Offset(cx, cy - maxRadius), Offset(cx, cy + maxRadius), 1f)
+                    drawLine(LuxuryGreen.copy(0.12f), Offset(cx - maxRadius, cy), Offset(cx + maxRadius, cy), 1f)
+
+                    // Path history (color-coded by movement speed)
+                    if (history.size >= 2) {
+                        val curX = history.last().first
+                        val curZ = history.last().second
                         val rad = Math.toRadians((-currentAzimuth).toDouble())
                         val cosA = cos(rad).toFloat()
                         val sinA = sin(rad).toFloat()
-                        val (curX, curZ) = history.last()
-                        fun transform(pX: Float, pZ: Float): Offset {
+
+                        fun toCanvas(pX: Float, pZ: Float): Offset {
                             val dx = pX - curX
                             val dz = pZ - curZ
-                            val rotX = dx * cosA - dz * sinA
-                            val rotZ = dx * sinA + dz * cosA
-                            return Offset((cx + rotX * scale).coerceIn(0f, size.width), (cy - rotZ * scale).coerceIn(0f, size.height))
+                            val rx = dx * cosA - dz * sinA
+                            val rz = dx * sinA + dz * cosA
+                            return Offset(
+                                (cx + rx * metersToPixels).coerceIn(0f, size.width),
+                                (cy - rz * metersToPixels).coerceIn(0f, size.height)
+                            )
                         }
-                        val first = transform(history.first().first, history.first().second)
-                        path.moveTo(first.x, first.y)
-                        for (i in 1 until history.size) {
-                            val p = transform(history[i].first, history[i].second)
-                            path.lineTo(p.x, p.y)
+
+                        val n = history.size
+                        for (i in 1 until n) {
+                            val segDx = history[i].first - history[i - 1].first
+                            val segDz = history[i].second - history[i - 1].second
+                            val mov = sqrt((segDx * segDx + segDz * segDz).toDouble()).toFloat()
+                            val segColor = when {
+                                mov > 0.03f -> LuxuryGreen
+                                mov > 0.008f -> LuxuryYellow
+                                else -> LuxuryRed
+                            }
+                            val ageFade = (0.25f + 0.75f * (i.toFloat() / n)).coerceIn(0.2f, 1f)
+                            drawLine(
+                                color = segColor.copy(alpha = ageFade),
+                                start = toCanvas(history[i - 1].first, history[i - 1].second),
+                                end = toCanvas(history[i].first, history[i].second),
+                                strokeWidth = 2.5f,
+                                cap = StrokeCap.Round
+                            )
                         }
-                        drawPath(path, LuxuryGreen, style = Stroke(2f))
-                        drawCircle(LuxuryYellow, 4f, first)
+                        // Start marker
+                        drawCircle(LuxuryYellow, 4f, toCanvas(history.first().first, history.first().second))
                     }
+
+                    // Current position dot
                     drawCircle(Color.White, 5f, Offset(cx, cy))
-                    drawLine(LuxuryCyan, Offset(cx, cy), Offset(cx, cy - 15f), strokeWidth = 3f, cap = StrokeCap.Round)
+
+                    // Heading arrow
+                    val arrowLen = maxRadius * 0.38f
+                    val aRad = Math.toRadians(currentAzimuth.toDouble())
+                    val tipX = cx + (sin(aRad) * arrowLen).toFloat()
+                    val tipY = cy - (cos(aRad) * arrowLen).toFloat()
+                    drawLine(LuxuryCyan, Offset(cx, cy), Offset(tipX, tipY), strokeWidth = 3f, cap = StrokeCap.Round)
+                    listOf(150.0, -150.0).forEach { offset ->
+                        val hr = Math.toRadians(currentAzimuth + offset)
+                        drawLine(
+                            LuxuryCyan,
+                            Offset(tipX, tipY),
+                            Offset(tipX + (sin(hr) * 8f).toFloat(), tipY - (cos(hr) * 8f).toFloat()),
+                            strokeWidth = 2.5f, cap = StrokeCap.Round
+                        )
+                    }
                 }
-                Text("RADAR", color = LuxuryGreen.copy(0.6f), fontSize = 8.sp, modifier = Modifier.align(Alignment.BottomCenter).padding(bottom = 4.dp))
+
+                // Distance from start label
+                Text(
+                    text = "${"%.1f".format(distFromStart)}m",
+                    color = LuxuryCyan,
+                    fontSize = 9.sp,
+                    fontWeight = FontWeight.Bold,
+                    modifier = Modifier.align(Alignment.BottomCenter).padding(bottom = 3.dp)
+                )
+                Text(
+                    "RADAR",
+                    color = LuxuryGreen.copy(0.45f),
+                    fontSize = 7.sp,
+                    letterSpacing = 1.sp,
+                    modifier = Modifier.align(Alignment.TopCenter).padding(top = 3.dp)
+                )
+            }
+        }
+    }
+
+    @Composable
+    private fun DebugRow(label: String, value: String, valueColor: Color) {
+        Row(
+            modifier = Modifier.fillMaxWidth(),
+            horizontalArrangement = Arrangement.SpaceBetween,
+            verticalAlignment = Alignment.CenterVertically
+        ) {
+            Text(label, color = LuxuryTextGrey, fontSize = 10.sp)
+            Text(value, color = valueColor, fontSize = 10.sp, fontWeight = FontWeight.Bold)
+        }
+    }
+
+    @Composable
+    fun DebugPanel(
+        isVisible: Boolean,
+        totalDistanceM: Double,
+        speedMs: Float,
+        qualityPct: Float,
+        fusionMode: String,
+        scaleFactor: Double,
+        headingDeg: Float
+    ) {
+        if (!isVisible) return
+        Surface(
+            color = Color.Black.copy(alpha = 0.82f),
+            shape = RoundedCornerShape(10.dp),
+            border = BorderStroke(1.dp, LuxuryCyan.copy(alpha = 0.35f)),
+            modifier = Modifier.width(165.dp)
+        ) {
+            Column(
+                modifier = Modifier.padding(horizontal = 10.dp, vertical = 7.dp),
+                verticalArrangement = Arrangement.spacedBy(3.dp)
+            ) {
+                Text(
+                    "DEBUG",
+                    color = LuxuryCyan,
+                    fontSize = 9.sp,
+                    fontWeight = FontWeight.Bold,
+                    letterSpacing = 1.5.sp
+                )
+                Divider(color = LuxuryCyan.copy(0.25f), thickness = 0.5.dp)
+                DebugRow("Dist", "${"%.2f".format(totalDistanceM)} m", LuxuryGreen)
+                DebugRow("Speed", "${"%.2f".format(speedMs)} m/s", LuxuryGreen)
+                DebugRow("Quality", "${"%.0f".format(qualityPct)}%",
+                    when {
+                        qualityPct > 70f -> LuxuryGreen
+                        qualityPct > 30f -> LuxuryYellow
+                        else -> LuxuryRed
+                    })
+                DebugRow("Mode", fusionMode,
+                    when (fusionMode) {
+                        "CAMERA" -> LuxuryGreen
+                        "HYBRID" -> LuxuryCyan
+                        "IMU" -> LuxuryYellow
+                        else -> LuxuryTextGrey
+                    })
+                DebugRow("Scale", "${"%.4f".format(scaleFactor)}", LuxuryCyan)
+                DebugRow("Heading", "${"%.1f".format(headingDeg)}\u00B0", LuxuryTextGrey)
             }
         }
     }

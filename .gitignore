@@ -25,3 +25,9 @@ local.properties
 
 # Ignore Claude files
 .claude/
+.claude-flow/
+.mcp.json
+.swarm/
+
+# Ignore test build artifacts
+tests/cpp/build*/
