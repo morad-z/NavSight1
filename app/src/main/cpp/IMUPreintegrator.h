@@ -15,6 +15,14 @@ struct AccelSample {
     float x, y, z;
 };
 
+struct PreintegratedDelta {
+    cv::Mat deltaR; // 3x3 rotation
+    cv::Mat deltaV; // 3x1 velocity
+    cv::Mat deltaP; // 3x1 position
+    double dt;
+    int sample_count;
+};
+
 class IMUPreintegrator {
 public:
     IMUPreintegrator();
@@ -25,8 +33,8 @@ public:
     // Integrate gyroscope readings between start_ns and end_ns into a rotation matrix
     cv::Mat integrateGyro(int64_t start_ns, int64_t end_ns);
 
-    // Full preintegration (returns deltaR for the interval)
-    cv::Mat integrate(int64_t start_ns, int64_t end_ns);
+    // Full preintegration (returns deltaR, deltaV, deltaP for the interval)
+    PreintegratedDelta integrate(int64_t start_ns, int64_t end_ns);
 
     // Initialize gravity vector from a batch of accelerometer samples
     void initializeFromGravity(const std::vector<cv::Point3f>& accel_samples);
@@ -38,6 +46,8 @@ public:
     bool isInitialized() const;
 
     void reset();
+
+    std::vector<AccelSample> getAccelBuffer() const;
 
     // Last known sensor values (for VioData passthrough)
     float lastAccelX() const { return last_ax; }
