@@ -28,21 +28,12 @@ class SensorRepository(private val context: Context) : SensorEventListener {
     private val fusedLocationClient = LocationServices.getFusedLocationProviderClient(context)
 
     private val orientationTracker = DeviceOrientationTracker()
-    private val opticalFlowProcessor = OpticalFlowProcessor()
 
     private val _orientationState = MutableStateFlow(DeviceOrientationTracker.OrientationResult(
         pitch = 0f, roll = 0f, azimuth = 0f,
         isHorizontal = false, deviationFromHorizontal = 90f, stabilityScore = 0f
     ))
     val orientationState = _orientationState.asStateFlow()
-
-    private val _flowResultState = MutableStateFlow(OpticalFlowProcessor.FlowResult(
-        dx = 0f, dy = 0f, magnitude = 0f,
-        direction = OpticalFlowProcessor.MovementDirection.STOPPED,
-        confidence = 0f,
-        mode = OpticalFlowProcessor.MovementMode.WALKING
-    ))
-    val flowResultState = _flowResultState.asStateFlow()
 
     private val _vioState = MutableStateFlow(VioData())
     val vioState = _vioState.asStateFlow()
@@ -61,6 +52,7 @@ class SensorRepository(private val context: Context) : SensorEventListener {
         private set
     var vioInitAzimuth = 0f
         private set
+
 
     // Camera Blocked
     private var consecutiveVioFailures = 0
@@ -241,15 +233,7 @@ class SensorRepository(private val context: Context) : SensorEventListener {
             timestamp = timestampNs
         )
 
-        val flowResult = opticalFlowProcessor.processFrame(
-            frame = data,
-            width = frame.size.width,
-            height = frame.size.height,
-            isYuv = true
-        )
-
         _vioState.value = vio
-        _flowResultState.value = flowResult
 
         if (vio.isInitialized && !wasVioInitialized) {
             wasVioInitialized = true
@@ -304,7 +288,6 @@ class SensorRepository(private val context: Context) : SensorEventListener {
     fun resetPath() {
         NativeBridge.resetVIO()
         _vioState.value = VioData()
-        opticalFlowProcessor.reset()
         orientationTracker.reset()
         wasVioInitialized = false
         vioInitAzimuth = 0f

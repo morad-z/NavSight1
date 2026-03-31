@@ -35,12 +35,10 @@ class NavSightViewModel(application: Application) : AndroidViewModel(application
     ))
         private set
 
-    var flowResultState by mutableStateOf(OpticalFlowProcessor.FlowResult(
-        dx = 0f, dy = 0f, magnitude = 0f,
-        direction = OpticalFlowProcessor.MovementDirection.STOPPED,
-        confidence = 0f,
-        mode = OpticalFlowProcessor.MovementMode.WALKING
-    ))
+    // VIO-derived motion state (replaces removed Kotlin OpticalFlowProcessor)
+    var isMoving by mutableStateOf(false)
+        private set
+    var isDriving by mutableStateOf(false)
         private set
 
     var vioState by mutableStateOf(VioData())
@@ -141,9 +139,6 @@ class NavSightViewModel(application: Application) : AndroidViewModel(application
         // Observe Repository states
         viewModelScope.launch {
             sensorRepository.orientationState.collect { orientationState = it }
-        }
-        viewModelScope.launch {
-            sensorRepository.flowResultState.collect { flowResultState = it }
         }
         viewModelScope.launch {
             sensorRepository.vioState.collect { vio ->

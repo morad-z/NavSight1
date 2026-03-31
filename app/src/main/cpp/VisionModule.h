@@ -106,6 +106,7 @@ private:
     // Forward-backward check
     static constexpr double FB_CHECK_THRESH  = 9.0;  // Relaxed for more point acceptance (squared pixel distance)
     static constexpr double MIN_FLOW_PX      = 0.4;
+    static constexpr double MAX_FLOW_PX      = 50.0; // Motion blur rejection threshold
     static constexpr int    MIN_INLIERS      = 8;    // Lowered from 10
     static constexpr double MIN_INLIER_RATIO = 0.25; // Lowered from 0.35
 

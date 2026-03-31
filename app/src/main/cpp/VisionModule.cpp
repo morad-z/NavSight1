@@ -312,8 +312,9 @@ VisionOutput VisionModule::processFrame(const uint8_t* yuv_data,
         }
         mean_flow /= static_cast<double>(prev_good_buf_.size());
     }
-    bool sufficient_motion = (mean_flow >= MIN_FLOW_PX);
-    bool has_parallax = (mean_flow >= MIN_PARALLAX_PX);
+    bool motion_blur = (mean_flow > MAX_FLOW_PX);
+    bool sufficient_motion = (mean_flow >= MIN_FLOW_PX) && !motion_blur;
+    bool has_parallax = (mean_flow >= MIN_PARALLAX_PX) && !motion_blur;
 
     // ZUPT requires BOTH low gyro AND low visual motion
     // Walking forward with zero rotation has low gyro but high flow — NOT static
@@ -341,8 +342,8 @@ VisionOutput VisionModule::processFrame(const uint8_t* yuv_data,
     static int frame_counter = 0;
     frame_counter++;
     if (frame_counter % 30 == 0) {
-        LOGI("GATES: flow=%.2f sufficient=%d parallax=%d static=%d pure_rot=%d pts=%d gyro=%.3f",
-             mean_flow, sufficient_motion, has_parallax, is_static, is_pure_rotation,
+        LOGI("GATES: flow=%.2f blur=%d sufficient=%d parallax=%d static=%d pure_rot=%d pts=%d gyro=%.3f",
+             mean_flow, motion_blur, sufficient_motion, has_parallax, is_static, is_pure_rotation,
              (int)prev_good_buf_.size(), gyro_norm);
     }
 
@@ -445,12 +446,17 @@ VisionOutput VisionModule::processFrame(const uint8_t* yuv_data,
     {
         std::lock_guard<std::mutex> lock(pose_mutex_);
 
-        // Always update rotation from the best available source
+        // Update rotation: use fused (camera+gyro) when pose is valid,
+        // gyro-only when walking with decent quality, freeze when quality is bad.
+        // Freezing heading on bad frames prevents gyro drift from accumulating
+        // during motion blur or feature loss.
         if (pose_valid) {
             global_R_ = global_R_ * R_fused;
-        } else if (!is_static) {
+        } else if (!is_static && quality >= 0.10 && !motion_blur) {
+            // Only trust gyro-only rotation when tracking is marginally OK
             global_R_ = global_R_ * imu_delta.deltaR;
         }
+        // else: freeze heading — bad quality or motion blur, gyro would just drift
 
         // Extract heading from rotation matrix (ZYX Euler convention)
         // This gives the physical heading direction in the world frame
