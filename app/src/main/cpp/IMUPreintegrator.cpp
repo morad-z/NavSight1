@@ -52,6 +52,7 @@ void IMUPreintegrator::addAccelReading(int64_t timestamp_ns, float x, float y, f
                          accel_buf_.begin() + static_cast<ptrdiff_t>(MAX_BUF / 2));
     }
     accel_buf_.push_back({timestamp_ns, x, y, z});
+    updateMotionMode(timestamp_ns, x, y, z);
     detectStep(timestamp_ns, x, y, z);
 }
 
@@ -301,15 +302,79 @@ bool IMUPreintegrator::isInitialized() const {
     return gravity_initialized_.load();
 }
 
+// ── Motion mode detection ─────────────────────────────────────────────────────
+
+void IMUPreintegrator::updateMotionMode(int64_t timestamp_ns, float ax, float ay, float az) {
+    // Must be called under mutex_ lock
+    float mag = std::sqrt(ax * ax + ay * ay + az * az);
+
+    // Very slow LP filter to get baseline accel magnitude
+    constexpr float SLOW_ALPHA = 0.02f;
+    accel_mag_slow_ = (1.0f - SLOW_ALPHA) * accel_mag_slow_ + SLOW_ALPHA * mag;
+
+    // Running variance estimate (exponential moving variance)
+    float diff = mag - accel_mag_slow_;
+    accel_variance_est_ = (1.0f - SLOW_ALPHA) * accel_variance_est_ + SLOW_ALPHA * (diff * diff);
+
+    // Walking has large periodic variance (>0.15), car vibrations are smaller (<0.10)
+    is_walking_pattern_ = (accel_variance_est_ > 0.15f);
+
+    // Vehicle speed estimation via forward accel integration
+    if (last_accel_ts_ns_ > 0) {
+        double dt = (timestamp_ns - last_accel_ts_ns_) * 1e-9;
+        if (dt > 0.0 && dt < 0.1) {
+            // Remove gravity component (approximate: subtract magnitude baseline)
+            float forward_accel = mag - accel_mag_slow_;
+
+            // Only integrate significant acceleration (> 0.3 m/s² after gravity removal)
+            if (std::abs(forward_accel) > 0.3f) {
+                vehicle_speed_mps_ += forward_accel * dt;
+                sustained_accel_s_ += dt;
+            } else {
+                // Decay speed when not accelerating (friction model)
+                vehicle_speed_mps_ *= 0.995;
+                sustained_accel_s_ = 0.0;
+            }
+
+            // Clamp to plausible range
+            vehicle_speed_mps_ = std::max(0.0, std::min(50.0, vehicle_speed_mps_));
+
+            // Detect vehicle mode: sustained non-walking motion
+            if (!is_walking_pattern_ && vehicle_speed_mps_ > 1.0) {
+                in_vehicle_mode_ = true;
+            } else if (is_walking_pattern_) {
+                in_vehicle_mode_ = false;
+                vehicle_speed_mps_ = 0.0; // Reset when walking detected
+            }
+        }
+    }
+    last_accel_ts_ns_ = timestamp_ns;
+}
+
+IMUPreintegrator::MotionMode IMUPreintegrator::getMotionMode() const {
+    std::lock_guard<std::mutex> lock(mutex_);
+    if (in_vehicle_mode_) return MotionMode::DRIVING;
+    if (is_walking_pattern_) return MotionMode::WALKING;
+    return MotionMode::STATIONARY;
+}
+
+double IMUPreintegrator::getVehicleSpeedEstimate() const {
+    std::lock_guard<std::mutex> lock(mutex_);
+    return in_vehicle_mode_ ? vehicle_speed_mps_ : 0.0;
+}
+
 // ── Step detection ────────────────────────────────────────────────────────────
 
 void IMUPreintegrator::detectStep(int64_t timestamp_ns, float ax, float ay, float az) {
     // Must be called under mutex_ lock
     float mag = std::sqrt(ax * ax + ay * ay + az * az);
 
-    // Low-pass filter (alpha ~0.15 at 100Hz)
+    // Low-pass filter
     constexpr float LP_ALPHA = 0.20f;
     accel_mag_filtered_ = (1.0f - LP_ALPHA) * accel_mag_filtered_ + LP_ALPHA * mag;
+
+    // Reject steps if accel pattern doesn't match walking (filters car vibrations)
+    if (!is_walking_pattern_) return;
 
     // Peak detection with hysteresis
     if (!was_above_thresh_ && accel_mag_filtered_ > STEP_ACCEL_THRESH_HIGH) {
@@ -322,17 +387,12 @@ void IMUPreintegrator::detectStep(int64_t timestamp_ns, float ax, float ay, floa
                 step_count_++;
                 step_period_s_ = period;
                 last_step_ns_ = timestamp_ns;
-                LOGI("STEP: count=%d freq=%.2f Hz", step_count_, 1.0 / period);
             } else if (period > MAX_STEP_PERIOD_S) {
-                // Too long since last step — accept as new walking start
                 step_count_++;
                 step_period_s_ = 0.0;
                 last_step_ns_ = timestamp_ns;
-                LOGI("STEP: new start count=%d", step_count_);
             }
-            // else: too fast, ignore (bounce/noise)
         } else {
-            // First step ever
             step_count_++;
             last_step_ns_ = timestamp_ns;
         }
@@ -382,4 +442,11 @@ void IMUPreintegrator::reset() {
     accel_mag_filtered_ = 9.81f;
     accel_mag_prev_ = 9.81f;
     was_above_thresh_ = false;
+    accel_mag_slow_ = 9.81f;
+    accel_variance_est_ = 0.0f;
+    is_walking_pattern_ = false;
+    vehicle_speed_mps_ = 0.0;
+    last_accel_ts_ns_ = 0;
+    sustained_accel_s_ = 0.0;
+    in_vehicle_mode_ = false;
 }

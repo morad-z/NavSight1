@@ -130,13 +130,8 @@ TEST_F(VisionModuleTest, ForwardTranslation_PositionGrows) {
         // Shift checkerboard 8px/frame (same as Kotlin on-device test)
         auto frame = test_utils::createCheckerboardNV21(W, H, 20, -8 * i, 0);
 
-        // Feed IMU with slight forward acceleration
-        int64_t imu_start = ts;
-        int64_t imu_dt = 5'000'000LL;
-        for (int j = 0; j < 6; j++) {
-            vm.addGyroData(imu_start + j * imu_dt, 0.0f, 0.0f, 0.0f);
-            vm.addAccelData(imu_start + j * imu_dt, 0.5f, 9.81f, 0.0f);
-        }
+        // Feed walking-like IMU (step impacts for step detector)
+        test_utils::feedWalkingIMU(vm, ts, 33, 0.5f);
 
         auto output = processOneFrame(frame, ts);
 
@@ -228,12 +223,8 @@ TEST_F(VisionModuleTest, FirstFrameNoIMU_GravityNotZero) {
         if (shifted.size() < 20) break;
         auto frame = test_utils::createSyntheticNV21(W, H, shifted);
 
-        // Feed normal walking IMU
-        for (int j = 0; j < 6; j++) {
-            int64_t imu_ts = ts + j * 5'000'000LL;
-            vm.addGyroData(imu_ts, 0.0f, 0.0f, 0.0f);
-            vm.addAccelData(imu_ts, 0.3f, 9.81f, 0.0f);
-        }
+        // Feed walking-like IMU with step impacts
+        test_utils::feedWalkingIMU(vm, ts, 33, 0.3f);
         auto output = processOneFrame(frame, ts);
 
         if (output.valid && !output.t.empty()) {

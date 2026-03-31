@@ -95,7 +95,7 @@ TEST_F(DriftScenarioTest, FullRotation360_NoPositionDrift) {
 
 // ── Scenario 3: Scale Estimation Convergence ─────────────────────────────────
 // Steady forward walk. Scale estimate should converge and stabilize.
-// Tests: estimateScaleFromAccel, smooth_scale_ EMA, outlier rejection
+// Tests: estimateScaleFromSteps, smooth_scale_ EMA, outlier rejection
 
 TEST_F(DriftScenarioTest, SteadyWalk_ScaleConverges) {
     auto features = test_utils::generateFeatureGrid(W, H, 15, 12);
@@ -113,12 +113,8 @@ TEST_F(DriftScenarioTest, SteadyWalk_ScaleConverges) {
 
         auto frame = test_utils::createSyntheticNV21(W, H, shifted);
 
-        // Feed matching IMU (constant velocity ~ 1.5 m/s)
-        for (int j = 0; j < 6; j++) {
-            int64_t imu_ts = ts + j * 5'000'000LL;
-            vm.addGyroData(imu_ts, 0.0f, 0.0f, 0.0f);
-            vm.addAccelData(imu_ts, 0.3f, 9.81f, 0.0f); // slight forward accel
-        }
+        // Feed walking-like IMU with step impacts for step detector
+        test_utils::feedWalkingIMU(vm, ts, 33, 0.3f);
 
         auto output = vm.processFrame(frame.data(), W, H, ts);
 
@@ -191,11 +187,8 @@ TEST_F(DriftScenarioTest, RightwardMotion_PositiveXDisplacement) {
         // Shift checkerboard left → camera moves right
         auto frame = test_utils::createCheckerboardNV21(W, H, 20, -8 * i, 0);
 
-        for (int j = 0; j < 6; j++) {
-            int64_t imu_ts = ts + j * 5'000'000LL;
-            vm.addGyroData(imu_ts, 0.0f, 0.0f, 0.0f);
-            vm.addAccelData(imu_ts, 0.5f, 9.81f, 0.0f);
-        }
+        // Feed walking-like IMU with step impacts
+        test_utils::feedWalkingIMU(vm, ts, 33, 0.5f);
 
         auto output = vm.processFrame(frame.data(), W, H, ts);
         if (output.valid && !output.t.empty()) {
@@ -248,12 +241,8 @@ TEST_F(DriftScenarioTest, SlowWalk_NotFalselyStatic) {
         // Shift checkerboard 8 px/frame — walking speed
         auto frame = test_utils::createCheckerboardNV21(W, H, 20, -8 * i, 0);
 
-        // Feed walking IMU with forward acceleration
-        for (int j = 0; j < 6; j++) {
-            int64_t imu_ts = ts + j * 5'000'000LL;
-            vm.addGyroData(imu_ts, 0.0f, 0.0f, 0.0f); // zero gyro (walking straight)
-            vm.addAccelData(imu_ts, 0.5f, 9.81f, 0.0f); // forward accel
-        }
+        // Feed walking-like IMU with step impacts (needed for step detector)
+        test_utils::feedWalkingIMU(vm, ts, 33, 0.5f);
 
         auto output = vm.processFrame(frame.data(), W, H, ts);
 
@@ -264,7 +253,7 @@ TEST_F(DriftScenarioTest, SlowWalk_NotFalselyStatic) {
     }
 
     EXPECT_GT(max_pos, 0.001)
-        << "ZUPT FALSE POSITIVE: Slow walk (4 px/frame flow) produced zero position. "
+        << "ZUPT FALSE POSITIVE: Slow walk (8 px/frame flow) produced zero position. "
         << "ZUPT or motion gates are incorrectly blocking real walking motion.";
 }
 
@@ -299,11 +288,8 @@ TEST_F(DriftScenarioTest, ScaleBootstrap_NoisyStart_DoesNotLockWild) {
         if (shifted.size() < 30) break;
         auto frame = test_utils::createSyntheticNV21(W, H, shifted);
 
-        for (int j = 0; j < 6; j++) {
-            int64_t imu_ts = ts + j * 5'000'000LL;
-            vm.addGyroData(imu_ts, 0.0f, 0.0f, 0.0f);
-            vm.addAccelData(imu_ts, 0.3f, 9.81f, 0.0f); // normal walking
-        }
+        // Feed walking-like IMU with step impacts
+        test_utils::feedWalkingIMU(vm, ts, 33, 0.3f);
 
         auto output = vm.processFrame(frame.data(), W, H, ts);
         if (output.valid && output.estimatedScale > 0.001) {
@@ -351,11 +337,8 @@ TEST_F(DriftScenarioTest, TurnThenWalk_PositionInRotatedDirection) {
         int64_t ts = BASE_NS + i * FRAME_DT;
         auto frame = test_utils::createCheckerboardNV21(W, H, 20, -8 * (i - 32), 0);
 
-        for (int j = 0; j < 6; j++) {
-            int64_t imu_ts = ts + j * 5'000'000LL;
-            vm.addGyroData(imu_ts, 0.0f, 0.0f, 0.0f);
-            vm.addAccelData(imu_ts, 0.5f, 9.81f, 0.0f);
-        }
+        // Feed walking-like IMU with step impacts
+        test_utils::feedWalkingIMU(vm, ts, 33, 0.5f);
 
         auto output = vm.processFrame(frame.data(), W, H, ts);
         if (output.valid && !output.t.empty()) {
@@ -396,11 +379,8 @@ TEST_F(DriftScenarioTest, WalkAfterReset_StillWorks) {
         int64_t ts = walk_base + i * FRAME_DT;
         auto frame = test_utils::createCheckerboardNV21(W, H, 20, -8 * i, 0);
 
-        for (int j = 0; j < 6; j++) {
-            int64_t imu_ts = ts + j * 5'000'000LL;
-            vm.addGyroData(imu_ts, 0.0f, 0.0f, 0.0f);
-            vm.addAccelData(imu_ts, 0.5f, 9.81f, 0.0f);
-        }
+        // Feed walking-like IMU with step impacts
+        test_utils::feedWalkingIMU(vm, ts, 33, 0.5f);
 
         auto output = vm.processFrame(frame.data(), W, H, ts);
         if (output.valid && !output.t.empty()) {
@@ -423,7 +403,7 @@ TEST_F(DriftScenarioTest, ScaleConsistency_DifferentSpeeds) {
     int slow_updates = 0;
     int fast_updates = 0;
 
-    // Phase 1: Slow walk (30 frames)
+    // Phase 1: Slow walk (40 frames)
     {
         VisionModule vm_slow;
         vm_slow.setIntrinsics(500.0, 500.0, W / 2.0, H / 2.0);
@@ -435,11 +415,8 @@ TEST_F(DriftScenarioTest, ScaleConsistency_DifferentSpeeds) {
             if (shifted.size() < 30) break;
             auto frame = test_utils::createSyntheticNV21(W, H, shifted);
 
-            for (int j = 0; j < 6; j++) {
-                int64_t imu_ts = ts + j * 5'000'000LL;
-                vm_slow.addGyroData(imu_ts, 0.0f, 0.0f, 0.0f);
-                vm_slow.addAccelData(imu_ts, 0.2f, 9.81f, 0.0f); // slow walk
-            }
+            // Walking IMU with step impacts
+            test_utils::feedWalkingIMU(vm_slow, ts, 33, 0.2f);
 
             auto output = vm_slow.processFrame(frame.data(), W, H, ts);
             if (output.valid && output.estimatedScale > 0.001) {
@@ -449,7 +426,7 @@ TEST_F(DriftScenarioTest, ScaleConsistency_DifferentSpeeds) {
         }
     }
 
-    // Phase 2: Fast walk (30 frames, separate VisionModule)
+    // Phase 2: Fast walk (40 frames, separate VisionModule)
     {
         VisionModule vm_fast;
         vm_fast.setIntrinsics(500.0, 500.0, W / 2.0, H / 2.0);
@@ -461,11 +438,8 @@ TEST_F(DriftScenarioTest, ScaleConsistency_DifferentSpeeds) {
             if (shifted.size() < 20) break;
             auto frame = test_utils::createSyntheticNV21(W, H, shifted);
 
-            for (int j = 0; j < 6; j++) {
-                int64_t imu_ts = ts + j * 5'000'000LL;
-                vm_fast.addGyroData(imu_ts, 0.0f, 0.0f, 0.0f);
-                vm_fast.addAccelData(imu_ts, 0.6f, 9.81f, 0.0f); // fast walk
-            }
+            // Walking IMU with step impacts (faster steps)
+            test_utils::feedWalkingIMU(vm_fast, ts, 33, 0.6f);
 
             auto output = vm_fast.processFrame(frame.data(), W, H, ts);
             if (output.valid && output.estimatedScale > 0.001) {
