@@ -6,16 +6,20 @@ import kotlin.math.sqrt
 
 /**
  * Device Orientation Tracker - מעקב מדויק אחר זווית המכשיר
- * מזהה אם הטלפון במצב אופקי (מקביל לרצפה, מצלמה למטה) עם tolerance מתאים
+ * מזהה אם הטלפון מוחזק במצב VIO אופטימלי (מוטה קדימה ~30-60° מהאנך)
+ * כך שהמצלמה רואה את הסצנה קדימה ולא את הרצפה
  */
 class DeviceOrientationTracker {
-    
+
     companion object {
         private const val TAG = "OrientationTracker"
-        
-        // Tolerance להחזקת הטלפון אופקית (מקביל לרצפה)
-        private const val HORIZONTAL_TOLERANCE_DEGREES = 25f  // סובלנות של ±25 מעלות
-        
+
+        // VIO-optimal tilt range: phone held upright, tilted 30-60° forward from vertical.
+        // Android pitch: -90° = upright, 0° = horizontal (floor). Ideal range: -75° to -30°.
+        private const val VIO_IDEAL_PITCH_MIN = -75f  // most upright acceptable
+        private const val VIO_IDEAL_PITCH_MAX = -30f  // most tilted acceptable
+        private const val HORIZONTAL_TOLERANCE_DEGREES = 25f  // used for deviation calc
+
         // Smoothing
         private const val SMOOTHING_ALPHA = 0.15f
     }
@@ -42,8 +46,8 @@ class DeviceOrientationTracker {
         val pitch: Float,           // זווית קדימה/אחורה (מעלות)
         val roll: Float,            // זווית צד (מעלות)
         val azimuth: Float,         // כיוון מצפן (מעלות)
-        val isHorizontal: Boolean,  // האם הטלפון אופקי (מקביל לרצפה)
-        val deviationFromHorizontal: Float, // כמה רחוק ממצב אופקי
+        val isHorizontal: Boolean,  // האם הטלפון במצב VIO תקין (מוטה קדימה, מצלמה לסצנה)
+        val deviationFromHorizontal: Float, // כמה רחוק מהמצב האופטימלי
         val stabilityScore: Float   // ציון יציבות (0-1)
     )
     
@@ -74,7 +78,7 @@ class DeviceOrientationTracker {
         if (!success) {
             // getRotationMatrix fails when magnetometer is unavailable (all zeros) or at gimbal lock.
             // Either way, use the raw accelerometer to determine tilt — it works without magnetometer.
-            val deviation = calculateHorizontalDeviation()
+            val deviation = calculateVioDeviation()
             return OrientationResult(
                 pitch = smoothedPitch,
                 roll = smoothedRoll,
@@ -106,8 +110,8 @@ class DeviceOrientationTracker {
         // חישוב יציבות
         val stability = calculateStability()
         
-        // בדיקה אם הטלפון אופקי (מקביל לרצפה)
-        val deviationFromHorizontal = calculateHorizontalDeviation()
+        // בדיקה אם הטלפון במצב VIO אופטימלי (מוטה קדימה)
+        val deviationFromHorizontal = calculateVioDeviation()
         val isHorizontal = deviationFromHorizontal <= HORIZONTAL_TOLERANCE_DEGREES
         
         return OrientationResult(
@@ -121,34 +125,33 @@ class DeviceOrientationTracker {
     }
     
     /**
-     * חישוב סטייה ממצב אופקי
-     * מצב אופקי = הטלפון מקביל לרצפה, המצלמה מכוונת למטה
+     * חישוב סטייה מהמצב האופטימלי ל-VIO
+     * מצב אופטימלי = הטלפון מוחזק כמו בשימוש רגיל, מוטה קדימה 30-60° מהאנך
+     * כך שהמצלמה רואה את הסצנה קדימה (לא את הרצפה)
+     *
+     * Android pitch values:
+     *   -90° = phone fully upright (screen facing user)
+     *     0° = phone flat/horizontal (screen facing ceiling, camera at floor)
+     *
+     * VIO ideal range: pitch between -75° and -30°
+     * (phone tilted 30-60° forward from vertical = camera sees forward scene)
      */
-    private fun calculateHorizontalDeviation(): Float {
-        val ax = accelerometerReading[0]
-        val ay = accelerometerReading[1]
-        val az = accelerometerReading[2]
-        
-        val totalAccel = sqrt(ax * ax + ay * ay + az * az)
-        
-        if (totalAccel < 0.1f) return 90f
-        
-        // נורמליזציה
-        val normZ = az / totalAccel
-        
-        // כשהטלפון אופקי לחלוטין (מקביל לרצפה, מסך למעלה):
-        // az צריך להיות קרוב ל-g (~9.8) כלומר normZ קרוב ל-1
-        // כשהטלפון אופקי עם המסך למטה (מצלמה לרצפה):
-        // az צריך להיות קרוב ל--g (~-9.8) כלומר normZ קרוב ל--1
-        
-        // אנחנו רוצים לזהות את שני המצבים - מסך למעלה או מסך למטה
-        val absNormZ = abs(normZ)
-        
-        // חישוב הזווית מהמצב האופקי
-        // acos(absNormZ) נותן את הזווית בין ציר Z לכיוון הגרביטציה
-        val angleFromHorizontal = Math.toDegrees(kotlin.math.acos(absNormZ.coerceIn(0f, 1f)).toDouble()).toFloat()
-        
-        return angleFromHorizontal
+    private fun calculateVioDeviation(): Float {
+        val pitch = smoothedPitch
+
+        // If pitch is in the ideal VIO range, deviation = 0
+        if (pitch in VIO_IDEAL_PITCH_MIN..VIO_IDEAL_PITCH_MAX) {
+            return 0f
+        }
+
+        // How far outside the ideal range
+        return if (pitch > VIO_IDEAL_PITCH_MAX) {
+            // Phone too tilted toward horizontal (camera at floor)
+            pitch - VIO_IDEAL_PITCH_MAX
+        } else {
+            // Phone too upright (camera at sky/face)
+            VIO_IDEAL_PITCH_MIN - pitch
+        }
     }
     
     /**
@@ -198,7 +201,7 @@ class DeviceOrientationTracker {
     }
     
     /**
-     * בדיקה מהירה אם הטלפון אופקי
+     * בדיקה מהירה אם הטלפון במצב VIO תקין
      */
     fun isPhoneHorizontal(): Boolean {
         return getOrientation().isHorizontal

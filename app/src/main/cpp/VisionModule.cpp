@@ -70,6 +70,26 @@ void VisionModule::setIntrinsics(double fx, double fy, double cx, double cy) {
     LOGI("setIntrinsics: fx=%.1f fy=%.1f cx=%.1f cy=%.1f", fx, fy, cx, cy);
 }
 
+// ── setInitialHeading ─────────────────────────────────────────────────────────
+// Called once at VIO init with the magnetometer azimuth (radians, CW from north).
+// Rotates global_R_ so that heading=0 in VIO corresponds to compass north.
+
+void VisionModule::setInitialHeading(double azimuth_rad) {
+    std::lock_guard<std::mutex> lock(pose_mutex_);
+    // Build a Z-axis rotation matrix by the azimuth angle.
+    // Heading is extracted as atan2(R[1][0], R[1][1]), which reads the Z-rotation.
+    // Frame-to-frame rotations (R_fused, imu deltaR) also accumulate Z-rotations
+    // for yaw, so the initial heading must be a Z-axis rotation to match.
+    double c = std::cos(azimuth_rad);
+    double s = std::sin(azimuth_rad);
+    cv::Mat Rz = (cv::Mat_<double>(3, 3) <<
+         c, -s, 0,
+         s,  c, 0,
+         0,  0, 1);
+    global_R_ = Rz.clone();
+    LOGI("setInitialHeading: azimuth=%.1f deg", azimuth_rad * 180.0 / M_PI);
+}
+
 // ── reset ─────────────────────────────────────────────────────────────────────
 
 void VisionModule::reset() {

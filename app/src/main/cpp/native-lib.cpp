@@ -327,5 +327,20 @@ Java_com_example_navsight1_NativeBridge_setIntrinsics(
     }
 }
 
+// ── setInitialHeading ────────────────────────────────────────────────────────
+
+JNIEXPORT void JNICALL
+Java_com_example_navsight1_NativeBridge_setInitialHeading(
+        JNIEnv*, jobject /* thiz */, jdouble azimuthRad) {
+    VisionModule* vision = nullptr;
+    {
+        std::lock_guard<std::mutex> lock(state_mutex);
+        vision = g_vision;
+    }
+    if (vision) {
+        vision->setInitialHeading(static_cast<double>(azimuthRad));
+    }
+}
+
 } // extern "C"
 

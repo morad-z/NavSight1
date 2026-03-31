@@ -254,8 +254,14 @@ class SensorRepository(private val context: Context) : SensorEventListener {
         if (vio.isInitialized && !wasVioInitialized) {
             wasVioInitialized = true
             vioInitAzimuth = _orientationState.value.azimuth
-            
-            // FR17: Magnetometer is only needed for initial direction. 
+
+            // Pass initial compass heading to C++ so VIO heading aligns to north.
+            // azimuth is in degrees (CW from north), convert to radians.
+            val azimuthRad = Math.toRadians(vioInitAzimuth.toDouble())
+            NativeBridge.setInitialHeading(azimuthRad)
+            Log.d(TAG, "Initial heading set: ${vioInitAzimuth}° (${azimuthRad} rad)")
+
+            // FR17: Magnetometer is only needed for initial direction.
             // Unregister it now to prevent interference and save battery.
             magnetometer?.let {
                 sensorManager.unregisterListener(this, it)

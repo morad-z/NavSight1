@@ -15,7 +15,7 @@ last_agent: "Claude-Opus-4-6"
 last_developer: "morad"
 branch: "morad"
 base_branch: "master"
-head_commit: "359ba4b"
+head_commit: "pending-commit"
 pr_merged: "#9 (morad → master, 2026-03-30)"
 ```
 
@@ -124,6 +124,23 @@ feature/ui-redesign: "merged via PR #7"
     atan2(R[1][0], R[1][1]). Also added step detector cross-check to prevent
     false ZUPT during walking, and smooth speed*dt fallback instead of full stride jumps.
   test: "tests/cpp/test_drift_scenarios.cpp::TurnThenWalk_PositionInRotatedDirection"
+
+- id: "BUG-006"
+  title: "VIO trajectory direction and scale mismatch vs GPS"
+  status: "FIXED_UNTESTED"
+  severity: "P0"
+  owner: "morad"
+  file: "app/src/main/cpp/VisionModule.cpp"
+  description: >
+    FIXED (2026-03-31): Two root causes identified from simulation analysis:
+    1. Direction: global_R_ started as identity (heading=0) regardless of compass.
+       VIO trajectory rotated ~110° from GPS. Fix: setInitialHeading() applies
+       magnetometer azimuth as Rz rotation at VIO init (one-time, mag unregistered after).
+       QA caught initial Ry bug — corrected to Rz (atan2(R[1][0],R[1][1]) reads Z-rotation).
+    2. Scale: UI told users to hold phone horizontal (camera at floor). Optical flow
+       was tiny → scale estimation diverged. Fix: DeviceOrientationTracker changed
+       to require pitch -75° to -30° (camera forward at scene, not floor).
+  test: "Needs on-device re-recording to verify"
 
 - id: "BUG-005"
   title: "IMU preintegrator sample_count returns 0"
@@ -309,6 +326,39 @@ feature/ui-redesign: "merged via PR #7"
     Updated ForwardTranslation and walking drift tests to use feedWalkingIMU().
     Fixed BUG-005 test assertions (check rotation/dt instead of sample_count).
     All 36 tests now expected to pass.
+
+- id: "TASK-015"
+  title: "Initial heading alignment from magnetometer (BUG-006 direction fix)"
+  status: "DONE"
+  owner: "morad"
+  priority: "P0"
+  completed: "2026-03-31"
+  files:
+    - "app/src/main/cpp/VisionModule.h (setInitialHeading declaration)"
+    - "app/src/main/cpp/VisionModule.cpp (Rz rotation implementation)"
+    - "app/src/main/cpp/native-lib.cpp (JNI bridge)"
+    - "app/src/main/java/.../NativeBridge.kt (external fun)"
+    - "app/src/main/java/.../SensorRepository.kt (call at VIO init)"
+  notes: >
+    Magnetometer azimuth captured at VIO init → passed to C++ setInitialHeading().
+    global_R_ initialized with Rz(azimuth) so heading=0 maps to compass north.
+    QA review caught Ry bug (row 1 invariant under Ry), corrected to Rz.
+    Magnetometer unregistered immediately after — single-use as per FR17.
+
+- id: "TASK-016"
+  title: "Phone orientation UI fix for VIO-optimal tilt (BUG-006 scale fix)"
+  status: "DONE"
+  owner: "morad"
+  priority: "P0"
+  completed: "2026-03-31"
+  files:
+    - "app/src/main/java/.../DeviceOrientationTracker.kt (VIO-ready pitch range)"
+    - "app/src/main/java/.../MainActivity.kt (UI text update)"
+  notes: >
+    Changed DeviceOrientationTracker from horizontal check (camera at floor) to
+    VIO-ready check (pitch -75° to -30°, camera forward at scene). UI warning
+    text changed to Hebrew "הטה את הטלפון קדימה — מצלמה לסצנה".
+    Camera pointed forward gives better optical flow → more reliable scale estimation.
 ```
 
 ---
@@ -316,6 +366,30 @@ feature/ui-redesign: "merged via PR #7"
 ## RECENT CHANGES (last 5 sessions)
 
 ```yaml
+- session: 0c
+  date: "2026-03-31"
+  developer: "morad"
+  agent: "Claude-Opus-4-6"
+  branch: "morad"
+  summary: >
+    Fixed VIO trajectory direction and scale mismatch vs GPS (BUG-006).
+    Direction fix: setInitialHeading() passes magnetometer azimuth to C++ at VIO init,
+    initializes global_R_ with Rz rotation so heading=0=north. QA review caught Ry→Rz bug.
+    Scale fix: DeviceOrientationTracker changed from horizontal (camera at floor) to
+    VIO-ready (pitch -75° to -30°, camera forward). UI text updated.
+    Also added graph explanations to NavSight_Simulation_Analysis.ipynb (8 markdown cells).
+    Simulation analysis: basic code avg 4.4% accuracy, extended code avg 92.9%.
+  files_changed:
+    - "app/src/main/cpp/VisionModule.h (setInitialHeading declaration)"
+    - "app/src/main/cpp/VisionModule.cpp (setInitialHeading Rz implementation)"
+    - "app/src/main/cpp/native-lib.cpp (JNI setInitialHeading bridge)"
+    - "app/src/main/java/.../NativeBridge.kt (external fun setInitialHeading)"
+    - "app/src/main/java/.../SensorRepository.kt (call setInitialHeading at VIO init)"
+    - "app/src/main/java/.../DeviceOrientationTracker.kt (VIO-ready pitch check)"
+    - "app/src/main/java/.../MainActivity.kt (orientation warning text)"
+    - "docs/NavSight_Simulation_Analysis.ipynb (graph explanations)"
+  impact: "VIO trajectory should align to GPS direction and scale with proper phone tilt. Needs re-recording."
+
 - session: 0a
   date: "2026-03-31"
   developer: "morad"
@@ -398,18 +472,6 @@ feature/ui-redesign: "merged via PR #7"
     - "docs/gemini_plan2.md (NEW)"
   impact: "JNI bridge stable. Drift fix plan documented but NOT implemented."
 
-- session: 3
-  date: "2026-03-29"
-  developer: "morad"
-  agent: "Claude-Code"
-  branch: "morad"
-  commit: "9e5e94e"
-  summary: "Implemented adaptive sensor fusion (quality-based alpha weighting)"
-  files_changed:
-    - "app/src/main/cpp/VisionModule.cpp"
-    - "app/src/main/cpp/VisionModule.h"
-  impact: "Fusion weight now adapts: quality>0.7 -> alpha=0.85 (camera), quality<0.3 -> alpha=0.995 (IMU)"
-
 
 ```
 
@@ -420,30 +482,30 @@ feature/ui-redesign: "merged via PR #7"
 <!-- When an AI stops mid-task, describe exactly where it left off so the next AI can resume. -->
 
 ```yaml
-current_task: "NONE - session completed, all changes merged to master"
-stopped_at: "All VIO fixes + driving mode + test updates committed and merged to master"
+current_task: "NONE - session completed, pending commit"
+stopped_at: "Heading alignment + phone orientation fixes applied, build passes"
 next_action: >
   Priority order:
-  1. Re-record simulation data with current code (camera at 30-45° from horizontal)
-  2. On-device verification: walking test with turnaround (BUG-004 device test)
-  3. On-device verification: driving test (car vibration rejection)
-  4. Gravity-aligned heading extraction (improvement 8 from analysis)
+  1. Commit and push heading/orientation fixes, merge to master
+  2. Re-record simulation data with current code (phone tilted forward, camera at scene)
+  3. On-device verification: walking test — VIO trajectory should align to GPS direction
+  4. On-device verification: turnaround test (BUG-004 device test)
+  5. On-device verification: driving test (car vibration rejection)
 resume_context: >
-  Two-part VIO session (2026-03-31):
-  Part 1: 2D heading, step-based scale, relaxed gates, diagnostic recording.
-  Part 2: Driving mode (accel variance filter, vehicle speed estimator),
-  timing fixes for 2.3fps camera (dt guards, LK window/pyramid),
-  test suite overhaul (feedWalkingIMU, 6 new IMU tests, all 36 pass).
-  Key current values: smooth_scale_=0.20, FB_CHECK_THRESH=9.0, MAX_FEATURES=500,
-  dt_scale_estimate=1.5s, dt_scale_ok=2.0s, LK_WINDOW=31, LK_PYRAMID=4,
-  walking variance threshold=0.15, vehicle friction decay=0.995.
+  Session 0c (2026-03-31): Fixed BUG-006 (trajectory direction + scale mismatch).
+  Direction: setInitialHeading(Rz) aligns VIO heading to compass north at init.
+  Scale: UI now requires phone at pitch -75° to -30° (camera forward, not floor).
+  QA review caught Ry→Rz bug in setInitialHeading (row 1 of Ry is invariant).
+  Simulation analysis notebook at docs/NavSight_Simulation_Analysis.ipynb.
+  Key: magnetometer + GPS used ONCE at startup only. Never during tracking.
   RULE: No magnetometer during VIO tracking — only at startup for initial heading.
-partial_state: "NONE"
+partial_state: "NONE — all code changes done, build passes, needs commit"
 warnings:
   - "MainActivity.kt is 805+ lines — consider splitting"
-  - "Simulation recordings are from BEFORE driving mode fix — must re-record"
+  - "Simulation recordings are from BEFORE heading fix — must re-record"
   - "BUG-004 fix is UNTESTED on device — need walking test with turnaround"
-  - "Camera should be held at 30-45° from horizontal, NOT pointing at floor"
+  - "BUG-006 fix is UNTESTED on device — need walking test to verify direction alignment"
+  - "Phone orientation UI changed — users now guided to tilt forward, not hold horizontal"
 ```
 
 ---
@@ -462,11 +524,11 @@ warnings:
 "app/src/main/java/.../MainActivity.kt":         "Compose UI, map, radar, AR overlay (805 lines)"
 "app/src/main/java/.../NavSightViewModel.kt":    "MVVM state, meters-to-LatLng (249 lines)"
 "app/src/main/java/.../SensorRepository.kt":     "Sensor registration, camera dispatch, VIO init (274 lines)"
-"app/src/main/java/.../NativeBridge.kt":          "JNI declarations (20 lines)"
+"app/src/main/java/.../NativeBridge.kt":          "JNI declarations incl setInitialHeading (21 lines)"
 "app/src/main/java/.../VioData.kt":               "VIO data class: 29 fields + JNI sig (~105 lines)"
 "app/src/main/java/.../OpticalFlowProcessor.kt":  "Kotlin-side optical flow (439 lines)"
 "app/src/main/java/.../NavigationManager.kt":     "Turn-by-turn nav (495 lines, out-of-scope extension)"
-"app/src/main/java/.../DeviceOrientationTracker.kt": "Accel+mag orientation for UI (219 lines)"
+"app/src/main/java/.../DeviceOrientationTracker.kt": "VIO-ready pitch check (-75° to -30°), accel+mag orientation (223 lines)"
 
 # Tests
 "tests/cpp/test_imu_preintegrator.cpp":  "16 IMU tests: preintegration + step detection + motion mode (all pass)"

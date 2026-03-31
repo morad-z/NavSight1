@@ -36,6 +36,7 @@ public:
     void addGyroData(int64_t timestamp_ns, float x, float y, float z);
     void addAccelData(int64_t timestamp_ns, float x, float y, float z);
     void setIntrinsics(double fx, double fy, double cx, double cy);
+    void setInitialHeading(double azimuth_rad);
     void reset();
 
     IMUPreintegrator& getIMU() { return imu_; }
