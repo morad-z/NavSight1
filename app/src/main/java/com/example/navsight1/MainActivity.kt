@@ -430,7 +430,7 @@ class MainActivity : ComponentActivity() {
                 Icon(Icons.Default.Phone, null, tint = LuxuryRed, modifier = Modifier.size(24.dp).rotate(deviation.coerceIn(-30f, 30f)))
                 Spacer(Modifier.width(8.dp))
                 Column {
-                    Text("החזק את הטלפון אופקית", color = LuxuryRed, fontWeight = FontWeight.Bold, fontSize = 14.sp)
+                    Text("הטה את הטלפון קדימה — מצלמה לסצנה", color = LuxuryRed, fontWeight = FontWeight.Bold, fontSize = 14.sp)
                     Text("סטייה: ${"%.0f".format(deviation)}°", color = LuxuryRed.copy(alpha = 0.8f), fontSize = 12.sp)
                 }
             }

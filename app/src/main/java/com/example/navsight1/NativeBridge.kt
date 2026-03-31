@@ -17,4 +17,5 @@ object NativeBridge {
     external fun resetVIO()
     external fun setScale(scale: Double)
     external fun setIntrinsics(fx: Double, fy: Double, cx: Double, cy: Double)
+    external fun setInitialHeading(azimuthRad: Double)
 }
