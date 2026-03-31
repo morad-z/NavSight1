@@ -147,8 +147,8 @@ class MainActivity : ComponentActivity() {
     @Composable
     fun MainScreen() {
         val orientation = viewModel.orientationState
-        val flowResult = viewModel.flowResultState
         val vio = viewModel.vioState
+        val isMoving = vio.isInitialized && vio.meanFlow > 1.0
         val azimuth = orientation.azimuth
 
         // Heading fusion
@@ -179,7 +179,7 @@ class MainActivity : ComponentActivity() {
                         )
                 ) {
                     CameraViewComposable()
-                    AROverlay(flowResult = flowResult, orientation = orientation)
+                    AROverlay(isMoving = isMoving, orientation = orientation)
 
                     Box(Modifier.align(Alignment.TopEnd).padding(12.dp)) {
                         SensorRadar(
@@ -190,8 +190,7 @@ class MainActivity : ComponentActivity() {
 
                     Box(Modifier.align(Alignment.TopStart).padding(12.dp)) {
                         DirectionBadge(
-                            direction = flowResult.direction,
-                            mode = flowResult.mode,
+                            isMoving = isMoving,
                             trackingQuality = vio.trackingQuality.toFloat()
                         )
                     }
@@ -223,7 +222,7 @@ class MainActivity : ComponentActivity() {
                     Box(Modifier.align(Alignment.BottomEnd).padding(12.dp)) {
                         StabilityIndicator(
                             stability = orientation.stabilityScore,
-                            confidence = flowResult.confidence
+                            confidence = vio.trackingQuality.toFloat()
                         )
                     }
 
@@ -374,10 +373,10 @@ class MainActivity : ComponentActivity() {
 
     @Composable
     fun AROverlay(
-        flowResult: OpticalFlowProcessor.FlowResult,
+        isMoving: Boolean,
         orientation: DeviceOrientationTracker.OrientationResult
     ) {
-        if (flowResult.direction != OpticalFlowProcessor.MovementDirection.STOPPED && orientation.isHorizontal) {
+        if (isMoving && orientation.isHorizontal) {
             val infiniteTransition = rememberInfiniteTransition(label = "grid")
             val gridOffset by infiniteTransition.animateFloat(
                 initialValue = 0f, targetValue = 60f,
@@ -395,25 +394,20 @@ class MainActivity : ComponentActivity() {
             }
         }
         Box(Modifier.fillMaxSize(), contentAlignment = Alignment.Center) {
-            AROverlayRenderer.DirectionArrow(direction = flowResult.direction, magnitude = flowResult.magnitude)
+            AROverlayRenderer.DirectionArrow(isMoving = isMoving, magnitude = if (isMoving) 5f else 0f)
         }
     }
 
     @Composable
-    fun DirectionBadge(direction: OpticalFlowProcessor.MovementDirection, mode: OpticalFlowProcessor.MovementMode, trackingQuality: Float) {
+    fun DirectionBadge(isMoving: Boolean, trackingQuality: Float) {
         val lowQuality = trackingQuality < 0.3f && trackingQuality > 0f
-        val (text, color, icon) = if (lowQuality) Triple("LOW QUALITY", LuxuryRed, Icons.Default.Place)
-        else when (direction) {
-            OpticalFlowProcessor.MovementDirection.FORWARD -> Triple("קדימה", LuxuryGreen, Icons.Default.KeyboardArrowUp)
-            OpticalFlowProcessor.MovementDirection.BACKWARD -> Triple("אחורה", LuxuryRed, Icons.Default.KeyboardArrowDown)
-            OpticalFlowProcessor.MovementDirection.LEFT -> Triple("שמאלה", LuxuryCyan, Icons.Default.ArrowBack)
-            OpticalFlowProcessor.MovementDirection.RIGHT -> Triple("ימינה", LuxuryCyan, Icons.Default.ArrowForward)
-            OpticalFlowProcessor.MovementDirection.STOPPED -> Triple("עומד", LuxuryYellow, Icons.Default.Place)
+        val (text, color, icon) = when {
+            lowQuality -> Triple("LOW QUALITY", LuxuryRed, Icons.Default.Place)
+            isMoving -> Triple("בתנועה", LuxuryGreen, Icons.Default.KeyboardArrowUp)
+            else -> Triple("עומד", LuxuryYellow, Icons.Default.Place)
         }
         Surface(color = Color.Black.copy(0.8f), shape = RoundedCornerShape(12.dp), border = BorderStroke(1.dp, color)) {
             Row(modifier = Modifier.padding(horizontal = 12.dp, vertical = 8.dp), verticalAlignment = Alignment.CenterVertically) {
-                Text(if (mode == OpticalFlowProcessor.MovementMode.WALKING) "🚶" else "🚗", fontSize = 16.sp)
-                Spacer(Modifier.width(6.dp))
                 Icon(icon, null, tint = color, modifier = Modifier.size(20.dp))
                 Spacer(Modifier.width(6.dp))
                 Text(text, color = color, fontWeight = FontWeight.Bold, fontSize = 14.sp)

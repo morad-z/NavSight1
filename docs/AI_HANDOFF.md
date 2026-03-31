@@ -15,7 +15,7 @@ last_agent: "Claude-Opus-4-6"
 last_developer: "morad"
 branch: "morad"
 base_branch: "master"
-head_commit: "6d3c596"
+head_commit: "5759378"
 pr_merged: "#9 (morad → master, 2026-03-30)"
 ```
 
@@ -359,6 +359,27 @@ feature/ui-redesign: "merged via PR #7"
     VIO-ready check (pitch -75° to -30°, camera forward at scene). UI warning
     text changed to Hebrew "הטה את הטלפון קדימה — מצלמה לסצנה".
     Camera pointed forward gives better optical flow → more reliable scale estimation.
+
+- id: "TASK-017"
+  title: "Remove Kotlin OpticalFlowProcessor to boost camera FPS"
+  status: "DONE"
+  owner: "morad"
+  priority: "P0"
+  completed: "2026-03-31"
+  files:
+    - "app/src/main/java/.../OpticalFlowProcessor.kt (DELETED)"
+    - "app/src/main/java/.../SensorRepository.kt (removed flow processing)"
+    - "app/src/main/java/.../NavSightViewModel.kt (removed flowResultState)"
+    - "app/src/main/java/.../MainActivity.kt (replaced flow-based UI with VIO-derived)"
+    - "app/src/main/java/.../AROverlayRenderer.kt (removed FlowResult dependency)"
+  notes: >
+    Camera was running at ~2-3fps because every frame went through BOTH C++ VIO
+    (~200-400ms) AND Kotlin OpticalFlowProcessor (~150ms). The Kotlin processor was
+    purely cosmetic (AR overlay direction arrows, floor grid, movement badge).
+    Removed entirely: deleted OpticalFlowProcessor.kt, stripped all references from
+    SensorRepository, ViewModel, MainActivity, AROverlayRenderer. AR overlay now uses
+    VIO-derived data: isMoving from vio.meanFlow > 1.0, confidence from vio.trackingQuality.
+    DirectionBadge simplified to "בתנועה"/"עומד" (moving/stopped). Expected ~2x FPS boost.
 ```
 
 ---
@@ -366,6 +387,27 @@ feature/ui-redesign: "merged via PR #7"
 ## RECENT CHANGES (last 5 sessions)
 
 ```yaml
+- session: 0d
+  date: "2026-03-31"
+  developer: "morad"
+  agent: "Claude-Opus-4-6"
+  branch: "morad"
+  summary: >
+    Removed Kotlin OpticalFlowProcessor entirely to boost camera FPS (TASK-017).
+    Camera was at ~2-3fps due to dual image processing: C++ VIO + Kotlin OpticalFlowProcessor
+    both ran on every frame. The Kotlin processor was purely cosmetic (AR direction arrows,
+    floor grid, movement badge). Deleted OpticalFlowProcessor.kt, stripped all references
+    from SensorRepository, ViewModel, MainActivity, AROverlayRenderer. AR overlay now uses
+    VIO-derived data (meanFlow, trackingQuality). Motion blur fix: MAX_FLOW_PX=50 rejection
+    and heading freeze on bad frames already in C++. Expected ~2x FPS improvement.
+  files_changed:
+    - "app/src/main/java/.../OpticalFlowProcessor.kt (DELETED)"
+    - "app/src/main/java/.../SensorRepository.kt (removed flow processing, frameCounter)"
+    - "app/src/main/java/.../NavSightViewModel.kt (removed flowResultState, added isMoving/isDriving)"
+    - "app/src/main/java/.../MainActivity.kt (VIO-derived AR overlay, simplified DirectionBadge)"
+    - "app/src/main/java/.../AROverlayRenderer.kt (removed FlowResult/MovementDirection deps)"
+  impact: "Camera FPS should roughly double. AR overlay simplified but functional."
+
 - session: 0c
   date: "2026-03-31"
   developer: "morad"
@@ -482,30 +524,32 @@ feature/ui-redesign: "merged via PR #7"
 <!-- When an AI stops mid-task, describe exactly where it left off so the next AI can resume. -->
 
 ```yaml
-current_task: "NONE - session completed, pending commit"
-stopped_at: "Heading alignment + phone orientation fixes applied, build passes"
+current_task: "NONE - session completed, committed and pushed"
+stopped_at: "OpticalFlowProcessor removed, heading fix + motion blur fix applied, build passes"
 next_action: >
   Priority order:
-  1. Commit and push heading/orientation fixes, merge to master
-  2. Re-record simulation data with current code (phone tilted forward, camera at scene)
-  3. On-device verification: walking test — VIO trajectory should align to GPS direction
+  1. Re-record simulation data with current code (phone tilted forward, camera at scene)
+  2. On-device verification: walking test — check FPS improvement (~2x expected)
+  3. On-device verification: VIO trajectory should align to GPS direction (BUG-006)
   4. On-device verification: turnaround test (BUG-004 device test)
   5. On-device verification: driving test (car vibration rejection)
 resume_context: >
-  Session 0c (2026-03-31): Fixed BUG-006 (trajectory direction + scale mismatch).
-  Direction: setInitialHeading(Rz) aligns VIO heading to compass north at init.
-  Scale: UI now requires phone at pitch -75° to -30° (camera forward, not floor).
-  QA review caught Ry→Rz bug in setInitialHeading (row 1 of Ry is invariant).
-  Simulation analysis notebook at docs/NavSight_Simulation_Analysis.ipynb.
+  Session 0d (2026-03-31): Removed Kotlin OpticalFlowProcessor (TASK-017).
+  Camera was at ~2-3fps due to dual processing (C++ VIO + Kotlin flow). Kotlin processor
+  was purely cosmetic. Deleted file, stripped all references. AR overlay now uses VIO data.
+  Motion blur: MAX_FLOW_PX=50 rejection + heading freeze already in C++ (session 0c).
+  Session 0c: setInitialHeading(Rz) aligns VIO heading to compass north at init.
+  UI: phone pitch -75° to -30° (camera forward, not floor).
   Key: magnetometer + GPS used ONCE at startup only. Never during tracking.
   RULE: No magnetometer during VIO tracking — only at startup for initial heading.
-partial_state: "NONE — all code changes done, build passes, needs commit"
+partial_state: "NONE — all code changes done, build passes, committed"
 warnings:
-  - "MainActivity.kt is 805+ lines — consider splitting"
+  - "MainActivity.kt is ~800 lines — consider splitting"
   - "Simulation recordings are from BEFORE heading fix — must re-record"
   - "BUG-004 fix is UNTESTED on device — need walking test with turnaround"
   - "BUG-006 fix is UNTESTED on device — need walking test to verify direction alignment"
-  - "Phone orientation UI changed — users now guided to tilt forward, not hold horizontal"
+  - "FPS improvement from OpticalFlowProcessor removal is UNTESTED on device"
+  - "isMoving/isDriving fields in ViewModel are not yet populated from VIO poseFlags"
 ```
 
 ---
@@ -526,7 +570,7 @@ warnings:
 "app/src/main/java/.../SensorRepository.kt":     "Sensor registration, camera dispatch, VIO init (274 lines)"
 "app/src/main/java/.../NativeBridge.kt":          "JNI declarations incl setInitialHeading (21 lines)"
 "app/src/main/java/.../VioData.kt":               "VIO data class: 29 fields + JNI sig (~105 lines)"
-"app/src/main/java/.../OpticalFlowProcessor.kt":  "Kotlin-side optical flow (439 lines)"
+"app/src/main/java/.../AROverlayRenderer.kt":      "AR overlay: direction arrow, tilt warning, speed/confidence indicators (167 lines)"
 "app/src/main/java/.../NavigationManager.kt":     "Turn-by-turn nav (495 lines, out-of-scope extension)"
 "app/src/main/java/.../DeviceOrientationTracker.kt": "VIO-ready pitch check (-75° to -30°), accel+mag orientation (223 lines)"
 
