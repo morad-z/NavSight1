@@ -116,13 +116,19 @@ double VisionModule::estimateScaleFromSteps(double vision_disp, int64_t dt_ns) {
     if (vision_disp < 1e-5) return -1.0;
 
     double dt = dt_ns * 1e-9;
-    if (dt <= 0.0 || dt > 0.2) return -1.0;
+    if (dt <= 0.0 || dt > 1.5) return -1.0;
 
     auto step_info = imu_.getStepInfo();
-    if (step_info.speed_mps < 0.2) return -1.0; // Not walking (< 0.2 m/s)
+    double speed = step_info.speed_mps;
+
+    // If step detector says not walking, try vehicle speed
+    if (speed < 0.2) {
+        speed = imu_.getVehicleSpeedEstimate();
+        if (speed < 1.0) return -1.0; // Neither walking nor driving
+    }
 
     // Expected real-world displacement this frame = speed * dt
-    double real_disp = step_info.speed_mps * dt;
+    double real_disp = speed * dt;
     if (real_disp < 1e-4) return -1.0;
 
     double obs_scale = real_disp / vision_disp;
@@ -242,14 +248,14 @@ VisionOutput VisionModule::processFrame(const uint8_t* yuv_data,
 
     cv::TermCriteria criteria(cv::TermCriteria::COUNT + cv::TermCriteria::EPS, 30, 0.01);
     cv::calcOpticalFlowPyrLK(current_prev_gray, gray_buf_, current_prev_pts_buf_, next_pts_buf_, status_buf_, err_buf_,
-                             cv::Size(21, 21), 3, criteria);
+                             cv::Size(31, 31), 4, criteria);
 
     // Forward-backward consistency: track back from next to prev
     back_pts_buf_.clear();
     back_status_buf_.clear();
     back_err_buf_.clear();
     cv::calcOpticalFlowPyrLK(gray_buf_, current_prev_gray, next_pts_buf_, back_pts_buf_, back_status_buf_, back_err_buf_,
-                             cv::Size(21, 21), 3, criteria);
+                             cv::Size(31, 31), 4, criteria);
 
     // ── 7. Filter valid points with FB check ────────────────────────────────
     prev_good_buf_.clear();
@@ -370,7 +376,7 @@ VisionOutput VisionModule::processFrame(const uint8_t* yuv_data,
 
                 // Relaxed quality gate (0.35) and dt (up to 250ms)
                 bool scale_ok = (quality > 0.15) && (!is_pure_rotation) && (!is_static)
-                             && (dt_ns_frame > 0) && (dt_ns_frame < 500'000'000LL);
+                             && (dt_ns_frame > 0) && (dt_ns_frame < 2'000'000'000LL);
 
                 if (scale_ok) {
                     double candidate = estimateScaleFromSteps(vo_dist, dt_ns_frame);
@@ -448,13 +454,22 @@ VisionOutput VisionModule::processFrame(const uint8_t* yuv_data,
                 global_t_.at<double>(1) += estimatedScale * t_vo.at<double>(1);
             }
         } else if (!is_static) {
-            // Fallback: step-based translation using heading
+            // Fallback: step-based or vehicle-based translation using heading
             used_fallback = true;
             auto step_info = imu_.getStepInfo();
-            if (step_info.speed_mps > 0.1) {
+            double fallback_speed = step_info.speed_mps;
+            double max_speed = 2.0; // walking cap
+
+            // If not walking, try vehicle mode
+            if (fallback_speed < 0.1) {
+                fallback_speed = imu_.getVehicleSpeedEstimate();
+                max_speed = 30.0; // vehicle cap (~108 km/h)
+            }
+
+            if (fallback_speed > 0.1) {
                 double dt_s = (timestamp_ns - current_prev_ts) * 1e-9;
-                double displacement = step_info.speed_mps * dt_s;
-                displacement = std::min(displacement, 0.5); // cap at 0.5m per frame
+                double displacement = fallback_speed * dt_s;
+                displacement = std::min(displacement, max_speed * dt_s);
                 double dx =  displacement * std::sin(heading);
                 double dz = -displacement * std::cos(heading);
 

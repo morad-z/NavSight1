@@ -82,6 +82,13 @@ public:
 
     StepInfo getStepInfo() const;
 
+    // Motion mode detection: walking vs driving vs stationary
+    enum class MotionMode { STATIONARY, WALKING, DRIVING };
+    MotionMode getMotionMode() const;
+
+    // Vehicle speed estimate from integrated acceleration (reset at ZUPT)
+    double getVehicleSpeedEstimate() const;
+
 private:
     // Step detector state
     int step_count_{0};
@@ -90,11 +97,25 @@ private:
     float accel_mag_filtered_{9.81f}; // Low-pass filtered accel magnitude
     float accel_mag_prev_{9.81f};     // Previous filtered value for peak detection
     bool was_above_thresh_{false};    // For peak detection hysteresis
-    static constexpr float STEP_ACCEL_THRESH_HIGH = 10.1f; // m/s² peak threshold (lowered for sensitivity)
-    static constexpr float STEP_ACCEL_THRESH_LOW  = 9.3f;  // m/s² valley threshold (tightened hysteresis)
+    static constexpr float STEP_ACCEL_THRESH_HIGH = 10.1f; // m/s² peak threshold
+    static constexpr float STEP_ACCEL_THRESH_LOW  = 9.3f;  // m/s² valley threshold
     static constexpr double MIN_STEP_PERIOD_S = 0.25;      // Max 4 steps/s (running)
     static constexpr double MAX_STEP_PERIOD_S = 1.5;       // Min ~0.67 steps/s (slow walk)
     static constexpr double DEFAULT_STRIDE_M  = 0.65;      // Average human stride
 
+    // Walking validation: reject car vibrations masquerading as steps
+    // Real walking has accel magnitude variance > 0.3 m/s² over ~1 second
+    // Car vibrations have smaller, higher-frequency oscillations
+    float accel_mag_slow_{9.81f};     // Very slow LP for walking detection (alpha ~0.02)
+    float accel_variance_est_{0.0f};  // Running variance of accel magnitude
+    bool is_walking_pattern_{false};  // True if recent accel matches walking, not vibration
+
+    // Vehicle motion detection
+    double vehicle_speed_mps_{0.0};   // Integrated forward acceleration
+    int64_t last_accel_ts_ns_{0};     // For dt computation
+    double sustained_accel_s_{0.0};   // How long accel has been above threshold
+    bool in_vehicle_mode_{false};     // True if we think we're in a vehicle
+
     void detectStep(int64_t timestamp_ns, float ax, float ay, float az);
+    void updateMotionMode(int64_t timestamp_ns, float ax, float ay, float az);
 };
