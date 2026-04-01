@@ -272,16 +272,19 @@ class NavSightViewModel(application: Application) : AndroidViewModel(application
     private fun saveSimulationData(getExternalFilesDir: (String?) -> java.io.File?, filesDir: java.io.File) {
         if (simulationDataPoints.isEmpty()) return
         
+        // Take a snapshot of the data immediately on the current thread (likely Main)
+        // to avoid ConcurrentModificationException while the camera thread is still active.
+        val snapshot = synchronized(simulationDataPoints) {
+            simulationDataPoints.toList()
+        }
+        
         viewModelScope.launch(Dispatchers.IO) {
-            val data = SimulationData(
-                startTime = simulationDataPoints.first().timestamp,
-                points = simulationDataPoints.toList()
-            )
+            val startTime = snapshot.firstOrNull()?.timestamp ?: System.currentTimeMillis()
             
             // Simple manual JSON conversion to avoid adding heavy libraries
             val sb = StringBuilder()
-            sb.append("{\"startTime\":${data.startTime},\"points\":[")
-            data.points.forEachIndexed { index, p ->
+            sb.append("{\"startTime\":$startTime,\"points\":[")
+            snapshot.forEachIndexed { index, p ->
                 if (index > 0) sb.append(",")
                 sb.append("{")
                 sb.append("\"ts\":${p.timestamp},")
@@ -363,10 +366,8 @@ class NavSightViewModel(application: Application) : AndroidViewModel(application
         path.forEachIndexed { idx, (x, z) ->
             if (idx > 0) sb.append(",")
             if (start != null) {
-                val lat = start.latitude + z / 111111.0
-                val cosLat = cos(Math.toRadians(start.latitude))
-                val lng = start.longitude + if (cosLat > 1e-10) x / (111111.0 * cosLat) else 0.0
-                sb.append("{\"lat\":$lat,\"lng\":$lng,\"x\":$x,\"z\":$z}")
+                val latLng = NavSightUtils.metersToLatLng(start, x.toDouble(), z.toDouble())
+                sb.append("{\"lat\":${latLng.latitude},\"lng\":${latLng.longitude},\"x\":$x,\"z\":$z}")
             } else {
                 sb.append("{\"x\":$x,\"z\":$z}")
             }

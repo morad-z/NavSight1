@@ -410,8 +410,15 @@ IMUPreintegrator::StepInfo IMUPreintegrator::getStepInfo() const {
     info.stride_length_m = DEFAULT_STRIDE_M;
     info.last_step_ns = last_step_ns_;
 
+    // ── STALE STEP CHECK (Fix for 'Ghost Walking') ──────────────────────────
+    // If it's been more than 2 seconds since the last step, assume we stopped.
+    // We use the last known accel timestamp to determine current 'VIO time'.
+    int64_t current_time_ns = last_accel_ts_ns_;
+    double ns_since_last = static_cast<double>(current_time_ns - last_step_ns_);
+    bool is_stale = (last_step_ns_ > 0 && ns_since_last > 2'000'000'000.0);
+
     // Estimate speed from step frequency
-    if (step_period_s_ > 0.0) {
+    if (step_period_s_ > 0.0 && !is_stale) {
         // Stride length scales with step frequency: faster steps = longer strides
         // Refined model: 0.4m base + 0.3 * freq to avoid underestimating slow walkers
         double freq = 1.0 / step_period_s_;
