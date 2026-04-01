@@ -380,6 +380,19 @@ feature/ui-redesign: "merged via PR #7"
     SensorRepository, ViewModel, MainActivity, AROverlayRenderer. AR overlay now uses
     VIO-derived data: isMoving from vio.meanFlow > 1.0, confidence from vio.trackingQuality.
     DirectionBadge simplified to "בתנועה"/"עומד" (moving/stopped). Expected ~2x FPS boost.
+
+- id: "TASK-018"
+  title: "Parallel VIO refactor (3-thread split + drift reduction)"
+  status: "TODO"
+  owner: "morad"
+  priority: "P1"
+  plan_ref: "docs/parallel_vio_refactor_plan.md"
+  notes: >
+    Phase 2: Tracker/Mapper thread split (target 40-60fps).
+    Phase 3: WorldState 200Hz IMU dead reckoning (smooth UI pose).
+    Phase 4: Keyframe tracking, local bundle adjustment, loop closure (drift reduction).
+    Old plan docs/gemini_plan3.md renamed to parallel_vio_refactor_plan.md.
+    Prerequisites: on-device verification of BUG-004, BUG-006, FPS improvement first.
 ```
 
 ---
@@ -533,6 +546,7 @@ next_action: >
   3. On-device verification: VIO trajectory should align to GPS direction (BUG-006)
   4. On-device verification: turnaround test (BUG-004 device test)
   5. On-device verification: driving test (car vibration rejection)
+  6. Begin parallel VIO refactor (TASK-018) — see docs/parallel_vio_refactor_plan.md
 resume_context: >
   Session 0d (2026-03-31): Removed Kotlin OpticalFlowProcessor (TASK-017).
   Camera was at ~2-3fps due to dual processing (C++ VIO + Kotlin flow). Kotlin processor
@@ -587,6 +601,7 @@ warnings:
 "docs/gemini_plan.md":     "P0/P1 rotation fix plan (APPLIED, untested)"
 "docs/gemini_plan2.md":    "Drift reduction + UI plan (NOT YET IMPLEMENTED)"
 "docs/simulation_plan.md": "Sim engine for AI tuning (NOT YET IMPLEMENTED)"
+"docs/parallel_vio_refactor_plan.md": "3-thread parallel VIO + drift reduction (Phase 2-4)"
 ```
 
 ---
