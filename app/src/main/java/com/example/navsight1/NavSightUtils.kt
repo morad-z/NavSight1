@@ -11,11 +11,27 @@ import kotlin.math.*
 
 object NavSightUtils {
     fun metersToLatLng(start: LatLng, dx: Double, dz: Double): LatLng {
-        val metersPerDegree = 111111.0
-        val lat = start.latitude + (dz / metersPerDegree)
-        val cosLat = cos(Math.toRadians(start.latitude))
-        val lngOffset = if (cosLat > 1e-10) dx / (metersPerDegree * cosLat) else 0.0
-        return LatLng(lat, start.longitude + lngOffset)
+        // Use a more accurate geodesic calculation (Destination point given distance and bearing)
+        // Earth's radius in meters
+        val R = 6378137.0
+        
+        // Bearing in radians (atan2(dx, dz) where z is north, x is east)
+        // In our coordinate system: z is north (forward), x is east (right)
+        val bearing = atan2(dx, dz)
+        val distance = sqrt(dx * dx + dz * dz)
+        
+        if (distance < 0.001) return start
+
+        val lat1 = Math.toRadians(start.latitude)
+        val lon1 = Math.toRadians(start.longitude)
+
+        val lat2 = asin(sin(lat1) * cos(distance / R) +
+                cos(lat1) * sin(distance / R) * cos(bearing))
+        
+        val lon2 = lon1 + atan2(sin(bearing) * sin(distance / R) * cos(lat1),
+                cos(distance / R) - sin(lat1) * sin(lat2))
+
+        return LatLng(Math.toDegrees(lat2), Math.toDegrees(lon2))
     }
 
     fun formatDistance(meters: Int): String {

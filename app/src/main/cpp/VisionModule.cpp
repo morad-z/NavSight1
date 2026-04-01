@@ -452,8 +452,10 @@ VisionOutput VisionModule::processFrame(const uint8_t* yuv_data,
         // during motion blur or feature loss.
         if (pose_valid) {
             global_R_ = global_R_ * R_fused;
-        } else if (!is_static && quality >= 0.10 && !motion_blur) {
-            // Only trust gyro-only rotation when tracking is marginally OK
+        } else if (!is_static) {
+            // Fallback to gyro-only rotation whenever we are moving.
+            // We removed the 'quality' and 'motion_blur' gates because missing a turn 
+            // is worse than potential gyro drift. The gyro is reliable for short turns.
             global_R_ = global_R_ * imu_delta.deltaR;
         }
         // else: freeze heading — bad quality or motion blur, gyro would just drift
