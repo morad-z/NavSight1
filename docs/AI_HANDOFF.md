@@ -118,10 +118,11 @@ feature/ui-redesign: "merged via PR #7"
   owner: "morad"
   file: "app/src/main/cpp/VisionModule.cpp"
   description: >
-    FIXED (2026-04-01): Relaxed motion_blur and quality gates for rotation.
-    Gyroscope now always updates global_R_ when moving, even if camera is blurry.
-    Turnaround verified in simulations 1775049041779 and 1775049111291.
-  test: "Verified via simulation analysis; needs on-device test"
+    FIXED (2026-04-01): Identified "Frozen Heading" bug during stationary turns
+    and high-speed driving. Gyroscope now ALWAYS updates global_R_ matrix
+    regardless of motion blur, tracking quality, or ZUPT state.
+    Verified failure in Driving Sim 1775054436054 (high-confidence GPS).
+  test: "Verify VIO pointer turns even when standing still in next run"
 
 - id: "BUG-006"
   title: "VIO trajectory direction and scale mismatch vs GPS"
@@ -142,9 +143,11 @@ feature/ui-redesign: "merged via PR #7"
   owner: "morad"
   file: "app/src/main/cpp/IMUPreintegrator.cpp"
   description: >
-    FIXED (2026-04-01): Speed was calculated from the last step period even after stopping.
-    Added a 2-second timeout: if no step is detected for 2s, speed is forced to zero.
-  test: "Verified by user observation; needs new simulation recording"
+    FIXED (2026-04-01): Implemented smarter motion classifier. Used variance
+    hysteresis (Schmidt trigger) to detect stops instantly (~200ms).
+    Added Camera Veto: optical flow > 1.0px overrides IMU stationary detection.
+    Verified overshoot in Walking Sim 1775054352848.
+  test: "Verify VIO pointer stops instantly when user stops"
 
 - id: "BUG-008"
   title: "App crash when stopping simulation recording"

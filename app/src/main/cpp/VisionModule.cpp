@@ -318,16 +318,19 @@ VisionOutput VisionModule::processFrame(const uint8_t* yuv_data,
 
     // ZUPT requires BOTH low gyro AND low visual motion
     // Walking forward with zero rotation has low gyro but high flow — NOT static
-    // Use 0.5px threshold to avoid dead zone between 0.5 and MIN_FLOW_PX
     if (mean_flow >= 0.5) is_static = false;  // any visible flow = not static
-    if (mean_flow < 0.5 && gyro_norm < ZUPT_GYRO_THRESH) is_static = true; // sub-pixel flow + low gyro = static
+    if (mean_flow < 0.5 && gyro_norm < ZUPT_GYRO_THRESH) is_static = true;
 
-    // Cross-check: step detector override to prevent false ZUPT while walking
+    // ── SMART VETO ──────────────────────────────────────────────────────────
+    // If the camera sees clear motion (flow > 1.0px), VETO the static detection.
+    // This handles smooth car rides or slow walking that might have low IMU variance.
+    if (mean_flow > 1.0) is_static = false;
+
+    // Cross-check: step detector override
     if (is_static) {
         auto zupt_step_info = imu_.getStepInfo();
-        int64_t ns_since_step = timestamp_ns - zupt_step_info.last_step_ns;
-        if (ns_since_step < 2'000'000'000LL && zupt_step_info.speed_mps > 0.2) {
-            is_static = false; // Step detector says we're walking, override visual ZUPT
+        if (zupt_step_info.speed_mps > 0.1) {
+            is_static = false; // Step detector says we're moving
         }
     }
 
@@ -447,26 +450,23 @@ VisionOutput VisionModule::processFrame(const uint8_t* yuv_data,
         std::lock_guard<std::mutex> lock(pose_mutex_);
 
         // Update rotation: use fused (camera+gyro) when pose is valid,
-        // gyro-only when walking with decent quality, freeze when quality is bad.
-        // Freezing heading on bad frames prevents gyro drift from accumulating
-        // during motion blur or feature loss.
+        // gyro-only fallback whenever we are NOT static or when quality is low.
+        // KEY FIX: Never freeze rotation updates. If we are physically turning while
+        // standing still, the gyro should still update the heading.
         if (pose_valid) {
             global_R_ = global_R_ * R_fused;
-        } else if (!is_static) {
-            // Fallback to gyro-only rotation whenever we are moving.
-            // We removed the 'quality' and 'motion_blur' gates because missing a turn 
-            // is worse than potential gyro drift. The gyro is reliable for short turns.
+        } else {
+            // Always allow gyro to update heading, even if camera is blurry or we are static.
+            // This prevents the 'frozen heading' bug during turns.
             global_R_ = global_R_ * imu_delta.deltaR;
         }
-        // else: freeze heading — bad quality or motion blur, gyro would just drift
 
         // Extract heading from rotation matrix (ZYX Euler convention)
-        // This gives the physical heading direction in the world frame
         double heading = std::atan2(global_R_.at<double>(1, 0),
                                      global_R_.at<double>(1, 1));
 
         if (is_static) {
-            // ZUPT: freeze pose completely — no drift
+            // ZUPT: physically stationary. Pose translation is frozen, but rotation remains live.
         } else if (pose_valid && !is_pure_rotation && quality >= 0.15) {
             // Full VIO: use VO displacement magnitude + heading for direction
             double displacement = estimatedScale * cv::norm(t_vo);
