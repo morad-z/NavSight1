@@ -305,46 +305,46 @@ bool IMUPreintegrator::isInitialized() const {
 // ── Motion mode detection ─────────────────────────────────────────────────────
 
 void IMUPreintegrator::updateMotionMode(int64_t timestamp_ns, float ax, float ay, float az) {
-    // Must be called under mutex_ lock
     float mag = std::sqrt(ax * ax + ay * ay + az * az);
 
-    // Very slow LP filter to get baseline accel magnitude
+    // Filter baseline gravity
     constexpr float SLOW_ALPHA = 0.02f;
     accel_mag_slow_ = (1.0f - SLOW_ALPHA) * accel_mag_slow_ + SLOW_ALPHA * mag;
 
-    // Running variance estimate (exponential moving variance)
+    // Running variance (energy)
     float diff = mag - accel_mag_slow_;
     accel_variance_est_ = (1.0f - SLOW_ALPHA) * accel_variance_est_ + SLOW_ALPHA * (diff * diff);
 
-    // Walking has large periodic variance (>0.15), car vibrations are smaller (<0.10)
-    is_walking_pattern_ = (accel_variance_est_ > 0.15f);
+    // ── SMARTER CLASSIFICATION ──────────────────────────────────────────────
+    // Use Hysteresis: harder to start walking than to keep walking.
+    if (!is_walking_pattern_ && accel_variance_est_ > 0.20f) {
+        is_walking_pattern_ = true;
+    } else if (is_walking_pattern_ && accel_variance_est_ < 0.05f) {
+        is_walking_pattern_ = false;
+    }
 
-    // Vehicle speed estimation via forward accel integration
+    // Vehicle speed integration
     if (last_accel_ts_ns_ > 0) {
         double dt = (timestamp_ns - last_accel_ts_ns_) * 1e-9;
         if (dt > 0.0 && dt < 0.1) {
-            // Remove gravity component (approximate: subtract magnitude baseline)
             float forward_accel = mag - accel_mag_slow_;
 
-            // Only integrate significant acceleration (> 0.3 m/s² after gravity removal)
-            if (std::abs(forward_accel) > 0.3f) {
+            if (std::abs(forward_accel) > 0.2f) {
                 vehicle_speed_mps_ += forward_accel * dt;
-                sustained_accel_s_ += dt;
             } else {
-                // Decay speed when not accelerating (friction model)
-                vehicle_speed_mps_ *= 0.995;
-                sustained_accel_s_ = 0.0;
+                vehicle_speed_mps_ *= 0.997; // Slower decay for better continuity
             }
 
-            // Clamp to plausible range
             vehicle_speed_mps_ = std::max(0.0, std::min(50.0, vehicle_speed_mps_));
 
-            // Detect vehicle mode: sustained non-walking motion
-            if (!is_walking_pattern_ && vehicle_speed_mps_ > 1.0) {
+            // CRITICAL FIX: Only exit vehicle mode if we detect a SUSTAINED walking pattern.
+            // This prevents road bumps from accidentally zeroing out car speed.
+            if (accel_variance_est_ < 0.10f && vehicle_speed_mps_ > 0.5) {
                 in_vehicle_mode_ = true;
-            } else if (is_walking_pattern_) {
+            } else if (is_walking_pattern_ && accel_variance_est_ > 0.30f) {
+                // If it really looks like walking (high rhythmic energy), stop driving.
                 in_vehicle_mode_ = false;
-                vehicle_speed_mps_ = 0.0; // Reset when walking detected
+                vehicle_speed_mps_ = 0.0;
             }
         }
     }
@@ -410,17 +410,20 @@ IMUPreintegrator::StepInfo IMUPreintegrator::getStepInfo() const {
     info.stride_length_m = DEFAULT_STRIDE_M;
     info.last_step_ns = last_step_ns_;
 
-    // ── STALE STEP CHECK (Fix for 'Ghost Walking') ──────────────────────────
-    // If it's been more than 2 seconds since the last step, assume we stopped.
-    // We use the last known accel timestamp to determine current 'VIO time'.
+    // ── SMART STOP DETECTION ────────────────────────────────────────────────
+    // We detect a stop by checking if the recent acceleration variance is low.
+    // walking has variance > 0.15. If variance < 0.08, we are almost certainly
+    // stationary or moving very smoothly.
+    bool is_stationary = (accel_variance_est_ < 0.08f);
+
+    // Also keep a watchdog: if no step for 3 seconds, force stop (safety)
     int64_t current_time_ns = last_accel_ts_ns_;
     double ns_since_last = static_cast<double>(current_time_ns - last_step_ns_);
-    bool is_stale = (last_step_ns_ > 0 && ns_since_last > 2'000'000'000.0);
+    bool watchdog_stop = (last_step_ns_ > 0 && ns_since_last > 3'000'000'000.0);
 
     // Estimate speed from step frequency
-    if (step_period_s_ > 0.0 && !is_stale) {
+    if (step_period_s_ > 0.0 && !is_stationary && !watchdog_stop) {
         // Stride length scales with step frequency: faster steps = longer strides
-        // Refined model: 0.4m base + 0.3 * freq to avoid underestimating slow walkers
         double freq = 1.0 / step_period_s_;
         info.stride_length_m = std::max(0.4, std::min(1.2, 0.4 + 0.3 * freq));
         info.speed_mps = info.stride_length_m * freq;
