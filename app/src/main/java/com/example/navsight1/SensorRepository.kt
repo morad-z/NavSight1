@@ -68,40 +68,75 @@ class SensorRepository(private val context: Context) : SensorEventListener {
     private val repositoryScope = CoroutineScope(Dispatchers.Main + SupervisorJob())
 
     fun startSensors() {
-        accelerometer?.let {
-            sensorManager.registerListener(this, it, SensorManager.SENSOR_DELAY_GAME)
+        try {
+            accelerometer?.let {
+                sensorManager.registerListener(this, it, SensorManager.SENSOR_DELAY_GAME)
+                Log.d(TAG, "Accelerometer registered")
+            } ?: Log.w(TAG, "Accelerometer not available on this device")
+            
+            magnetometer?.let {
+                sensorManager.registerListener(this, it, SensorManager.SENSOR_DELAY_GAME)
+                Log.d(TAG, "Magnetometer registered")
+            } ?: Log.w(TAG, "Magnetometer not available on this device")
+            
+            gyroscope?.let {
+                sensorManager.registerListener(this, it, SensorManager.SENSOR_DELAY_GAME)
+                Log.d(TAG, "Gyroscope registered")
+            } ?: Log.w(TAG, "Gyroscope not available on this device")
+            
+            if (NativeBridge.isLoaded()) {
+                NativeBridge.startVIO()
+            } else {
+                Log.e(TAG, "Cannot start VIO: native library not loaded")
+            }
+        } catch (e: Exception) {
+            Log.e(TAG, "Error starting sensors: ${e.message}", e)
         }
-        magnetometer?.let {
-            sensorManager.registerListener(this, it, SensorManager.SENSOR_DELAY_GAME)
-        }
-        gyroscope?.let {
-            sensorManager.registerListener(this, it, SensorManager.SENSOR_DELAY_GAME)
-        }
-        NativeBridge.startVIO()
     }
 
     // ── FOR SIMULATION ────────────────────────────────────────────────────────
-    @SuppressLint("MissingPermission")
-    fun startGpsUpdates() {
-        val request = LocationRequest.Builder(Priority.PRIORITY_HIGH_ACCURACY, 1000L)
-            .setMinUpdateIntervalMillis(500L)
-            .build()
+    fun startGpsUpdates(granted: Boolean = false) {
+        if (!granted) {
+            Log.w(TAG, "Cannot start GPS updates: location permission not granted")
+            return
+        }
         
-        locationCallback = object : LocationCallback() {
-            override fun onLocationResult(result: LocationResult) {
-                result.lastLocation?.let {
-                    _currentLocation.value = it
-                    // Also update start location if not set
-                    if (_startLocation.value == null) {
-                        _startLocation.value = LatLng(it.latitude, it.longitude)
+        try {
+            val request = LocationRequest.Builder(Priority.PRIORITY_HIGH_ACCURACY, 1000L)
+                .setMinUpdateIntervalMillis(500L)
+                .build()
+            
+            locationCallback = object : LocationCallback() {
+                override fun onLocationResult(result: LocationResult) {
+                    result.lastLocation?.let {
+                        _currentLocation.value = it
+                        // Also update start location if not set
+                        if (_startLocation.value == null) {
+                            _startLocation.value = LatLng(it.latitude, it.longitude)
+                        }
                     }
                 }
             }
+            
+            locationCallback?.let {
+                // Use safe location request with proper permission checks
+                if (android.os.Build.VERSION.SDK_INT >= android.os.Build.VERSION_CODES.S) {
+                    fusedLocationClient.requestLocationUpdates(
+                        request, it, android.os.Looper.getMainLooper()
+                    )
+                } else {
+                    @Suppress("MissingPermission")
+                    fusedLocationClient.requestLocationUpdates(
+                        request, it, android.os.Looper.getMainLooper()
+                    )
+                }
+            }
+            Log.d(TAG, "GPS updates started for simulation")
+        } catch (e: SecurityException) {
+            Log.e(TAG, "SecurityException starting GPS updates: ${e.message}")
+        } catch (e: Exception) {
+            Log.e(TAG, "Error starting GPS updates: ${e.message}", e)
         }
-        locationCallback?.let {
-            fusedLocationClient.requestLocationUpdates(request, it, android.os.Looper.getMainLooper())
-        }
-        Log.d(TAG, "GPS updates started for simulation")
     }
 
     fun stopGpsUpdates() {
@@ -160,10 +195,26 @@ class SensorRepository(private val context: Context) : SensorEventListener {
     }
 
     fun stopSensors() {
-        sensorManager.unregisterListener(this)
-        NativeBridge.stopVIO()
+        try {
+            sensorManager.unregisterListener(this)
+            Log.d(TAG, "All sensors unregistered")
+        } catch (e: Exception) {
+            Log.e(TAG, "Error unregistering listeners: ${e.message}")
+        }
+        
+        try {
+            if (NativeBridge.isLoaded()) {
+                NativeBridge.stopVIO()
+            }
+        } catch (e: Exception) {
+            Log.e(TAG, "Error stopping VIO: ${e.message}")
+        }
+        
         locationTokenSource?.cancel()
+        stopGpsUpdates()
         intrinsicsInitialized = false
+        repositoryScope.cancel()
+        Log.d(TAG, "Repository cleaned up")
     }
 
     override fun onSensorChanged(event: SensorEvent) {
@@ -202,7 +253,8 @@ class SensorRepository(private val context: Context) : SensorEventListener {
 
         if (ts - lastOrientationUpdateNs >= 50_000_000L) {
             lastOrientationUpdateNs = ts
-            _orientationState.value = orientationTracker.getOrientation()
+            val orientation = orientationTracker.getOrientation()
+            _orientationState.value = orientation
         }
     }
 
@@ -262,27 +314,67 @@ class SensorRepository(private val context: Context) : SensorEventListener {
         }
     }
 
-    @SuppressLint("MissingPermission")
-    fun requestInitialLocation() {
-        fusedLocationClient.lastLocation.addOnSuccessListener { last ->
-            if (last != null && _startLocation.value == null) {
-                _startLocation.value = LatLng(last.latitude, last.longitude)
-            }
+    fun requestInitialLocation(granted: Boolean = false) {
+        if (!granted) {
+            Log.w(TAG, "Cannot request location: permission not granted")
+            return
         }
-
-        locationTokenSource?.cancel()
-        val tokenSource = CancellationTokenSource()
-        locationTokenSource = tokenSource
-        fusedLocationClient.getCurrentLocation(Priority.PRIORITY_HIGH_ACCURACY, tokenSource.token)
-            .addOnSuccessListener { location ->
-                if (location != null) {
-                    _startLocation.value = LatLng(location.latitude, location.longitude)
+        
+        try {
+            if (android.os.Build.VERSION.SDK_INT >= android.os.Build.VERSION_CODES.S) {
+                fusedLocationClient.lastLocation.addOnSuccessListener { last ->
+                    if (last != null && _startLocation.value == null) {
+                        _startLocation.value = LatLng(last.latitude, last.longitude)
+                    }
                 }
-                locationTokenSource = null
+            } else {
+                @Suppress("MissingPermission")
+                fusedLocationClient.lastLocation.addOnSuccessListener { last ->
+                    if (last != null && _startLocation.value == null) {
+                        _startLocation.value = LatLng(last.latitude, last.longitude)
+                    }
+                }
             }
-            .addOnFailureListener {
-                locationTokenSource = null
+
+            locationTokenSource?.cancel()
+            val tokenSource = CancellationTokenSource()
+            locationTokenSource = tokenSource
+            
+            if (android.os.Build.VERSION.SDK_INT >= android.os.Build.VERSION_CODES.S) {
+                fusedLocationClient.getCurrentLocation(
+                    Priority.PRIORITY_HIGH_ACCURACY, tokenSource.token
+                )
+                    .addOnSuccessListener { location ->
+                        if (location != null) {
+                            _startLocation.value = LatLng(location.latitude, location.longitude)
+                        }
+                        locationTokenSource = null
+                    }
+                    .addOnFailureListener {
+                        Log.w(TAG, "Failed to get current location")
+                        locationTokenSource = null
+                    }
+            } else {
+                @Suppress("MissingPermission")
+                fusedLocationClient.getCurrentLocation(
+                    Priority.PRIORITY_HIGH_ACCURACY, tokenSource.token
+                )
+                    .addOnSuccessListener { location ->
+                        if (location != null) {
+                            _startLocation.value = LatLng(location.latitude, location.longitude)
+                        }
+                        locationTokenSource = null
+                    }
+                    .addOnFailureListener {
+                        Log.w(TAG, "Failed to get current location")
+                        locationTokenSource = null
+                    }
             }
+        } catch (e: SecurityException) {
+            Log.e(TAG, "SecurityException requesting location: ${e.message}")
+        } catch (e: Exception) {
+            Log.e(TAG, "Error requesting location: ${e.message}", e)
+        }
     }
 
     fun resetPath() {

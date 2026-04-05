@@ -106,7 +106,7 @@ class MainActivity : ComponentActivity() {
 
             LaunchedEffect(perms.allPermissionsGranted) {
                 if (perms.allPermissionsGranted) {
-                    viewModel.requestInitialLocation()
+                    viewModel.requestInitialLocation(true)
                 }
             }
 
@@ -151,13 +151,9 @@ class MainActivity : ComponentActivity() {
         val isMoving = vio.isInitialized && vio.meanFlow > 1.0
         val azimuth = orientation.azimuth
 
-        // Heading fusion
+        // Heading: vio.heading is absolute compass heading (initial azimuth baked into global_R_)
         val fusedHeading: Float = if (vio.isInitialized) {
-            // vioInitAzimuth is the magnetometer azimuth captured at VIO init time
-            // vio.yaw is the accumulated yaw from VIO (in radians)
-            // FR3: If rotation is inverted, we flip the sign here
-            val vioYawDeg = Math.toDegrees(vio.yaw).toFloat()
-            (viewModel.vioInitAzimuth - vioYawDeg + 360f) % 360f
+            ((Math.toDegrees(vio.heading).toFloat() % 360f) + 360f) % 360f
         } else {
             azimuth
         }
@@ -168,7 +164,7 @@ class MainActivity : ComponentActivity() {
             Column(Modifier.fillMaxSize()) {
                 Box(
                     modifier = Modifier
-                        .weight(0.55f)
+                        .weight(0.65f)
                         .fillMaxWidth()
                         .padding(12.dp)
                         .clip(RoundedCornerShape(20.dp))
@@ -261,9 +257,9 @@ class MainActivity : ComponentActivity() {
 
                 Box(
                     modifier = Modifier
-                        .weight(0.45f)
+                        .weight(0.35f)
                         .fillMaxWidth()
-                        .padding(start = 7.dp, end = 7.dp, top = 7.dp, bottom = 50.dp)
+                        .padding(start = 7.dp, end = 7.dp, top = 4.dp, bottom = 50.dp)
                         .clip(RoundedCornerShape(20.dp))
                         .background(LuxuryDarkGrey)
                 ) {
@@ -288,6 +284,7 @@ class MainActivity : ComponentActivity() {
 
                     val navState = viewModel.navigationState
                     val instruction = viewModel.currentInstruction
+                    val navigationStartMessage = viewModel.navigationStartMessage
                     if (navState is NavigationState.Active && instruction != null) {
                         Box(Modifier.align(Alignment.TopCenter).padding(16.dp).fillMaxWidth(0.95f)) {
                             NavigationInstructionBanner(
@@ -299,12 +296,28 @@ class MainActivity : ComponentActivity() {
                     }
 
                     if (navState is NavigationState.Idle) {
-                        Box(Modifier.align(Alignment.TopCenter).padding(16.dp).fillMaxWidth(0.95f)) {
-                            DestinationSearchBar(
-                                onDestinationSelected = { destination ->
-                                    viewModel.startNavigation(destination)
+                        Box(Modifier.align(Alignment.TopCenter).padding(horizontal = 12.dp, vertical = 8.dp).fillMaxWidth(0.95f)) {
+                            Column(verticalArrangement = Arrangement.spacedBy(6.dp)) {
+                                DestinationSearchBar(
+                                    onDestinationSelected = { destination ->
+                                        viewModel.startNavigation(destination)
+                                    }
+                                )
+                                if (navigationStartMessage != null) {
+                                    Surface(
+                                        onClick = { viewModel.clearNavigationStartMessage() },
+                                        color = LuxuryRed.copy(alpha = 0.92f),
+                                        shape = RoundedCornerShape(12.dp)
+                                    ) {
+                                        Text(
+                                            text = navigationStartMessage,
+                                            color = Color.White,
+                                            fontSize = 13.sp,
+                                            modifier = Modifier.padding(horizontal = 14.dp, vertical = 10.dp)
+                                        )
+                                    }
                                 }
-                            )
+                            }
                         }
                     }
 
@@ -644,11 +657,18 @@ class MainActivity : ComponentActivity() {
         headingDeg: Float
     ) {
         if (!isVisible) return
+
+        var calibrationExpanded by remember { mutableStateOf(false) }
+        val session = viewModel.scaleCalibrationSession
+        val calibMessage = viewModel.scaleCalibrationMessage
+        val calibFactor = viewModel.scaleCalibrationFactor
+        val currentVio = viewModel.vioState
+
         Surface(
-            color = Color.Black.copy(alpha = 0.82f),
+            color = Color.Black.copy(alpha = 0.85f),
             shape = RoundedCornerShape(10.dp),
             border = BorderStroke(1.dp, LuxuryCyan.copy(alpha = 0.35f)),
-            modifier = Modifier.width(165.dp)
+            modifier = Modifier.width(185.dp)
         ) {
             Column(
                 modifier = Modifier.padding(horizontal = 10.dp, vertical = 7.dp),
@@ -700,9 +720,149 @@ class MainActivity : ComponentActivity() {
                     })
                 DebugRow("Scale", "${"%.4f".format(scaleFactor)}", LuxuryCyan)
                 DebugRow("Heading", "${"%.1f".format(headingDeg)}\u00B0", LuxuryTextGrey)
+
+                // ── USER HEIGHT ───────────────────────────────────────────────────
+                Divider(color = LuxuryCyan.copy(0.2f), thickness = 0.5.dp)
+                Row(
+                    modifier = Modifier.fillMaxWidth(),
+                    horizontalArrangement = Arrangement.SpaceBetween,
+                    verticalAlignment = Alignment.CenterVertically
+                ) {
+                    Text("Height", color = LuxuryTextGrey, fontSize = 10.sp)
+                    Row(verticalAlignment = Alignment.CenterVertically) {
+                        SmallFloatingActionButton(
+                            onClick = { viewModel.updateUserHeight(viewModel.userHeight - 0.05f) },
+                            containerColor = LuxuryDarkGrey,
+                            modifier = Modifier.size(20.dp)
+                        ) { Text("-", color = Color.White, fontSize = 10.sp) }
+                        Text(
+                            "${"%.2f".format(viewModel.userHeight)}m",
+                            color = LuxuryGreen,
+                            fontSize = 10.sp,
+                            fontWeight = FontWeight.Bold,
+                            modifier = Modifier.padding(horizontal = 4.dp)
+                        )
+                        SmallFloatingActionButton(
+                            onClick = { viewModel.updateUserHeight(viewModel.userHeight + 0.05f) },
+                            containerColor = LuxuryDarkGrey,
+                            modifier = Modifier.size(20.dp)
+                        ) { Text("+", color = Color.White, fontSize = 10.sp) }
+                    }
+                }
+
+                // ── SCALE CALIBRATION ─────────────────────────────────────────────
+                Divider(color = LuxuryCyan.copy(0.2f), thickness = 0.5.dp)
+                Surface(
+                    onClick = { calibrationExpanded = !calibrationExpanded },
+                    color = Color.Transparent,
+                    modifier = Modifier.fillMaxWidth()
+                ) {
+                    Row(
+                        modifier = Modifier.fillMaxWidth().padding(vertical = 2.dp),
+                        horizontalArrangement = Arrangement.SpaceBetween,
+                        verticalAlignment = Alignment.CenterVertically
+                    ) {
+                        Text("Calibration", color = LuxuryCyan, fontSize = 10.sp, fontWeight = FontWeight.Bold)
+                        Row(verticalAlignment = Alignment.CenterVertically) {
+                            Text("${"%.2f".format(calibFactor)}x", color = LuxuryGreen, fontSize = 10.sp, fontWeight = FontWeight.Bold)
+                            Icon(
+                                if (calibrationExpanded) Icons.Default.KeyboardArrowUp else Icons.Default.KeyboardArrowDown,
+                                contentDescription = null,
+                                tint = LuxuryTextGrey,
+                                modifier = Modifier.size(14.dp)
+                            )
+                        }
+                    }
+                }
+
+                if (calibrationExpanded) {
+                    if (session != null && currentVio.isInitialized) {
+                        val closure = sqrt(
+                            (currentVio.x - session.startX).pow(2) +
+                                (currentVio.z - session.startZ).pow(2)
+                        )
+                        val avgQuality = session.sumQuality / max(1, session.sampleCount)
+                        Column(verticalArrangement = Arrangement.spacedBy(2.dp)) {
+                            DebugRow("Path", "${"%.1f".format(session.pathLengthMeters)} m", Color.White)
+                            DebugRow("Out", "${"%.1f".format(session.maxDistanceFromStartMeters)} m", LuxuryGreen)
+                            DebugRow("Back", "${"%.1f".format(closure)} m", LuxuryYellow)
+                            DebugRow("Avg Q", "${"%.2f".format(avgQuality)}", LuxuryTextGrey)
+                        }
+                    }
+
+                    if (session == null) {
+                        Text("Walk out & back to calibrate scale", color = LuxuryTextGrey, fontSize = 9.sp)
+                        Row(
+                            modifier = Modifier.fillMaxWidth(),
+                            horizontalArrangement = Arrangement.spacedBy(4.dp)
+                        ) {
+                            Button(
+                                onClick = { viewModel.startScaleCalibration(5.0) },
+                                modifier = Modifier.weight(1f).height(26.dp),
+                                contentPadding = PaddingValues(0.dp),
+                                colors = ButtonDefaults.buttonColors(containerColor = LuxuryGreen),
+                                shape = RoundedCornerShape(4.dp)
+                            ) {
+                                Text("5m", color = LuxuryBlack, fontSize = 9.sp, fontWeight = FontWeight.Bold)
+                            }
+                            Button(
+                                onClick = { viewModel.startScaleCalibration(10.0) },
+                                modifier = Modifier.weight(1f).height(26.dp),
+                                contentPadding = PaddingValues(0.dp),
+                                colors = ButtonDefaults.buttonColors(containerColor = LuxuryCyan),
+                                shape = RoundedCornerShape(4.dp)
+                            ) {
+                                Text("10m", color = LuxuryBlack, fontSize = 9.sp, fontWeight = FontWeight.Bold)
+                            }
+                            OutlinedButton(
+                                onClick = { viewModel.resetScaleCalibration() },
+                                modifier = Modifier.weight(1f).height(26.dp),
+                                contentPadding = PaddingValues(0.dp),
+                                border = BorderStroke(1.dp, LuxuryTextGrey),
+                                shape = RoundedCornerShape(4.dp)
+                            ) {
+                                Text("Reset", color = Color.White, fontSize = 9.sp)
+                            }
+                        }
+                    } else {
+                        Row(
+                            modifier = Modifier.fillMaxWidth(),
+                            horizontalArrangement = Arrangement.spacedBy(4.dp)
+                        ) {
+                            Button(
+                                onClick = { viewModel.finishScaleCalibration() },
+                                modifier = Modifier.weight(1f).height(26.dp),
+                                contentPadding = PaddingValues(0.dp),
+                                colors = ButtonDefaults.buttonColors(containerColor = LuxuryGreen),
+                                shape = RoundedCornerShape(4.dp)
+                            ) {
+                                Text("Finish", color = LuxuryBlack, fontSize = 9.sp, fontWeight = FontWeight.Bold)
+                            }
+                            OutlinedButton(
+                                onClick = { viewModel.cancelScaleCalibration() },
+                                modifier = Modifier.weight(1f).height(26.dp),
+                                contentPadding = PaddingValues(0.dp),
+                                border = BorderStroke(1.dp, LuxuryTextGrey),
+                                shape = RoundedCornerShape(4.dp)
+                            ) {
+                                Text("Cancel", color = Color.White, fontSize = 9.sp)
+                            }
+                        }
+                    }
+
+                    if (calibMessage != null) {
+                        Text(
+                            calibMessage,
+                            color = LuxuryYellow,
+                            fontSize = 9.sp,
+                            modifier = Modifier.padding(top = 2.dp)
+                        )
+                    }
+                }
             }
         }
     }
+
 
     @Composable
     fun NavigationMapWrapper(start: LatLng, azimuth: Float, history: List<Pair<Float, Float>>) {
@@ -711,7 +871,7 @@ class MainActivity : ComponentActivity() {
         val displayAzimuth by animateFloatAsState(targetValue = azimuth, animationSpec = spring(stiffness = Spring.StiffnessLow), label = "azimuth")
         val targetZoom = if (navState is NavigationState.Active) 19f else 18f
         val targetTilt = if (navState is NavigationState.Active) 60f else 30f
-        
+
         val cameraState = rememberCameraPositionState {
             position = CameraPosition.Builder().target(displayPosition).zoom(targetZoom).bearing(azimuth).tilt(targetTilt).build()
         }

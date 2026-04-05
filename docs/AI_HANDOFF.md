@@ -127,6 +127,53 @@ on_device_testing: "UNTESTED — latest changes from 2026-04-05 need on-device v
     for real motion — raised to 9.0 (3px). (2) CLAHE amplifies noise in darkness,
     noise tracks with ~0px flow → false 90% quality. Added: quality=0 when is_low_light.
   test: "Cover camera — quality should drop to 0%. Good light should show 50%+."
+
+- id: "BUG-012"
+  title: "Tracking quality drops to 0 when moving — falls back to IMU-only"
+  status: "OPEN"
+  severity: "P0"
+  owner: "morad"
+  file: "app/src/main/cpp/Tracker.cpp"
+  reported: "2026-04-05 (on-device test)"
+  description: >
+    When walking, tracking quality drops to 0 and system falls to IMU-only mode.
+    Likely causes: (1) Section 8 gate at line 297 requires !is_low_light — check
+    if brightness threshold 0.12 is too high for indoor lighting. (2) FB check
+    (FB_CHECK_THRESH=9.0) may still be too strict for large optical flow during
+    walking. (3) is_low_light clamp at line 253 forces quality=0 even if features
+    are tracked. (4) Possible: all features genuinely lost during motion (replenishment
+    not fast enough). Check GATES log line for diagnostics: flow, blur, motion,
+    parallax, static, rot, pts, gyro, lowlight values during walking.
+  fix_hints: >
+    - Log frame_brightness during walks to verify is_low_light isn't false-triggering.
+    - If brightness is fine, FB_CHECK_THRESH may need raising (try 16.0 = 4px).
+    - If tracked count is fine but quality=0, the is_low_light clamp is the culprit.
+    - Consider removing is_low_light from section 8 gate — let quality handle it.
+  test: "Walk in good light — quality should be >30%, pflags should have bit2 (pose_valid=4)."
+
+- id: "BUG-013"
+  title: "Heading rotates when standing still"
+  status: "OPEN"
+  severity: "P0"
+  owner: "morad"
+  file: "app/src/main/cpp/Tracker.cpp"
+  reported: "2026-04-05 (on-device test)"
+  description: >
+    When stationary, heading keeps drifting/rotating. Root cause: Section 9
+    (lines 428-439) applies rotation to global_R_ BEFORE the is_static check
+    at line 443. ZUPT only freezes translation, not rotation. So gyro noise
+    (even bias-corrected) accumulates in heading when standing still. Also:
+    if pose_valid=false (due to BUG-012), gyro fallback at line 432-439 applies
+    raw gyro rotation with imperfect bias correction, causing drift.
+  fix_hints: >
+    - When is_static is true, skip the rotation update entirely (both camera
+      and gyro paths). Heading should be frozen when standing still.
+    - Move the is_static check BEFORE the rotation update block.
+    - Alternative: apply a tiny rotation damping factor when is_static detected
+      (multiply rv by 0.0 or very small alpha).
+    - Also check if ZUPT_GYRO_THRESH (0.04 rad/s) is too low — phone table
+      vibrations can exceed this. Try 0.08.
+  test: "Place phone on table — heading should stay constant (±0.5° max over 30s)."
 ```
 
 ---
@@ -299,16 +346,15 @@ on_device_testing: "UNTESTED — latest changes from 2026-04-05 need on-device v
 ## CONVERSATION CONTEXT
 
 ```yaml
-current_task: "NONE — all code changes done, build passes, UNTESTED"
-stopped_at: "All fixes applied. User needs to rebuild APK and record new simulations."
+current_task: "Fix BUG-012 (quality=0 when moving) and BUG-013 (heading rotates when still)"
+stopped_at: "Bugs documented. On-device test confirms both issues. Code fixes needed."
 next_action: >
-  1. Install new APK on device and record simulations (straight line, circle, out-and-back).
-  2. Verify pflags shows pose_valid (bit2=4) for frames with good inliers.
-  3. Verify heading stability (straight walk should show constant heading).
-  4. Verify tracking quality: >50% in good light, 0% when camera covered.
-  5. Verify scale updates (vsc should change from 0.20 as steps are detected).
-  6. If scale/distance still off: consider MiDaS depth integration (TASK-028).
-  7. If heading still drifts: check gyro bias convergence in logs.
+  1. FIX BUG-012: Check if is_low_light false-triggers indoors. Remove is_low_light
+     from section 8 gate (line 297). Possibly raise FB_CHECK_THRESH. Log brightness.
+  2. FIX BUG-013: Move is_static check BEFORE rotation update in section 9.
+     When static, skip both camera and gyro rotation updates entirely.
+  3. Rebuild APK and re-test: walk (quality >30%, pose_valid), stand (heading frozen).
+  4. If scale/distance still off: consider MiDaS depth integration (TASK-028).
 resume_context: >
   Architecture: VisionModule replaced by Tracker+Mapper+VioEngine.
   VioEngine spawns background thread for Mapper in constructor.
@@ -319,7 +365,8 @@ resume_context: >
   Key fix: FB_CHECK_THRESH = 9.0 (was 2.0), low-light quality = 0.
 partial_state: "NONE — all code changes done, build passes"
 warnings:
-  - "ALL CHANGES FROM 2026-04-05 ARE UNTESTED ON DEVICE"
+  - "BUG-012 and BUG-013 confirmed on device — need code fixes"
+  - "ALL CHANGES FROM 2026-04-05 session 0f ARE UNTESTED ON DEVICE"
   - "C++ tests reference old VisionModule — need updating for Tracker/Mapper"
   - "Simulation recordings from 2026-04-05 were made with OLD code (pre-fixes)"
   - "MiDaS depth model suggested but not implemented (TASK-028)"

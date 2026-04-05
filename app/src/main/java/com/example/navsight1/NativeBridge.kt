@@ -1,11 +1,27 @@
 package com.example.navsight1
 
+import android.util.Log
 import com.example.navsight1.VioData
 
 object NativeBridge {
+    private const val TAG = "NativeBridge"
+    private var isLibraryLoaded = false
+
     init {
-        System.loadLibrary("navsight")
+        try {
+            System.loadLibrary("navsight")
+            isLibraryLoaded = true
+            Log.d(TAG, "Native library 'navsight' loaded successfully")
+        } catch (e: UnsatisfiedLinkError) {
+            Log.e(TAG, "Failed to load native library 'navsight': ${e.message}", e)
+            isLibraryLoaded = false
+        } catch (e: Exception) {
+            Log.e(TAG, "Unexpected error loading native library: ${e.message}", e)
+            isLibraryLoaded = false
+        }
     }
+
+    fun isLoaded(): Boolean = isLibraryLoaded
 
     external fun startVIO()
     external fun stopVIO()
@@ -18,4 +34,6 @@ object NativeBridge {
     external fun setScale(scale: Double)
     external fun setIntrinsics(fx: Double, fy: Double, cx: Double, cy: Double)
     external fun setInitialHeading(azimuthRad: Double)
+    external fun setUserHeight(heightM: Float)
+    external fun setMagnetometerHeading(yawRad: Float)
 }

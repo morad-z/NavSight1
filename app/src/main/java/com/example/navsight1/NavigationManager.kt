@@ -2,6 +2,8 @@ package com.example.navsight1
 
 import android.content.Context
 import android.util.Log
+import androidx.annotation.Nullable
+import androidx.annotation.NonNull
 import androidx.compose.material.icons.Icons
 import androidx.compose.material.icons.filled.ArrowBack
 import androidx.compose.material.icons.filled.ArrowForward
@@ -48,7 +50,8 @@ class NavigationManager(private val context: Context, private val apiKey: String
         private const val ROUTE_RECALC_DISTANCE_METERS = 50.0
     }
 
-    // Google Directions API context — lazily initialized
+    // Google Directions API context — lazily initialized (may be null if API key missing)
+    // Note: @Nullable cannot be applied to delegated properties, type system handles nullability
     private val geoApiContext: GeoApiContext? by lazy {
         if (apiKey.isBlank()) {
             Log.e(TAG, "API key is blank — Directions API routing will be disabled")
@@ -69,8 +72,10 @@ class NavigationManager(private val context: Context, private val apiKey: String
     val currentInstruction: StateFlow<NavigationInstruction?> = _currentInstruction.asStateFlow()
 
     // Internal state
+    @Nullable
     private var currentRoute: NavigationRoute? = null
     private var currentStepIndex = 0
+    @Nullable
     private var lastPosition: LatLng? = null
 
     /**

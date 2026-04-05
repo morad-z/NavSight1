@@ -2,6 +2,7 @@ package com.example.navsight1
 
 import org.junit.Assert.*
 import org.junit.Test
+import com.google.android.gms.maps.model.LatLng
 import kotlin.math.sqrt
 
 /**
@@ -118,5 +119,43 @@ class VioDataTest {
 
         // 10 - 45 + 360 = 325 degrees (NNW)
         assertEquals(325f, fusedHeading, 1f)
+    }
+
+    @Test
+    fun resolveNavigationStart_prefersSnappedPosition() {
+        val snapped = LatLng(1.0, 2.0)
+        val start = LatLng(3.0, 4.0)
+
+        val resolved = NavSightUtils.resolveNavigationStart(snapped, start)
+
+        assertEquals(snapped, resolved)
+    }
+
+    @Test
+    fun resolveNavigationStart_returnsNullWhenNoLocationAvailable() {
+        val resolved = NavSightUtils.resolveNavigationStart(null, null)
+
+        assertNull(resolved)
+    }
+
+    @Test
+    fun computeCalibrationStraightness_capsAtOne() {
+        val straightness = NavSightUtils.computeCalibrationStraightness(
+            displacementMeters = 9.0,
+            pathLengthMeters = 8.0
+        )
+
+        assertEquals(1.0, straightness, 0.001)
+    }
+
+    @Test
+    fun computeUpdatedScaleCalibrationFactor_multipliesCurrentFactor() {
+        val updated = NavSightUtils.computeUpdatedScaleCalibrationFactor(
+            currentFactor = 1.2,
+            knownDistanceMeters = 10.0,
+            measuredDistanceMeters = 8.0
+        )
+
+        assertEquals(1.5, updated!!, 0.001)
     }
 }
