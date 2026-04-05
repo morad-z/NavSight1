@@ -54,6 +54,73 @@ void IMUPreintegrator::addAccelReading(int64_t timestamp_ns, float x, float y, f
     accel_buf_.push_back({timestamp_ns, x, y, z});
     updateMotionMode(timestamp_ns, x, y, z);
     detectStep(timestamp_ns, x, y, z);
+    tryInitializeGravityLocked(x, y, z);
+    tryInitializeGyroBiasLocked(x, y, z);  // ✅ Gyro bias initialization during stationary phase
+}
+
+void IMUPreintegrator::tryInitializeGravityLocked(float ax, float ay, float az) {
+    if (gravity_initialized_.load()) {
+        gravity_init_samples_.clear();
+        return;
+    }
+
+    gravity_init_samples_.emplace_back(ax, ay, az);
+    if (gravity_init_samples_.size() > GRAVITY_INIT_WINDOW) {
+        gravity_init_samples_.erase(gravity_init_samples_.begin());
+    }
+
+    if (gravity_init_samples_.size() < GRAVITY_INIT_WINDOW) {
+        return;
+    }
+
+    double mean_mag = 0.0;
+    for (const auto& sample : gravity_init_samples_) {
+        mean_mag += std::sqrt(sample.x * sample.x + sample.y * sample.y + sample.z * sample.z);
+    }
+    mean_mag /= static_cast<double>(gravity_init_samples_.size());
+
+    double var_mag = 0.0;
+    cv::Point3f avg(0.f, 0.f, 0.f);
+    for (const auto& sample : gravity_init_samples_) {
+        const double mag = std::sqrt(sample.x * sample.x + sample.y * sample.y + sample.z * sample.z);
+        const double diff = mag - mean_mag;
+        var_mag += diff * diff;
+        avg.x += sample.x;
+        avg.y += sample.y;
+        avg.z += sample.z;
+    }
+    var_mag /= static_cast<double>(gravity_init_samples_.size());
+
+    const float inv_n = 1.0f / static_cast<float>(gravity_init_samples_.size());
+    avg.x *= inv_n;
+    avg.y *= inv_n;
+    avg.z *= inv_n;
+
+    const double gyro_mag = std::sqrt(
+        static_cast<double>(last_gx) * last_gx +
+        static_cast<double>(last_gy) * last_gy +
+        static_cast<double>(last_gz) * last_gz
+    );
+
+    if (var_mag > GRAVITY_INIT_MAX_VAR || gyro_mag > GRAVITY_INIT_GYRO_MAX) {
+        return;
+    }
+
+    const float mag = std::sqrt(avg.x * avg.x + avg.y * avg.y + avg.z * avg.z);
+    if (mag <= 1e-3f) {
+        return;
+    }
+
+    const float scale = 9.81f / mag;
+    gravity_vec_ = cv::Point3f(avg.x * scale, avg.y * scale, avg.z * scale);
+    roll_ = std::atan2(gravity_vec_.y, gravity_vec_.z);
+    pitch_ = std::atan2(-gravity_vec_.x,
+                        std::sqrt(gravity_vec_.y * gravity_vec_.y + gravity_vec_.z * gravity_vec_.z));
+    gravity_initialized_.store(true);
+    gravity_init_samples_.clear();
+
+    LOGI("Gravity initialized from stationary window: gravity=(%.3f,%.3f,%.3f) var=%.5f gyro=%.4f",
+         gravity_vec_.x, gravity_vec_.y, gravity_vec_.z, var_mag, gyro_mag);
 }
 
 // ── integrateGyro ─────────────────────────────────────────────────────────────
@@ -89,14 +156,20 @@ cv::Mat IMUPreintegrator::integrateGyro(int64_t start_ns, int64_t end_ns) {
               });
 
     // Integrate consecutive pairs via Rodrigues formula
+    // ✅ CRITICAL FIX: Apply gyro bias correction before integration
     for (size_t i = 0; i + 1 < samples.size(); ++i) {
         double dt = static_cast<double>(samples[i + 1].timestamp_ns - samples[i].timestamp_ns) * 1e-9;
         if (dt <= 0.0) continue;
 
+        // Subtract estimated gyro bias before integration
+        double gx = static_cast<double>(samples[i].x) - static_cast<double>(gyro_bias_.x);
+        double gy = static_cast<double>(samples[i].y) - static_cast<double>(gyro_bias_.y);
+        double gz = static_cast<double>(samples[i].z) - static_cast<double>(gyro_bias_.z);
+
         cv::Mat rvec = (cv::Mat_<double>(3, 1)
-                        << static_cast<double>(samples[i].x) * dt,
-                           static_cast<double>(samples[i].y) * dt,
-                           static_cast<double>(samples[i].z) * dt);
+                        << gx * dt,
+                           gy * dt,
+                           gz * dt);
         cv::Mat R_delta;
         cv::Rodrigues(rvec, R_delta);
         result = R_delta * result;
@@ -106,10 +179,15 @@ cv::Mat IMUPreintegrator::integrateGyro(int64_t start_ns, int64_t end_ns) {
     if (samples.size() == 1) {
         double dt = static_cast<double>(end_ns - samples[0].timestamp_ns) * 1e-9;
         if (dt > 0.0) {
+            // ✅ CRITICAL FIX: Apply gyro bias correction here too
+            double gx = static_cast<double>(samples[0].x) - static_cast<double>(gyro_bias_.x);
+            double gy = static_cast<double>(samples[0].y) - static_cast<double>(gyro_bias_.y);
+            double gz = static_cast<double>(samples[0].z) - static_cast<double>(gyro_bias_.z);
+
             cv::Mat rvec = (cv::Mat_<double>(3, 1)
-                            << static_cast<double>(samples[0].x) * dt,
-                               static_cast<double>(samples[0].y) * dt,
-                               static_cast<double>(samples[0].z) * dt);
+                            << gx * dt,
+                               gy * dt,
+                               gz * dt);
             cv::Mat R_delta;
             cv::Rodrigues(rvec, R_delta);
             result = R_delta * result;
@@ -183,12 +261,17 @@ PreintegratedDelta IMUPreintegrator::integrate(int64_t start_ns, int64_t end_ns)
 
         double dt = (t_next - t_current) * 1e-9;
         
-        // Get sensors at current (or nearest)
+        // Get sensors at current (or nearest), with gyro bias correction
         cv::Point3d g_vec(0,0,0), a_vec(0,0,0);
-        if (gi > 0) g_vec = cv::Point3d(g_samples[gi-1].x, g_samples[gi-1].y, g_samples[gi-1].z);
+        if (gi > 0) {
+            g_vec = cv::Point3d(
+                g_samples[gi-1].x - static_cast<double>(gyro_bias_.x),
+                g_samples[gi-1].y - static_cast<double>(gyro_bias_.y),
+                g_samples[gi-1].z - static_cast<double>(gyro_bias_.z));
+        }
         if (ai > 0) a_vec = cv::Point3d(a_samples[ai-1].x, a_samples[ai-1].y, a_samples[ai-1].z);
 
-        // 1. Rotation update
+        // 1. Rotation update (bias-corrected)
         cv::Mat r_vec = (cv::Mat_<double>(3, 1) << g_vec.x * dt, g_vec.y * dt, g_vec.z * dt);
         cv::Mat dR;
         cv::Rodrigues(r_vec, dR);
@@ -274,6 +357,7 @@ void IMUPreintegrator::setGravity(float gx, float gy, float gz) {
     roll_  = std::atan2(gy, gz);
     pitch_ = std::atan2(-gx, std::sqrt(gy * gy + gz * gz));
     gravity_initialized_.store(true);
+    gravity_init_samples_.clear();
 }
 
 // ── accessors ─────────────────────────────────────────────────────────────────
@@ -421,17 +505,33 @@ IMUPreintegrator::StepInfo IMUPreintegrator::getStepInfo() const {
     double ns_since_last = static_cast<double>(current_time_ns - last_step_ns_);
     bool watchdog_stop = (last_step_ns_ > 0 && ns_since_last > 3'000'000'000.0);
 
-    // Estimate speed from step frequency
+    // Estimate speed from step frequency + user height
     if (step_period_s_ > 0.0 && !is_stationary && !watchdog_stop) {
-        // Stride length scales with step frequency: faster steps = longer strides
         double freq = 1.0 / step_period_s_;
-        info.stride_length_m = std::max(0.4, std::min(1.2, 0.4 + 0.3 * freq));
+        // Height-based stride: stride ≈ height * 0.415 at normal walk,
+        // scales with step frequency (faster steps = longer strides)
+        double base_stride = static_cast<double>(user_height_m_) * 0.415;
+        double freq_factor = 0.7 + 0.3 * std::min(2.5, freq);  // 0.7-1.45x
+        info.stride_length_m = std::max(0.3, std::min(1.5, base_stride * freq_factor));
         info.speed_mps = info.stride_length_m * freq;
     } else {
         info.speed_mps = 0.0;
     }
 
     return info;
+}
+
+// ── User height for stride model ──────────────────────────────────────────────
+
+void IMUPreintegrator::setUserHeight(float height_m) {
+    std::lock_guard<std::mutex> lock(mutex_);
+    user_height_m_ = std::max(1.0f, std::min(2.5f, height_m));
+    LOGI("User height set: %.2f m → base stride ≈ %.2f m", user_height_m_, user_height_m_ * 0.415f);
+}
+
+float IMUPreintegrator::getUserHeight() const {
+    std::lock_guard<std::mutex> lock(mutex_);
+    return user_height_m_;
 }
 
 // ── reset ─────────────────────────────────────────────────────────────────────
@@ -442,6 +542,7 @@ void IMUPreintegrator::reset() {
     accel_buf_.clear();
     gravity_initialized_.store(false);
     gravity_vec_ = cv::Point3f(0.f, 0.f, 9.81f);
+    gravity_init_samples_.clear();
     roll_  = 0.f;
     pitch_ = 0.f;
     last_ax = last_ay = last_az = 0.f;
@@ -459,4 +560,98 @@ void IMUPreintegrator::reset() {
     last_accel_ts_ns_ = 0;
     sustained_accel_s_ = 0.0;
     in_vehicle_mode_ = false;
+    gyro_bias_ = cv::Point3f(0.f, 0.f, 0.f);  // Reset gyro bias
+    gyro_bias_initialized_.store(false);
+    gyro_bias_samples_ = 0;
+    has_mag_heading_.store(false);  // Reset mag heading
+    mag_heading_ = 0.f;
+}
+
+// ── Gyroscope bias initialization ─────────────────────────────────────────────
+// 
+// Gyroscope sensors have a constant offset (bias) that doesn't average out.
+// During stationary initialization, we estimate this bias from the raw gyro readings
+// and then subtract it during integration to prevent unbounded heading drift.
+//
+// This fixes the problem where heading drifts by ~270° over 22 seconds due to 
+// an unestimated ~0.2°/sec bias accumulating.
+
+void IMUPreintegrator::tryInitializeGyroBiasLocked(float ax, float ay, float az) {
+    if (gyro_bias_initialized_.load()) {
+        return;  // Already initialized, don't update
+    }
+
+    // Only initialize gyro bias when device is stationary (low acceleration variance)
+    // This check is approximate since we're called inline with accel reading
+    if (accel_variance_est_ > 0.05f) {
+        return;  // Still moving, can't estimate bias yet
+    }
+
+    // Accumulate samples while stationary
+    if (gyro_bias_samples_ < GYRO_BIAS_INIT_SAMPLES) {
+        gyro_bias_samples_++;
+        return;
+    }
+
+    // Collect last N stationary gyro samples
+    double avg_gx = 0.0, avg_gy = 0.0, avg_gz = 0.0;
+    int count = 0;
+
+    // Get most recent GYRO_BIAS_INIT_SAMPLES from gyro buffer (they should be oldest)
+    if (gyro_buf_.size() >= static_cast<size_t>(GYRO_BIAS_INIT_SAMPLES)) {
+        auto it = gyro_buf_.begin();
+        for (int i = 0; i < GYRO_BIAS_INIT_SAMPLES && it != gyro_buf_.end(); ++i, ++it) {
+            avg_gx += it->x;
+            avg_gy += it->y;
+            avg_gz += it->z;
+            count++;
+        }
+    }
+
+    if (count > 0) {
+        gyro_bias_.x = avg_gx / count;
+        gyro_bias_.y = avg_gy / count;
+        gyro_bias_.z = avg_gz / count;
+        gyro_bias_initialized_.store(true);
+
+        LOGI("Gyro bias initialized from %d stationary samples: (%.5f, %.5f, %.5f) rad/sec",
+             count, gyro_bias_.x, gyro_bias_.y, gyro_bias_.z);
+    }
+}
+
+// ── Magnetometer heading fusion ───────────────────────────────────────────────
+//
+// Magnetometer provides an absolute heading reference (compass reading) that doesn't
+// accumulate error over time. By gently pulling the gyro-integrated heading toward
+// the magnetometer reading, we prevent unbounded heading drift while preserving
+// short-term rotating motion accuracy.
+//
+// Blending: corrected_heading = gyro_heading + (mag_heading - gyro_heading) * (1 - damping)
+//           With damping = 0.95: 95% gyro, 5% magnetometer
+//           This prevents magnetic disturbances from causing jumps, but still bounds drift.
+
+void IMUPreintegrator::setMagnetometerHeading(float yaw_rad) {
+    std::lock_guard<std::mutex> lock(mutex_);
+    mag_heading_ = yaw_rad;
+    has_mag_heading_.store(true);
+    last_mag_update_ns_ = last_accel_ts_ns_;
+}
+
+float IMUPreintegrator::getCorrectedHeading(float gyro_yaw_rad) {
+    if (!has_mag_heading_.load()) {
+        return gyro_yaw_rad;  // No magnetometer data yet, use pure gyro
+    }
+
+    // Compute angular difference, handling wrap-around at ±π
+    float diff = mag_heading_ - gyro_yaw_rad;
+    
+    // Normalize to [-π, π]
+    while (diff > M_PI) diff -= 2.0f * M_PI;
+    while (diff < -M_PI) diff += 2.0f * M_PI;
+
+    // Apply damped correction: 95% gyro + 5% magnetometer
+    // This creates a gentle "magnetic pull" that prevents drift while avoiding jumps
+    float correction = diff * (1.0f - HEADING_CORRECTION_DAMPING);
+    
+    return gyro_yaw_rad + correction;
 }

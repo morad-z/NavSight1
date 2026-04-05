@@ -5,7 +5,7 @@
 #include <cstdint>
 #include <cmath>
 #include <opencv2/calib3d.hpp>
-#include "VisionModule.h"
+#include "VioEngine.h"
 
 #define TAG "NavSight-Native"
 #define LOGI(...) __android_log_print(ANDROID_LOG_INFO,  TAG, __VA_ARGS__)
@@ -15,12 +15,13 @@
 // ── Global state ──────────────────────────────────────────────────────────────
 
 static std::mutex  state_mutex;
-static VisionModule* g_vision = nullptr;
+static VioEngine* g_vision = nullptr;
 
 // Accumulated pose
 static double g_x = 0, g_y = 0, g_z = 0;
 static double g_roll = 0, g_pitch = 0, g_yaw = 0;
 static double g_scale = 1.0;
+static double g_user_scale_correction = 1.0;
 
 // RAW VO for simulation
 static double g_raw_x = 0, g_raw_y = 0, g_raw_z = 0, g_raw_yaw = 0;
@@ -63,7 +64,8 @@ Java_com_example_navsight1_NativeBridge_startVIO(JNIEnv*, jobject) {
         delete g_vision;
         g_vision = nullptr;
     }
-    g_vision = new VisionModule();
+    g_vision = new VioEngine();
+    g_vision->setUserScaleCorrection(g_user_scale_correction);
     resetPoseState();
     LOGI("VIO started");
 }
@@ -72,7 +74,7 @@ Java_com_example_navsight1_NativeBridge_startVIO(JNIEnv*, jobject) {
 
 JNIEXPORT void JNICALL
 Java_com_example_navsight1_NativeBridge_stopVIO(JNIEnv*, jobject) {
-    VisionModule* to_delete = nullptr;
+    VioEngine* to_delete = nullptr;
     {
         std::lock_guard<std::mutex> lock(state_mutex);
         to_delete = g_vision;
@@ -99,13 +101,13 @@ Java_com_example_navsight1_NativeBridge_processCameraFrame(
         jlong timestamp) {
 
     // Snapshot g_vision pointer under lock to prevent use-after-free with stopVIO
-    VisionModule* vision = nullptr;
+    VioEngine* vision = nullptr;
     {
         std::lock_guard<std::mutex> lock(state_mutex);
         vision = g_vision;
     }
 
-    // Run VIO pipeline outside the state lock (VisionModule has its own locks)
+    // Run VIO pipeline outside the state lock (VioEngine has its own locks)
     VisionOutput output{};
     output.valid = false;
 
@@ -252,7 +254,7 @@ Java_com_example_navsight1_NativeBridge_processGyroscope(
         return;
     }
 
-    VisionModule* vision = nullptr;
+    VioEngine* vision = nullptr;
     {
         std::lock_guard<std::mutex> lock(state_mutex);
         g_gx = x; g_gy = y; g_gz = z;
@@ -275,7 +277,7 @@ Java_com_example_navsight1_NativeBridge_processAccelerometer(
         return;
     }
 
-    VisionModule* vision = nullptr;
+    VioEngine* vision = nullptr;
     {
         std::lock_guard<std::mutex> lock(state_mutex);
         g_ax = x; g_ay = y; g_az = z;
@@ -290,7 +292,7 @@ Java_com_example_navsight1_NativeBridge_processAccelerometer(
 
 JNIEXPORT void JNICALL
 Java_com_example_navsight1_NativeBridge_resetVIO(JNIEnv*, jobject) {
-    VisionModule* vision = nullptr;
+    VioEngine* vision = nullptr;
     {
         std::lock_guard<std::mutex> lock(state_mutex);
         vision = g_vision;
@@ -307,8 +309,15 @@ Java_com_example_navsight1_NativeBridge_resetVIO(JNIEnv*, jobject) {
 JNIEXPORT void JNICALL
 Java_com_example_navsight1_NativeBridge_setScale(
         JNIEnv*, jobject /* thiz */, jdouble scale) {
-    std::lock_guard<std::mutex> lock(state_mutex);
-    g_scale = scale;
+    VioEngine* vision = nullptr;
+    {
+        std::lock_guard<std::mutex> lock(state_mutex);
+        g_user_scale_correction = scale;
+        vision = g_vision;
+    }
+    if (vision) {
+        vision->setUserScaleCorrection(static_cast<double>(scale));
+    }
 }
 
 // ── setIntrinsics ─────────────────────────────────────────────────────────────
@@ -317,7 +326,7 @@ JNIEXPORT void JNICALL
 Java_com_example_navsight1_NativeBridge_setIntrinsics(
         JNIEnv*, jobject /* thiz */,
         jdouble fx, jdouble fy, jdouble cx, jdouble cy) {
-    VisionModule* vision = nullptr;
+    VioEngine* vision = nullptr;
     {
         std::lock_guard<std::mutex> lock(state_mutex);
         vision = g_vision;
@@ -332,13 +341,43 @@ Java_com_example_navsight1_NativeBridge_setIntrinsics(
 JNIEXPORT void JNICALL
 Java_com_example_navsight1_NativeBridge_setInitialHeading(
         JNIEnv*, jobject /* thiz */, jdouble azimuthRad) {
-    VisionModule* vision = nullptr;
+    VioEngine* vision = nullptr;
     {
         std::lock_guard<std::mutex> lock(state_mutex);
         vision = g_vision;
     }
     if (vision) {
         vision->setInitialHeading(static_cast<double>(azimuthRad));
+    }
+}
+
+// ── setUserHeight ────────────────────────────────────────────────────────────
+
+JNIEXPORT void JNICALL
+Java_com_example_navsight1_NativeBridge_setUserHeight(
+        JNIEnv*, jobject /* thiz */, jfloat heightM) {
+    VioEngine* vision = nullptr;
+    {
+        std::lock_guard<std::mutex> lock(state_mutex);
+        vision = g_vision;
+    }
+    if (vision) {
+        vision->setUserHeight(static_cast<float>(heightM));
+    }
+}
+
+// ── setMagnetometerHeading ───────────────────────────────────────────────────
+
+JNIEXPORT void JNICALL
+Java_com_example_navsight1_NativeBridge_setMagnetometerHeading(
+        JNIEnv*, jobject /* thiz */, jfloat yawRad) {
+    VioEngine* vision = nullptr;
+    {
+        std::lock_guard<std::mutex> lock(state_mutex);
+        vision = g_vision;
+    }
+    if (vision) {
+        vision->setMagnetometerHeading(static_cast<float>(yawRad));
     }
 }
 
