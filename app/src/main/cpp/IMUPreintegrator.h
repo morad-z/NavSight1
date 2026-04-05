@@ -62,6 +62,10 @@ private:
     std::vector<GyroSample>  gyro_buf_;
     std::vector<AccelSample> accel_buf_;
     static constexpr size_t MAX_BUF = 2000;
+    std::vector<cv::Point3f> gravity_init_samples_;
+    static constexpr size_t GRAVITY_INIT_WINDOW = 40;
+    static constexpr float GRAVITY_INIT_MAX_VAR = 0.08f;
+    static constexpr float GRAVITY_INIT_GYRO_MAX = 0.12f;
 
     std::atomic<bool> gravity_initialized_{false};
     cv::Point3f gravity_vec_{0.f, 0.f, 9.81f};
@@ -102,6 +106,7 @@ private:
     static constexpr double MIN_STEP_PERIOD_S = 0.25;      // Max 4 steps/s (running)
     static constexpr double MAX_STEP_PERIOD_S = 1.5;       // Min ~0.67 steps/s (slow walk)
     static constexpr double DEFAULT_STRIDE_M  = 0.65;      // Average human stride
+    float user_height_m_{1.70f};                              // User height for stride model
 
     // Walking validation: reject car vibrations masquerading as steps
     // Real walking has accel magnitude variance > 0.3 m/s² over ~1 second
@@ -118,4 +123,31 @@ private:
 
     void detectStep(int64_t timestamp_ns, float ax, float ay, float az);
     void updateMotionMode(int64_t timestamp_ns, float ax, float ay, float az);
+    void tryInitializeGravityLocked(float ax, float ay, float az);
+    void tryInitializeGyroBiasLocked(float ax, float ay, float az);
+
+    // ── Gyroscope bias correction ──────────────────────────────────────────
+    // Gyroscope bias is a constant offset that accumulates over time.
+    // Estimate it during stationary initialization, subtract during integration.
+private:
+    cv::Point3f gyro_bias_{0.f, 0.f, 0.f};              // Estimated bias in rad/sec
+    std::atomic<bool> gyro_bias_initialized_{false};
+    int gyro_bias_samples_{0};
+    static constexpr int GYRO_BIAS_INIT_SAMPLES = 200;  // ~6-7 frames at 30fps
+
+    // ── Magnetometer heading fusion ────────────────────────────────────────
+    // Magnetometer provides absolute heading reference (doesn't accumulate error)
+public:
+    void setMagnetometerHeading(float yaw_rad);
+    float getCorrectedHeading(float gyro_yaw_rad);
+
+    // User height for stride estimation (default 1.70m)
+    void setUserHeight(float height_m);
+    float getUserHeight() const;
+
+private:
+    float mag_heading_{0.f};                            // Yaw from magnetometer (rad)
+    std::atomic<bool> has_mag_heading_{false};
+    int64_t last_mag_update_ns_{0};
+    static constexpr float HEADING_CORRECTION_DAMPING = 0.95f;  // Smooth fusion
 };

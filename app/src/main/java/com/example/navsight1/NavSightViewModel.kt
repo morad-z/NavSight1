@@ -22,11 +22,30 @@ import kotlinx.coroutines.withContext
 import kotlin.math.*
 
 class NavSightViewModel(application: Application) : AndroidViewModel(application) {
+    data class ScaleCalibrationSession(
+        val legDistanceMeters: Double,
+        val startX: Double,
+        val startZ: Double,
+        val lastX: Double,
+        val lastZ: Double,
+        val pathLengthMeters: Double,
+        val sampleCount: Int,
+        val maxDistanceFromStartMeters: Double,
+        val sumQuality: Double,
+        val lowQualityFrames: Int
+    )
+
+    companion object {
+        private const val PREFS_NAME = "navsight_prefs"
+        private const val PREF_SCALE_CALIBRATION_FACTOR = "scale_calibration_factor"
+        private const val PREF_USER_HEIGHT = "user_height_m"
+    }
 
     private val sensorRepository = SensorRepository(application)
     private val apiKey = BuildConfig.GOOGLE_MAPS_API_KEY
     private val navigationManager = NavigationManager(application, apiKey)
     private val roadSnapper = RoadSnapper(apiKey = apiKey)
+    private val prefs = application.getSharedPreferences(PREFS_NAME, Application.MODE_PRIVATE)
 
     // UI States (exposed as Compose State)
     var orientationState by mutableStateOf(DeviceOrientationTracker.OrientationResult(
@@ -69,6 +88,18 @@ class NavSightViewModel(application: Application) : AndroidViewModel(application
         private set
 
     var showCameraBlocked by mutableStateOf(false)
+        private set
+    var navigationStartMessage by mutableStateOf<String?>(null)
+        private set
+    var scaleCalibrationFactor by mutableStateOf(
+        prefs.getFloat(PREF_SCALE_CALIBRATION_FACTOR, 1.0f).toDouble()
+    )
+        private set
+    var scaleCalibrationMessage by mutableStateOf<String?>(null)
+        private set
+    var scaleCalibrationSession by mutableStateOf<ScaleCalibrationSession?>(null)
+        private set
+    var userHeight by mutableStateOf(prefs.getFloat(PREF_USER_HEIGHT, 1.70f))
         private set
 
     // ── FOR SIMULATION ────────────────────────────────────────────────────────
@@ -123,7 +154,12 @@ class NavSightViewModel(application: Application) : AndroidViewModel(application
     private var lastVioForDist: VioData? = null
     private var lastSpeedTimeMs = 0L
     private var lastSnapTimeMs = 0L
-    
+    private var lastUiUpdateTimeMs = 0L
+    private val UI_UPDATE_THROTTLE_MS = 100L
+
+    private var latestVioState: VioData = VioData()
+    private var hasLocationPermission = false
+
     val placesClient by lazy {
         if (apiKey.isNotBlank() && !com.google.android.libraries.places.api.Places.isInitialized()) {
             com.google.android.libraries.places.api.Places.initialize(getApplication(), apiKey)
@@ -135,7 +171,17 @@ class NavSightViewModel(application: Application) : AndroidViewModel(application
         }
     }
 
+    fun updateUserHeight(height: Float) {
+        val h = height.coerceIn(1.0f, 2.5f)
+        userHeight = h
+        prefs.edit().putFloat(PREF_USER_HEIGHT, h).apply()
+        NativeBridge.setUserHeight(h)
+    }
+
     init {
+        NativeBridge.setScale(scaleCalibrationFactor)
+        NativeBridge.setUserHeight(userHeight)
+
         // Observe Repository states
         viewModelScope.launch {
             sensorRepository.orientationState.collect { orientationState = it }
@@ -168,12 +214,39 @@ class NavSightViewModel(application: Application) : AndroidViewModel(application
     }
 
     private fun handleVioUpdate(vio: VioData) {
-        vioState = vio
+        latestVioState = vio
+
+        val nowMs = System.currentTimeMillis()
+        val shouldUpdateUI = (nowMs - lastUiUpdateTimeMs) >= UI_UPDATE_THROTTLE_MS
+
+        if (shouldUpdateUI) {
+            lastUiUpdateTimeMs = nowMs
+            vioState = vio
+            if (vio.isInitialized) {
+                virtualX = vio.x
+                virtualZ = vio.z
+                pathHistory.add(Pair(vio.x.toFloat(), vio.z.toFloat()))
+                if (pathHistory.size > 500) pathHistory.removeAt(0)
+            }
+        }
+
         if (vio.isInitialized) {
-            virtualX = vio.x
-            virtualZ = vio.z
-            pathHistory.add(Pair(vio.x.toFloat(), vio.z.toFloat()))
-            if (pathHistory.size > 500) pathHistory.removeAt(0)
+            scaleCalibrationSession?.let { session ->
+                val dx = vio.x - session.lastX
+                val dz = vio.z - session.lastZ
+                val startDx = vio.x - session.startX
+                val startDz = vio.z - session.startZ
+                val distanceFromStart = sqrt(startDx * startDx + startDz * startDz)
+                scaleCalibrationSession = session.copy(
+                    lastX = vio.x,
+                    lastZ = vio.z,
+                    pathLengthMeters = session.pathLengthMeters + sqrt(dx * dx + dz * dz),
+                    sampleCount = session.sampleCount + 1,
+                    maxDistanceFromStartMeters = max(session.maxDistanceFromStartMeters, distanceFromStart),
+                    sumQuality = session.sumQuality + vio.trackingQuality,
+                    lowQualityFrames = session.lowQualityFrames + if (vio.trackingQuality < 0.2) 1 else 0
+                )
+            }
 
             // ── FOR SIMULATION ────────────────────────────────────────────────────────
             if (isRecordingSimulation) {
@@ -257,7 +330,7 @@ class NavSightViewModel(application: Application) : AndroidViewModel(application
         if (!isRecordingSimulation) {
             // Start recording
             simulationDataPoints.clear()
-            sensorRepository.startGpsUpdates()
+            sensorRepository.startGpsUpdates(hasLocationPermission)
             isRecordingSimulation = true
             Log.d("SIMULATION", "Started recording simulation")
         } else {
@@ -331,8 +404,9 @@ class NavSightViewModel(application: Application) : AndroidViewModel(application
         sensorRepository.processCameraFrame(frame)
     }
 
-    fun requestInitialLocation() {
-        sensorRepository.requestInitialLocation()
+    fun requestInitialLocation(granted: Boolean = false) {
+        hasLocationPermission = granted
+        sensorRepository.requestInitialLocation(granted)
     }
 
     fun resetPath() {
@@ -348,9 +422,109 @@ class NavSightViewModel(application: Application) : AndroidViewModel(application
 
     fun startNavigation(destination: LatLng) {
         viewModelScope.launch {
-            val currentPos = snappedPosition ?: startLocation ?: LatLng(32.0853, 34.7818)
+            val currentPos = NavSightUtils.resolveNavigationStart(snappedPosition, startLocation)
+            if (currentPos == null) {
+                navigationStartMessage = "Current location not ready yet."
+                return@launch
+            }
+            navigationStartMessage = null
             navigationManager.startNavigation(currentPos, destination)
         }
+    }
+
+    fun clearNavigationStartMessage() {
+        navigationStartMessage = null
+    }
+
+    fun startScaleCalibration(targetDistanceMeters: Double) {
+        val current = latestVioState
+        if (!current.isInitialized) {
+            scaleCalibrationMessage = "Tracking is not ready yet."
+            return
+        }
+
+        scaleCalibrationSession = ScaleCalibrationSession(
+            legDistanceMeters = targetDistanceMeters,
+            startX = current.x,
+            startZ = current.z,
+            lastX = current.x,
+            lastZ = current.z,
+            pathLengthMeters = 0.0,
+            sampleCount = 0,
+            maxDistanceFromStartMeters = 0.0,
+            sumQuality = current.trackingQuality,
+            lowQualityFrames = if (current.trackingQuality < 0.2) 1 else 0
+        )
+        scaleCalibrationMessage = "Walk ${targetDistanceMeters.toInt()} m out, return to start, then tap Finish."
+    }
+
+    fun finishScaleCalibration() {
+        val session = scaleCalibrationSession
+        val current = latestVioState
+        if (session == null || !current.isInitialized) {
+            scaleCalibrationMessage = "Calibration session is not ready to finish."
+            return
+        }
+
+        val dx = current.x - session.startX
+        val dz = current.z - session.startZ
+        val closureErrorMeters = sqrt(dx * dx + dz * dz)
+        val pathLengthMeters = session.pathLengthMeters
+        val roundTripTargetMeters = session.legDistanceMeters * 2.0
+        val avgQuality = session.sumQuality / max(1, session.sampleCount)
+        val lowQualityRatio = session.lowQualityFrames.toDouble() / max(1, session.sampleCount)
+
+        scaleCalibrationSession = null
+
+        if (session.sampleCount < 10) {
+            scaleCalibrationMessage = "Calibration was too short. Please try again."
+            return
+        }
+        if (session.maxDistanceFromStartMeters < session.legDistanceMeters * 0.7) {
+            scaleCalibrationMessage = "You did not walk far enough from the start point."
+            return
+        }
+        if (avgQuality < 0.35 || lowQualityRatio > 0.35) {
+            scaleCalibrationMessage =
+                "Tracking quality was too low for calibration. Avg ${"%.2f".format(avgQuality)}."
+            return
+        }
+        if (pathLengthMeters < roundTripTargetMeters * 0.6) {
+            scaleCalibrationMessage = "Measured round trip was too short. Please retry."
+            return
+        }
+        if (closureErrorMeters > max(2.0, session.legDistanceMeters * 0.4)) {
+            scaleCalibrationMessage =
+                "Return-to-start drift was too large (${ "%.2f".format(closureErrorMeters)} m)."
+            return
+        }
+
+        val newFactor = NavSightUtils.computeUpdatedScaleCalibrationFactor(
+            currentFactor = scaleCalibrationFactor,
+            knownDistanceMeters = roundTripTargetMeters,
+            measuredDistanceMeters = pathLengthMeters
+        ) ?: run {
+            scaleCalibrationMessage = "Calibration factor could not be computed."
+            return
+        }
+        saveScaleCalibrationFactor(newFactor)
+        scaleCalibrationMessage =
+            "Saved scale correction ${"%.2f".format(newFactor)}x. Measured ${"%.1f".format(pathLengthMeters)} m, closure ${"%.2f".format(closureErrorMeters)} m."
+    }
+
+    fun cancelScaleCalibration() {
+        scaleCalibrationSession = null
+        scaleCalibrationMessage = "Calibration cancelled."
+    }
+
+    fun clearScaleCalibrationMessage() {
+        scaleCalibrationMessage = null
+    }
+
+    fun resetScaleCalibration() {
+        scaleCalibrationSession = null
+        saveScaleCalibrationFactor(1.0)
+        scaleCalibrationMessage = "Scale calibration reset to 1.00x."
     }
 
     fun stopNavigation() {
@@ -385,5 +559,11 @@ class NavSightViewModel(application: Application) : AndroidViewModel(application
     override fun onCleared() {
         super.onCleared()
         roadSnapper.shutdown()
+    }
+
+    private fun saveScaleCalibrationFactor(factor: Double) {
+        scaleCalibrationFactor = factor
+        prefs.edit().putFloat(PREF_SCALE_CALIBRATION_FACTOR, factor.toFloat()).apply()
+        NativeBridge.setScale(factor)
     }
 }

@@ -3,6 +3,7 @@ package com.example.navsight1
 import android.graphics.Bitmap
 import android.graphics.Canvas
 import android.content.Context
+import android.util.Log
 import androidx.core.content.ContextCompat
 import com.google.android.gms.maps.model.BitmapDescriptor
 import com.google.android.gms.maps.model.BitmapDescriptorFactory
@@ -10,6 +11,27 @@ import com.google.android.gms.maps.model.LatLng
 import kotlin.math.*
 
 object NavSightUtils {
+    fun resolveNavigationStart(snappedPosition: LatLng?, startLocation: LatLng?): LatLng? {
+        return snappedPosition ?: startLocation
+    }
+
+    fun computeCalibrationStraightness(displacementMeters: Double, pathLengthMeters: Double): Double {
+        if (pathLengthMeters <= 0.0) return 0.0
+        return (displacementMeters / pathLengthMeters).coerceIn(0.0, 1.0)
+    }
+
+    fun computeUpdatedScaleCalibrationFactor(
+        currentFactor: Double,
+        knownDistanceMeters: Double,
+        measuredDistanceMeters: Double
+    ): Double? {
+        if (currentFactor <= 0.0 || knownDistanceMeters <= 0.0 || measuredDistanceMeters <= 0.0) {
+            return null
+        }
+        val ratio = knownDistanceMeters / measuredDistanceMeters
+        return (currentFactor * ratio).coerceIn(0.25, 4.0)
+    }
+
     fun metersToLatLng(start: LatLng, dx: Double, dz: Double): LatLng {
         // Use a more accurate geodesic calculation (Destination point given distance and bearing)
         // Earth's radius in meters
@@ -49,16 +71,21 @@ object NavSightUtils {
         }
     }
 
-    fun vectorToBitmap(context: Context, drawableId: Int): BitmapDescriptor {
-        val vectorDrawable = ContextCompat.getDrawable(context, drawableId)
-        vectorDrawable!!.setBounds(0, 0, vectorDrawable.intrinsicWidth, vectorDrawable.intrinsicHeight)
-        val bitmap = Bitmap.createBitmap(
-            vectorDrawable.intrinsicWidth,
-            vectorDrawable.intrinsicHeight,
-            Bitmap.Config.ARGB_8888
-        )
-        val canvas = Canvas(bitmap)
-        vectorDrawable.draw(canvas)
-        return BitmapDescriptorFactory.fromBitmap(bitmap)
+    fun vectorToBitmap(context: Context, drawableId: Int): BitmapDescriptor? {
+        return try {
+            val vectorDrawable = ContextCompat.getDrawable(context, drawableId) ?: return null
+            vectorDrawable.setBounds(0, 0, vectorDrawable.intrinsicWidth, vectorDrawable.intrinsicHeight)
+            val bitmap = Bitmap.createBitmap(
+                vectorDrawable.intrinsicWidth,
+                vectorDrawable.intrinsicHeight,
+                Bitmap.Config.ARGB_8888
+            )
+            val canvas = Canvas(bitmap)
+            vectorDrawable.draw(canvas)
+            BitmapDescriptorFactory.fromBitmap(bitmap)
+        } catch (e: Exception) {
+            Log.e("NavSightUtils", "Failed to convert vector to bitmap", e)
+            null
+        }
     }
 }

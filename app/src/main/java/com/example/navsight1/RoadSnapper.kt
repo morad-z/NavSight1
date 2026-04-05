@@ -2,6 +2,8 @@ package com.example.navsight1
 
 import android.util.Log
 import android.util.LruCache
+import androidx.annotation.Nullable
+import androidx.annotation.NonNull
 import com.google.android.gms.maps.model.LatLng
 import com.google.maps.GeoApiContext
 import com.google.maps.RoadsApi
@@ -32,7 +34,8 @@ class RoadSnapper(private val apiKey: String) {
         private const val MAX_BATCH_SIZE = 100
     }
 
-    // Google Roads API context — lazily initialized off the main thread
+    // Google Roads API context — lazily initialized (may be null if API key missing)
+    // Note: @Nullable cannot be applied to delegated properties, type system handles nullability
     private val geoApiContext: GeoApiContext? by lazy {
         if (apiKey.isBlank()) {
             Log.e(TAG, "Roads API key is blank — road snapping will be disabled")

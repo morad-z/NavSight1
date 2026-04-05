@@ -108,6 +108,33 @@ TEST_F(IMUPreintegratorTest, GravityInit_PhoneUpright) {
     EXPECT_TRUE(imu.isInitialized());
 }
 
+TEST_F(IMUPreintegratorTest, GravityAutoInit_RequiresStationaryWindow) {
+    for (int i = 0; i < 39; i++) {
+        int64_t ts = BASE_NS + i * DT_NS;
+        imu.addGyroReading(ts, 0.0f, 0.0f, 0.0f);
+        imu.addAccelReading(ts, 0.0f, 9.81f, 0.0f);
+    }
+
+    EXPECT_FALSE(imu.isInitialized()) << "Gravity init should wait for a full stationary window";
+
+    imu.addGyroReading(BASE_NS + 39 * DT_NS, 0.0f, 0.0f, 0.0f);
+    imu.addAccelReading(BASE_NS + 39 * DT_NS, 0.0f, 9.81f, 0.0f);
+
+    EXPECT_TRUE(imu.isInitialized()) << "Gravity should auto-initialize after a stable stationary window";
+}
+
+TEST_F(IMUPreintegratorTest, GravityAutoInit_SkipsMovingStartup) {
+    for (int i = 0; i < 50; i++) {
+        int64_t ts = BASE_NS + i * DT_NS;
+        imu.addGyroReading(ts, 0.0f, 0.0f, 0.35f);
+        float wobble = (i % 2 == 0) ? 1.2f : -1.2f;
+        imu.addAccelReading(ts, 0.0f, 9.81f + wobble, 0.0f);
+    }
+
+    EXPECT_FALSE(imu.isInitialized())
+        << "Gravity should not initialize while startup samples are still moving";
+}
+
 // ── Buffer Management ────────────────────────────────────────────────────────
 
 TEST_F(IMUPreintegratorTest, BufferOverflow_DoesNotCrash) {
