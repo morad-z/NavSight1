@@ -20,6 +20,7 @@ import kotlinx.coroutines.flow.collect
 import kotlinx.coroutines.launch
 import kotlinx.coroutines.withContext
 import kotlin.math.*
+import com.example.navsight1.BuildConfig
 
 class NavSightViewModel(application: Application) : AndroidViewModel(application) {
     data class ScaleCalibrationSession(
