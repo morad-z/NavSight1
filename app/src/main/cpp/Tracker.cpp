@@ -447,6 +447,17 @@ VisionOutput Tracker::processFrame(const uint8_t* yuv_data, int width, int heigh
 
         double heading = std::atan2(global_R_.at<double>(1,0), global_R_.at<double>(0,0));
 
+        // Phase 2.3: Apply magnetometer heading correction (80% VIO / 20% magnetometer)
+        // This prevents long-term heading drift by gently pulling toward compass north
+        double corrected_heading = imu.getCorrectedHeading(static_cast<float>(heading));
+        if (std::abs(corrected_heading - heading) > 1e-6) {
+            heading = corrected_heading;
+            // Update global_R_ to reflect corrected heading (Rz rotation only)
+            double c = std::cos(heading), s = std::sin(heading);
+            global_R_.at<double>(0,0) = c;  global_R_.at<double>(0,1) = -s;
+            global_R_.at<double>(1,0) = s;  global_R_.at<double>(1,1) = c;
+        }
+
         if (is_static) {
             // ZUPT: freeze both rotation (above) and translation
         } else if (pose_valid && !is_pure_rotation && !translation_degenerate && quality >= 0.15) {

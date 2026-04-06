@@ -245,6 +245,13 @@ class SensorRepository(private val context: Context) : SensorEventListener {
             }
             Sensor.TYPE_MAGNETIC_FIELD -> {
                 orientationTracker.updateMagnetometer(event.values)
+                // Phase 2.3: Send magnetometer heading to C++ for continuous fusion
+                // Only after VIO is initialized (we have valid orientation data)
+                if (wasVioInitialized) {
+                    val orientation = orientationTracker.getOrientation()
+                    val azimuthRad = Math.toRadians(orientation.azimuth.toDouble()).toFloat()
+                    NativeBridge.setMagnetometerHeading(azimuthRad)
+                }
             }
             Sensor.TYPE_GYROSCOPE -> {
                 NativeBridge.processGyroscope(ts, event.values[0], event.values[1], event.values[2])
@@ -296,13 +303,7 @@ class SensorRepository(private val context: Context) : SensorEventListener {
             val azimuthRad = Math.toRadians(vioInitAzimuth.toDouble())
             NativeBridge.setInitialHeading(azimuthRad)
             Log.d(TAG, "Initial heading set: ${vioInitAzimuth}° (${azimuthRad} rad)")
-
-            // FR17: Magnetometer is only needed for initial direction.
-            // Unregister it now to prevent interference and save battery.
-            magnetometer?.let {
-                sensorManager.unregisterListener(this, it)
-                Log.d(TAG, "Magnetometer unregistered - initial heading captured.")
-            }
+            // Phase 2.3: Keep magnetometer registered for continuous heading fusion
         }
 
         if (vio.isInitialized && vio.trackedFeatures < 5) {
