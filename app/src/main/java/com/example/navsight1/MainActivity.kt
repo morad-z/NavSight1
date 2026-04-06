@@ -876,12 +876,12 @@ class MainActivity : ComponentActivity() {
             position = CameraPosition.Builder().target(displayPosition).zoom(targetZoom).bearing(azimuth).tilt(targetTilt).build()
         }
 
-        // FR31: Throttle map camera updates to 1Hz to fix lag
+        // FR31: Throttle map camera updates to 2Hz (500ms) for balance between responsiveness and performance
         var lastMapUpdateTime by remember { mutableStateOf(0L) }
         LaunchedEffect(displayPosition, azimuth, navState) {
             val now = System.currentTimeMillis()
             // Re-center if enough time passed OR if navigation just became active
-            if (now - lastMapUpdateTime >= 1000L || navState is NavigationState.Routing) {
+            if (now - lastMapUpdateTime >= 500L || navState is NavigationState.Routing) {
                 lastMapUpdateTime = now
                 cameraState.animate(com.google.android.gms.maps.CameraUpdateFactory.newCameraPosition(
                     CameraPosition.Builder().target(displayPosition).zoom(targetZoom).bearing(azimuth).tilt(targetTilt).build()
