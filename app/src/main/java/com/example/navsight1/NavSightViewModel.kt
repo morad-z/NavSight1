@@ -21,7 +21,6 @@ import kotlinx.coroutines.flow.sample
 import kotlinx.coroutines.launch
 import kotlinx.coroutines.withContext
 import kotlin.math.*
-import com.example.navsight1.BuildConfig
 
 class NavSightViewModel(application: Application) : AndroidViewModel(application) {
     data class ScaleCalibrationSession(
@@ -192,9 +191,6 @@ class NavSightViewModel(application: Application) : AndroidViewModel(application
     init {
         NativeBridge.setScale(scaleCalibrationFactor)
         NativeBridge.setUserHeight(userHeight)
-
-        // Initialize depth estimator for automatic scale calibration
-        sensorRepository.initDepthEstimator()
 
         // Observe Repository states
         viewModelScope.launch {

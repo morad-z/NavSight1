@@ -149,13 +149,6 @@ void VioEngine::setUserHeight(float height_m) {
     // mapper_.setCameraHeight(static_cast<double>(height_m));
 }
 
-void VioEngine::updateDepthScale(double scale, double alpha) {
-    // Apply depth-based scale from MiDaS estimation
-    // Blends the depth scale into the tracker's smooth scale
-    tracker_.blendScale(scale, alpha);
-    LOGI("updateDepthScale: scale=%.3f alpha=%.3f", scale, alpha);
-}
-
 void VioEngine::reset() {
     // DISABLED: Mapper thread/result reset — Mapper pipeline disabled
     // {
