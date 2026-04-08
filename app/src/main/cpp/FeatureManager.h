@@ -25,17 +25,21 @@ public:
                          std::vector<cv::Point2f>& out_new,
                          int max_total, double quality_level, double min_dist);
 
-    // Store a keyframe for re-localization
+    // Store a keyframe for re-localization and heading correction
     struct Keyframe {
         cv::Mat gray;
         std::vector<cv::Point2f> points;
         int64_t timestamp_ns;
         int frame_id;
+        double heading;         // scalar heading at keyframe time
+        cv::Point3f position;   // global position at keyframe time
     };
 
     void storeKeyframe(const cv::Mat& gray,
                        const std::vector<cv::Point2f>& points,
-                       int64_t timestamp_ns, int frame_id);
+                       int64_t timestamp_ns, int frame_id,
+                       double heading = 0.0,
+                       cv::Point3f position = cv::Point3f(0,0,0));
 
     // Try to match current features against the last keyframe.
     // Returns true if enough matches found, fills matched pairs.
@@ -44,8 +48,13 @@ public:
                               std::vector<cv::Point2f>& kf_matched,
                               std::vector<cv::Point2f>& cur_matched) const;
 
-    // DEAD CODE: getKeyframeCount — never called
-    // int getKeyframeCount() const { return static_cast<int>(keyframes_.size()); }
+    // Get last keyframe heading/position (for drift correction)
+    bool getLastKeyframeInfo(double& heading_out, cv::Point3f& position_out) const {
+        if (keyframes_.empty()) return false;
+        heading_out = keyframes_.back().heading;
+        position_out = keyframes_.back().position;
+        return true;
+    }
     void reset();
 
     // ── MSCKF Feature Track Management ──────────────────────────────────────

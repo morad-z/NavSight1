@@ -1,10 +1,15 @@
 #include "VioEngine.h"
-#include <android/log.h>
 #include <cmath>
 
+#ifdef __ANDROID__
+#include <android/log.h>
 #define TAG "NavSight-VioEngine"
 #define LOGI(...) __android_log_print(ANDROID_LOG_INFO, TAG, __VA_ARGS__)
 #define LOGE(...) __android_log_print(ANDROID_LOG_ERROR, TAG, __VA_ARGS__)
+#else
+#define LOGI(...) (void)0
+#define LOGE(...) (void)0
+#endif
 
 VioEngine::VioEngine() {
     // DISABLED: Mapper background thread — output was discarded (applyMapperResult was a no-op)

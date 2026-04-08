@@ -337,22 +337,12 @@ class MainActivity : ComponentActivity() {
                         }
                     }
 
-                    Column(
-                        Modifier.align(Alignment.BottomEnd).padding(16.dp),
-                        verticalArrangement = Arrangement.spacedBy(8.dp)
+                    FloatingActionButton(
+                        onClick = { viewModel.resetPath() },
+                        modifier = Modifier.align(Alignment.BottomEnd).padding(16.dp),
+                        containerColor = LuxuryGreen
                     ) {
-                        SmallFloatingActionButton(
-                            onClick = { viewModel.exportPath(::getExternalFilesDir, filesDir) },
-                            containerColor = LuxuryCyan
-                        ) {
-                            Icon(Icons.Default.ArrowForward, "Export", tint = LuxuryBlack)
-                        }
-                        FloatingActionButton(
-                            onClick = { viewModel.resetPath() },
-                            containerColor = LuxuryGreen
-                        ) {
-                            Icon(Icons.Default.Refresh, "Reset", tint = LuxuryBlack)
-                        }
+                        Icon(Icons.Default.Refresh, "Reset", tint = LuxuryBlack)
                     }
 
                     Box(
@@ -915,7 +905,6 @@ class MainActivity : ComponentActivity() {
     fun NavigationMapWrapper(start: LatLng, azimuth: Float, history: List<Pair<Float, Float>>) {
         val navState = viewModel.navigationState
         val displayPosition = viewModel.snappedPosition ?: NavSightUtils.metersToLatLng(start, viewModel.virtualX, viewModel.virtualZ)
-        val displayAzimuth by animateFloatAsState(targetValue = azimuth, animationSpec = spring(stiffness = Spring.StiffnessLow), label = "azimuth")
         val targetZoom = if (navState is NavigationState.Active) 19f else 18f
         val targetTilt = if (navState is NavigationState.Active) 60f else 30f
 
@@ -923,45 +912,100 @@ class MainActivity : ComponentActivity() {
             position = CameraPosition.Builder().target(displayPosition).zoom(targetZoom).bearing(azimuth).tilt(targetTilt).build()
         }
 
-        // Throttle camera + polyline + marker updates to ~1Hz.
-        // Previous impl: camera at 1Hz but GoogleMap content (Polyline, Marker) recomposed at 5Hz
-        // because displayPosition/history changed at UI throttle rate. Google Maps Compose recreates
-        // overlays from scratch on each content recompose — this was the main lag source.
-        var mapPosition by remember { mutableStateOf(displayPosition) }
-        var mapAzimuth by remember { mutableStateOf(azimuth) }
-        var mapPathLatLngs by remember { mutableStateOf<List<LatLng>>(emptyList()) }
-        var lastMapUpdateTime by remember { mutableStateOf(0L) }
+        // Camera-follow state: true = locked to position+heading (Waze-style), false = free pan
+        var isFollowing by remember { mutableStateOf(true) }
 
-        LaunchedEffect(displayPosition, azimuth, navState, history.size) {
-            val now = System.currentTimeMillis()
-            if (now - lastMapUpdateTime >= 1000L || navState is NavigationState.Routing) {
-                lastMapUpdateTime = now
-                mapPosition = displayPosition
-                mapAzimuth = azimuth
-                // Remap polyline at 1Hz (not 5Hz) — 500 trig ops once/sec is fine
-                mapPathLatLngs = history.map {
-                    NavSightUtils.metersToLatLng(start, it.first.toDouble(), it.second.toDouble())
-                }
-                cameraState.animate(com.google.android.gms.maps.CameraUpdateFactory.newCameraPosition(
-                    CameraPosition.Builder().target(mapPosition).zoom(targetZoom).bearing(mapAzimuth).tilt(targetTilt).build()
-                ), durationMs = 800)
+        // Keep fresh references for the coroutine loop (rememberUpdatedState avoids stale captures)
+        val currentPosition by rememberUpdatedState(displayPosition)
+        val currentAzimuth by rememberUpdatedState(azimuth)
+        val currentZoom by rememberUpdatedState(targetZoom)
+        val currentTilt by rememberUpdatedState(targetTilt)
+
+        // Detect user gesture (pan/zoom) to break camera lock
+        LaunchedEffect(cameraState.isMoving) {
+            if (cameraState.isMoving && cameraState.cameraMoveStartedReason == com.google.maps.android.compose.CameraMoveStartedReason.GESTURE) {
+                isFollowing = false
             }
         }
 
-        // GoogleMap content only recomposes when mapPosition/mapPathLatLngs/mapAzimuth change (1Hz)
-        GoogleMap(modifier = Modifier.fillMaxSize(), cameraPositionState = cameraState, uiSettings = MapUiSettings(zoomControlsEnabled = false, compassEnabled = false, myLocationButtonEnabled = false)) {
-            // Cache icons inside GoogleMap scope — BitmapDescriptorFactory requires Maps SDK initialized
-            val navArrowIcon = remember { NavSightUtils.vectorToBitmap(this@MainActivity, R.drawable.navigation_arrow) }
-            val startIcon = remember { BitmapDescriptorFactory.defaultMarker(BitmapDescriptorFactory.HUE_GREEN) }
-            if (navState is NavigationState.Active) {
-                Polyline(points = navState.route.polyline, color = LuxuryCyan, width = 12f, zIndex = 10f)
-                Marker(state = MarkerState(navState.route.destination), title = "Destination")
+        // Smooth camera updates at ~4Hz when following — reads fresh state each tick
+        LaunchedEffect(isFollowing) {
+            while (isFollowing) {
+                cameraState.animate(
+                    com.google.android.gms.maps.CameraUpdateFactory.newCameraPosition(
+                        CameraPosition.Builder()
+                            .target(currentPosition)
+                            .zoom(currentZoom)
+                            .bearing(currentAzimuth)
+                            .tilt(currentTilt)
+                            .build()
+                    ), durationMs = 300
+                )
+                delay(250L)
             }
-            if (mapPathLatLngs.isNotEmpty()) {
-                Polyline(points = mapPathLatLngs, color = LuxuryGreen, width = 6f, zIndex = 5f)
+        }
+
+        // Overlay state: polyline + marker position throttled at 1Hz to avoid recomposition lag
+        var mapPosition by remember { mutableStateOf(displayPosition) }
+        var mapAzimuth by remember { mutableStateOf(azimuth) }
+        var mapPathLatLngs by remember { mutableStateOf<List<LatLng>>(emptyList()) }
+        var lastOverlayUpdateTime by remember { mutableStateOf(0L) }
+
+        LaunchedEffect(displayPosition, azimuth, history.size) {
+            val now = System.currentTimeMillis()
+            if (now - lastOverlayUpdateTime >= 1000L || navState is NavigationState.Routing) {
+                lastOverlayUpdateTime = now
+                mapPosition = displayPosition
+                mapAzimuth = azimuth
+                mapPathLatLngs = history.map {
+                    NavSightUtils.metersToLatLng(start, it.first.toDouble(), it.second.toDouble())
+                }
             }
-            Marker(state = MarkerState(mapPosition), rotation = mapAzimuth, flat = true, anchor = Offset(0.5f, 0.5f), icon = navArrowIcon)
-            Marker(state = MarkerState(start), title = "Start", icon = startIcon)
+        }
+
+        Box(Modifier.fillMaxSize()) {
+            GoogleMap(
+                modifier = Modifier.fillMaxSize(),
+                cameraPositionState = cameraState,
+                uiSettings = MapUiSettings(
+                    zoomControlsEnabled = false,
+                    compassEnabled = false,
+                    myLocationButtonEnabled = false
+                )
+            ) {
+                val navArrowIcon = remember { NavSightUtils.vectorToBitmap(this@MainActivity, R.drawable.navigation_arrow) }
+                val startIcon = remember { BitmapDescriptorFactory.defaultMarker(BitmapDescriptorFactory.HUE_GREEN) }
+                if (navState is NavigationState.Active) {
+                    Polyline(points = navState.route.polyline, color = LuxuryCyan, width = 12f, zIndex = 10f)
+                    Marker(state = MarkerState(navState.route.destination), title = "Destination")
+                }
+                if (mapPathLatLngs.isNotEmpty()) {
+                    Polyline(points = mapPathLatLngs, color = LuxuryGreen, width = 6f, zIndex = 5f)
+                }
+                Marker(state = MarkerState(mapPosition), rotation = mapAzimuth, flat = true, anchor = Offset(0.5f, 0.5f), icon = navArrowIcon)
+                Marker(state = MarkerState(start), title = "Start", icon = startIcon)
+            }
+
+            // Recenter button — shows when user pans away, tap to re-lock heading + position
+            // Positioned above the Export+Reset column (which sits at BottomEnd padding 16dp)
+            if (!isFollowing) {
+                FloatingActionButton(
+                    onClick = { isFollowing = true },
+                    modifier = Modifier
+                        .align(Alignment.BottomEnd)
+                        .padding(end = 16.dp, bottom = 96.dp)
+                        .size(56.dp),
+                    containerColor = Color.White,
+                    contentColor = LuxuryCyan,
+                    elevation = FloatingActionButtonDefaults.elevation(defaultElevation = 6.dp)
+                ) {
+                    Icon(
+                        imageVector = Icons.Default.Place,
+                        contentDescription = "Recenter",
+                        modifier = Modifier.size(28.dp)
+                    )
+                }
+            }
         }
     }
 
@@ -979,8 +1023,15 @@ class MainActivity : ComponentActivity() {
                     Spacer(Modifier.width(12.dp))
                     BasicTextField(value = searchText, onValueChange = { query ->
                         searchText = query
+                        Log.d(TAG, "Search query: '$query' (length=${query.length})")
                         if (query.length >= 2) {
-                            scope.launch { fetchPlacePredictions(query, sessionToken) { predictions = it } }
+                            scope.launch {
+                                try {
+                                    fetchPlacePredictions(query, sessionToken) { predictions = it }
+                                } catch (e: Exception) {
+                                    Log.e(TAG, "Places search crashed: ${e.message}", e)
+                                }
+                            }
                         } else predictions = emptyList()
                     }, modifier = Modifier.weight(1f), textStyle = TextStyle(color = Color.Black, fontSize = 16.sp), singleLine = true, decorationBox = { if (searchText.isEmpty()) Text("Where to?", color = Color(0xFFB0B0B0), fontSize = 16.sp); it() })
                     if (searchText.isNotEmpty()) IconButton(onClick = { searchText = ""; predictions = emptyList() }, modifier = Modifier.size(32.dp)) { Icon(Icons.Default.Close, null, tint = Color.Gray) }
@@ -1014,14 +1065,21 @@ class MainActivity : ComponentActivity() {
     private fun fetchPlacePredictions(query: String, sessionToken: com.google.android.libraries.places.api.model.AutocompleteSessionToken, onResult: (List<PlacePrediction>) -> Unit) {
         val request = com.google.android.libraries.places.api.net.FindAutocompletePredictionsRequest.builder().setSessionToken(sessionToken).setQuery(query).build()
         viewModel.placesClient.findAutocompletePredictions(request).addOnSuccessListener { response ->
+            Log.d(TAG, "Places: got ${response.autocompletePredictions.size} predictions for '$query'")
             onResult(response.autocompletePredictions.map { PlacePrediction(it.placeId, it.getPrimaryText(null).toString(), it.getSecondaryText(null).toString()) })
-        }.addOnFailureListener { onResult(emptyList()) }
+        }.addOnFailureListener { e ->
+            Log.e(TAG, "Places autocomplete failed: ${e.message}", e)
+            onResult(emptyList())
+        }
     }
 
     private fun fetchPlaceLatLng(placeId: String, onResult: (LatLng?) -> Unit) {
         val fields = listOf(com.google.android.libraries.places.api.model.Place.Field.LAT_LNG)
         val request = com.google.android.libraries.places.api.net.FetchPlaceRequest.newInstance(placeId, fields)
-        viewModel.placesClient.fetchPlace(request).addOnSuccessListener { onResult(it.place.latLng) }.addOnFailureListener { onResult(null) }
+        viewModel.placesClient.fetchPlace(request).addOnSuccessListener { onResult(it.place.latLng) }.addOnFailureListener { e ->
+            Log.e(TAG, "Places fetch failed: ${e.message}", e)
+            onResult(null)
+        }
     }
 
     data class PlacePrediction(val placeId: String, val primaryText: String, val secondaryText: String)

@@ -26,21 +26,30 @@ else()
     find_package(OpenCV REQUIRED)
 endif()
 
-# VIO core library (no Android deps)
+# VIO core library (all active source files)
 set(VIO_SRC_DIR "${CMAKE_CURRENT_SOURCE_DIR}/../../app/src/main/cpp")
 add_library(navsight_core STATIC
-    ${VIO_SRC_DIR}/VisionModule.cpp
+    ${VIO_SRC_DIR}/Tracker.cpp
+    ${VIO_SRC_DIR}/EKFState.cpp
     ${VIO_SRC_DIR}/IMUPreintegrator.cpp
+    ${VIO_SRC_DIR}/FeatureManager.cpp
+    ${VIO_SRC_DIR}/LensCorrector.cpp
+    ${VIO_SRC_DIR}/TrackKLT.cpp
+    ${VIO_SRC_DIR}/UpdaterZeroVelocity.cpp
+    ${VIO_SRC_DIR}/UpdaterMSCKF.cpp
+    ${VIO_SRC_DIR}/InertialInitializer.cpp
+    ${VIO_SRC_DIR}/VioEngine.cpp
 )
 target_compile_definitions(navsight_core PUBLIC NAVSIGHT_DESKTOP_TEST=1)
 target_include_directories(navsight_core PUBLIC ${VIO_SRC_DIR})
 target_link_libraries(navsight_core ${OpenCV_LIBS})
 
 # Test executable
+# NOTE: test_imu_preintegrator.cpp, test_drift_scenarios.cpp, test_vision_module.cpp
+# reference old APIs (VisionModule, setGravity, getMotionMode) and need updating.
 add_executable(navsight_tests
-    test_imu_preintegrator.cpp
-    test_vision_module.cpp
-    test_drift_scenarios.cpp
+    test_tracker.cpp
+    test_zupt.cpp
 )
 target_link_libraries(navsight_tests navsight_core GTest::gtest_main)
 

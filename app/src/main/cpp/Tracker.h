@@ -92,6 +92,9 @@ private:
     double smooth_scale_{0.20};
     int scale_obs_count_{0};
     double user_scale_correction_{1.0};
+    // Scale bootstrap: collect first N observations and take median
+    static constexpr int SCALE_BOOTSTRAP_COUNT = 15;
+    std::vector<double> scale_bootstrap_buf_;
     cv::Mat accel_bias_;
     int accel_bias_count_{0};
     // gyro_bias_ removed — unified: use IMUPreintegrator::getGyroBias() only

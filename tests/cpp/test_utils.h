@@ -4,6 +4,9 @@
 #include <cstdint>
 #include <cstring>
 #include <opencv2/core.hpp>
+#include "Tracker.h"
+#include "IMUPreintegrator.h"
+#include "VioEngine.h"
 
 namespace test_utils {
 
@@ -68,50 +71,65 @@ inline std::vector<cv::Point2f> shiftFeatures(
     return shifted;
 }
 
-// Feed static IMU data (gravity only, no rotation) into a VisionModule
-template<typename VisionModuleT>
-void feedStaticIMU(VisionModuleT& vm, int64_t start_ns, int duration_ms, int rate_hz = 200) {
+// IMU data dispatch helpers — handle both IMUPreintegrator (addGyroReading)
+// and VioEngine (addGyroData) method naming
+namespace detail {
+    // IMUPreintegrator overloads
+    inline void addGyro(IMUPreintegrator& imu, int64_t ts, float x, float y, float z) {
+        imu.addGyroReading(ts, x, y, z);
+    }
+    inline void addAccel(IMUPreintegrator& imu, int64_t ts, float x, float y, float z) {
+        imu.addAccelReading(ts, x, y, z);
+    }
+    // VioEngine overloads
+    inline void addGyro(VioEngine& engine, int64_t ts, float x, float y, float z) {
+        engine.addGyroData(ts, x, y, z);
+    }
+    inline void addAccel(VioEngine& engine, int64_t ts, float x, float y, float z) {
+        engine.addAccelData(ts, x, y, z);
+    }
+}
+
+// Feed static IMU data (gravity only, no rotation)
+template<typename T>
+void feedStaticIMU(T& vm, int64_t start_ns, int duration_ms, int rate_hz = 200) {
     int64_t dt_ns = 1'000'000'000LL / rate_hz;
     int samples = duration_ms * rate_hz / 1000;
     for (int i = 0; i < samples; i++) {
         int64_t ts = start_ns + i * dt_ns;
-        vm.addGyroData(ts, 0.0f, 0.0f, 0.0f);
-        vm.addAccelData(ts, 0.0f, 9.81f, 0.0f); // phone upright, Y is up
+        detail::addGyro(vm, ts, 0.0f, 0.0f, 0.0f);
+        detail::addAccel(vm, ts, 0.0f, 9.81f, 0.0f); // phone upright, Y is up
     }
 }
 
 // Feed walking IMU data with realistic step-like accel pattern
-// Simulates periodic vertical acceleration peaks (~1.3 Hz step frequency)
-template<typename VisionModuleT>
-void feedWalkingIMU(VisionModuleT& vm, int64_t start_ns, int duration_ms,
+template<typename T>
+void feedWalkingIMU(T& vm, int64_t start_ns, int duration_ms,
                     float forward_accel = 0.3f, int rate_hz = 200) {
     int64_t dt_ns = 1'000'000'000LL / rate_hz;
     int samples = duration_ms * rate_hz / 1000;
-    double step_freq = 1.3; // Hz, typical walking
+    double step_freq = 1.3;
     for (int i = 0; i < samples; i++) {
         int64_t ts = start_ns + i * dt_ns;
         double t = i * (1.0 / rate_hz);
-        // Simulate step impact: periodic accel magnitude peaks
-        // Walking produces ~0.5-1.0 m/s² oscillation around gravity
         float step_component = 0.7f * static_cast<float>(
             std::sin(2.0 * M_PI * step_freq * t));
-        // Add peak sharpening (walking has sharper upward peaks)
         if (step_component > 0) step_component *= 1.5f;
-        vm.addGyroData(ts, 0.0f, 0.0f, 0.0f);
-        vm.addAccelData(ts, forward_accel, 9.81f + step_component, 0.0f);
+        detail::addGyro(vm, ts, 0.0f, 0.0f, 0.0f);
+        detail::addAccel(vm, ts, forward_accel, 9.81f + step_component, 0.0f);
     }
 }
 
 // Feed constant-rotation IMU data
-template<typename VisionModuleT>
-void feedRotatingIMU(VisionModuleT& vm, int64_t start_ns, int duration_ms,
+template<typename T>
+void feedRotatingIMU(T& vm, int64_t start_ns, int duration_ms,
                      float gx, float gy, float gz, int rate_hz = 200) {
     int64_t dt_ns = 1'000'000'000LL / rate_hz;
     int samples = duration_ms * rate_hz / 1000;
     for (int i = 0; i < samples; i++) {
         int64_t ts = start_ns + i * dt_ns;
-        vm.addGyroData(ts, gx, gy, gz);
-        vm.addAccelData(ts, 0.0f, 9.81f, 0.0f);
+        detail::addGyro(vm, ts, gx, gy, gz);
+        detail::addAccel(vm, ts, 0.0f, 9.81f, 0.0f);
     }
 }
 
@@ -159,6 +177,21 @@ inline cv::Mat rotZ(double angle_rad) {
     R.at<double>(1, 0) = std::sin(angle_rad);
     R.at<double>(1, 1) = std::cos(angle_rad);
     return R;
+}
+
+// Helper: process a frame through Tracker (wraps the TrackerFrame out-param)
+inline VisionOutput processFrame(Tracker& tracker, IMUPreintegrator& imu,
+                                  const std::vector<uint8_t>& frame,
+                                  int width, int height, int64_t ts) {
+    TrackerFrame frame_out;
+    return tracker.processFrame(frame.data(), width, height, ts, imu, frame_out);
+}
+
+// Helper: process a frame through VioEngine
+inline VisionOutput processFrameEngine(VioEngine& engine,
+                                        const std::vector<uint8_t>& frame,
+                                        int width, int height, int64_t ts) {
+    return engine.processFrame(frame.data(), width, height, ts);
 }
 
 } // namespace test_utils
