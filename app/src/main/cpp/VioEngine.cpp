@@ -48,7 +48,7 @@ void VioEngine::mapperThreadFunc() {
         }
 
         // Run mapper (heavy: ground plane, BA, loop closure)
-        MapperResult mr = mapper_.process(frame, scale);
+        MapperResult mr = mapper_.process(frame, scale, tracker_.getEKF());
 
         // Store result for next processFrame to pick up
         {
@@ -98,24 +98,18 @@ VisionOutput VioEngine::processFrame(const uint8_t* yuv_data, int width, int hei
 // ── Apply Mapper corrections to Tracker state ───────────────────────────────
 
 void VioEngine::applyMapperResult(const MapperResult& mr, VisionOutput& out) {
-    // Ground plane scale correction (6-15% weight based on confidence)
-    if (mr.ground_plane.is_valid) {
-        double gp_alpha = 0.15 * mr.ground_plane.confidence;
-        tracker_.blendScale(mr.ground_plane.ground_scale, gp_alpha);
-    }
-
-    // BA scale correction (8% weight)
-    if (mr.bundle_adj.is_valid) {
-        tracker_.blendScale(mr.bundle_adj.optimized_scale, mr.bundle_adj.alpha);
-    }
-
-    // Loop closure correction (30% blend per detection)
-    if (mr.loop_closure.detected) {
-        tracker_.applyLoopCorrection(
-            mr.loop_closure.target_x, mr.loop_closure.target_y,
-            mr.loop_closure.target_z, mr.loop_closure.target_heading,
-            mr.loop_closure.blend, out);
-    }
+    // SIMPLIFIED PIPELINE:
+    // Scale comes from step detector only (via Tracker's EKF).
+    // Mapper corrections (BA, ground plane, depth, loop closure) are DISABLED.
+    // They were all fighting each other and causing teleportation spikes.
+    //
+    // MiDaS depth and ground plane are still computed by the Mapper thread
+    // for future use, but their corrections are not applied.
+    //
+    // TODO: Re-enable depth scale once the core pipeline is stable,
+    // using it as a consistency check rather than a competing scale source.
+    (void)mr;
+    (void)out;
 }
 
 // ── Sensor data forwarding ──────────────────────────────────────────────────
@@ -126,6 +120,9 @@ void VioEngine::addGyroData(int64_t timestamp_ns, float x, float y, float z) {
         return;
     }
     imu_.addGyroReading(timestamp_ns, x, y, z);
+    
+    // Also pass to tracker for initialization
+    tracker_.addImuData(timestamp_ns, imu_.lastAccelX(), imu_.lastAccelY(), imu_.lastAccelZ(), x, y, z);
 }
 
 void VioEngine::addAccelData(int64_t timestamp_ns, float x, float y, float z) {
@@ -134,6 +131,9 @@ void VioEngine::addAccelData(int64_t timestamp_ns, float x, float y, float z) {
         return;
     }
     imu_.addAccelReading(timestamp_ns, x, y, z);
+
+    // Also pass to tracker for initialization
+    tracker_.addImuData(timestamp_ns, x, y, z, imu_.lastGyroX(), imu_.lastGyroY(), imu_.lastGyroZ());
 }
 
 void VioEngine::setIntrinsics(double fx, double fy, double cx, double cy) {
@@ -148,12 +148,29 @@ void VioEngine::setMagnetometerHeading(float yaw_rad) {
     imu_.setMagnetometerHeading(yaw_rad);
 }
 
+void VioEngine::setDepthMap(const float* depth_data, int width, int height) {
+    if (!depth_data || width <= 0 || height <= 0) return;
+
+    std::lock_guard<std::mutex> lock(depth_mutex_);
+    size_t size = static_cast<size_t>(width * height);
+    if (latest_depth_map_.size() != size) {
+        latest_depth_map_.resize(size);
+    }
+    std::copy(depth_data, depth_data + size, latest_depth_map_.begin());
+    depth_width_ = width;
+    depth_height_ = height;
+
+    // Also update mapper state
+    mapper_.setDepthMap(depth_data, width, height);
+}
+
 void VioEngine::setUserScaleCorrection(double correction) {
     tracker_.setUserScaleCorrection(correction);
 }
 
 void VioEngine::setUserHeight(float height_m) {
     imu_.setUserHeight(height_m);
+    mapper_.setCameraHeight(static_cast<double>(height_m));
 }
 
 void VioEngine::reset() {

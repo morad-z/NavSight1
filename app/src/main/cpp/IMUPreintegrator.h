@@ -15,12 +15,23 @@ struct AccelSample {
     float x, y, z;
 };
 
-struct PreintegratedDelta {
+struct PreintegratedMeasurement {
     cv::Mat deltaR; // 3x3 rotation
     cv::Mat deltaV; // 3x1 velocity
     cv::Mat deltaP; // 3x1 position
+    cv::Mat cov;    // 9x9 covariance (order: rotation, velocity, position)
+    
+    // Jacobians w.r.t. biases
+    cv::Mat J_R_bg; // 3x3
+    cv::Mat J_V_bg; // 3x3
+    cv::Mat J_V_ba; // 3x3
+    cv::Mat J_P_bg; // 3x3
+    cv::Mat J_P_ba; // 3x3
+
     double dt;
     int sample_count;
+
+    PreintegratedMeasurement();
 };
 
 class IMUPreintegrator {
@@ -34,20 +45,37 @@ public:
     cv::Mat integrateGyro(int64_t start_ns, int64_t end_ns);
 
     // Full preintegration (returns deltaR, deltaV, deltaP for the interval)
-    PreintegratedDelta integrate(int64_t start_ns, int64_t end_ns);
+    PreintegratedMeasurement integrate(int64_t start_ns, int64_t end_ns);
+
+    // Get interpolated sensor data at specific timestamp
+    GyroSample interpolateGyro(int64_t ts_ns) const;
+    AccelSample interpolateAccel(int64_t ts_ns) const;
+
+    // Bias correction using Taylor expansion
+    void correctMeasurement(PreintegratedMeasurement& meas, 
+                            const cv::Point3f& delta_bg, 
+                            const cv::Point3f& delta_ba);
+
+    // Set IMU noise parameters
+    void setNoiseParameters(float accel_noise, float gyro_noise, 
+                            float accel_rw, float gyro_rw);
 
     // Initialize gravity vector from a batch of accelerometer samples
     void initializeFromGravity(const std::vector<cv::Point3f>& accel_samples);
     void setGravity(float gx, float gy, float gz);
 
     cv::Point3f getGravityVector() const;
+    // Low-pass filtered accelerometer — tracks current gravity direction
+    // even as the phone tilts during use (unlike getGravityVector which is
+    // frozen from initialization).
+    cv::Point3f getFilteredGravity() const;
     float getRoll() const;
     float getPitch() const;
     bool isInitialized() const;
 
     void reset();
-
     std::vector<AccelSample> getAccelBuffer() const;
+    std::vector<GyroSample> getGyroBuffer() const;
 
     // Last known sensor values (for VioData passthrough)
     float lastAccelX() const { return last_ax; }
@@ -57,26 +85,6 @@ public:
     float lastGyroY()  const { return last_gy; }
     float lastGyroZ()  const { return last_gz; }
 
-private:
-    mutable std::mutex mutex_;
-    std::vector<GyroSample>  gyro_buf_;
-    std::vector<AccelSample> accel_buf_;
-    static constexpr size_t MAX_BUF = 2000;
-    std::vector<cv::Point3f> gravity_init_samples_;
-    static constexpr size_t GRAVITY_INIT_WINDOW = 40;
-    static constexpr float GRAVITY_INIT_MAX_VAR = 0.08f;
-    static constexpr float GRAVITY_INIT_GYRO_MAX = 0.12f;
-
-    std::atomic<bool> gravity_initialized_{false};
-    cv::Point3f gravity_vec_{0.f, 0.f, 9.81f};
-    float roll_{0.f}, pitch_{0.f};
-
-    // Last sensor values for passthrough
-    float last_ax{0.f}, last_ay{0.f}, last_az{0.f};
-    float last_gx{0.f}, last_gy{0.f}, last_gz{0.f};
-
-    // ── Step detection ──────────────────────────────────────────────────────
-public:
     struct StepInfo {
         int step_count;           // Total steps since reset
         double stride_length_m;   // Estimated stride length in meters
@@ -93,7 +101,41 @@ public:
     // Vehicle speed estimate from integrated acceleration (reset at ZUPT)
     double getVehicleSpeedEstimate() const;
 
+    // User height for stride estimation (default 1.70m)
+    void setUserHeight(float height_m);
+    float getUserHeight() const;
+
+    // Magnetometer heading fusion
+    void setMagnetometerHeading(float yaw_rad);
+    float getCorrectedHeading(float gyro_yaw_rad);
+    bool hasMagHeading() const { return has_mag_heading_.load(); }
+    float getMagHeading() const { return mag_heading_; }
+
+    // Gyro bias accessor (unified — Tracker no longer maintains its own)
+    cv::Point3f getGyroBias() const;
+
 private:
+    mutable std::mutex mutex_;
+    std::vector<GyroSample>  gyro_buf_;
+    std::vector<AccelSample> accel_buf_;
+    static constexpr size_t MAX_BUF = 2000;
+    std::vector<cv::Point3f> gravity_init_samples_;
+    static constexpr size_t GRAVITY_INIT_WINDOW = 40;
+    static constexpr float GRAVITY_INIT_MAX_VAR = 0.08f;
+    static constexpr float GRAVITY_INIT_GYRO_MAX = 0.12f;
+
+    std::atomic<bool> gravity_initialized_{false};
+    cv::Point3f gravity_vec_{0.f, 0.f, 9.81f};
+    float roll_{0.f}, pitch_{0.f};
+
+    // Low-pass filtered gravity (tracks phone tilt changes during use)
+    cv::Point3f filtered_gravity_{0.f, 0.f, 9.81f};
+    bool filtered_gravity_init_{false};
+
+    // Last sensor values for passthrough
+    float last_ax{0.f}, last_ay{0.f}, last_az{0.f};
+    float last_gx{0.f}, last_gy{0.f}, last_gz{0.f};
+
     // Step detector state
     int step_count_{0};
     int64_t last_step_ns_{0};
@@ -108,9 +150,6 @@ private:
     static constexpr double DEFAULT_STRIDE_M  = 0.65;      // Average human stride
     float user_height_m_{1.70f};                              // User height for stride model
 
-    // Walking validation: reject car vibrations masquerading as steps
-    // Real walking has accel magnitude variance > 0.3 m/s² over ~1 second
-    // Car vibrations have smaller, higher-frequency oscillations
     float accel_mag_slow_{9.81f};     // Very slow LP for walking detection (alpha ~0.02)
     float accel_variance_est_{0.0f};  // Running variance of accel magnitude
     bool is_walking_pattern_{false};  // True if recent accel matches walking, not vibration
@@ -126,28 +165,21 @@ private:
     void tryInitializeGravityLocked(float ax, float ay, float az);
     void tryInitializeGyroBiasLocked(float ax, float ay, float az);
 
-    // ── Gyroscope bias correction ──────────────────────────────────────────
-    // Gyroscope bias is a constant offset that accumulates over time.
-    // Estimate it during stationary initialization, subtract during integration.
-private:
+    // Gyroscope bias correction
     cv::Point3f gyro_bias_{0.f, 0.f, 0.f};              // Estimated bias in rad/sec
     std::atomic<bool> gyro_bias_initialized_{false};
     int gyro_bias_samples_{0};
     static constexpr int GYRO_BIAS_INIT_SAMPLES = 200;  // ~6-7 frames at 30fps
 
-    // ── Magnetometer heading fusion ────────────────────────────────────────
-    // Magnetometer provides absolute heading reference (doesn't accumulate error)
-public:
-    void setMagnetometerHeading(float yaw_rad);
-    float getCorrectedHeading(float gyro_yaw_rad);
-
-    // User height for stride estimation (default 1.70m)
-    void setUserHeight(float height_m);
-    float getUserHeight() const;
-
-private:
+    // Magnetometer heading fusion
     float mag_heading_{0.f};                            // Yaw from magnetometer (rad)
     std::atomic<bool> has_mag_heading_{false};
     int64_t last_mag_update_ns_{0};
     static constexpr float HEADING_CORRECTION_DAMPING = 0.95f;  // Smooth fusion
+
+    // Noise parameters
+    float accel_noise_sigma_{0.1f};   // m/s^2/sqrt(Hz)
+    float gyro_noise_sigma_{0.01f};    // rad/s/sqrt(Hz)
+    float accel_rw_sigma_{0.001f};     // m/s^3/sqrt(Hz)
+    float gyro_rw_sigma_{0.0001f};     // rad/s^2/sqrt(Hz)
 };

@@ -71,6 +71,22 @@ object NavSightUtils {
         }
     }
 
+    /**
+     * Converts NV21 byte array to a Bitmap.
+     * Uses Android's YuvImage for robust conversion.
+     */
+    fun nv21ToBitmap(data: ByteArray, width: Int, height: Int): android.graphics.Bitmap? {
+        return try {
+            val yuvImage = android.graphics.YuvImage(data, android.graphics.ImageFormat.NV21, width, height, null)
+            val out = java.io.ByteArrayOutputStream()
+            yuvImage.compressToJpeg(android.graphics.Rect(0, 0, width, height), 90, out)
+            val imageBytes = out.toByteArray()
+            android.graphics.BitmapFactory.decodeByteArray(imageBytes, 0, imageBytes.size)
+        } catch (e: Exception) {
+            null
+        }
+    }
+
     fun vectorToBitmap(context: Context, drawableId: Int): BitmapDescriptor? {
         return try {
             val vectorDrawable = ContextCompat.getDrawable(context, drawableId) ?: return null

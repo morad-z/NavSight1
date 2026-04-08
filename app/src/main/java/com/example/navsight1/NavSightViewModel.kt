@@ -14,9 +14,10 @@ import com.google.android.gms.location.LocationRequest
 import com.google.android.gms.location.LocationResult
 import com.google.android.gms.location.Priority
 import com.google.android.gms.maps.model.LatLng
-import com.otaliastudios.cameraview.frame.Frame
+import androidx.camera.core.ImageProxy
 import kotlinx.coroutines.Dispatchers
 import kotlinx.coroutines.flow.collect
+import kotlinx.coroutines.flow.sample
 import kotlinx.coroutines.launch
 import kotlinx.coroutines.withContext
 import kotlin.math.*
@@ -155,7 +156,7 @@ class NavSightViewModel(application: Application) : AndroidViewModel(application
     private var lastSpeedTimeMs = 0L
     private var lastSnapTimeMs = 0L
     private var lastUiUpdateTimeMs = 0L
-    private val UI_UPDATE_THROTTLE_MS = 100L
+    private val UI_UPDATE_THROTTLE_MS = 200L  // 5Hz — halves recomposition load
 
     private var latestVioState: VioData = VioData()
     private var hasLocationPermission = false
@@ -184,7 +185,7 @@ class NavSightViewModel(application: Application) : AndroidViewModel(application
 
         // Observe Repository states
         viewModelScope.launch {
-            sensorRepository.orientationState.collect { orientationState = it }
+            sensorRepository.orientationState.sample(200L).collect { orientationState = it }
         }
         viewModelScope.launch {
             sensorRepository.vioState.collect { vio ->
@@ -400,8 +401,8 @@ class NavSightViewModel(application: Application) : AndroidViewModel(application
         sensorRepository.stopSensors()
     }
 
-    fun processCameraFrame(frame: Frame) {
-        sensorRepository.processCameraFrame(frame)
+    fun processCameraFrame(image: ImageProxy) {
+        sensorRepository.processCameraFrame(image)
     }
 
     fun requestInitialLocation(granted: Boolean = false) {

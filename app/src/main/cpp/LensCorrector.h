@@ -30,7 +30,9 @@ private:
     cv::Mat dist_coeffs_;      // 5x1 [k1, k2, p1, p2, k3]
     bool has_intrinsics_{false};
 
-    // Default distortion for typical phone cameras (mild barrel)
-    static constexpr double DEFAULT_K1 = -0.08;
-    static constexpr double DEFAULT_K2 =  0.01;
+    // Default: zero distortion (no correction if uncalibrated)
+    // Wrong distortion coefficients are WORSE than no correction —
+    // they corrupt point positions and cause essential matrix failure.
+    static constexpr double DEFAULT_K1 = 0.0;
+    static constexpr double DEFAULT_K2 = 0.0;
 };
