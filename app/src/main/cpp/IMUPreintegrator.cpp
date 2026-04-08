@@ -522,8 +522,7 @@ void IMUPreintegrator::setUserHeight(float height_m) {
     LOGI("User height set: %.2f m → base stride ≈ %.2f m", user_height_m_, user_height_m_ * 0.415f);
 }
 
-// DEAD CODE: getUserHeight — never called
-// float IMUPreintegrator::getUserHeight() const { return user_height_m_; }
+float IMUPreintegrator::getUserHeight() const { return user_height_m_; }
 
 // ── reset ─────────────────────────────────────────────────────────────────────
 
