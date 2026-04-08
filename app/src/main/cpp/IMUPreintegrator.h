@@ -106,8 +106,7 @@ public:
 
     // User height for stride estimation (default 1.70m)
     void setUserHeight(float height_m);
-    // DEAD CODE: getUserHeight — never called
-    // float getUserHeight() const;
+    float getUserHeight() const;
 
     // Magnetometer heading fusion
     void setMagnetometerHeading(float yaw_rad);

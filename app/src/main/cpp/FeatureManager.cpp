@@ -143,12 +143,15 @@ void FeatureManager::replenishSparse(const cv::Mat& gray,
 
 void FeatureManager::storeKeyframe(const cv::Mat& gray,
                                     const std::vector<cv::Point2f>& points,
-                                    int64_t timestamp_ns, int frame_id) {
+                                    int64_t timestamp_ns, int frame_id,
+                                    double heading, cv::Point3f position) {
     Keyframe kf;
     kf.gray = gray.clone();
     kf.points = points;
     kf.timestamp_ns = timestamp_ns;
     kf.frame_id = frame_id;
+    kf.heading = heading;
+    kf.position = position;
 
     keyframes_.push_back(std::move(kf));
     if (static_cast<int>(keyframes_.size()) > MAX_KEYFRAMES) {
