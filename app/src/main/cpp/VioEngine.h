@@ -24,6 +24,7 @@ public:
     void setIntrinsics(double fx, double fy, double cx, double cy);
     void setInitialHeading(double azimuth_rad);
     void setMagnetometerHeading(float yaw_rad);
+    void setDepthMap(const float* depth_data, int width, int height);
     void setUserScaleCorrection(double correction);
     void setUserHeight(float height_m);
     void reset();
@@ -46,6 +47,11 @@ private:
     bool mapper_has_work_{false};
     TrackerFrame mapper_pending_frame_;
     double mapper_pending_scale_{0.0};
+
+    // Depth map (monocular inference result)
+    std::mutex         depth_mutex_;
+    std::vector<float> latest_depth_map_;
+    int                depth_width_{0}, depth_height_{0};
 
     // Latest mapper result (consumed by next processFrame)
     std::mutex result_mutex_;

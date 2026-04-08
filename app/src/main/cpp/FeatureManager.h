@@ -1,11 +1,12 @@
 #pragma once
 #include <vector>
+#include <unordered_map>
 #include <opencv2/core.hpp>
 #include <opencv2/imgproc.hpp>
+#include "UpdaterMSCKF.h"
 
-// Grid-based feature detection and spatial distribution enforcement.
-// Ensures features are spread across the image, not clustered in one area.
-// Also manages keyframe storage for re-localization after tracking loss.
+// Grid-based feature detection, spatial distribution enforcement,
+// and multi-clone feature track management for MSCKF.
 class FeatureManager {
 public:
     FeatureManager();
@@ -46,11 +47,36 @@ public:
     int getKeyframeCount() const { return static_cast<int>(keyframes_.size()); }
     void reset();
 
+    // ── MSCKF Feature Track Management ──────────────────────────────────────
+
+    // Assign unique IDs to a set of newly detected features.
+    // Returns vector of IDs (same size as points).
+    std::vector<int> assignIds(int count);
+
+    // Record that feature_id was observed from clone_state_id at pixel_ud.
+    void addObservation(int feature_id, int clone_state_id,
+                        const cv::Point2f& pixel_ud);
+
+    // Given current tracked feature IDs, find features that are no longer
+    // being tracked (lost) and have enough observations for MSCKF update.
+    // Removes lost features from internal tracking state.
+    std::vector<LostFeature> extractLostFeatures(
+        const std::vector<int>& current_ids, int min_obs = 3);
+
+    // Remove observations referencing clones that have been marginalized.
+    void pruneObservations(int min_clone_id);
+
+    int getNextFeatureId() const { return next_feature_id_; }
+
 private:
     int countInCell(const std::vector<cv::Point2f>& points,
                     int row, int col, int cell_w, int cell_h) const;
 
     std::vector<Keyframe> keyframes_;
+
+    // MSCKF: per-feature observation history
+    int next_feature_id_{0};
+    std::unordered_map<int, std::vector<FeatureObservation>> active_tracks_;
 
     static constexpr int GRID_ROWS = 4;
     static constexpr int GRID_COLS = 5;

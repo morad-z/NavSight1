@@ -1,12 +1,17 @@
 #include "IMUPreintegrator.h"
 #include <algorithm>
 #include <cmath>
-#include <android/log.h>
 #include <opencv2/calib3d.hpp>
 
+#ifdef __ANDROID__
+#include <android/log.h>
 #define TAG "NavSight-Native"
 #define LOGI(...) __android_log_print(ANDROID_LOG_INFO,  TAG, __VA_ARGS__)
 #define LOGE(...) __android_log_print(ANDROID_LOG_ERROR, TAG, __VA_ARGS__)
+#else
+#define LOGI(...) (void)0
+#define LOGE(...) (void)0
+#endif
 
 // ── Constructor ───────────────────────────────────────────────────────────────
 
@@ -15,10 +20,67 @@ IMUPreintegrator::IMUPreintegrator() {
     accel_buf_.reserve(MAX_BUF);
 }
 
+// ── PreintegratedMeasurement ──────────────────────────────────────────────────
+
+PreintegratedMeasurement::PreintegratedMeasurement() {
+    deltaR = cv::Mat::eye(3, 3, CV_64F);
+    deltaV = cv::Mat::zeros(3, 1, CV_64F);
+    deltaP = cv::Mat::zeros(3, 1, CV_64F);
+    cov    = cv::Mat::zeros(9, 9, CV_64F);
+    
+    J_R_bg = cv::Mat::zeros(3, 3, CV_64F);
+    J_V_bg = cv::Mat::zeros(3, 3, CV_64F);
+    J_V_ba = cv::Mat::zeros(3, 3, CV_64F);
+    J_P_bg = cv::Mat::zeros(3, 3, CV_64F);
+    J_P_ba = cv::Mat::zeros(3, 3, CV_64F);
+    
+    dt = 0.0;
+    sample_count = 0;
+}
+
 // ── Helpers ───────────────────────────────────────────────────────────────────
+
+static cv::Mat skewSymmetric(const cv::Mat& v) {
+    cv::Mat m = cv::Mat::zeros(3, 3, CV_64F);
+    m.at<double>(0, 1) = -v.at<double>(2);
+    m.at<double>(0, 2) =  v.at<double>(1);
+    m.at<double>(1, 0) =  v.at<double>(2);
+    m.at<double>(1, 2) = -v.at<double>(0);
+    m.at<double>(2, 0) = -v.at<double>(1);
+    m.at<double>(2, 1) =  v.at<double>(0);
+    return m;
+}
 
 static inline bool isValidSensorFloat(float v) {
     return !std::isnan(v) && !std::isinf(v);
+}
+
+void IMUPreintegrator::setNoiseParameters(float accel_noise, float gyro_noise, 
+                                        float accel_rw, float gyro_rw) {
+    std::lock_guard<std::mutex> lock(mutex_);
+    accel_noise_sigma_ = accel_noise;
+    gyro_noise_sigma_ = gyro_noise;
+    accel_rw_sigma_ = accel_rw;
+    gyro_rw_sigma_ = gyro_rw;
+}
+
+void IMUPreintegrator::correctMeasurement(PreintegratedMeasurement& meas, 
+                                         const cv::Point3f& delta_bg, 
+                                         const cv::Point3f& delta_ba) {
+    cv::Mat dbg = (cv::Mat_<double>(3,1) << delta_bg.x, delta_bg.y, delta_bg.z);
+    cv::Mat dba = (cv::Mat_<double>(3,1) << delta_ba.x, delta_ba.y, delta_ba.z);
+
+    // deltaR = deltaR * Exp(J_R_bg * delta_bg)
+    cv::Mat dR_cor_vec = meas.J_R_bg * dbg;
+    cv::Mat dR_cor;
+    cv::Rodrigues(dR_cor_vec, dR_cor);
+    meas.deltaR = meas.deltaR * dR_cor;
+
+    // deltaV = deltaV + J_V_bg * delta_bg + J_V_ba * delta_ba
+    meas.deltaV += meas.J_V_bg * dbg + meas.J_V_ba * dba;
+
+    // deltaP = deltaP + J_P_bg * delta_bg + J_P_ba * dba
+    meas.deltaP += meas.J_P_bg * dbg + meas.J_P_ba * dba;
 }
 
 // ── addGyroReading ────────────────────────────────────────────────────────────
@@ -52,6 +114,20 @@ void IMUPreintegrator::addAccelReading(int64_t timestamp_ns, float x, float y, f
                          accel_buf_.begin() + static_cast<ptrdiff_t>(MAX_BUF / 2));
     }
     accel_buf_.push_back({timestamp_ns, x, y, z});
+
+    // Low-pass filter accelerometer to track current gravity direction.
+    // At ~200 Hz IMU rate, alpha=0.02 gives ~1.6 s time constant —
+    // fast enough to follow phone tilts, slow enough to reject steps/vibration.
+    if (!filtered_gravity_init_) {
+        filtered_gravity_ = cv::Point3f(x, y, z);
+        filtered_gravity_init_ = true;
+    } else {
+        constexpr float alpha = 0.02f;
+        filtered_gravity_.x = alpha * x + (1.0f - alpha) * filtered_gravity_.x;
+        filtered_gravity_.y = alpha * y + (1.0f - alpha) * filtered_gravity_.y;
+        filtered_gravity_.z = alpha * z + (1.0f - alpha) * filtered_gravity_.z;
+    }
+
     updateMotionMode(timestamp_ns, x, y, z);
     detectStep(timestamp_ns, x, y, z);
     tryInitializeGravityLocked(x, y, z);
@@ -199,14 +275,8 @@ cv::Mat IMUPreintegrator::integrateGyro(int64_t start_ns, int64_t end_ns) {
 
 // ── integrate ─────────────────────────────────────────────────────────────────
 
-PreintegratedDelta IMUPreintegrator::integrate(int64_t start_ns, int64_t end_ns) {
-    PreintegratedDelta out;
-    out.deltaR = cv::Mat::eye(3, 3, CV_64F);
-    out.deltaV = cv::Mat::zeros(3, 1, CV_64F);
-    out.deltaP = cv::Mat::zeros(3, 1, CV_64F);
-    out.dt = 0.0;
-    out.sample_count = 0;
-
+PreintegratedMeasurement IMUPreintegrator::integrate(int64_t start_ns, int64_t end_ns) {
+    PreintegratedMeasurement out;
     if (start_ns >= end_ns) {
         LOGE("integrate: invalid time window");
         return out;
@@ -216,8 +286,6 @@ PreintegratedDelta IMUPreintegrator::integrate(int64_t start_ns, int64_t end_ns)
     std::vector<AccelSample> a_samples;
     {
         std::lock_guard<std::mutex> lock(mutex_);
-        g_samples.reserve(gyro_buf_.size()); // Conservative estimate
-        a_samples.reserve(accel_buf_.size());
         for (const auto& s : gyro_buf_) {
             if (s.timestamp_ns >= start_ns && s.timestamp_ns <= end_ns) g_samples.push_back(s);
         }
@@ -227,13 +295,10 @@ PreintegratedDelta IMUPreintegrator::integrate(int64_t start_ns, int64_t end_ns)
     }
 
     if (g_samples.empty() || a_samples.empty()) {
-        out.deltaR = integrateGyro(start_ns, end_ns);
         out.dt = (end_ns - start_ns) * 1e-9;
-        out.sample_count = (int)g_samples.size();
         return out;
     }
 
-    // Sort both
     auto sort_fn = [](const auto& a, const auto& b) { return a.timestamp_ns < b.timestamp_ns; };
     std::sort(g_samples.begin(), g_samples.end(), sort_fn);
     std::sort(a_samples.begin(), a_samples.end(), sort_fn);
@@ -241,57 +306,136 @@ PreintegratedDelta IMUPreintegrator::integrate(int64_t start_ns, int64_t end_ns)
     cv::Mat current_R = cv::Mat::eye(3, 3, CV_64F);
     cv::Mat current_V = cv::Mat::zeros(3, 1, CV_64F);
     cv::Mat current_P = cv::Mat::zeros(3, 1, CV_64F);
-
-    // Mid-point integration
-    size_t gi = 0, ai = 0;
-    int64_t t_current = start_ns;
     
-    cv::Mat gravity = (cv::Mat_<double>(3, 1) << (double)gravity_vec_.x, (double)gravity_vec_.y, (double)gravity_vec_.z);
+    cv::Mat P = cv::Mat::zeros(9, 9, CV_64F);
+    cv::Mat J_R_bg = cv::Mat::zeros(3, 3, CV_64F);
+    cv::Mat J_V_bg = cv::Mat::zeros(3, 3, CV_64F);
+    cv::Mat J_V_ba = cv::Mat::zeros(3, 3, CV_64F);
+    cv::Mat J_P_bg = cv::Mat::zeros(3, 3, CV_64F);
+    cv::Mat J_P_ba = cv::Mat::zeros(3, 3, CV_64F);
 
-    while (t_current < end_ns) {
+    cv::Mat Q = cv::Mat::eye(6, 6, CV_64F);
+    cv::Mat Q_gyro = Q(cv::Range(0,3), cv::Range(0,3));
+    Q_gyro *= (gyro_noise_sigma_ * gyro_noise_sigma_);
+    cv::Mat Q_accel = Q(cv::Range(3,6), cv::Range(3,6));
+    Q_accel *= (accel_noise_sigma_ * accel_noise_sigma_);
+
+    size_t gi = 0, ai = 0;
+    int64_t t_curr = start_ns;
+
+    while (t_curr < end_ns) {
         int64_t t_next = end_ns;
         if (gi < g_samples.size()) t_next = std::min(t_next, g_samples[gi].timestamp_ns);
         if (ai < a_samples.size()) t_next = std::min(t_next, a_samples[ai].timestamp_ns);
         
-        if (t_next <= t_current) {
-            if (gi < g_samples.size() && g_samples[gi].timestamp_ns <= t_current) gi++;
-            if (ai < a_samples.size() && a_samples[ai].timestamp_ns <= t_current) ai++;
+        if (t_next <= t_curr) {
+            if (gi < g_samples.size() && g_samples[gi].timestamp_ns <= t_curr) gi++;
+            if (ai < a_samples.size() && a_samples[ai].timestamp_ns <= t_curr) ai++;
             continue;
         }
 
-        double dt = (t_next - t_current) * 1e-9;
+        double dt = (t_next - t_curr) * 1e-9;
         
-        // Get sensors at current (or nearest), with gyro bias correction
-        cv::Point3d g_vec(0,0,0), a_vec(0,0,0);
-        if (gi > 0) {
-            g_vec = cv::Point3d(
-                g_samples[gi-1].x - static_cast<double>(gyro_bias_.x),
-                g_samples[gi-1].y - static_cast<double>(gyro_bias_.y),
-                g_samples[gi-1].z - static_cast<double>(gyro_bias_.z));
+        cv::Mat w = (cv::Mat_<double>(3,1) << 0,0,0);
+        cv::Mat a = (cv::Mat_<double>(3,1) << 0,0,0);
+        if (gi > 0) w = (cv::Mat_<double>(3,1) << g_samples[gi-1].x - gyro_bias_.x, 
+                                                 g_samples[gi-1].y - gyro_bias_.y, 
+                                                 g_samples[gi-1].z - gyro_bias_.z);
+        if (ai > 0) a = (cv::Mat_<double>(3,1) << a_samples[ai-1].x, a_samples[ai-1].y, a_samples[ai-1].z);
+
+        // ── RK4 State Propagation ───────────────────────────────────────────
+        cv::Mat dR, dV, dP;
+        {
+            // k1
+            cv::Mat k1_R_dot = current_R * skewSymmetric(w);
+            cv::Mat k1_V_dot = current_R * a;
+            cv::Mat k1_P_dot = current_V;
+
+            // k2
+            cv::Mat k2_R = current_R + k1_R_dot * (dt * 0.5);
+            cv::Mat k2_V = current_V + k1_V_dot * (dt * 0.5);
+            cv::Mat k2_R_dot = k2_R * skewSymmetric(w);
+            cv::Mat k2_V_dot = k2_R * a;
+            cv::Mat k2_P_dot = k2_V;
+
+            // k3
+            cv::Mat k3_R = current_R + k2_R_dot * (dt * 0.5);
+            cv::Mat k3_V = current_V + k2_V_dot * (dt * 0.5);
+            cv::Mat k3_R_dot = k3_R * skewSymmetric(w);
+            cv::Mat k3_V_dot = k3_R * a;
+            cv::Mat k3_P_dot = k3_V;
+
+            // k4
+            cv::Mat k4_R = current_R + k3_R_dot * dt;
+            cv::Mat k4_V = current_V + k3_V_dot * dt;
+            cv::Mat k4_R_dot = k4_R * skewSymmetric(w);
+            cv::Mat k4_V_dot = k4_R * a;
+            cv::Mat k4_P_dot = k4_V;
+
+            dR = (k1_R_dot + 2.0*k2_R_dot + 2.0*k3_R_dot + k4_R_dot) * (dt / 6.0);
+            dV = (k1_V_dot + 2.0*k2_V_dot + 2.0*k3_V_dot + k4_V_dot) * (dt / 6.0);
+            dP = (k1_P_dot + 2.0*k2_P_dot + 2.0*k3_P_dot + k4_P_dot) * (dt / 6.0);
         }
-        if (ai > 0) a_vec = cv::Point3d(a_samples[ai-1].x, a_samples[ai-1].y, a_samples[ai-1].z);
 
-        // 1. Rotation update (bias-corrected)
-        cv::Mat r_vec = (cv::Mat_<double>(3, 1) << g_vec.x * dt, g_vec.y * dt, g_vec.z * dt);
-        cv::Mat dR;
-        cv::Rodrigues(r_vec, dR);
+        // ── Covariance & Jacobian Propagation (Forster 2017) ────────────────
+        cv::Mat F = cv::Mat::eye(9, 9, CV_64F);
+        cv::Mat w_dt = w * dt;
+        cv::Mat dR_step;
+        cv::Rodrigues(w_dt, dR_step);
         
-        // 2. Position and velocity update (Delta P = V*dt + 0.5*a*dt^2)
-        // a_global = R * a_local - gravity
-        cv::Mat a_local = (cv::Mat_<double>(3, 1) << a_vec.x, a_vec.y, a_vec.z);
-        cv::Mat a_global = current_R * a_local - gravity;
-        
-        current_P += current_V * dt + 0.5 * a_global * dt * dt;
-        current_V += a_global * dt;
-        current_R = current_R * dR;
+        cv::Mat dR_step_t = dR_step.t();
+        dR_step_t.copyTo(F(cv::Range(0,3), cv::Range(0,3)));
+        cv::Mat F30 = -current_R * skewSymmetric(a) * dt;
+        F30.copyTo(F(cv::Range(3,6), cv::Range(0,3)));
+        cv::Mat F60 = -0.5 * current_R * skewSymmetric(a) * dt * dt;
+        F60.copyTo(F(cv::Range(6,9), cv::Range(0,3)));
+        cv::Mat F63 = cv::Mat::eye(3, 3, CV_64F) * dt;
+        F63.copyTo(F(cv::Range(6,9), cv::Range(3,6)));
 
-        t_current = t_next;
+        cv::Mat G = cv::Mat::zeros(9, 6, CV_64F);
+        cv::Mat G00 = cv::Mat::eye(3, 3, CV_64F) * dt;
+        G00.copyTo(G(cv::Range(0,3), cv::Range(0,3)));
+        cv::Mat G33 = current_R * dt;
+        G33.copyTo(G(cv::Range(3,6), cv::Range(3,6)));
+        cv::Mat G63 = 0.5 * current_R * dt * dt;
+        G63.copyTo(G(cv::Range(6,9), cv::Range(3,6)));
+
+        P = F * P * F.t() + G * Q * G.t();
+
+        // Update Jacobians
+        J_P_bg += J_V_bg * dt - 0.5 * current_R * skewSymmetric(a) * dt * dt;
+        J_P_ba += J_V_ba * dt + 0.5 * current_R * dt * dt;
+        J_V_bg += -current_R * skewSymmetric(a) * dt;
+        J_V_ba += current_R * dt;
+        
+        cv::Mat Jr_inv; // Right Jacobian inverse approximation
+        Jr_inv = cv::Mat::eye(3, 3, CV_64F) - 0.5 * skewSymmetric(w_dt);
+        J_R_bg = dR_step.t() * J_R_bg - Jr_inv * dt;
+
+        // Apply state updates
+        current_R += dR; // Note: simplified manifold addition
+        // Re-orthogonalize R
+        cv::SVD svd(current_R);
+        current_R = svd.u * svd.vt;
+        
+        current_V += dV;
+        current_P += dP;
+
+        t_curr = t_next;
     }
 
     out.deltaR = current_R;
     out.deltaV = current_V;
     out.deltaP = current_P;
+    out.cov = P;
+    out.J_R_bg = J_R_bg;
+    out.J_V_bg = J_V_bg;
+    out.J_V_ba = J_V_ba;
+    out.J_P_bg = J_P_bg;
+    out.J_P_ba = J_P_ba;
     out.dt = (end_ns - start_ns) * 1e-9;
+    out.sample_count = (int)g_samples.size();
+
     return out;
 }
 
@@ -367,9 +511,19 @@ std::vector<AccelSample> IMUPreintegrator::getAccelBuffer() const {
     return accel_buf_;
 }
 
+std::vector<GyroSample> IMUPreintegrator::getGyroBuffer() const {
+    std::lock_guard<std::mutex> lock(mutex_);
+    return gyro_buf_;
+}
+
 cv::Point3f IMUPreintegrator::getGravityVector() const {
     std::lock_guard<std::mutex> lock(mutex_);
     return gravity_vec_;
+}
+
+cv::Point3f IMUPreintegrator::getFilteredGravity() const {
+    std::lock_guard<std::mutex> lock(mutex_);
+    return filtered_gravity_;
 }
 
 float IMUPreintegrator::getRoll() const {
@@ -542,6 +696,8 @@ void IMUPreintegrator::reset() {
     accel_buf_.clear();
     gravity_initialized_.store(false);
     gravity_vec_ = cv::Point3f(0.f, 0.f, 9.81f);
+    filtered_gravity_ = cv::Point3f(0.f, 0.f, 9.81f);
+    filtered_gravity_init_ = false;
     gravity_init_samples_.clear();
     roll_  = 0.f;
     pitch_ = 0.f;
@@ -654,4 +810,9 @@ float IMUPreintegrator::getCorrectedHeading(float gyro_yaw_rad) {
     float correction = diff * (1.0f - HEADING_CORRECTION_DAMPING);
     
     return gyro_yaw_rad + correction;
+}
+
+cv::Point3f IMUPreintegrator::getGyroBias() const {
+    std::lock_guard<std::mutex> lock(mutex_);
+    return gyro_bias_;
 }

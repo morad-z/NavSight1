@@ -46,10 +46,12 @@ import com.google.accompanist.permissions.ExperimentalPermissionsApi
 import com.google.accompanist.permissions.rememberMultiplePermissionsState
 import com.google.android.gms.maps.model.*
 import com.google.maps.android.compose.*
-import com.otaliastudios.cameraview.CameraView
-import com.otaliastudios.cameraview.controls.Audio
-import com.otaliastudios.cameraview.frame.Frame
-import com.otaliastudios.cameraview.frame.FrameProcessor
+import androidx.camera.core.CameraSelector
+import androidx.camera.core.ImageAnalysis
+import androidx.camera.core.Preview
+import androidx.camera.lifecycle.ProcessCameraProvider
+import androidx.camera.view.PreviewView
+import androidx.core.content.ContextCompat
 import androidx.annotation.MainThread
 import kotlinx.coroutines.Dispatchers
 import kotlinx.coroutines.delay
@@ -158,6 +160,11 @@ class MainActivity : ComponentActivity() {
             azimuth
         }
 
+        // Snapshot path once per recompose — avoids two separate .toList() copies
+        val historySnapshot = remember(viewModel.pathHistory.size) {
+            viewModel.pathHistory.toList()
+        }
+
         var debugPanelVisible by remember { mutableStateOf(false) }
 
         Box(Modifier.fillMaxSize().background(LuxuryBlack)) {
@@ -175,11 +182,10 @@ class MainActivity : ComponentActivity() {
                         )
                 ) {
                     CameraViewComposable()
-                    AROverlay(isMoving = isMoving, orientation = orientation)
 
                     Box(Modifier.align(Alignment.TopEnd).padding(12.dp)) {
                         SensorRadar(
-                            history = viewModel.pathHistory.toList(),
+                            history = historySnapshot,
                             currentAzimuth = fusedHeading
                         )
                     }
@@ -278,7 +284,7 @@ class MainActivity : ComponentActivity() {
                         NavigationMapWrapper(
                             start = mapStartLocation,
                             azimuth = fusedHeading,
-                            history = viewModel.pathHistory.toList()
+                            history = historySnapshot
                         )
                     }
 
@@ -366,19 +372,51 @@ class MainActivity : ComponentActivity() {
 
     @Composable
     fun CameraViewComposable() {
-        val lifecycle = LocalLifecycleOwner.current
+        val lifecycleOwner = LocalLifecycleOwner.current
         AndroidView(
             factory = { ctx ->
-                CameraView(ctx).apply {
-                    setLifecycleOwner(lifecycle)
-                    setAudio(Audio.OFF)
-                    setFrameProcessingFormat(android.graphics.ImageFormat.YUV_420_888)
-                    addFrameProcessor(object : FrameProcessor {
-                        override fun process(frame: Frame) {
-                            viewModel.processCameraFrame(frame)
-                        }
-                    })
+                val previewView = PreviewView(ctx).apply {
+                    implementationMode = PreviewView.ImplementationMode.PERFORMANCE
+                    scaleType = PreviewView.ScaleType.FILL_CENTER
                 }
+
+                val cameraProviderFuture = ProcessCameraProvider.getInstance(ctx)
+                cameraProviderFuture.addListener({
+                    val cameraProvider = cameraProviderFuture.get()
+
+                    val preview = Preview.Builder()
+                        .build()
+                        .also { it.setSurfaceProvider(previewView.surfaceProvider) }
+
+                    @Suppress("DEPRECATION")
+                    val imageAnalysis = ImageAnalysis.Builder()
+                        .setTargetResolution(android.util.Size(640, 480))
+                        .setBackpressureStrategy(ImageAnalysis.STRATEGY_KEEP_ONLY_LATEST)
+                        .setOutputImageFormat(ImageAnalysis.OUTPUT_IMAGE_FORMAT_YUV_420_888)
+                        .build()
+                        .also { analysis ->
+                            analysis.setAnalyzer(
+                                java.util.concurrent.Executors.newSingleThreadExecutor()
+                            ) { image ->
+                                viewModel.processCameraFrame(image)
+                                // image.close() is called inside SensorRepository after JNI completes
+                            }
+                        }
+
+                    try {
+                        cameraProvider.unbindAll()
+                        cameraProvider.bindToLifecycle(
+                            lifecycleOwner,
+                            CameraSelector.DEFAULT_BACK_CAMERA,
+                            preview,
+                            imageAnalysis
+                        )
+                    } catch (e: Exception) {
+                        Log.e("NavSight", "CameraX bind failed: ${e.message}", e)
+                    }
+                }, ContextCompat.getMainExecutor(ctx))
+
+                previewView
             },
             modifier = Modifier.fillMaxSize()
         )
@@ -500,6 +538,23 @@ class MainActivity : ComponentActivity() {
             sqrt(lx * lx + lz * lz).toFloat()
         }
 
+        // Cache Paint objects — avoid per-draw allocation (major GC pressure fix)
+        val ringPaint = remember {
+            android.graphics.Paint().apply {
+                color = android.graphics.Color.argb(150, 0, 230, 118)
+                textSize = 16f
+                textAlign = android.graphics.Paint.Align.CENTER
+            }
+        }
+        val cardPaint = remember {
+            android.graphics.Paint().apply {
+                color = android.graphics.Color.argb(130, 142, 142, 147)
+                textSize = 20f
+                textAlign = android.graphics.Paint.Align.CENTER
+                isFakeBoldText = true
+            }
+        }
+
         Card(
             shape = RoundedCornerShape(12.dp),
             colors = CardDefaults.cardColors(containerColor = Color.Black.copy(0.88f)),
@@ -526,21 +581,11 @@ class MainActivity : ComponentActivity() {
                             label,
                             cx + ringR * 0.72f,
                             cy - ringR * 0.72f + 10f,
-                            android.graphics.Paint().apply {
-                                color = android.graphics.Color.argb(150, 0, 230, 118)
-                                textSize = 16f
-                                textAlign = android.graphics.Paint.Align.CENTER
-                            }
+                            ringPaint
                         )
                     }
 
                     // Cardinal labels (N/S/E/W)
-                    val cardPaint = android.graphics.Paint().apply {
-                        color = android.graphics.Color.argb(130, 142, 142, 147)
-                        textSize = 20f
-                        textAlign = android.graphics.Paint.Align.CENTER
-                        isFakeBoldText = true
-                    }
                     val cr = maxRadius + 1f
                     drawContext.canvas.nativeCanvas.apply {
                         drawText("N", cx, cy - cr + 14f, cardPaint)
@@ -553,7 +598,7 @@ class MainActivity : ComponentActivity() {
                     drawLine(LuxuryGreen.copy(0.12f), Offset(cx, cy - maxRadius), Offset(cx, cy + maxRadius), 1f)
                     drawLine(LuxuryGreen.copy(0.12f), Offset(cx - maxRadius, cy), Offset(cx + maxRadius, cy), 1f)
 
-                    // Path history (color-coded by movement speed)
+                    // Path history — only draw last 100 segments (older ones are off-screen anyway)
                     if (history.size >= 2) {
                         val curX = history.last().first
                         val curZ = history.last().second
@@ -573,7 +618,8 @@ class MainActivity : ComponentActivity() {
                         }
 
                         val n = history.size
-                        for (i in 1 until n) {
+                        val drawStart = maxOf(1, n - 100) // Only draw last 100 segments
+                        for (i in drawStart until n) {
                             val segDx = history[i].first - history[i - 1].first
                             val segDz = history[i].second - history[i - 1].second
                             val mov = sqrt((segDx * segDx + segDz * segDz).toDouble()).toFloat()
@@ -888,13 +934,17 @@ class MainActivity : ComponentActivity() {
                 ), durationMs = 800)
             }
         }
+        // Cache LatLng polyline — avoid re-mapping 500 points every recompose
+        val pathLatLngs = remember(history.size) {
+            history.map { NavSightUtils.metersToLatLng(start, it.first.toDouble(), it.second.toDouble()) }
+        }
         GoogleMap(modifier = Modifier.fillMaxSize(), cameraPositionState = cameraState, uiSettings = MapUiSettings(zoomControlsEnabled = false, compassEnabled = false, myLocationButtonEnabled = false)) {
             if (navState is NavigationState.Active) {
                 Polyline(points = navState.route.polyline, color = LuxuryCyan, width = 12f, zIndex = 10f)
                 Marker(state = MarkerState(navState.route.destination), title = "Destination")
             }
-            if (history.isNotEmpty()) {
-                Polyline(points = history.map { NavSightUtils.metersToLatLng(start, it.first.toDouble(), it.second.toDouble()) }, color = LuxuryGreen, width = 6f, zIndex = 5f)
+            if (pathLatLngs.isNotEmpty()) {
+                Polyline(points = pathLatLngs, color = LuxuryGreen, width = 6f, zIndex = 5f)
             }
             Marker(state = MarkerState(displayPosition), rotation = displayAzimuth, flat = true, anchor = Offset(0.5f, 0.5f), icon = NavSightUtils.vectorToBitmap(this@MainActivity, R.drawable.navigation_arrow))
             Marker(state = MarkerState(start), title = "Start", icon = BitmapDescriptorFactory.defaultMarker(BitmapDescriptorFactory.HUE_GREEN))

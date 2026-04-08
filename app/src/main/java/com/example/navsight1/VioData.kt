@@ -49,7 +49,8 @@ data class VioData(
     val stepFreq: Double = 0.0,
     val strideLength: Double = 0.0,
     val poseFlags: Int = 0,
-    val heading: Double = 0.0
+    val heading: Double = 0.0,
+    val tdImuCam: Double = 0.0
 ) {
     override fun equals(other: Any?): Boolean {
         if (this === other) return true

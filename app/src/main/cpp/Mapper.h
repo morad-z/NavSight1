@@ -4,6 +4,8 @@
 #include <cstdint>
 #include <opencv2/core.hpp>
 #include "LoopClosureDetector.h"
+#include "PoseGraph.h"
+#include "EKFState.h"
 
 struct TrackerFrame;  // forward declaration
 
@@ -30,6 +32,7 @@ struct LoopClosureResult {
 struct MapperResult {
     GroundPlaneResult  ground_plane;
     BAResult           bundle_adj;
+    BAResult           depth_scale;
     LoopClosureResult  loop_closure;
 };
 
@@ -39,14 +42,25 @@ public:
 
     // Run all background processing for this frame.
     // current_smooth_scale: snapshot from Tracker for BA temporal constraint.
-    MapperResult process(const TrackerFrame& frame, double current_smooth_scale);
+    // ekf: read-only access to MSCKF sliding window for clone-based BA.
+    MapperResult process(const TrackerFrame& frame, double current_smooth_scale,
+                         const EKFState* ekf = nullptr);
+    void setDepthMap(const float* depth_data, int width, int height);
+    void setCameraHeight(double height_m) { user_camera_height_ = height_m; }
     void reset();
 
 private:
-    GroundPlaneResult  detectGroundPlane(const TrackerFrame& frame);
+    GroundPlaneResult  detectGroundPlane(const TrackerFrame& frame, const EKFState* ekf);
     BAResult           runBundleAdjustment(const TrackerFrame& frame,
-                                           double current_smooth_scale);
+                                           double current_smooth_scale,
+                                           const EKFState* ekf);
     LoopClosureResult  detectLoopClosure(const TrackerFrame& frame);
+    BAResult           constrainScaleWithDepth(const TrackerFrame& frame);
+
+    // ── Depth map state ──────────────────────────────────────────────────────
+    std::mutex         depth_mutex_;
+    std::vector<float> latest_depth_map_;
+    int                depth_width_{0}, depth_height_{0};
 
     // ── Ground plane state ───────────────────────────────────────────────────
     struct GroundPlaneEstimate {
@@ -57,7 +71,7 @@ private:
         bool   is_valid;
     };
     GroundPlaneEstimate ground_plane_estimate_{};
-    static constexpr double CAMERA_HEIGHT = 1.4;  // meters (standing with phone)
+    double user_camera_height_{1.4};  // meters (standing with phone)
 
     // ── Bundle adjustment state ──────────────────────────────────────────────
     struct Keyframe {
@@ -92,6 +106,8 @@ private:
 
     // ── Loop closure state ───────────────────────────────────────────────────
     LoopClosureDetector loop_closure_detector_;
+    PoseGraph pose_graph_;
     int          frames_since_last_keyframe_{0};
     cv::Point3f  last_keyframe_position_{0, 0, 0};
+    int          last_pose_graph_node_id_{-1};
 };

@@ -24,4 +24,5 @@ struct VisionOutput {
     double strideLength;
     int    poseFlags;        // bit0=static, bit1=pureRot, bit2=poseValid, bit3=fallback
     double heading;
+    double td_imu_cam;       // Camera-to-IMU time offset (seconds)
 };

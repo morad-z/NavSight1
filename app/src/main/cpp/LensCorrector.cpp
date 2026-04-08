@@ -1,9 +1,12 @@
 #include "LensCorrector.h"
 #include <opencv2/calib3d.hpp>
+#ifdef __ANDROID__
 #include <android/log.h>
-
 #define TAG "NavSight-Lens"
 #define LOGI(...) __android_log_print(ANDROID_LOG_INFO, TAG, __VA_ARGS__)
+#else
+#define LOGI(...) (void)0
+#endif
 
 LensCorrector::LensCorrector() {
     camera_matrix_ = cv::Mat::eye(3, 3, CV_64F);
