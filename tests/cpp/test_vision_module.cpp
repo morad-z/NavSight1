@@ -1,11 +1,11 @@
 #include <gtest/gtest.h>
 #include <cmath>
-#include "VisionModule.h"
+#include "VioEngine.h"
 #include "test_utils.h"
 
 class VisionModuleTest : public ::testing::Test {
 protected:
-    VisionModule vm;
+    VioEngine vm;
     static constexpr int W = 640;
     static constexpr int H = 480;
     static constexpr int64_t BASE_NS = 1'000'000'000LL;
@@ -25,7 +25,7 @@ protected:
 // ── Construction & Reset ─────────────────────────────────────────────────────
 
 TEST_F(VisionModuleTest, Construction_NoThrow) {
-    VisionModule v;
+    VioEngine v;
     // Should not crash
     SUCCEED();
 }

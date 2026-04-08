@@ -29,8 +29,14 @@ endif()
 # VIO core library (no Android deps)
 set(VIO_SRC_DIR "${CMAKE_CURRENT_SOURCE_DIR}/../../app/src/main/cpp")
 add_library(navsight_core STATIC
-    ${VIO_SRC_DIR}/VisionModule.cpp
+    ${VIO_SRC_DIR}/VioEngine.cpp
+    ${VIO_SRC_DIR}/Tracker.cpp
+    ${VIO_SRC_DIR}/Mapper.cpp
     ${VIO_SRC_DIR}/IMUPreintegrator.cpp
+    ${VIO_SRC_DIR}/EKFState.cpp
+    ${VIO_SRC_DIR}/FeatureManager.cpp
+    ${VIO_SRC_DIR}/LensCorrector.cpp
+    ${VIO_SRC_DIR}/LoopClosureDetector.cpp
 )
 target_compile_definitions(navsight_core PUBLIC NAVSIGHT_DESKTOP_TEST=1)
 target_include_directories(navsight_core PUBLIC ${VIO_SRC_DIR})
@@ -42,7 +48,7 @@ add_executable(navsight_tests
     test_vision_module.cpp
     test_drift_scenarios.cpp
 )
-target_link_libraries(navsight_tests navsight_core GTest::gtest_main)
+target_link_libraries(navsight_tests navsight_core GTest::gtest_main c++)
 
 if(NOT ANDROID)
     include(GoogleTest)

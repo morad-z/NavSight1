@@ -117,13 +117,13 @@ private:
     static constexpr double RANSAC_CONF        = 0.9999;
     static constexpr double RANSAC_THRESH      = 0.5;
     static constexpr double MIN_PARALLAX_PX    = 0.8;
-    static constexpr double FB_CHECK_THRESH    = 9.0;  // 3px threshold (squared)
+    static constexpr double FB_CHECK_THRESH    = 16.0; // 4px threshold (squared)
     static constexpr double MIN_FLOW_PX        = 0.4;
     static constexpr double MAX_FLOW_PX        = 150.0;
     static constexpr int    MIN_INLIERS        = 8;
     static constexpr double MIN_INLIER_RATIO   = 0.25;
     static constexpr double GYRO_ROT_ONLY_THRESH = 2.0;
-    static constexpr double ZUPT_GYRO_THRESH   = 0.04;
+    static constexpr double ZUPT_GYRO_THRESH   = 0.08;
     static constexpr int    ACCEL_BIAS_WARMUP  = 150;
     static constexpr double ACCEL_BIAS_ALPHA   = 0.005;
 };

@@ -32,7 +32,7 @@ android {
         externalNativeBuild {
             cmake {
                 cppFlags.add("-std=c++17")
-                arguments.add("-DANDROID_STL=c++_static")
+                arguments.add("-DANDROID_STL=c++_shared")
             }
         }
     }

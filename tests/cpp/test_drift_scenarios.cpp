@@ -1,6 +1,6 @@
 #include <gtest/gtest.h>
 #include <cmath>
-#include "VisionModule.h"
+#include "VioEngine.h"
 #include "test_utils.h"
 
 // ── Drift Scenario Tests ─────────────────────────────────────────────────────
@@ -16,7 +16,7 @@
 
 class DriftScenarioTest : public ::testing::Test {
 protected:
-    VisionModule vm;
+    VioEngine vm;
     static constexpr int W = 640;
     static constexpr int H = 480;
     static constexpr int64_t BASE_NS = 1'000'000'000LL;
@@ -405,7 +405,7 @@ TEST_F(DriftScenarioTest, ScaleConsistency_DifferentSpeeds) {
 
     // Phase 1: Slow walk (40 frames)
     {
-        VisionModule vm_slow;
+        VioEngine vm_slow;
         vm_slow.setIntrinsics(500.0, 500.0, W / 2.0, H / 2.0);
         auto features = test_utils::generateFeatureGrid(W, H, 15, 12);
 
@@ -428,7 +428,7 @@ TEST_F(DriftScenarioTest, ScaleConsistency_DifferentSpeeds) {
 
     // Phase 2: Fast walk (40 frames, separate VisionModule)
     {
-        VisionModule vm_fast;
+        VioEngine vm_fast;
         vm_fast.setIntrinsics(500.0, 500.0, W / 2.0, H / 2.0);
         auto features = test_utils::generateFeatureGrid(W, H, 15, 12);
 

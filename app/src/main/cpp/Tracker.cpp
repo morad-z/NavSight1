@@ -294,7 +294,7 @@ VisionOutput Tracker::processFrame(const uint8_t* yuv_data, int width, int heigh
              is_pure_rotation, tracked, gyro_norm, is_low_light);
     }
 
-    if (sufficient_motion && has_parallax && !is_static && !is_low_light && tracked >= 8) {
+    if (sufficient_motion && has_parallax && !is_static && tracked >= 8) {
         // Undistort matched points before geometric estimation
         std::vector<cv::Point2f> prev_ud = prev_good_buf_;
         std::vector<cv::Point2f> next_ud = next_good_buf_;
@@ -425,75 +425,74 @@ VisionOutput Tracker::processFrame(const uint8_t* yuv_data, int width, int heigh
     {
         std::lock_guard<std::mutex> lock(pose_mutex_);
 
-        if (pose_valid) {
-            // Camera-fused rotation (includes translation-degenerate frames)
-            global_R_ = global_R_ * R_fused;
-        } else {
-            // Apply Tracker's gyro bias correction to IMU rotation for fallback
-            cv::Mat rv_gyro;
-            cv::Rodrigues(imu_delta.deltaR, rv_gyro);
-            cv::Mat rv_corrected = rv_gyro - gyro_bias_;
-            cv::Mat R_corrected;
-            cv::Rodrigues(rv_corrected, R_corrected);
-            global_R_ = global_R_ * R_corrected;
-        }
-
-        double heading = std::atan2(global_R_.at<double>(1,0), global_R_.at<double>(0,0));
-
         if (is_static) {
-            // ZUPT: freeze translation, rotation remains live
-        } else if (pose_valid && !is_pure_rotation && !translation_degenerate && quality >= 0.15) {
-            double disp = appliedScale * cv::norm(t_vo);
+            // ZUPT: freeze both translation and rotation to prevent drift
+        } else {
+            if (pose_valid) {
+                // Camera-fused rotation (includes translation-degenerate frames)
+                global_R_ = global_R_ * R_fused;
+            } else {
+                // Apply Tracker's gyro bias correction to IMU rotation for fallback
+                cv::Mat rv_gyro;
+                cv::Rodrigues(imu_delta.deltaR, rv_gyro);
+                cv::Mat rv_corrected = rv_gyro - gyro_bias_;
+                cv::Mat R_corrected;
+                cv::Rodrigues(rv_corrected, R_corrected);
+                global_R_ = global_R_ * R_corrected;
+            }
 
-            // IMU cross-check: compare camera displacement direction with IMU deltaP
-            if (imu_delta.dt > 0 && !imu_delta.deltaP.empty()) {
-                double imu_disp = cv::norm(imu_delta.deltaP);
-                // If IMU says minimal motion but camera says large, trust the smaller
-                if (imu_disp > 0.001 && disp > 3.0 * imu_disp && imu_disp < 0.05) {
-                    disp = std::min(disp, imu_disp * 2.0);
+            double heading = std::atan2(global_R_.at<double>(1,0), global_R_.at<double>(0,0));
+
+            if (pose_valid && !is_pure_rotation && !translation_degenerate && quality >= 0.15) {
+                double disp = appliedScale * cv::norm(t_vo);
+
+                // IMU cross-check: compare camera displacement direction with IMU deltaP
+                if (imu_delta.dt > 0 && !imu_delta.deltaP.empty()) {
+                    double imu_disp = cv::norm(imu_delta.deltaP);
+                    // If IMU says minimal motion but camera says large, trust the smaller
+                    if (imu_disp > 0.001 && disp > 3.0 * imu_disp && imu_disp < 0.05) {
+                        disp = std::min(disp, imu_disp * 2.0);
+                    }
                 }
-            }
 
-            global_t_.at<double>(0) += disp * std::sin(heading);  // +X = East
-            global_t_.at<double>(2) += disp * std::cos(heading);  // +Z = North
-            if (!t_vo.empty())
-                global_t_.at<double>(1) += appliedScale * t_vo.at<double>(1);
-        } else if (!is_static) {
-            used_fallback = true;
-            auto si = imu.getStepInfo();
-            double dt_s = (timestamp_ns - current_prev_ts) * 1e-9;
-            double since = (si.last_step_ns > 0)
-                ? (timestamp_ns - si.last_step_ns) * 1e-9
-                : std::numeric_limits<double>::infinity();
+                global_t_.at<double>(0) += disp * std::sin(heading);  // +X = East
+                global_t_.at<double>(2) += disp * std::cos(heading);  // +Z = North
+                if (!t_vo.empty())
+                    global_t_.at<double>(1) += appliedScale * t_vo.at<double>(1);
+            } else {
+                // Use step fallback (not is_static, but vision not valid)
+                used_fallback = true;
+                auto si = imu.getStepInfo();
+                double dt_s = (timestamp_ns - current_prev_ts) * 1e-9;
+                double since = (si.last_step_ns > 0)
+                    ? (timestamp_ns - si.last_step_ns) * 1e-9
+                    : std::numeric_limits<double>::infinity();
 
-            // Update last known step speed when steps are active
-            if (si.speed_mps > 0.2 && since <= 1.0) {
-                last_step_speed_ = si.speed_mps;
-                last_step_speed_ns_ = timestamp_ns;
-            }
-
-            // Use current step speed, or interpolate from last known speed
-            double speed = 0.0;
-            if (since <= 1.5 && si.speed_mps > 0.2) {
-                speed = si.speed_mps;
-            } else if (last_step_speed_ > 0.2) {
-                double age = (timestamp_ns - last_step_speed_ns_) * 1e-9;
-                if (age <= 2.5 && mean_flow >= 0.3) {
-                    // Decay speed over the gap period
-                    speed = last_step_speed_ * std::max(0.0, 1.0 - age / 3.0);
+                // Update last known step speed when steps are active
+                if (si.speed_mps > 0.2 && since <= 1.0) {
+                    last_step_speed_ = si.speed_mps;
+                    last_step_speed_ns_ = timestamp_ns;
                 }
-            }
 
-            if (speed > 0.1) {
-                double d = std::min(std::min(speed, 2.0) * dt_s, 1.0 * dt_s);
-                global_t_.at<double>(0) += d * std::sin(heading);  // +X = East
-                global_t_.at<double>(2) += d * std::cos(heading);  // +Z = North
+                // Use current step speed, or interpolate from last known speed
+                double speed = 0.0;
+                if (since <= 1.5 && si.speed_mps > 0.2) {
+                    speed = si.speed_mps;
+                } else if (last_step_speed_ > 0.2) {
+                    double age = (timestamp_ns - last_step_speed_ns_) * 1e-9;
+                    if (age <= 2.5 && mean_flow >= 0.3) {
+                        // Decay speed over the gap period
+                        speed = last_step_speed_ * std::max(0.0, 1.0 - age / 3.0);
+                    }
+                }
+
+                if (speed > 0.1) {
+                    double d = std::min(std::min(speed, 2.0) * dt_s, 1.0 * dt_s);
+                    global_t_.at<double>(0) += d * std::sin(heading);  // +X = East
+                    global_t_.at<double>(2) += d * std::cos(heading);  // +Z = North
+                }
             }
         }
-
-        // Heading comes solely from global_R_ accumulation (camera-primary rotation fusion).
-        // EKF heading calls (predict/updateHeading/updateZUPT) removed to prevent
-        // cross-covariance leakage into the scale estimate.
     }
 
     // ── 10. Accel bias estimation (diagnostic, when static) ──────────────────
