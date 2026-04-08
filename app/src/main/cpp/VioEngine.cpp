@@ -131,12 +131,8 @@ void VioEngine::setMagnetometerHeading(float yaw_rad) {
 }
 
 void VioEngine::setDepthMap(const float* depth_data, int width, int height) {
-    // DISABLED: Depth map storage + Mapper forwarding — Mapper pipeline is disabled,
-    // depth results were never applied (applyMapperResult was a no-op).
-    // Kotlin DepthEstimator also disabled to save CPU/GPU/battery.
-    (void)depth_data;
-    (void)width;
-    (void)height;
+    // Forward to Tracker for depth-based scale constraint (bypasses Mapper)
+    tracker_.setDepthMap(depth_data, width, height);
 }
 
 void VioEngine::setUserScaleCorrection(double correction) {
