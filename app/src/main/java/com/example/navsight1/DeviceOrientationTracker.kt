@@ -200,19 +200,15 @@ class DeviceOrientationTracker {
         return normalized
     }
     
-    /**
-     * בדיקה מהירה אם הטלפון במצב VIO תקין
-     */
-    fun isPhoneHorizontal(): Boolean {
-        return getOrientation().isHorizontal
-    }
-    
-    /**
-     * קבלת כיוון מצפן (0-360)
-     */
-    fun getCompassHeading(): Float {
-        return normalizeAzimuth(smoothedAzimuth)
-    }
+    // DEAD CODE: never called from anywhere — orientation is checked via getOrientation().isHorizontal directly
+    // fun isPhoneHorizontal(): Boolean {
+    //     return getOrientation().isHorizontal
+    // }
+
+    // DEAD CODE: never called — heading comes from VIO gyro integration, not this
+    // fun getCompassHeading(): Float {
+    //     return normalizeAzimuth(smoothedAzimuth)
+    // }
     
     /**
      * איפוס

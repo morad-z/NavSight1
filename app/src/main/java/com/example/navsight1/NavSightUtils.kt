@@ -15,10 +15,11 @@ object NavSightUtils {
         return snappedPosition ?: startLocation
     }
 
-    fun computeCalibrationStraightness(displacementMeters: Double, pathLengthMeters: Double): Double {
-        if (pathLengthMeters <= 0.0) return 0.0
-        return (displacementMeters / pathLengthMeters).coerceIn(0.0, 1.0)
-    }
+    // DEAD CODE: never called from anywhere
+    // fun computeCalibrationStraightness(displacementMeters: Double, pathLengthMeters: Double): Double {
+    //     if (pathLengthMeters <= 0.0) return 0.0
+    //     return (displacementMeters / pathLengthMeters).coerceIn(0.0, 1.0)
+    // }
 
     fun computeUpdatedScaleCalibrationFactor(
         currentFactor: Double,
@@ -70,6 +71,19 @@ object NavSightUtils {
             else -> "${minutes / 60}h ${minutes % 60}min"
         }
     }
+
+    // DEAD CODE: never called — camera uses direct ByteBuffer via processCameraFrameDirect
+    // fun nv21ToBitmap(data: ByteArray, width: Int, height: Int): android.graphics.Bitmap? {
+    //     return try {
+    //         val yuvImage = android.graphics.YuvImage(data, android.graphics.ImageFormat.NV21, width, height, null)
+    //         val out = java.io.ByteArrayOutputStream()
+    //         yuvImage.compressToJpeg(android.graphics.Rect(0, 0, width, height), 90, out)
+    //         val imageBytes = out.toByteArray()
+    //         android.graphics.BitmapFactory.decodeByteArray(imageBytes, 0, imageBytes.size)
+    //     } catch (e: Exception) {
+    //         null
+    //     }
+    // }
 
     fun vectorToBitmap(context: Context, drawableId: Int): BitmapDescriptor? {
         return try {

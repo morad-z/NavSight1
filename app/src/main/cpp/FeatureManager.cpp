@@ -1,11 +1,16 @@
 #include "FeatureManager.h"
 #include <opencv2/video/tracking.hpp>
-#include <android/log.h>
 #include <algorithm>
 #include <cmath>
+#include <unordered_set>
 
+#ifdef __ANDROID__
+#include <android/log.h>
 #define TAG "NavSight-Features"
 #define LOGI(...) __android_log_print(ANDROID_LOG_INFO, TAG, __VA_ARGS__)
+#else
+#define LOGI(...) (void)0
+#endif
 
 FeatureManager::FeatureManager() {
     keyframes_.reserve(MAX_KEYFRAMES);
@@ -13,6 +18,8 @@ FeatureManager::FeatureManager() {
 
 void FeatureManager::reset() {
     keyframes_.clear();
+    active_tracks_.clear();
+    next_feature_id_ = 0;
 }
 
 int FeatureManager::countInCell(const std::vector<cv::Point2f>& points,
@@ -149,6 +156,65 @@ void FeatureManager::storeKeyframe(const cv::Mat& gray,
     }
 }
 
+// ── MSCKF Feature Track Management ──────────────────────────────────────────
+
+std::vector<int> FeatureManager::assignIds(int count) {
+    std::vector<int> ids(count);
+    for (int i = 0; i < count; i++) {
+        ids[i] = next_feature_id_++;
+    }
+    return ids;
+}
+
+void FeatureManager::addObservation(int feature_id, int clone_state_id,
+                                     const cv::Point2f& pixel_ud) {
+    active_tracks_[feature_id].push_back({clone_state_id, pixel_ud});
+}
+
+std::vector<LostFeature> FeatureManager::extractLostFeatures(
+        const std::vector<int>& current_ids, int min_obs) {
+    // Build set of currently tracked IDs
+    std::unordered_set<int> current_set(current_ids.begin(), current_ids.end());
+
+    std::vector<LostFeature> lost;
+    auto it = active_tracks_.begin();
+    while (it != active_tracks_.end()) {
+        if (current_set.count(it->first) == 0) {
+            // Feature is no longer tracked
+            if (static_cast<int>(it->second.size()) >= min_obs) {
+                LostFeature lf;
+                lf.feature_id = it->first;
+                lf.observations = std::move(it->second);
+                lost.push_back(std::move(lf));
+            }
+            it = active_tracks_.erase(it);
+        } else {
+            ++it;
+        }
+    }
+    return lost;
+}
+
+void FeatureManager::pruneObservations(int min_clone_id) {
+    for (auto& [fid, obs] : active_tracks_) {
+        obs.erase(std::remove_if(obs.begin(), obs.end(),
+            [min_clone_id](const FeatureObservation& o) {
+                return o.clone_state_id < min_clone_id;
+            }), obs.end());
+    }
+    // Remove features with no remaining observations
+    auto it = active_tracks_.begin();
+    while (it != active_tracks_.end()) {
+        if (it->second.empty()) {
+            it = active_tracks_.erase(it);
+        } else {
+            ++it;
+        }
+    }
+}
+
+// ── Keyframe re-localization ────────────────────────────────────────────────
+
 bool FeatureManager::matchAgainstKeyframe(
         const cv::Mat& gray,
         const std::vector<cv::Point2f>& current_points,
@@ -168,9 +234,9 @@ bool FeatureManager::matchAgainstKeyframe(
     std::vector<uchar> status;
     std::vector<float> err;
 
-    cv::TermCriteria criteria(cv::TermCriteria::COUNT + cv::TermCriteria::EPS, 30, 0.01);
+    cv::TermCriteria criteria(cv::TermCriteria::COUNT + cv::TermCriteria::EPS, 20, 0.03);
     cv::calcOpticalFlowPyrLK(kf.gray, gray, kf.points, tracked,
-                              status, err, cv::Size(31, 31), 4, criteria);
+                              status, err, cv::Size(21, 21), 3, criteria);
 
     // Collect valid matches
     for (size_t i = 0; i < status.size(); i++) {
