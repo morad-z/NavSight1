@@ -342,6 +342,7 @@ MAP_UPDATE_THROTTLE:   1000 # 1Hz map camera + polyline + markers
 2. Check ACTIVE BUGS — do not duplicate work on IN_PROGRESS items.
 3. Check CONVERSATION CONTEXT for any partial work to resume.
 4. REFERENCE COMMIT 10fb69a = best drift (revert here if regressions).
+5. Read `docs/SLACK_SETUP.md` for team Slack integration.
 
 ### For the finishing AI agent:
 1. Update ACTIVE BUGS statuses.
@@ -349,7 +350,8 @@ MAP_UPDATE_THROTTLE:   1000 # 1Hz map camera + polyline + markers
 3. Add a session entry to RECENT CHANGES (keep only last 5).
 4. Update CONVERSATION CONTEXT with where you stopped.
 5. Update META section.
-6. Commit this file.
+6. Post session-end summary to Slack: `python slack_agent.py post --message "..." --final`
+7. Commit this file.
 
 ### Purge policy:
 - Remove RESOLVED bugs after 2 sessions.
