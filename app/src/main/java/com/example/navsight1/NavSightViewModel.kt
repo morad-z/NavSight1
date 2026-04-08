@@ -183,6 +183,9 @@ class NavSightViewModel(application: Application) : AndroidViewModel(application
         NativeBridge.setScale(scaleCalibrationFactor)
         NativeBridge.setUserHeight(userHeight)
 
+        // Initialize depth estimator for automatic scale calibration
+        sensorRepository.initDepthEstimator()
+
         // Observe Repository states
         viewModelScope.launch {
             sensorRepository.orientationState.collect { orientationState = it }

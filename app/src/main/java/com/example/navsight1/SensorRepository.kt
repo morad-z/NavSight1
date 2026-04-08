@@ -2,6 +2,10 @@ package com.example.navsight1
 
 import android.annotation.SuppressLint
 import android.content.Context
+import android.graphics.Bitmap
+import android.graphics.ImageFormat
+import android.graphics.Rect
+import android.graphics.YuvImage
 import android.hardware.Sensor
 import android.hardware.SensorEvent
 import android.hardware.SensorEventListener
@@ -15,6 +19,8 @@ import com.otaliastudios.cameraview.frame.Frame
 import kotlinx.coroutines.*
 import kotlinx.coroutines.flow.MutableStateFlow
 import kotlinx.coroutines.flow.asStateFlow
+import java.io.ByteArrayOutputStream
+import android.graphics.BitmapFactory
 import kotlin.math.sqrt
 
 class SensorRepository(private val context: Context) : SensorEventListener {
@@ -66,6 +72,26 @@ class SensorRepository(private val context: Context) : SensorEventListener {
     // ──────────────────────────────────────────────────────────────────────────
 
     private val repositoryScope = CoroutineScope(Dispatchers.Main + SupervisorJob())
+
+    // Depth estimation for automatic scale calibration
+    private var depthEstimator: DepthEstimator? = null
+    private var depthFrameCount = 0
+    private val DEPTH_ESTIMATION_INTERVAL = 10  // Process every Nth frame (~3Hz at 30fps)
+
+    fun initDepthEstimator() {
+        try {
+            depthEstimator = DepthEstimator(context)
+            if (depthEstimator?.isInitialized() == true) {
+                Log.d(TAG, "DepthEstimator initialized successfully")
+            } else {
+                Log.w(TAG, "DepthEstimator failed to initialize, depth-based scale disabled")
+                depthEstimator = null
+            }
+        } catch (e: Exception) {
+            Log.e(TAG, "Failed to create DepthEstimator: ${e.message}", e)
+            depthEstimator = null
+        }
+    }
 
     fun startSensors() {
         try {
@@ -213,6 +239,12 @@ class SensorRepository(private val context: Context) : SensorEventListener {
         locationTokenSource?.cancel()
         stopGpsUpdates()
         intrinsicsInitialized = false
+
+        // Clean up depth estimator
+        depthEstimator?.close()
+        depthEstimator = null
+        depthFrameCount = 0
+
         repositoryScope.cancel()
         Log.d(TAG, "Repository cleaned up")
     }
@@ -312,6 +344,50 @@ class SensorRepository(private val context: Context) : SensorEventListener {
         } else {
             consecutiveVioFailures = 0
             _showCameraBlocked.value = false
+        }
+
+        // Depth estimation for automatic scale calibration (~3Hz)
+        if (depthEstimator != null && ++depthFrameCount % DEPTH_ESTIMATION_INTERVAL == 0) {
+            // Convert frame to bitmap on background thread
+            val frameData = data.copyOf()  // Copy to avoid frame being recycled
+            val frameWidth = frame.size.width
+            val frameHeight = frame.size.height
+
+            repositoryScope.launch(Dispatchers.Default) {
+                try {
+                    val bitmap = yuvToBitmap(frameData, frameWidth, frameHeight)
+                    if (bitmap != null) {
+                        val depth = depthEstimator?.estimateDepth(bitmap) ?: 0f
+                        val scale = depthEstimator?.estimateScaleFromDepth(depth)
+
+                        if (scale != null && scale in 0.1f..10f) {
+                            // Pass to native VIO with moderate confidence
+                            NativeBridge.updateDepthScale(scale.toDouble(), 0.7)
+                            Log.d(TAG, "Depth estimation: depth=$depth scale=$scale")
+                        }
+
+                        bitmap.recycle()
+                    }
+                } catch (e: Exception) {
+                    Log.e(TAG, "Depth estimation error: ${e.message}")
+                }
+            }
+        }
+    }
+
+    /**
+     * Convert YUV NV21 frame data to Bitmap for depth estimation.
+     */
+    private fun yuvToBitmap(yuvData: ByteArray, width: Int, height: Int): Bitmap? {
+        return try {
+            val yuvImage = YuvImage(yuvData, ImageFormat.NV21, width, height, null)
+            val out = ByteArrayOutputStream()
+            yuvImage.compressToJpeg(Rect(0, 0, width, height), 80, out)
+            val jpegBytes = out.toByteArray()
+            BitmapFactory.decodeByteArray(jpegBytes, 0, jpegBytes.size)
+        } catch (e: Exception) {
+            Log.e(TAG, "YUV to Bitmap conversion failed: ${e.message}")
+            null
         }
     }
 
