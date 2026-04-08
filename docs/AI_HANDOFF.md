@@ -10,7 +10,7 @@
 ## META
 
 ```yaml
-last_updated: "2026-04-08"
+last_updated: "2026-04-09"
 last_agent: "Claude-Opus-4-6"
 last_developer: "morad"
 branch: "morad"
@@ -78,8 +78,11 @@ roey:
 # DISABLED PIPELINE (2026-04-08 session 0i):
 #   Mapper thread, LoopClosureDetector, PoseGraph removed from CMakeLists.
 #   applyMapperResult was already a no-op — corrections caused teleportation spikes.
-#   DepthEstimator (MiDaS TFLite) disabled in Kotlin — fed Mapper which is disabled.
-#   Saves: 2 background threads, MiDaS GPU inference at 5Hz, ORB+RANSAC per frame.
+#
+# RE-ENABLED (2026-04-09 session 0j):
+#   DepthEstimator (MiDaS TFLite) re-enabled at 1Hz in SensorRepository.
+#   Feeds Tracker::applyDepthScaleConstraint() directly (bypasses disabled Mapper).
+#   MiDaS depth → metric scale via camera height + pitch → blends into smooth_scale_.
 #
 # Camera pipeline: CameraX ImageAnalysis (zero-copy via GetDirectBufferAddress)
 #   processCameraFrameDirect only (old ByteArray version commented out)
@@ -158,10 +161,36 @@ on_device_testing: "TESTED 2026-04-08 — app launches, no crash after cleanup"
 
 - id: "TASK-028"
   title: "MiDaS monocular depth for absolute scale"
-  status: "DISABLED"
+  status: "RE-ENABLED"
   owner: "morad"
   priority: "P2"
-  notes: "TFLite model bundled but DepthEstimator disabled (Mapper pipeline off)."
+  notes: >
+    Re-enabled 2026-04-09: DepthEstimator runs at 1Hz GPU, feeds Tracker
+    applyDepthScaleConstraint() directly (bypasses disabled Mapper).
+    Not yet verified firing in real walking simulations.
+
+- id: "TASK-034"
+  title: "Map UX overhaul: heading lock, recenter, smooth camera"
+  status: "DONE"
+  owner: "morad"
+  priority: "P1"
+  completed: "2026-04-09"
+  notes: >
+    4Hz camera animation with heading lock. Recenter FAB on user pan.
+    Removed unused export arrow button. rememberUpdatedState for fresh values.
+
+- id: "TASK-035"
+  title: "Fix V-shape heading on 180° turns"
+  status: "DONE (needs device test)"
+  owner: "morad"
+  priority: "P1"
+  completed: "2026-04-09"
+  notes: >
+    Root cause: keyframe heading correction used atan2(R[1,0],R[0,0]) which
+    extracts camera Z-rotation, not yaw. Systematically under-counted heading
+    during turns, removing ~30-40° of real heading via 30% correction.
+    Fix: gate correction on gyro_norm < 0.3 rad/s (skip during turns).
+    Also: magnetic declination correction, ZUPT heading unfreezing.
 
 - id: "TASK-032"
   title: "Fix remaining QA scan issues"
@@ -180,6 +209,33 @@ on_device_testing: "TESTED 2026-04-08 — app launches, no crash after cleanup"
 ## RECENT CHANGES (last 5 sessions)
 
 ```yaml
+- session: "0j"
+  date: "2026-04-09"
+  developer: "morad"
+  agent: "Claude-Opus-4-6"
+  branch: "morad"
+  summary: >
+    MAP UX + HEADING FIX + MIDAS RE-ENABLE SESSION.
+    (1) Map UX overhaul: 4Hz heading-locked camera, recenter FAB on gesture,
+    removed unused export button, rememberUpdatedState for fresh coroutine values.
+    (2) MiDaS depth re-enabled at 1Hz: feeds Tracker::applyDepthScaleConstraint()
+    directly (metric depth from camera height + pitch → smooth_scale_ blend).
+    (3) Magnetic declination correction (~5.5° Haifa) on initial heading.
+    (4) ZUPT heading unfreezing: allow turn-in-place detection.
+    (5) V-SHAPE BUG FIX (key finding): keyframe heading correction used
+    atan2(R[1,0],R[0,0]) = camera Z-rotation, NOT yaw. This removed ~30-40°
+    of real heading during 180° turns. Fix: gate on gyro_norm < 0.3 rad/s.
+    (6) Synced libs.versions.toml + FeatureManager from master (were diverged).
+  files_changed:
+    - "app/src/main/java/.../MainActivity.kt (map UX: heading lock, recenter FAB)"
+    - "app/src/main/java/.../SensorRepository.kt (MiDaS re-enable, declination)"
+    - "app/src/main/cpp/Tracker.cpp (V-shape fix, depth constraint, ZUPT heading)"
+    - "app/src/main/cpp/Tracker.h (depth members, filtered_yaw_rate)"
+    - "app/src/main/cpp/VioEngine.cpp (setDepthMap forwarding)"
+    - "app/src/main/cpp/IMUPreintegrator.cpp/h (getUserHeight uncommented)"
+    - "app/src/main/cpp/FeatureManager.h/cpp (heading+position in Keyframe)"
+    - "gradle/libs.versions.toml (synced from master)"
+
 - session: "0i"
   date: "2026-04-08"
   developer: "morad"
@@ -242,12 +298,6 @@ on_device_testing: "TESTED 2026-04-08 — app launches, no crash after cleanup"
   branch: "morad"
   summary: "Major VIO architecture overhaul + 6 critical fixes. Deleted VisionModule.cpp."
 
-- session: "0e"
-  date: "2026-04-01"
-  developer: "morad"
-  agent: "Gemini CLI"
-  branch: "morad"
-  summary: "Fixed heading freeze, geodesic coordinates, ghost walking, simulation save crash."
 ```
 
 ---
@@ -255,27 +305,29 @@ on_device_testing: "TESTED 2026-04-08 — app launches, no crash after cleanup"
 ## CONVERSATION CONTEXT
 
 ```yaml
-current_task: "Dead code cleanup complete. Map lag fixed. Merging to master."
-stopped_at: "All cleanup done, app launches clean, merging morad → master."
+current_task: "V-shape heading fix committed. Awaiting real-device test."
+stopped_at: "All session 0j changes committed to morad branch. Build passes."
 next_action: >
-  1. FIX BUG-016: use-after-free — switch to shared_ptr<VioEngine>.
-  2. Scale calibration: investigate why scale stuck at 0.12-0.20 despite steps.
-  3. Consider re-enabling Mapper pipeline once core pipeline is stable.
-  4. VIO accuracy plan phases 2-5 (feature aging, reprojection gating, ZUPT tuning).
+  1. TEST V-SHAPE FIX: walk straight, 180° turn, walk back. Return path should overlap.
+  2. VERIFY MiDaS: check logcat for DEPTH_SCALE messages during walking.
+  3. FIX BUG-016: use-after-free — switch to shared_ptr<VioEngine>.
+  4. Scale calibration: investigate why scale stuck at 0.12-0.20 despite steps.
+  5. Places API: enable billing on Google Cloud Project to fix search.
 resume_context: >
   Architecture: Tracker-only (Mapper disabled). CameraX with zero-copy JNI.
-  Heading: scalar_heading_ with gravity-projected yaw rate.
-  IMU: proper SO(3) Exp map, accel bias subtracted, midpoint V/P.
-  EKF: 15-DOF error-state (legacy 1-state scale still active).
-  Map: 1Hz update throttle, cached icons, plain list + version counter.
+  Heading: scalar_heading_ with gravity-projected yaw rate + keyframe correction
+  (gated on gyro_norm < 0.3 to prevent turn damage).
+  MiDaS: re-enabled at 1Hz, feeds depth-based scale constraint in Tracker.
+  Declination: added at startup via GeomagneticField (~5.5° Haifa).
+  Map: 4Hz heading-locked camera, recenter FAB, 1Hz overlays.
   REFERENCE COMMIT: 10fb69a = best drift (5.4%, 1.2m on 22m).
-partial_state: "NONE — all changes done, build passes, app verified"
+partial_state: "NONE — all changes committed, build passes"
 warnings:
   - "BUG-016 (use-after-free) can crash on VIO stop/restart — fix before release"
+  - "V-shape fix not yet tested on device — needs 180° turn simulation"
+  - "MiDaS depth constraint hasn't fired in any simulation yet"
+  - "Places API search needs Google Cloud billing enabled"
   - "Scale never calibrates (0.12-0.20) — position accuracy comes from VO, not scale"
-  - "Mapper/LoopClosure/PoseGraph/DepthEstimator are DISABLED, not deleted"
-  - "C++ tests reference old VisionModule — need updating for Tracker"
-  - "MiDaS TFLite bundled in assets but pipeline disabled"
 ```
 
 ---
@@ -302,11 +354,11 @@ warnings:
 "app/src/main/cpp/InertialInitializer.h/cpp": "ACTIVE — used by Tracker for system init"
 
 # Kotlin App Layer
-"app/src/main/java/.../MainActivity.kt":       "CameraX setup, Compose UI, map (1Hz throttle)"
+"app/src/main/java/.../MainActivity.kt":       "CameraX, Compose UI, 4Hz heading-locked map, recenter FAB"
 "app/src/main/java/.../NavSightViewModel.kt":  "MVVM state, pathHistory (ArrayList + version)"
-"app/src/main/java/.../SensorRepository.kt":   "ImageProxy dispatch (DepthEstimator disabled)"
+"app/src/main/java/.../SensorRepository.kt":   "ImageProxy dispatch, DepthEstimator at 1Hz, declination"
 "app/src/main/java/.../NativeBridge.kt":        "JNI declarations (processCameraFrameDirect)"
-"app/src/main/java/.../DepthEstimator.kt":      "MiDaS TFLite depth (DISABLED — not instantiated)"
+"app/src/main/java/.../DepthEstimator.kt":      "MiDaS TFLite depth (RE-ENABLED at 1Hz GPU)"
 ```
 
 ---

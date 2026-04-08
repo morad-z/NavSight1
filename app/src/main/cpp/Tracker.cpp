@@ -55,6 +55,123 @@ void Tracker::setUserScaleCorrection(double correction) {
     user_scale_correction_ = std::max(0.1, std::min(5.0, correction));
 }
 
+void Tracker::setDepthMap(const float* depth_data, int width, int height) {
+    if (!depth_data || width <= 0 || height <= 0) return;
+    std::lock_guard<std::mutex> lock(depth_mutex_);
+    size_t sz = static_cast<size_t>(width * height);
+    if (depth_map_.size() != sz) depth_map_.resize(sz);
+    std::copy(depth_data, depth_data + sz, depth_map_.begin());
+    depth_width_ = width;
+    depth_height_ = height;
+}
+
+// Depth-based scale constraint: uses MiDaS relative depth + camera height
+// to estimate absolute scale and blend it into smooth_scale_.
+// Only applies when confidence is high (many matching points, consistent ratios).
+void Tracker::applyDepthScaleConstraint(
+        const std::vector<cv::Point2f>& pts2d,
+        const std::vector<cv::Point3f>& pts3d,
+        int img_width, int img_height,
+        const IMUPreintegrator& imu) {
+
+    std::vector<float> depth_copy;
+    int dw, dh;
+    {
+        std::lock_guard<std::mutex> lock(depth_mutex_);
+        if (depth_map_.empty()) return;
+        depth_copy = depth_map_;
+        dw = depth_width_;
+        dh = depth_height_;
+    }
+
+    if (pts3d.size() < 15 || pts2d.size() != pts3d.size()) return;
+    if (fx_ <= 0 || fy_ <= 0) return;
+
+    // Camera height from user height (phone held ~0.85 * user_height)
+    float user_h = imu.getUserHeight();
+    double camera_h = static_cast<double>(user_h) * 0.85;
+    if (camera_h < 0.8 || camera_h > 2.2) return;
+
+    // Use gravity vector to estimate camera pitch (how much phone tilts down)
+    float ax = imu.lastAccelX(), ay = imu.lastAccelY(), az = imu.lastAccelZ();
+    double g_mag = std::sqrt(ax*ax + ay*ay + az*az);
+    if (g_mag < 5.0) return; // no valid gravity
+    // Pitch: angle between phone's Z-axis and horizontal plane
+    double pitch = std::asin(std::min(1.0, std::max(-1.0, static_cast<double>(az) / g_mag)));
+
+    // For features in the lower 40% of the image (likely floor/ground),
+    // compute: metric_depth = camera_h / (norm_y * cos(pitch) + sin(pitch))
+    // Then compare to VIO triangulated depth → scale ratio
+    std::vector<double> scale_ratios;
+    float fh = static_cast<float>(img_height);
+    float fw = static_cast<float>(img_width);
+
+    for (size_t i = 0; i < pts3d.size(); i++) {
+        // Only use features in the lower 40% of the image
+        if (pts2d[i].y < fh * 0.6f) continue;
+        if (pts3d[i].z < 0.3 || pts3d[i].z > 12.0) continue;
+
+        // Map 2D point to depth map coordinates
+        int dx = static_cast<int>((pts2d[i].x / fw) * dw);
+        int dy = static_cast<int>((pts2d[i].y / fh) * dh);
+        if (dx < 0 || dx >= dw || dy < 0 || dy >= dh) continue;
+
+        float rel_depth = depth_copy[dy * dw + dx];
+        if (rel_depth < 0.01f) continue;
+
+        // Normalized image coordinate (vertical)
+        double norm_y = (static_cast<double>(pts2d[i].y) - cy_) / fy_;
+
+        // Ground plane constraint: metric_Z = camera_h / (norm_y * cos(pitch) + sin(pitch))
+        double denom = norm_y * std::cos(pitch) + std::sin(pitch);
+        if (denom < 0.05) continue; // too close to horizon
+
+        double metric_z = camera_h / denom;
+        if (metric_z < 0.3 || metric_z > 10.0) continue;
+
+        // Scale ratio: how much should we multiply VIO depth to get metric depth?
+        double ratio = metric_z / pts3d[i].z;
+        if (ratio > 0.1 && ratio < 10.0) {
+            scale_ratios.push_back(ratio);
+        }
+    }
+
+    if (scale_ratios.size() < 8) return; // not enough confident matches
+
+    // Take median ratio
+    std::sort(scale_ratios.begin(), scale_ratios.end());
+    double median_ratio = scale_ratios[scale_ratios.size() / 2];
+
+    // Compute target scale: current_scale * median_ratio
+    double current;
+    {
+        std::lock_guard<std::mutex> slock(pose_mutex_);
+        current = smooth_scale_;
+    }
+    double target_scale = current * median_ratio;
+    target_scale = std::max(0.01, std::min(10.0, target_scale));
+
+    // Safety gate: only apply if correction is within 3x of current
+    if (target_scale > 3.0 * current || target_scale < current / 3.0) {
+        LOGI("DEPTH_SCALE: REJECTED target=%.4f current=%.4f ratio=%.4f (too extreme)",
+             target_scale, current, median_ratio);
+        return;
+    }
+
+    // Conservative blend: alpha=0.03, only nudges the scale gently
+    double alpha = 0.03;
+    {
+        std::lock_guard<std::mutex> slock(pose_mutex_);
+        smooth_scale_ = (1.0 - alpha) * smooth_scale_ + alpha * target_scale;
+        smooth_scale_ = std::max(0.01, std::min(10.0, smooth_scale_));
+    }
+
+    if (frame_counter_ % 30 == 0) {
+        LOGI("DEPTH_SCALE: applied target=%.4f current=%.4f ratio=%.4f samples=%zu",
+             target_scale, current, median_ratio, scale_ratios.size());
+    }
+}
+
 void Tracker::setInitialHeading(double azimuth_rad) {
     std::lock_guard<std::mutex> lock(pose_mutex_);
     double c = std::cos(azimuth_rad), s = std::sin(azimuth_rad);
@@ -83,6 +200,7 @@ void Tracker::reset() {
     feature_ids_.clear();
     heading_initialized_ = false;
     scalar_heading_ = 0.0;
+    filtered_yaw_rate_ = 0.0;
     heading_fej_set_ = false;
     heading_fej_ = 0.0;
     td_warmup_done_ = false;
@@ -595,6 +713,13 @@ VisionOutput Tracker::processFrame(const uint8_t* yuv_data, int width, int heigh
                 // that fight against the reliable step-based scale.
                 // Step detection + stride estimation is the primary scale source.
 
+                // Depth-based scale constraint (MiDaS): runs every ~30 frames (~1Hz)
+                // Uses floor features + camera height to estimate absolute scale
+                if (frame_counter_ % 30 == 0 && !points_3d_current_.empty()) {
+                    applyDepthScaleConstraint(next_good_buf_, points_3d_current_,
+                                              width, height, imu);
+                }
+
                 pose_valid = true;
             }
         }
@@ -621,7 +746,10 @@ VisionOutput Tracker::processFrame(const uint8_t* yuv_data, int width, int heigh
         // extracts heading by projecting forward onto ground plane.
         // Our simplified approach: track heading as a scalar, project gyro
         // onto gravity to get yaw rate. Same result for 2D navigation.
-        if (!is_static && imu_delta.dt > 0.001) {
+        // Always update heading from gyro — even during ZUPT.
+        // Turning in place is common (look around, change direction before walking).
+        // Only translation is frozen during ZUPT, not rotation.
+        if (imu_delta.dt > 0.001) {
             // Get gravity direction in phone body frame (normalized)
             cv::Point3f grav = imu.getFilteredGravity();
             double grav_mag = std::sqrt(grav.x*grav.x + grav.y*grav.y + grav.z*grav.z);
@@ -795,7 +923,15 @@ VisionOutput Tracker::processFrame(const uint8_t* yuv_data, int width, int heigh
         // Every keyframe interval, match current frame against the last keyframe.
         // The essential matrix R from that match gives the visual heading change.
         // Compare to gyro-integrated heading change and apply gentle correction.
-        if (frames_since_keyframe_ >= 14 && pose_valid && tracked >= MIN_INLIERS * 2) {
+        //
+        // BUG FIX: Only apply during slow movement (gyro_norm < 0.3 rad/s ≈ 17°/s).
+        // The visual heading uses atan2(R[1,0], R[0,0]) which extracts rotation
+        // around the camera Z-axis (optical axis), NOT around gravity (true yaw).
+        // During turns, this systematically under-counts heading change, causing
+        // the correction to REMOVE real heading from the gyro integration.
+        // This was the root cause of 180° turns registering as only ~134°.
+        if (frames_since_keyframe_ >= 14 && pose_valid && tracked >= MIN_INLIERS * 2
+            && gyro_norm < 0.3) {
             double kf_heading = 0.0;
             cv::Point3f kf_pos;
             if (feature_mgr_.getLastKeyframeInfo(kf_heading, kf_pos)) {
@@ -827,18 +963,18 @@ VisionOutput Tracker::processFrame(const uint8_t* yuv_data, int width, int heigh
                             while (drift > M_PI) drift -= 2.0 * M_PI;
                             while (drift < -M_PI) drift += 2.0 * M_PI;
 
-                            // Only correct if drift is small enough to be real (not a bad match)
-                            // Max expected gyro drift: ~2 deg/sec * 0.5 sec keyframe interval = ~1 deg
-                            // Allow up to 10 deg to catch accumulation
-                            if (std::abs(drift) < 10.0 * M_PI / 180.0) {
-                                // Gentle 15% correction — avoids jumps
-                                scalar_heading_ -= 0.15 * drift;
+                            // Correct drift if within reasonable range
+                            // Walking oscillation can cause 2-4°/step drift; allow up to 20°
+                            // to catch multi-step accumulation between keyframes
+                            if (std::abs(drift) < 20.0 * M_PI / 180.0) {
+                                // 30% correction — stronger than before to fight walking drift
+                                scalar_heading_ -= 0.30 * drift;
                                 while (scalar_heading_ > M_PI) scalar_heading_ -= 2.0 * M_PI;
                                 while (scalar_heading_ < -M_PI) scalar_heading_ += 2.0 * M_PI;
 
                                 if (frame_counter_ % 30 == 0) {
                                     LOGI("KF_HEADING_CORR: drift=%.2f° correction=%.2f° inliers=%d",
-                                         drift * 180.0 / M_PI, 0.15 * drift * 180.0 / M_PI, inl);
+                                         drift * 180.0 / M_PI, 0.30 * drift * 180.0 / M_PI, inl);
                                 }
                             }
                         }

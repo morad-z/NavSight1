@@ -51,11 +51,8 @@ public:
     // Handle IMU data for initialization
     void addImuData(int64_t ts, float ax, float ay, float az, float gx, float gy, float gz);
 
-    // DEAD CODE: blendScale/applyLoopCorrection — VioEngine.applyMapperResult is a no-op
-    // void blendScale(double target_scale, double alpha);
-    // void applyLoopCorrection(double target_x, double target_y, double target_z,
-    //                          double target_heading, double blend,
-    //                          VisionOutput& out);
+    // Depth-based scale constraint: receives MiDaS depth map at ~1Hz
+    void setDepthMap(const float* depth_data, int width, int height);
 
     // Thread-safe read-only accessors
     double getSmoothScale() const;
@@ -110,6 +107,7 @@ private:
     // Fixes coordinate system bug: atan2(R[1,0], R[0,0]) only captures Z-rotation,
     // but phone yaw is around gravity (Y-axis), so turns were under-reported.
     double scalar_heading_{0.0};
+    double filtered_yaw_rate_{0.0};  // Low-pass filtered yaw rate (removes step oscillation)
 
     // Phase 7: FEJ heading — locked at first pose_valid frame
     double heading_fej_{0.0};
@@ -141,6 +139,15 @@ private:
 
     // Keyframe tracking state
     int frames_since_keyframe_{0};
+
+    // Depth-based scale constraint (MiDaS)
+    mutable std::mutex depth_mutex_;
+    std::vector<float> depth_map_;
+    int depth_width_{0}, depth_height_{0};
+    void applyDepthScaleConstraint(const std::vector<cv::Point2f>& pts2d,
+                                    const std::vector<cv::Point3f>& pts3d,
+                                    int img_width, int img_height,
+                                    const IMUPreintegrator& imu);
 
     // Constants
     static constexpr int    MAX_FEATURES       = 200;  // OpenVINS default for monocular
