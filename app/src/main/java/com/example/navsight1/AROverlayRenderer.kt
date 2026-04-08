@@ -1,5 +1,10 @@
 package com.example.navsight1
 
+// DEAD FILE: All composables in AROverlayRenderer are unused.
+// DirectionArrow was only called from the dead AROverlay() in MainActivity.
+// TiltWarning, SpeedIndicator, ConfidenceIndicator were never called.
+
+/*
 import androidx.compose.animation.core.*
 import androidx.compose.foundation.Canvas
 import androidx.compose.foundation.layout.*
@@ -179,3 +184,4 @@ object AROverlayRenderer {
         }
     }
 }
+*/

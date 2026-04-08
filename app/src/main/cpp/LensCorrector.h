@@ -12,12 +12,11 @@ public:
     // Set camera intrinsics (must be called before undistort)
     void setIntrinsics(double fx, double fy, double cx, double cy);
 
-    // Set distortion coefficients [k1, k2, p1, p2, k3]
-    // Default: typical phone camera barrel distortion
-    void setDistortion(double k1, double k2, double p1, double p2, double k3 = 0.0);
+    // DEAD CODE: setDistortion — never called
+    // void setDistortion(double k1, double k2, double p1, double p2, double k3 = 0.0);
 
-    // Undistort a set of 2D points in-place using the current model
-    void undistortPoints(std::vector<cv::Point2f>& points) const;
+    // DEAD CODE: undistortPoints (single-set) — never called
+    // void undistortPoints(std::vector<cv::Point2f>& points) const;
 
     // Undistort two matched point sets (prev, next) for essential matrix
     void undistortMatchedPoints(std::vector<cv::Point2f>& prev,
@@ -30,7 +29,9 @@ private:
     cv::Mat dist_coeffs_;      // 5x1 [k1, k2, p1, p2, k3]
     bool has_intrinsics_{false};
 
-    // Default distortion for typical phone cameras (mild barrel)
-    static constexpr double DEFAULT_K1 = -0.08;
-    static constexpr double DEFAULT_K2 =  0.01;
+    // Default: zero distortion (no correction if uncalibrated)
+    // Wrong distortion coefficients are WORSE than no correction —
+    // they corrupt point positions and cause essential matrix failure.
+    static constexpr double DEFAULT_K1 = 0.0;
+    static constexpr double DEFAULT_K2 = 0.0;
 };

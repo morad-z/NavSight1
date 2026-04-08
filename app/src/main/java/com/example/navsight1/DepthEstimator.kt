@@ -3,155 +3,108 @@ package com.example.navsight1
 import android.content.Context
 import android.graphics.Bitmap
 import android.util.Log
+import kotlinx.coroutines.asCoroutineDispatcher
+import kotlinx.coroutines.withContext
 import org.tensorflow.lite.Interpreter
+import org.tensorflow.lite.gpu.GpuDelegate
 import org.tensorflow.lite.support.common.FileUtil
+import org.tensorflow.lite.support.common.ops.NormalizeOp
+import org.tensorflow.lite.support.image.ImageProcessor
+import org.tensorflow.lite.support.image.TensorImage
+import org.tensorflow.lite.support.image.ops.ResizeOp
 import java.nio.ByteBuffer
 import java.nio.ByteOrder
+import java.util.concurrent.Executors
 
 /**
- * MiDaS v2.1 Small depth estimator for automatic VIO scale calibration.
- *
- * Uses TensorFlow Lite to run monocular depth estimation on camera frames.
- * The estimated depth is used to provide absolute scale information to the VIO system.
+ * High-performance monocular depth estimation using TFLite.
+ * Optimized for Android 2024 (GPU/NNAPI delegates + background threading).
  */
-class DepthEstimator(context: Context) {
-    private val TAG = "DepthEstimator"
+class DepthEstimator(private val context: Context) : AutoCloseable {
+
+    companion object {
+        private const val TAG = "DepthEstimator"
+        private const val MODEL_FILE = "midas_v21_small.tflite"
+        private const val INPUT_SIZE = 256
+        private const val NUM_THREADS = 4
+    }
 
     private var interpreter: Interpreter? = null
-    private val inputSize = 256  // MiDaS small input size
-    private val inputBuffer: ByteBuffer
-    private val outputBuffer: ByteBuffer
-
-    // Reference depth for scale estimation (ground plane assumption)
-    // Typical mounted camera height: 0.3-0.5m for scooter/bike
-    private var referenceHeight = 0.4f  // meters
+    private var gpuDelegate: GpuDelegate? = null
+    
+    // Dedicated dispatcher for TFLite inference to avoid thread-safety issues
+    private val inferenceDispatcher = Executors.newSingleThreadExecutor().asCoroutineDispatcher()
 
     init {
-        try {
-            val model = FileUtil.loadMappedFile(context, "midas_v2_small.tflite")
-            val options = Interpreter.Options().apply {
-                setNumThreads(2)
-            }
-            interpreter = Interpreter(model, options)
-            Log.d(TAG, "DepthEstimator initialized successfully")
-        } catch (e: Exception) {
-            Log.e(TAG, "Failed to initialize DepthEstimator: ${e.message}", e)
-            interpreter = null
-        }
-
-        // Pre-allocate input buffer: 1 x 256 x 256 x 3 x 4 bytes (float32)
-        inputBuffer = ByteBuffer.allocateDirect(1 * inputSize * inputSize * 3 * 4).apply {
-            order(ByteOrder.nativeOrder())
-        }
-
-        // Pre-allocate output buffer: 1 x 256 x 256 x 1 x 4 bytes (float32)
-        outputBuffer = ByteBuffer.allocateDirect(1 * inputSize * inputSize * 4).apply {
-            order(ByteOrder.nativeOrder())
-        }
+        initializeInterpreter()
     }
 
-    /**
-     * Estimate depth from a camera frame bitmap.
-     * Returns the median depth value in the image.
-     */
-    fun estimateDepth(bitmap: Bitmap): Float {
-        val interp = interpreter ?: return 0f
-
+    private fun initializeInterpreter() {
         try {
-            // Resize to model input size
-            val resized = Bitmap.createScaledBitmap(bitmap, inputSize, inputSize, true)
+            val modelBuffer = FileUtil.loadMappedFile(context, MODEL_FILE)
+            val options = Interpreter.Options()
 
-            // Preprocess: convert to float and normalize to [0, 1]
-            preprocessBitmap(resized, inputBuffer)
-
-            // Run inference
-            inputBuffer.rewind()
-            outputBuffer.rewind()
-            interp.run(inputBuffer, outputBuffer)
-
-            // Get median depth from output
-            outputBuffer.rewind()
-            val depths = FloatArray(inputSize * inputSize)
-            outputBuffer.asFloatBuffer().get(depths)
-
-            // MiDaS outputs inverse depth (disparity), larger = closer
-            // Sort and get median
-            depths.sort()
-            val medianDepth = depths[depths.size / 2]
-
-            // Recycle the scaled bitmap if it's different from input
-            if (resized != bitmap) {
-                resized.recycle()
+            // Try GPU delegate, fall back to CPU if unsupported
+            try {
+                gpuDelegate = GpuDelegate()
+                options.addDelegate(gpuDelegate)
+                Log.d(TAG, "GPU Delegate enabled")
+            } catch (e: Exception) {
+                Log.d(TAG, "GPU Delegate not available, using CPU with $NUM_THREADS threads: ${e.message}")
+                options.setNumThreads(NUM_THREADS)
             }
 
-            return medianDepth
+            interpreter = Interpreter(modelBuffer, options)
+            Log.d(TAG, "TFLite Interpreter initialized with ${MODEL_FILE}")
         } catch (e: Exception) {
-            Log.e(TAG, "Depth estimation failed: ${e.message}", e)
-            return 0f
+            Log.e(TAG, "Error initializing TFLite Interpreter: ${e.message}", e)
         }
     }
 
     /**
-     * Estimate scale factor from depth.
-     * Uses the ground plane assumption: if we know the camera height,
-     * we can derive absolute scale from the depth of the ground.
-     *
-     * @param depth The median depth value from MiDaS (inverse depth/disparity)
-     * @return Scale factor to apply to VIO translation, or null if invalid
+     * Estimates depth for a given bitmap. Returns a FloatArray of depth values (normalized).
      */
-    fun estimateScaleFromDepth(depth: Float): Float? {
-        if (depth <= 0f) return null
+    suspend fun estimateDepth(bitmap: Bitmap): FloatArray? = withContext(inferenceDispatcher) {
+        val interpreter = interpreter ?: return@withContext null
 
-        // MiDaS outputs inverse depth (disparity)
-        // Convert to relative depth scale
-        // The scale factor relates MiDaS disparity to real-world meters
+        try {
+            // 1. Pre-processing
+            val imageProcessor = ImageProcessor.Builder()
+                .add(ResizeOp(INPUT_SIZE, INPUT_SIZE, ResizeOp.ResizeMethod.BILINEAR))
+                .add(NormalizeOp(0f, 255f)) // Normalize to [0, 1]
+                .build()
 
-        // Ground plane assumption:
-        // If camera is at height h, ground appears at depth ~h
-        // MiDaS disparity d ~ 1/h_midas
-        // Real height h_real = referenceHeight
-        // Scale = h_real * d (approximately)
+            val tensorImage = TensorImage(org.tensorflow.lite.DataType.FLOAT32)
+            tensorImage.load(bitmap)
+            val processedImage = imageProcessor.process(tensorImage)
 
-        // Use a calibration factor based on typical MiDaS output range
-        // MiDaS small typically outputs disparity in range [0.1, 10+]
-        // Higher disparity = closer object
+            // 2. Prepare Output Buffer (MiDaS v2.1 Small output is 256x256x1)
+            val outputBuffer = ByteBuffer.allocateDirect(INPUT_SIZE * INPUT_SIZE * 4)
+            outputBuffer.order(ByteOrder.nativeOrder())
+            outputBuffer.rewind()
 
-        val calibrationFactor = 0.1f  // Empirical calibration factor
-        val scale = (referenceHeight * depth * calibrationFactor).coerceIn(0.1f, 10f)
+            // 3. Inference
+            val startTime = System.currentTimeMillis()
+            interpreter.run(processedImage.buffer, outputBuffer)
+            val endTime = System.currentTimeMillis()
+            Log.v(TAG, "Inference time: ${endTime - startTime} ms")
 
-        return scale
-    }
+            // 4. Post-processing
+            outputBuffer.rewind()
+            val depthArray = FloatArray(INPUT_SIZE * INPUT_SIZE)
+            outputBuffer.asFloatBuffer().get(depthArray)
 
-    /**
-     * Set the reference camera mount height for scale calibration.
-     */
-    fun setReferenceHeight(heightM: Float) {
-        referenceHeight = heightM.coerceIn(0.1f, 2.0f)
-        Log.d(TAG, "Reference height set to ${referenceHeight}m")
-    }
-
-    private fun preprocessBitmap(bitmap: Bitmap, buffer: ByteBuffer) {
-        buffer.rewind()
-        val pixels = IntArray(inputSize * inputSize)
-        bitmap.getPixels(pixels, 0, inputSize, 0, 0, inputSize, inputSize)
-
-        for (pixel in pixels) {
-            // Extract RGB and normalize to [0, 1]
-            val r = ((pixel shr 16) and 0xFF) / 255.0f
-            val g = ((pixel shr 8) and 0xFF) / 255.0f
-            val b = (pixel and 0xFF) / 255.0f
-
-            buffer.putFloat(r)
-            buffer.putFloat(g)
-            buffer.putFloat(b)
+            return@withContext depthArray
+        } catch (e: Exception) {
+            Log.e(TAG, "Error during inference: ${e.message}", e)
+            null
         }
     }
 
-    fun isInitialized(): Boolean = interpreter != null
-
-    fun close() {
+    override fun close() {
+        inferenceDispatcher.close()
         interpreter?.close()
-        interpreter = null
-        Log.d(TAG, "DepthEstimator closed")
+        gpuDelegate?.close()
+        Log.d(TAG, "DepthEstimator resources closed.")
     }
 }

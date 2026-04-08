@@ -15,7 +15,7 @@ import android.util.Log
 import com.google.android.gms.location.*
 import com.google.android.gms.maps.model.LatLng
 import com.google.android.gms.tasks.CancellationTokenSource
-import com.otaliastudios.cameraview.frame.Frame
+import androidx.camera.core.ImageProxy
 import kotlinx.coroutines.*
 import kotlinx.coroutines.flow.MutableStateFlow
 import kotlinx.coroutines.flow.asStateFlow
@@ -34,6 +34,24 @@ class SensorRepository(private val context: Context) : SensorEventListener {
     private val fusedLocationClient = LocationServices.getFusedLocationProviderClient(context)
 
     private val orientationTracker = DeviceOrientationTracker()
+    // DISABLED: DepthEstimator — MiDaS depth feeds Mapper pipeline which is disabled (output discarded)
+    // private val depthEstimator = DepthEstimator(context)
+
+    // Dedicated VIO processing thread — decouples camera preview from VIO computation.
+    // Frame dropping: if VIO is still busy when the next frame arrives, we skip it.
+    private val vioExecutor = java.util.concurrent.Executors.newSingleThreadExecutor { r ->
+        Thread(r, "NavSight-VIO").apply { isDaemon = true }
+    }
+    @Volatile private var vioProcessing = false
+    @Volatile private var vioFrameCount = 0
+
+    // DISABLED: Depth estimation thread + state — DepthEstimator/Mapper pipeline disabled
+    // private val depthExecutor = java.util.concurrent.Executors.newSingleThreadExecutor { r ->
+    //     Thread(r, "NavSight-Depth").apply { isDaemon = true }
+    // }
+    // @Volatile private var depthProcessing = false
+    // private var lastDepthTimeMs = 0L
+    // private val DEPTH_THROTTLE_MS = 200L // 5Hz depth updates
 
     private val _orientationState = MutableStateFlow(DeviceOrientationTracker.OrientationResult(
         pitch = 0f, roll = 0f, azimuth = 0f,
@@ -238,6 +256,10 @@ class SensorRepository(private val context: Context) : SensorEventListener {
         
         locationTokenSource?.cancel()
         stopGpsUpdates()
+        vioExecutor.shutdown()
+        // DISABLED: depth cleanup — DepthEstimator/Mapper pipeline disabled
+        // depthExecutor.shutdown()
+        // depthEstimator.close()
         intrinsicsInitialized = false
 
         // Clean up depth estimator
@@ -299,12 +321,19 @@ class SensorRepository(private val context: Context) : SensorEventListener {
 
     override fun onAccuracyChanged(sensor: Sensor?, accuracy: Int) {}
 
-    fun processCameraFrame(frame: Frame) {
-        val data = frame.getData<ByteArray>() ?: return
+    fun processCameraFrame(image: ImageProxy) {
+        // Drop frame if VIO is still processing the previous one.
+        if (vioProcessing) {
+            image.close()
+            return
+        }
 
-        // FR1: Initialize intrinsics for the actual preview dimensions
+        val w = image.width
+        val h = image.height
+
+        // Initialize intrinsics once
         if (!intrinsicsInitialized) {
-            val intrinsics = getCameraIntrinsics(frame.size.width, frame.size.height)
+            val intrinsics = getCameraIntrinsics(w, h)
             NativeBridge.setIntrinsics(
                 intrinsics[0].toDouble(), intrinsics[1].toDouble(),
                 intrinsics[2].toDouble(), intrinsics[3].toDouble()
@@ -312,32 +341,103 @@ class SensorRepository(private val context: Context) : SensorEventListener {
             intrinsicsInitialized = true
         }
 
-        // FR1: Use the same time base as sensor events (nanoseconds since boot)
-        val timestampNs = android.os.SystemClock.elapsedRealtimeNanos()
+        // Get direct ByteBuffers from ImageProxy planes (zero-copy)
+        val yPlane = image.planes[0]
+        val uvPlane = image.planes[2] // V plane — for NV21, this is the interleaved VU plane
+        val yBuffer = yPlane.buffer
+        val uvBuffer = uvPlane.buffer
+        val yRowStride = yPlane.rowStride
+        val uvRowStride = uvPlane.rowStride
+        val uvPixelStride = uvPlane.pixelStride
 
-        Log.d(TAG, "TIMESTAMP_CHECK camera_frame_time=${frame.time} sensor_last_ts=${System.nanoTime()} elapsed_rt=$timestampNs")
+        val timestampNs = image.imageInfo.timestamp
+        val nowMs = System.currentTimeMillis()
 
-        val vio = NativeBridge.processCameraFrame(
-            frameData = data,
-            width = frame.size.width,
-            height = frame.size.height,
-            timestamp = timestampNs
-        )
+        // 1. VIO processing — pass direct buffers to JNI (near zero-copy)
+        vioProcessing = true
+        val frameStartMs = nowMs
+        vioExecutor.execute {
+            try {
+                val jniStartMs = System.currentTimeMillis()
+                val vio = NativeBridge.processCameraFrameDirect(
+                    yBuffer = yBuffer,
+                    uvBuffer = uvBuffer,
+                    width = w,
+                    height = h,
+                    yRowStride = yRowStride,
+                    uvRowStride = uvRowStride,
+                    uvPixelStride = uvPixelStride,
+                    timestamp = timestampNs
+                )
+                val jniMs = System.currentTimeMillis() - jniStartMs
+                val totalMs = System.currentTimeMillis() - frameStartMs
+                vioFrameCount++
+                if (vioFrameCount % 30 == 0) {
+                    Log.i(TAG, "VIO_FPS: jni=${jniMs}ms total=${totalMs}ms fc=$vioFrameCount pts=${vio.trackedFeatures}")
+                }
+                _vioState.value = vio
+                handleVioInitialized(vio)
+                checkCameraBlocked(vio)
+            } finally {
+                image.close()  // Release ImageProxy AFTER JNI is done
+                vioProcessing = false
+            }
+        }
 
-        _vioState.value = vio
+        // DISABLED: Depth estimation — Mapper pipeline disabled, MiDaS output was never applied
+        // if (!depthProcessing && (nowMs - lastDepthTimeMs >= DEPTH_THROTTLE_MS)) {
+        //     val yBytes = ByteArray(w * h)
+        //     yBuffer.rewind()
+        //     if (yRowStride == w) {
+        //         yBuffer.get(yBytes, 0, w * h)
+        //     } else {
+        //         for (row in 0 until h) {
+        //             yBuffer.position(row * yRowStride)
+        //             yBuffer.get(yBytes, row * w, w)
+        //         }
+        //     }
+        //     depthProcessing = true
+        //     lastDepthTimeMs = nowMs
+        //     depthExecutor.execute {
+        //         try {
+        //             val bitmap = android.graphics.Bitmap.createBitmap(w, h, android.graphics.Bitmap.Config.ARGB_8888)
+        //             val pixels = IntArray(w * h)
+        //             for (i in yBytes.indices) {
+        //                 val lum = yBytes[i].toInt() and 0xFF
+        //                 pixels[i] = (0xFF shl 24) or (lum shl 16) or (lum shl 8) or lum
+        //             }
+        //             bitmap.setPixels(pixels, 0, w, 0, 0, w, h)
+        //             repositoryScope.launch {
+        //                 val depthMap = depthEstimator.estimateDepth(bitmap)
+        //                 if (depthMap != null) {
+        //                     NativeBridge.setDepthMap(depthMap, 256, 256)
+        //                 }
+        //             }
+        //         } catch (e: Exception) {
+        //             Log.e(TAG, "Depth processing error: ${e.message}")
+        //         } finally {
+        //             depthProcessing = false
+        //         }
+        //     }
+        // }
+    }
 
+    private fun handleVioInitialized(vio: VioData) {
         if (vio.isInitialized && !wasVioInitialized) {
             wasVioInitialized = true
             vioInitAzimuth = _orientationState.value.azimuth
-
-            // Pass initial compass heading to C++ so VIO heading aligns to north.
-            // azimuth is in degrees (CW from north), convert to radians.
             val azimuthRad = Math.toRadians(vioInitAzimuth.toDouble())
             NativeBridge.setInitialHeading(azimuthRad)
-            Log.d(TAG, "Initial heading set: ${vioInitAzimuth}° (${azimuthRad} rad)")
-            // Phase 2.3: Keep magnetometer registered for continuous heading fusion
-        }
+            Log.i(TAG, "Initial heading set: ${vioInitAzimuth}° (${azimuthRad} rad)")
 
+            magnetometer?.let {
+                sensorManager.unregisterListener(this, it)
+                Log.i(TAG, "Magnetometer unregistered - initial heading captured.")
+            }
+        }
+    }
+
+    private fun checkCameraBlocked(vio: VioData) {
         if (vio.isInitialized && vio.trackedFeatures < 5) {
             consecutiveVioFailures++
             if (consecutiveVioFailures > 30) _showCameraBlocked.value = true
@@ -465,7 +565,8 @@ class SensorRepository(private val context: Context) : SensorEventListener {
         accelMagnitudeHistory.clear()
     }
 
-    fun setScale(scale: Double) {
-        NativeBridge.setScale(scale)
-    }
+    // DEAD CODE: never called — ViewModel calls NativeBridge.setScale() directly
+    // fun setScale(scale: Double) {
+    //     NativeBridge.setScale(scale)
+    // }
 }

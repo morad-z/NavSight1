@@ -1,11 +1,16 @@
 #include "LoopClosureDetector.h"
-#include <android/log.h>
 #include <cmath>
 #include <algorithm>
 
+#ifdef __ANDROID__
+#include <android/log.h>
 #define TAG "LoopClosureDetector"
 #define LOGI(...) __android_log_print(ANDROID_LOG_INFO, TAG, __VA_ARGS__)
 #define LOGD(...) __android_log_print(ANDROID_LOG_DEBUG, TAG, __VA_ARGS__)
+#else
+#define LOGI(...) (void)0
+#define LOGD(...) (void)0
+#endif
 
 LoopClosureDetector::LoopClosureDetector() {
     orb_matcher_ = cv::ORB::create(500, 1.2f, 8);

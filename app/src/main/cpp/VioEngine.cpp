@@ -7,50 +7,43 @@
 #define LOGE(...) __android_log_print(ANDROID_LOG_ERROR, TAG, __VA_ARGS__)
 
 VioEngine::VioEngine() {
-    // Start Mapper background thread
-    mapper_thread_ = std::thread(&VioEngine::mapperThreadFunc, this);
-    LOGI("VioEngine created (Mapper on background thread)");
+    // DISABLED: Mapper background thread — output was discarded (applyMapperResult was a no-op)
+    // mapper_thread_ = std::thread(&VioEngine::mapperThreadFunc, this);
+    LOGI("VioEngine created (Mapper pipeline disabled — output was discarded)");
 }
 
 VioEngine::~VioEngine() {
-    // Signal mapper thread to stop and join
-    {
-        std::lock_guard<std::mutex> lock(mapper_mutex_);
-        mapper_stop_.store(true);
-        mapper_cv_.notify_one();
-    }
-    if (mapper_thread_.joinable()) {
-        mapper_thread_.join();
-    }
+    // DISABLED: Mapper thread join
+    // {
+    //     std::lock_guard<std::mutex> lock(mapper_mutex_);
+    //     mapper_stop_.store(true);
+    //     mapper_cv_.notify_one();
+    // }
+    // if (mapper_thread_.joinable()) {
+    //     mapper_thread_.join();
+    // }
     LOGI("VioEngine destroyed");
 }
 
-// ── Mapper background thread ────────────────────────────────────────────────
-// Waits for work, processes one frame at a time, stores result for pickup.
-
+// DISABLED: Mapper background thread — Mapper, LoopClosureDetector, PoseGraph all
+// ran but applyMapperResult was a no-op. Corrections caused teleportation spikes.
+/*
 void VioEngine::mapperThreadFunc() {
     LOGI("Mapper thread started");
     while (!mapper_stop_.load()) {
         TrackerFrame frame;
         double scale;
-
-        // Wait for work
         {
             std::unique_lock<std::mutex> lock(mapper_mutex_);
             mapper_cv_.wait(lock, [this] {
                 return mapper_has_work_ || mapper_stop_.load();
             });
             if (mapper_stop_.load()) break;
-
             frame = std::move(mapper_pending_frame_);
             scale = mapper_pending_scale_;
             mapper_has_work_ = false;
         }
-
-        // Run mapper (heavy: ground plane, BA, loop closure)
-        MapperResult mr = mapper_.process(frame, scale);
-
-        // Store result for next processFrame to pick up
+        MapperResult mr = mapper_.process(frame, scale, tracker_.getEKF());
         {
             std::lock_guard<std::mutex> lock(result_mutex_);
             latest_mapper_result_ = mr;
@@ -59,63 +52,46 @@ void VioEngine::mapperThreadFunc() {
     }
     LOGI("Mapper thread stopped");
 }
+*/
+
+// DISABLED: applyMapperResult — was already a no-op
+/*
+void VioEngine::applyMapperResult(const MapperResult& mr, VisionOutput& out) {
+    (void)mr;
+    (void)out;
+}
+*/
 
 // ── processFrame ────────────────────────────────────────────────────────────
-// 1. Apply any pending Mapper corrections from previous frame (non-blocking).
-// 2. Run Tracker (fast path, ~5-10ms).
-// 3. Submit frame to Mapper thread (non-blocking).
+// Tracker only (fast path, ~5-10ms). Mapper pipeline disabled.
 
 VisionOutput VioEngine::processFrame(const uint8_t* yuv_data, int width, int height,
                                       int64_t timestamp_ns) {
-    // Fast path: core tracking
     TrackerFrame frame;
     VisionOutput out = tracker_.processFrame(yuv_data, width, height,
                                               timestamp_ns, imu_, frame);
 
-    // Apply latest Mapper result if available (from previous frame's background work)
-    {
-        std::lock_guard<std::mutex> lock(result_mutex_);
-        if (has_mapper_result_) {
-            applyMapperResult(latest_mapper_result_, out);
-            has_mapper_result_ = false;
-        }
-    }
+    // DISABLED: Mapper result pickup — applyMapperResult was a no-op
+    // {
+    //     std::lock_guard<std::mutex> lock(result_mutex_);
+    //     if (has_mapper_result_) {
+    //         applyMapperResult(latest_mapper_result_, out);
+    //         has_mapper_result_ = false;
+    //     }
+    // }
 
-    // Submit to Mapper thread (non-blocking: if Mapper is still busy, skip this frame)
-    {
-        std::lock_guard<std::mutex> lock(mapper_mutex_);
-        if (!mapper_has_work_) {
-            mapper_pending_frame_ = std::move(frame);
-            mapper_pending_scale_ = tracker_.getSmoothScale();
-            mapper_has_work_ = true;
-            mapper_cv_.notify_one();
-        }
-    }
+    // DISABLED: Mapper thread submission — output was discarded
+    // {
+    //     std::lock_guard<std::mutex> lock(mapper_mutex_);
+    //     if (!mapper_has_work_) {
+    //         mapper_pending_frame_ = std::move(frame);
+    //         mapper_pending_scale_ = tracker_.getSmoothScale();
+    //         mapper_has_work_ = true;
+    //         mapper_cv_.notify_one();
+    //     }
+    // }
 
     return out;
-}
-
-// ── Apply Mapper corrections to Tracker state ───────────────────────────────
-
-void VioEngine::applyMapperResult(const MapperResult& mr, VisionOutput& out) {
-    // Ground plane scale correction (6-15% weight based on confidence)
-    if (mr.ground_plane.is_valid) {
-        double gp_alpha = 0.15 * mr.ground_plane.confidence;
-        tracker_.blendScale(mr.ground_plane.ground_scale, gp_alpha);
-    }
-
-    // BA scale correction (8% weight)
-    if (mr.bundle_adj.is_valid) {
-        tracker_.blendScale(mr.bundle_adj.optimized_scale, mr.bundle_adj.alpha);
-    }
-
-    // Loop closure correction (30% blend per detection)
-    if (mr.loop_closure.detected) {
-        tracker_.applyLoopCorrection(
-            mr.loop_closure.target_x, mr.loop_closure.target_y,
-            mr.loop_closure.target_z, mr.loop_closure.target_heading,
-            mr.loop_closure.blend, out);
-    }
 }
 
 // ── Sensor data forwarding ──────────────────────────────────────────────────
@@ -126,6 +102,9 @@ void VioEngine::addGyroData(int64_t timestamp_ns, float x, float y, float z) {
         return;
     }
     imu_.addGyroReading(timestamp_ns, x, y, z);
+    
+    // Also pass to tracker for initialization
+    tracker_.addImuData(timestamp_ns, imu_.lastAccelX(), imu_.lastAccelY(), imu_.lastAccelZ(), x, y, z);
 }
 
 void VioEngine::addAccelData(int64_t timestamp_ns, float x, float y, float z) {
@@ -134,6 +113,9 @@ void VioEngine::addAccelData(int64_t timestamp_ns, float x, float y, float z) {
         return;
     }
     imu_.addAccelReading(timestamp_ns, x, y, z);
+
+    // Also pass to tracker for initialization
+    tracker_.addImuData(timestamp_ns, x, y, z, imu_.lastGyroX(), imu_.lastGyroY(), imu_.lastGyroZ());
 }
 
 void VioEngine::setIntrinsics(double fx, double fy, double cx, double cy) {
@@ -148,12 +130,23 @@ void VioEngine::setMagnetometerHeading(float yaw_rad) {
     imu_.setMagnetometerHeading(yaw_rad);
 }
 
+void VioEngine::setDepthMap(const float* depth_data, int width, int height) {
+    // DISABLED: Depth map storage + Mapper forwarding — Mapper pipeline is disabled,
+    // depth results were never applied (applyMapperResult was a no-op).
+    // Kotlin DepthEstimator also disabled to save CPU/GPU/battery.
+    (void)depth_data;
+    (void)width;
+    (void)height;
+}
+
 void VioEngine::setUserScaleCorrection(double correction) {
     tracker_.setUserScaleCorrection(correction);
 }
 
 void VioEngine::setUserHeight(float height_m) {
     imu_.setUserHeight(height_m);
+    // DISABLED: mapper_.setCameraHeight — Mapper pipeline disabled
+    // mapper_.setCameraHeight(static_cast<double>(height_m));
 }
 
 void VioEngine::updateDepthScale(double scale, double alpha) {
@@ -164,18 +157,18 @@ void VioEngine::updateDepthScale(double scale, double alpha) {
 }
 
 void VioEngine::reset() {
-    // Stop mapper thread work before resetting
-    {
-        std::lock_guard<std::mutex> lock(mapper_mutex_);
-        mapper_has_work_ = false;
-    }
-    {
-        std::lock_guard<std::mutex> lock(result_mutex_);
-        has_mapper_result_ = false;
-        latest_mapper_result_ = {};
-    }
+    // DISABLED: Mapper thread/result reset — Mapper pipeline disabled
+    // {
+    //     std::lock_guard<std::mutex> lock(mapper_mutex_);
+    //     mapper_has_work_ = false;
+    // }
+    // {
+    //     std::lock_guard<std::mutex> lock(result_mutex_);
+    //     has_mapper_result_ = false;
+    //     latest_mapper_result_ = {};
+    // }
     tracker_.reset();
-    mapper_.reset();
+    // mapper_.reset();
     imu_.reset();
     LOGI("VioEngine reset");
 }
