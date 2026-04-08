@@ -160,14 +160,11 @@ class RoadSnapper(private val apiKey: String) {
         return "%.6f,%.6f".format(latLng.latitude, latLng.longitude)
     }
 
-    /**
-     * Clears the snapping cache.
-     * Useful when starting a new navigation session.
-     */
-    fun clearCache() {
-        snapCache.evictAll()
-        Log.d(TAG, "Snap cache cleared")
-    }
+    // DEAD CODE: never called from anywhere
+    // fun clearCache() {
+    //     snapCache.evictAll()
+    //     Log.d(TAG, "Snap cache cleared")
+    // }
 
     /**
      * Shuts down the GeoApiContext.

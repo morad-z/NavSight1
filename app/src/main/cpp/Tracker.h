@@ -51,13 +51,11 @@ public:
     // Handle IMU data for initialization
     void addImuData(int64_t ts, float ax, float ay, float az, float gx, float gy, float gz);
 
-    // Called by VioEngine after Mapper returns scale corrections.
-    void blendScale(double target_scale, double alpha);
-
-    // Called by VioEngine after Mapper detects a loop closure.
-    void applyLoopCorrection(double target_x, double target_y, double target_z,
-                             double target_heading, double blend,
-                             VisionOutput& out);
+    // DEAD CODE: blendScale/applyLoopCorrection — VioEngine.applyMapperResult is a no-op
+    // void blendScale(double target_scale, double alpha);
+    // void applyLoopCorrection(double target_x, double target_y, double target_z,
+    //                          double target_heading, double blend,
+    //                          VisionOutput& out);
 
     // Thread-safe read-only accessors
     double getSmoothScale() const;
@@ -132,7 +130,8 @@ private:
     LensCorrector lens_;
     TrackKLT klt_;
     UpdaterZeroVelocity zupt_detector_;
-    UpdaterMSCKF msckf_updater_;
+    // DEAD CODE: MSCKF updater — processLostFeatures never called (MSCKF update disabled)
+    UpdaterMSCKF msckf_updater_; // kept as member to avoid header changes cascading
 
     // MSCKF feature ID tracking (parallel to prev_pts_)
     std::vector<int> feature_ids_;

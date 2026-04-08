@@ -127,54 +127,9 @@ double Tracker::estimateScaleFromSteps(double vision_disp, int64_t dt_ns,
     return obs_scale;
 }
 
-// ── Scale / Loop Correction (called by VioEngine) ───────────────────────────
-
-void Tracker::blendScale(double target_scale, double alpha) {
-    std::lock_guard<std::mutex> lock(pose_mutex_);
-    smooth_scale_ = (1.0 - alpha) * smooth_scale_ + alpha * target_scale;
-    smooth_scale_ = std::max(0.005, std::min(20.0, smooth_scale_));
-    // Also update EKF scale
-    ekf_.updateScale(target_scale, alpha);
-}
-
-void Tracker::applyLoopCorrection(double tx, double ty, double tz,
-                                   double target_heading, double blend,
-                                   VisionOutput& out) {
-    std::lock_guard<std::mutex> lock(pose_mutex_);
-    global_t_.at<double>(0) += blend * (tx - global_t_.at<double>(0));
-    global_t_.at<double>(1) += blend * (ty - global_t_.at<double>(1));
-    global_t_.at<double>(2) += blend * (tz - global_t_.at<double>(2));
-
-    double hdiff = target_heading - out.heading;
-    while (hdiff >  M_PI) hdiff -= 2.0 * M_PI;
-    while (hdiff < -M_PI) hdiff += 2.0 * M_PI;
-    double h = out.heading + blend * hdiff;
-    double c = std::cos(h), s = std::sin(h);
-    global_R_ = (cv::Mat_<double>(3, 3) << c,-s,0, s,c,0, 0,0,1);
-    out.t = global_t_.clone();
-    out.heading = h;
-
-    // Propagate loop closure correction to MSCKF sliding window clones
-    if (ekf_.isFullInitialized()) {
-        // Compute correction delta
-        cv::Mat dp = (cv::Mat_<double>(3,1) <<
-            blend * (tx - out.t.at<double>(0)),
-            blend * (ty - out.t.at<double>(1)),
-            blend * (tz - out.t.at<double>(2)));
-        double dh = blend * hdiff;
-
-        // Apply same correction to all clones in the window
-        // This maintains relative pose consistency within the window
-        for (auto& clone : const_cast<std::deque<CameraPose>&>(ekf_.getWindow())) {
-            clone.p_G += dp;
-            cv::Mat dR_clone = (cv::Mat_<double>(3,3) <<
-                std::cos(dh), -std::sin(dh), 0,
-                std::sin(dh),  std::cos(dh), 0,
-                0, 0, 1);
-            clone.R_GtoC = dR_clone * clone.R_GtoC;
-        }
-    }
-}
+// DEAD CODE: blendScale/applyLoopCorrection — VioEngine.applyMapperResult is a no-op, never calls these
+// void Tracker::blendScale(double target_scale, double alpha) { ... }
+// void Tracker::applyLoopCorrection(double tx, double ty, double tz, ...) { ... }
 
 double Tracker::getSmoothScale() const {
     std::lock_guard<std::mutex> lock(pose_mutex_); return smooth_scale_;

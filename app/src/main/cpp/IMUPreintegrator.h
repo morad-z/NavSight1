@@ -41,36 +41,38 @@ public:
     void addGyroReading(int64_t timestamp_ns, float x, float y, float z);
     void addAccelReading(int64_t timestamp_ns, float x, float y, float z);
 
-    // Integrate gyroscope readings between start_ns and end_ns into a rotation matrix
-    cv::Mat integrateGyro(int64_t start_ns, int64_t end_ns);
+    // DEAD CODE: superseded by integrate()
+    // cv::Mat integrateGyro(int64_t start_ns, int64_t end_ns);
 
     // Full preintegration (returns deltaR, deltaV, deltaP for the interval)
     PreintegratedMeasurement integrate(int64_t start_ns, int64_t end_ns);
 
-    // Get interpolated sensor data at specific timestamp
-    GyroSample interpolateGyro(int64_t ts_ns) const;
-    AccelSample interpolateAccel(int64_t ts_ns) const;
+    // DEAD CODE: interpolateGyro/Accel — never called, never implemented in .cpp
+    // GyroSample interpolateGyro(int64_t ts_ns) const;
+    // AccelSample interpolateAccel(int64_t ts_ns) const;
 
-    // Bias correction using Taylor expansion
-    void correctMeasurement(PreintegratedMeasurement& meas, 
-                            const cv::Point3f& delta_bg, 
-                            const cv::Point3f& delta_ba);
+    // DEAD CODE: correctMeasurement — never called
+    // void correctMeasurement(PreintegratedMeasurement& meas,
+    //                         const cv::Point3f& delta_bg,
+    //                         const cv::Point3f& delta_ba);
 
     // Set IMU noise parameters
     void setNoiseParameters(float accel_noise, float gyro_noise, 
                             float accel_rw, float gyro_rw);
 
-    // Initialize gravity vector from a batch of accelerometer samples
-    void initializeFromGravity(const std::vector<cv::Point3f>& accel_samples);
-    void setGravity(float gx, float gy, float gz);
+    // DEAD CODE: initializeFromGravity, setGravity — never called
+    // void initializeFromGravity(const std::vector<cv::Point3f>& accel_samples);
+    // void setGravity(float gx, float gy, float gz);
 
-    cv::Point3f getGravityVector() const;
+    // DEAD CODE: getGravityVector — never called (only getFilteredGravity is used)
+    // cv::Point3f getGravityVector() const;
     // Low-pass filtered accelerometer — tracks current gravity direction
     // even as the phone tilts during use (unlike getGravityVector which is
     // frozen from initialization).
     cv::Point3f getFilteredGravity() const;
-    float getRoll() const;
-    float getPitch() const;
+    // DEAD CODE: getRoll/getPitch — never called
+    // float getRoll() const;
+    // float getPitch() const;
     bool isInitialized() const;
 
     void reset();
@@ -96,18 +98,21 @@ public:
 
     // Motion mode detection: walking vs driving vs stationary
     enum class MotionMode { STATIONARY, WALKING, DRIVING };
-    MotionMode getMotionMode() const;
+    // DEAD CODE: getMotionMode — never called externally
+    // MotionMode getMotionMode() const;
 
     // Vehicle speed estimate from integrated acceleration (reset at ZUPT)
     double getVehicleSpeedEstimate() const;
 
     // User height for stride estimation (default 1.70m)
     void setUserHeight(float height_m);
-    float getUserHeight() const;
+    // DEAD CODE: getUserHeight — never called
+    // float getUserHeight() const;
 
     // Magnetometer heading fusion
     void setMagnetometerHeading(float yaw_rad);
-    float getCorrectedHeading(float gyro_yaw_rad);
+    // DEAD CODE: getCorrectedHeading — never called
+    // float getCorrectedHeading(float gyro_yaw_rad);
     bool hasMagHeading() const { return has_mag_heading_.load(); }
     float getMagHeading() const { return mag_heading_; }
 

@@ -264,18 +264,11 @@ void EKFState::updateZUPT() {
     }
 }
 
-double EKFState::checkConsistency(double camera_disp, double step_disp) const {
-    if (camera_disp < 0.001 && step_disp < 0.001) return 1.0;
-    double max_d = std::max(camera_disp, step_disp);
-    if (max_d < 0.001) return 1.0;
-    double diff = std::abs(camera_disp - step_disp);
-    double ratio = 1.0 - std::min(1.0, diff / max_d);
-    return ratio * ratio;
-}
+// DEAD CODE: checkConsistency — never called
+// double EKFState::checkConsistency(double camera_disp, double step_disp) const { ... }
 
-double EKFState::getScaleStd() const {
-    return std::sqrt(std::max(0.0, P_scale_));
-}
+// DEAD CODE: getScaleStd — never called
+// double EKFState::getScaleStd() const { ... }
 
 // ── Clone Management ────────────────────────────────────────────────────────
 
@@ -496,17 +489,8 @@ int EKFState::getLatestCloneId() const {
     return window_.back().state_id;
 }
 
-void EKFState::getFEJ(int state_id, cv::Mat& R_fej, cv::Mat& p_fej) const {
-    for (const auto& pose : window_) {
-        if (pose.state_id == state_id) {
-            R_fej = pose.R_FEJ.clone();
-            p_fej = pose.p_FEJ.clone();
-            return;
-        }
-    }
-    R_fej = global_first_estimate_R_.clone();
-    p_fej = global_first_estimate_p_.clone();
-}
+// DEAD CODE: getFEJ — only called from UpdaterMSCKF which is disabled
+// void EKFState::getFEJ(int state_id, cv::Mat& R_fej, cv::Mat& p_fej) const { ... }
 
 // ── Online Temporal Calibration ─────────────────────────────────────────────
 
@@ -516,33 +500,5 @@ void EKFState::setTimeOffset(double td_seconds) {
     LOGI("EKF: Time offset warm-started to %.3fms (std=2.0ms)", td_seconds * 1000.0);
 }
 
-void EKFState::updateTemporal(double observed_scale, double confidence, double H_td) {
-    if (observed_scale <= 0.005 || confidence <= 0.0) return;
-
-    P_td_ += 0.0001 * 0.0001;
-
-    // Use current scale for innovation (scale is observable)
-    double innov = observed_scale - scale_;
-
-    double R = SIGMA_SCALE_MEAS / (confidence + 0.01);
-    double S = P_scale_ + H_td * H_td * P_td_ + R;
-
-    if ((innov * innov) / S > 16.0) return;
-
-    double K_scale = P_scale_ / S;
-    double K_td    = (H_td * P_td_) / S;
-
-    scale_     += K_scale * innov;
-    t_offset_cam_imu_ += K_td * innov;
-
-    scale_ = std::max(0.005, std::min(20.0, scale_));
-    t_offset_cam_imu_ = std::max(-0.1, std::min(0.1, t_offset_cam_imu_));
-
-    P_scale_ = (1.0 - K_scale) * P_scale_;
-    P_td_    = (1.0 - K_td * H_td) * P_td_;
-
-    if (std::abs(K_td * innov) > 0.0001) {
-        LOGI("Temporal Calibration: td=%.4fs (std=%.4f) scale=%.3f",
-             t_offset_cam_imu_, getTimeOffsetStd(), scale_);
-    }
-}
+// DEAD CODE: updateTemporal — never called
+// void EKFState::updateTemporal(double observed_scale, double confidence, double H_td) { ... }
