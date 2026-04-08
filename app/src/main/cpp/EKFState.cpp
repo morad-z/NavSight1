@@ -84,10 +84,11 @@ void EKFState::propagateIMU(const cv::Mat& deltaR, const cv::Mat& deltaV,
                              const cv::Mat& J_P_ba) {
     if (!full_initialized_ || dt <= 0 || P_.empty()) return;
 
-    // Propagate mean state
+    // Propagate mean state (gravity in global frame: [0, -9.81, 0] for Y-up)
+    cv::Mat g = (cv::Mat_<double>(3,1) << 0.0, -9.81, 0.0);
     cv::Mat R_new = R_GtoI_ * deltaR;
-    cv::Mat v_new = v_G_ + R_GtoI_.t() * deltaV;  // deltaV is in body frame
-    cv::Mat p_new = p_G_ + v_G_ * dt + R_GtoI_.t() * deltaP;
+    cv::Mat v_new = v_G_ + g * dt + R_GtoI_.t() * deltaV;
+    cv::Mat p_new = p_G_ + v_G_ * dt + 0.5 * g * dt * dt + R_GtoI_.t() * deltaP;
 
     // Build discrete state transition matrix Phi (15x15)
     // Error-state: [δθ, δb_g, δv, δb_a, δp]
@@ -244,12 +245,19 @@ void EKFState::updateZUPT() {
     // Zero velocity in full EKF state (prevents IMU-propagated drift)
     if (full_initialized_) {
         v_G_ = cv::Mat::zeros(3, 1, CV_64F);
-        // Shrink velocity covariance
+        // Shrink velocity covariance — scale factor applied once to full block
         if (!P_.empty() && P_.rows >= IMU_STATE_DIM) {
+            constexpr double shrink = 0.01; // Equivalent to "velocity is near-zero"
             for (int i = 6; i < 9; i++) {
                 for (int j = 0; j < P_.cols; j++) {
-                    P_.at<double>(i, j) *= 0.1;
-                    P_.at<double>(j, i) *= 0.1;
+                    if (j >= 6 && j < 9) {
+                        // Velocity-velocity block: scale by shrink
+                        P_.at<double>(i, j) *= shrink;
+                    } else {
+                        // Cross-correlation: scale by sqrt(shrink) to maintain PSD
+                        P_.at<double>(i, j) *= std::sqrt(shrink);
+                        P_.at<double>(j, i) *= std::sqrt(shrink);
+                    }
                 }
             }
         }
