@@ -638,3 +638,31 @@ cv::Point3f IMUPreintegrator::getGyroBias() const {
     std::lock_guard<std::mutex> lock(mutex_);
     return gyro_bias_;
 }
+
+void IMUPreintegrator::refineGyroBiasDuringZUPT() {
+    std::lock_guard<std::mutex> lock(mutex_);
+    if (!gyro_bias_initialized_.load()) return;
+    if (gyro_buf_.size() < 10) return;
+
+    // Average recent gyro readings — when truly stationary, this IS the bias
+    double avg_gx = 0.0, avg_gy = 0.0, avg_gz = 0.0;
+    int count = 0;
+    int n = std::min(static_cast<int>(gyro_buf_.size()), 20);
+    auto it = gyro_buf_.end() - n;
+    for (; it != gyro_buf_.end(); ++it) {
+        avg_gx += it->x;
+        avg_gy += it->y;
+        avg_gz += it->z;
+        count++;
+    }
+    if (count == 0) return;
+    avg_gx /= count;
+    avg_gy /= count;
+    avg_gz /= count;
+
+    // Gentle update (alpha=0.01) — prevents overcorrection from brief pauses
+    constexpr float alpha = 0.01f;
+    gyro_bias_.x = (1.0f - alpha) * gyro_bias_.x + alpha * static_cast<float>(avg_gx);
+    gyro_bias_.y = (1.0f - alpha) * gyro_bias_.y + alpha * static_cast<float>(avg_gy);
+    gyro_bias_.z = (1.0f - alpha) * gyro_bias_.z + alpha * static_cast<float>(avg_gz);
+}

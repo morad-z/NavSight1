@@ -77,6 +77,7 @@ void Tracker::reset() {
     accel_bias_count_ = 0;
     smooth_scale_ = 0.20;
     scale_obs_count_ = 0;
+    scale_bootstrap_buf_.clear();
     points_3d_current_.clear();
     feature_ages_.clear();
     feature_ids_.clear();
@@ -233,7 +234,9 @@ VisionOutput Tracker::processFrame(const uint8_t* yuv_data, int width, int heigh
                 auto gb = imu.getGyroBias();
                 ekf_.initializeFull(global_R_, gb, cv::Point3f(0,0,0));
             }
-            feature_mgr_.storeKeyframe(gray_buf_, prev_pts_, timestamp_ns, 0);
+            feature_mgr_.storeKeyframe(gray_buf_, prev_pts_, timestamp_ns, 0,
+                                      scalar_heading_,
+                                      cv::Point3f(0, 0, 0));
             LOGI("processFrame: first frame, grid-detected %zu features", prev_pts_.size());
             return out;
         }
@@ -414,6 +417,8 @@ VisionOutput Tracker::processFrame(const uint8_t* yuv_data, int width, int heigh
     if (is_static && imu.getStepInfo().speed_mps > 0.3) is_static = false;
     if (is_static) {
         ekf_.updateZUPT();
+        // Refine gyro bias while stationary — prevents heading drift during pauses
+        imu.refineGyroBiasDuringZUPT();
     }
 
     // ── 8. Lens undistortion + Essential matrix + pose ───────────────────────
@@ -519,10 +524,9 @@ VisionOutput Tracker::processFrame(const uint8_t* yuv_data, int width, int heigh
                          translation_degenerate ? 1 : 0, quality, smooth_scale_);
                 }
 
-                // ── Scale estimation from steps (simple EMA) ─
-                // Scale = step_displacement / visual_displacement
-                // t_vo is a unit vector from recoverPose, so norm(t_vo) ≈ 1.0
-                // scale * norm(t_vo) = real_displacement_in_meters
+                // ── Scale estimation from steps (median bootstrap + EMA) ─
+                // Phase 1: Collect first N observations, take median (avoids bad init)
+                // Phase 2: EMA refinement with outlier rejection relative to median
                 if (!translation_degenerate) {
                     double vo_dist = cv::norm(t_vo);
                     int64_t dt_ns_frame = timestamp_ns - current_prev_ts;
@@ -531,33 +535,54 @@ VisionOutput Tracker::processFrame(const uint8_t* yuv_data, int width, int heigh
                     if (vo_dist > 0.01 && dt_sec > 0.01 && dt_sec < 1.5
                         && !is_pure_rotation && !is_static) {
                         auto si = imu.getStepInfo();
-                        // Only update scale when we have active step data
                         if (si.speed_mps > 0.3) {
                             double step_disp = si.speed_mps * dt_sec;
                             double obs_scale = step_disp / vo_dist;
 
-                            // Reject wild outliers (>3x or <1/3 of current)
-                            bool reject = false;
-                            if (scale_obs_count_ > 10) {
-                                std::lock_guard<std::mutex> slock(pose_mutex_);
-                                if (obs_scale > 3.0 * smooth_scale_ || obs_scale < smooth_scale_ / 3.0) {
-                                    reject = true;
-                                }
-                            }
+                            // Clamp to sane range
+                            obs_scale = std::max(0.005, std::min(10.0, obs_scale));
 
-                            if (!reject) {
-                                // EMA with adaptive learning rate
-                                // Fast convergence early (alpha=0.2), slow later (alpha=0.05)
-                                double alpha = (scale_obs_count_ < 20) ? 0.15 : 0.05;
-                                std::lock_guard<std::mutex> slock(pose_mutex_);
-                                smooth_scale_ = (1.0 - alpha) * smooth_scale_ + alpha * obs_scale;
-                                smooth_scale_ = std::max(0.01, std::min(10.0, smooth_scale_));
+                            if (scale_obs_count_ < SCALE_BOOTSTRAP_COUNT) {
+                                // Phase 1: Bootstrap — collect observations
+                                scale_bootstrap_buf_.push_back(obs_scale);
                                 scale_obs_count_++;
-                                estimatedScale = smooth_scale_;
 
-                                if (frame_counter_ % 30 == 0) {
-                                    LOGI("SCALE: obs=%.4f smooth=%.4f vo=%.4f step_d=%.3f count=%d",
-                                         obs_scale, smooth_scale_, vo_dist, step_disp, scale_obs_count_);
+                                if (scale_obs_count_ >= SCALE_BOOTSTRAP_COUNT) {
+                                    // Take median of bootstrap buffer
+                                    std::vector<double> sorted = scale_bootstrap_buf_;
+                                    std::sort(sorted.begin(), sorted.end());
+                                    double median = sorted[sorted.size() / 2];
+
+                                    std::lock_guard<std::mutex> slock(pose_mutex_);
+                                    smooth_scale_ = median;
+                                    estimatedScale = smooth_scale_;
+                                    LOGI("SCALE_BOOTSTRAP: median=%.4f from %d samples (range %.4f-%.4f)",
+                                         median, SCALE_BOOTSTRAP_COUNT, sorted.front(), sorted.back());
+                                    scale_bootstrap_buf_.clear();
+                                    scale_bootstrap_buf_.shrink_to_fit();
+                                }
+                            } else {
+                                // Phase 2: EMA refinement with outlier rejection
+                                bool reject = false;
+                                {
+                                    std::lock_guard<std::mutex> slock(pose_mutex_);
+                                    if (obs_scale > 2.5 * smooth_scale_ || obs_scale < smooth_scale_ / 2.5) {
+                                        reject = true;
+                                    }
+                                }
+
+                                if (!reject) {
+                                    double alpha = (scale_obs_count_ < 50) ? 0.08 : 0.03;
+                                    std::lock_guard<std::mutex> slock(pose_mutex_);
+                                    smooth_scale_ = (1.0 - alpha) * smooth_scale_ + alpha * obs_scale;
+                                    smooth_scale_ = std::max(0.01, std::min(10.0, smooth_scale_));
+                                    scale_obs_count_++;
+                                    estimatedScale = smooth_scale_;
+
+                                    if (frame_counter_ % 30 == 0) {
+                                        LOGI("SCALE: obs=%.4f smooth=%.4f vo=%.4f step_d=%.3f count=%d",
+                                             obs_scale, smooth_scale_, vo_dist, step_disp, scale_obs_count_);
+                                    }
                                 }
                             }
                         }
@@ -766,10 +791,71 @@ VisionOutput Tracker::processFrame(const uint8_t* yuv_data, int width, int heigh
             }
         }
 
-        // Keyframe storage
+        // ── 11.2 Keyframe heading drift correction ──
+        // Every keyframe interval, match current frame against the last keyframe.
+        // The essential matrix R from that match gives the visual heading change.
+        // Compare to gyro-integrated heading change and apply gentle correction.
+        if (frames_since_keyframe_ >= 14 && pose_valid && tracked >= MIN_INLIERS * 2) {
+            double kf_heading = 0.0;
+            cv::Point3f kf_pos;
+            if (feature_mgr_.getLastKeyframeInfo(kf_heading, kf_pos)) {
+                std::vector<cv::Point2f> kf_matched, cur_matched;
+                if (feature_mgr_.matchAgainstKeyframe(gray_buf_, next_good_buf_,
+                                                       kf_matched, cur_matched)
+                    && kf_matched.size() >= 30) {
+                    // Compute essential matrix between keyframe and current frame
+                    cv::Mat E, R_kf, t_kf;
+                    std::vector<uchar> mask;
+                    E = cv::findEssentialMat(kf_matched, cur_matched, K,
+                                             cv::RANSAC, RANSAC_CONF, RANSAC_THRESH, mask);
+                    if (!E.empty()) {
+                        int inl = cv::recoverPose(E, kf_matched, cur_matched, K, R_kf, t_kf, mask);
+                        if (inl >= 20 && !R_kf.empty()) {
+                            // Extract yaw from visual rotation (atan2 of 2D rotation component)
+                            double visual_delta_heading = std::atan2(
+                                R_kf.at<double>(1, 0), R_kf.at<double>(0, 0));
+
+                            // Gyro-integrated heading change since keyframe
+                            double gyro_delta_heading = scalar_heading_ - kf_heading;
+                            // Normalize to [-pi, pi]
+                            while (gyro_delta_heading > M_PI) gyro_delta_heading -= 2.0 * M_PI;
+                            while (gyro_delta_heading < -M_PI) gyro_delta_heading += 2.0 * M_PI;
+                            while (visual_delta_heading > M_PI) visual_delta_heading -= 2.0 * M_PI;
+                            while (visual_delta_heading < -M_PI) visual_delta_heading += 2.0 * M_PI;
+
+                            double drift = gyro_delta_heading - visual_delta_heading;
+                            while (drift > M_PI) drift -= 2.0 * M_PI;
+                            while (drift < -M_PI) drift += 2.0 * M_PI;
+
+                            // Only correct if drift is small enough to be real (not a bad match)
+                            // Max expected gyro drift: ~2 deg/sec * 0.5 sec keyframe interval = ~1 deg
+                            // Allow up to 10 deg to catch accumulation
+                            if (std::abs(drift) < 10.0 * M_PI / 180.0) {
+                                // Gentle 15% correction — avoids jumps
+                                scalar_heading_ -= 0.15 * drift;
+                                while (scalar_heading_ > M_PI) scalar_heading_ -= 2.0 * M_PI;
+                                while (scalar_heading_ < -M_PI) scalar_heading_ += 2.0 * M_PI;
+
+                                if (frame_counter_ % 30 == 0) {
+                                    LOGI("KF_HEADING_CORR: drift=%.2f° correction=%.2f° inliers=%d",
+                                         drift * 180.0 / M_PI, 0.15 * drift * 180.0 / M_PI, inl);
+                                }
+                            }
+                        }
+                    }
+                }
+            }
+        }
+
+        // Keyframe storage (with heading + position for drift correction)
         frames_since_keyframe_++;
         if (frames_since_keyframe_ >= 15 || (tracked < MIN_FEATURES / 2 && frames_since_keyframe_ > 3)) {
-            feature_mgr_.storeKeyframe(gray_buf_, next_good_buf_, timestamp_ns, frame_counter_);
+            cv::Point3f kf_pos(
+                static_cast<float>(global_t_.at<double>(0)),
+                static_cast<float>(global_t_.at<double>(1)),
+                static_cast<float>(global_t_.at<double>(2)));
+            feature_mgr_.storeKeyframe(gray_buf_, next_good_buf_, timestamp_ns, frame_counter_,
+                                       scalar_heading_, kf_pos);
             frames_since_keyframe_ = 0;
         }
 

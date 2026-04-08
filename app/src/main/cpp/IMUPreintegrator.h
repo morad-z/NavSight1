@@ -119,6 +119,10 @@ public:
     // Gyro bias accessor (unified — Tracker no longer maintains its own)
     cv::Point3f getGyroBias() const;
 
+    // Refine gyro bias during stationary periods (called by Tracker ZUPT)
+    // Uses recent gyro samples to nudge bias estimate with small alpha
+    void refineGyroBiasDuringZUPT();
+
 private:
     mutable std::mutex mutex_;
     std::vector<GyroSample>  gyro_buf_;
