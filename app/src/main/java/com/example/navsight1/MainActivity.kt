@@ -159,6 +159,7 @@ class MainActivity : ComponentActivity() {
         }
 
         var debugPanelVisible by remember { mutableStateOf(false) }
+        var scaleValue by remember { mutableStateOf(1.0f) }
 
         Box(Modifier.fillMaxSize().background(LuxuryBlack)) {
             Column(Modifier.fillMaxSize()) {
@@ -347,6 +348,36 @@ class MainActivity : ComponentActivity() {
                         ) {
                             Icon(Icons.Default.Refresh, "Reset", tint = LuxuryBlack)
                         }
+                    }
+
+                    // Scale slider — bottom left of map
+                    Column(
+                        Modifier
+                            .align(Alignment.BottomStart)
+                            .padding(start = 12.dp, bottom = 12.dp)
+                            .background(Color.Black.copy(alpha = 0.7f), RoundedCornerShape(8.dp))
+                            .padding(horizontal = 10.dp, vertical = 6.dp)
+                            .width(160.dp)
+                    ) {
+                        Text(
+                            text = "Scale: ${"%.2f".format(scaleValue)}x",
+                            color = LuxuryTextGrey,
+                            fontSize = 11.sp
+                        )
+                        Slider(
+                            value = scaleValue,
+                            onValueChange = { newVal ->
+                                scaleValue = newVal
+                                NativeBridge.setScale(newVal.toDouble())
+                            },
+                            valueRange = 0.1f..5.0f,
+                            colors = SliderDefaults.colors(
+                                thumbColor = LuxuryCyan,
+                                activeTrackColor = LuxuryCyan,
+                                inactiveTrackColor = LuxuryDarkGrey
+                            ),
+                            modifier = Modifier.height(28.dp)
+                        )
                     }
 
                     Box(
@@ -876,12 +907,12 @@ class MainActivity : ComponentActivity() {
             position = CameraPosition.Builder().target(displayPosition).zoom(targetZoom).bearing(azimuth).tilt(targetTilt).build()
         }
 
-        // FR31: Throttle map camera updates to 1Hz to fix lag
+        // FR31: Throttle map camera updates to 2Hz (500ms) for balance between responsiveness and performance
         var lastMapUpdateTime by remember { mutableStateOf(0L) }
         LaunchedEffect(displayPosition, azimuth, navState) {
             val now = System.currentTimeMillis()
             // Re-center if enough time passed OR if navigation just became active
-            if (now - lastMapUpdateTime >= 1000L || navState is NavigationState.Routing) {
+            if (now - lastMapUpdateTime >= 500L || navState is NavigationState.Routing) {
                 lastMapUpdateTime = now
                 cameraState.animate(com.google.android.gms.maps.CameraUpdateFactory.newCameraPosition(
                     CameraPosition.Builder().target(displayPosition).zoom(targetZoom).bearing(azimuth).tilt(targetTilt).build()

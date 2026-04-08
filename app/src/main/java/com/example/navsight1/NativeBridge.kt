@@ -36,4 +36,5 @@ object NativeBridge {
     external fun setInitialHeading(azimuthRad: Double)
     external fun setUserHeight(heightM: Float)
     external fun setMagnetometerHeading(yawRad: Float)
+    external fun updateDepthScale(scale: Double, confidence: Double)
 }

@@ -294,7 +294,9 @@ VisionOutput Tracker::processFrame(const uint8_t* yuv_data, int width, int heigh
              is_pure_rotation, tracked, gyro_norm, is_low_light);
     }
 
-    if (sufficient_motion && has_parallax && !is_static && !is_low_light && tracked >= 8) {
+    // NOTE: is_low_light removed from gate (BUG-012 fix) — quality=0 in low light
+    // already prevents scale estimation, but rotation fusion can still run
+    if (sufficient_motion && has_parallax && !is_static && tracked >= 8) {
         // Undistort matched points before geometric estimation
         std::vector<cv::Point2f> prev_ud = prev_good_buf_;
         std::vector<cv::Point2f> next_ud = next_good_buf_;
@@ -425,23 +427,39 @@ VisionOutput Tracker::processFrame(const uint8_t* yuv_data, int width, int heigh
     {
         std::lock_guard<std::mutex> lock(pose_mutex_);
 
-        if (pose_valid) {
-            // Camera-fused rotation (includes translation-degenerate frames)
-            global_R_ = global_R_ * R_fused;
-        } else {
-            // Apply Tracker's gyro bias correction to IMU rotation for fallback
-            cv::Mat rv_gyro;
-            cv::Rodrigues(imu_delta.deltaR, rv_gyro);
-            cv::Mat rv_corrected = rv_gyro - gyro_bias_;
-            cv::Mat R_corrected;
-            cv::Rodrigues(rv_corrected, R_corrected);
-            global_R_ = global_R_ * R_corrected;
+        // BUG-013 fix: When static, skip rotation update entirely to prevent heading drift.
+        // Previously rotation was applied before is_static check, causing gyro noise
+        // to accumulate in heading even when standing still.
+        if (!is_static) {
+            if (pose_valid) {
+                // Camera-fused rotation (includes translation-degenerate frames)
+                global_R_ = global_R_ * R_fused;
+            } else {
+                // Apply Tracker's gyro bias correction to IMU rotation for fallback
+                cv::Mat rv_gyro;
+                cv::Rodrigues(imu_delta.deltaR, rv_gyro);
+                cv::Mat rv_corrected = rv_gyro - gyro_bias_;
+                cv::Mat R_corrected;
+                cv::Rodrigues(rv_corrected, R_corrected);
+                global_R_ = global_R_ * R_corrected;
+            }
         }
 
         double heading = std::atan2(global_R_.at<double>(1,0), global_R_.at<double>(0,0));
 
+        // Phase 2.3: Apply magnetometer heading correction (80% VIO / 20% magnetometer)
+        // This prevents long-term heading drift by gently pulling toward compass north
+        double corrected_heading = imu.getCorrectedHeading(static_cast<float>(heading));
+        if (std::abs(corrected_heading - heading) > 1e-6) {
+            heading = corrected_heading;
+            // Update global_R_ to reflect corrected heading (Rz rotation only)
+            double c = std::cos(heading), s = std::sin(heading);
+            global_R_.at<double>(0,0) = c;  global_R_.at<double>(0,1) = -s;
+            global_R_.at<double>(1,0) = s;  global_R_.at<double>(1,1) = c;
+        }
+
         if (is_static) {
-            // ZUPT: freeze translation, rotation remains live
+            // ZUPT: freeze both rotation (above) and translation
         } else if (pose_valid && !is_pure_rotation && !translation_degenerate && quality >= 0.15) {
             double disp = appliedScale * cv::norm(t_vo);
 

@@ -627,7 +627,7 @@ void IMUPreintegrator::tryInitializeGyroBiasLocked(float ax, float ay, float az)
 // short-term rotating motion accuracy.
 //
 // Blending: corrected_heading = gyro_heading + (mag_heading - gyro_heading) * (1 - damping)
-//           With damping = 0.95: 95% gyro, 5% magnetometer
+//           With damping = 0.80: 80% VIO, 20% magnetometer
 //           This prevents magnetic disturbances from causing jumps, but still bounds drift.
 
 void IMUPreintegrator::setMagnetometerHeading(float yaw_rad) {
