@@ -50,6 +50,11 @@ class RoadSnapper(private val apiKey: String) {
     // LRU cache to store recent snapped positions
     private val snapCache = LruCache<String, SnappedLatLng>(CACHE_SIZE)
 
+    // Track API failure state to reduce log spam
+    private var consecutiveFailures = 0
+    private var lastErrorMessage: String? = null
+    private var apiDisabledLogged = false
+
     /**
      * Snaps a VIO position to the nearest road.
      *
@@ -89,16 +94,30 @@ class RoadSnapper(private val apiKey: String) {
             Log.d(TAG, "Snapping ${geoPoints.size} points to roads...")
 
             // Call Roads API with interpolate=true for smoother results
-            val ctx = geoApiContext ?: return@withContext SnappedLatLng(
-                latitude = vioPosition.latitude,
-                longitude = vioPosition.longitude,
-                placeId = null,
-                originalIndex = null,
-                isSnapped = false
-            )
+            val ctx = geoApiContext
+            if (ctx == null) {
+                if (!apiDisabledLogged) {
+                    Log.w(TAG, "Roads API disabled (no API key) — using raw VIO positions")
+                    apiDisabledLogged = true
+                }
+                return@withContext SnappedLatLng(
+                    latitude = vioPosition.latitude,
+                    longitude = vioPosition.longitude,
+                    placeId = null,
+                    originalIndex = null,
+                    isSnapped = false
+                )
+            }
+
             val snappedPoints = RoadsApi.snapToRoads(ctx, true, *geoPoints).await()
 
             if (snappedPoints.isNotEmpty()) {
+                // Success - reset failure counter
+                if (consecutiveFailures > 0) {
+                    Log.i(TAG, "Roads API recovered after $consecutiveFailures failures")
+                    consecutiveFailures = 0
+                    lastErrorMessage = null
+                }
                 // Get the last snapped point (corresponds to current position)
                 val lastSnapped = snappedPoints.last()
                 val snappedLatLng = SnappedLatLng(
@@ -139,7 +158,22 @@ class RoadSnapper(private val apiKey: String) {
             }
 
         } catch (e: Exception) {
-            Log.e(TAG, "Roads API error: ${e.message}", e)
+            consecutiveFailures++
+            val errorMsg = e.message ?: e.javaClass.simpleName
+
+            // Log intelligently: full stack trace on first error, then only on change or every 20 failures
+            when {
+                consecutiveFailures == 1 -> {
+                    Log.e(TAG, "Roads API error (will retry): $errorMsg", e)
+                }
+                errorMsg != lastErrorMessage -> {
+                    Log.e(TAG, "Roads API error changed: $errorMsg (${consecutiveFailures} consecutive failures)", e)
+                    lastErrorMessage = errorMsg
+                }
+                consecutiveFailures % 20 == 0 -> {
+                    Log.w(TAG, "Roads API still failing: $errorMsg (${consecutiveFailures} consecutive failures)")
+                }
+            }
 
             // Graceful fallback: return unsnapped position
             return@withContext SnappedLatLng(
