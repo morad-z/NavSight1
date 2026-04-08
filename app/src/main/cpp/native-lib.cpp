@@ -608,32 +608,5 @@ Java_com_example_navsight1_NativeBridge_setMagnetometerHeading(
 }
 */
 
-// ── updateDepthScale ─────────────────────────────────────────────────────────
-
-JNIEXPORT void JNICALL
-Java_com_example_navsight1_NativeBridge_updateDepthScale(
-        JNIEnv*, jobject /* thiz */, jdouble scale, jdouble confidence) {
-    if (!std::isfinite(scale) || !std::isfinite(confidence)) {
-        LOGE("updateDepthScale: NaN/Inf value, dropping");
-        return;
-    }
-    if (scale < 0.1 || scale > 10.0) {
-        LOGD("updateDepthScale: scale %.3f out of range [0.1, 10.0], clamping", scale);
-        scale = std::max(0.1, std::min(10.0, scale));
-    }
-
-    VioEngine* vision = nullptr;
-    {
-        std::lock_guard<std::mutex> lock(state_mutex);
-        vision = g_vision;
-    }
-    if (vision) {
-        // Apply depth scale with weighted confidence (15% max weight as per plan)
-        double alpha = confidence * 0.15;
-        vision->updateDepthScale(static_cast<double>(scale), alpha);
-        LOGD("updateDepthScale: scale=%.3f confidence=%.2f alpha=%.3f", scale, confidence, alpha);
-    }
-}
-
 } // extern "C"
 

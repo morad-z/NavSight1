@@ -166,7 +166,6 @@ class MainActivity : ComponentActivity() {
         }
 
         var debugPanelVisible by remember { mutableStateOf(false) }
-        var scaleValue by remember { mutableStateOf(1.0f) }
 
         Box(Modifier.fillMaxSize().background(LuxuryBlack)) {
             Column(Modifier.fillMaxSize()) {
@@ -354,36 +353,6 @@ class MainActivity : ComponentActivity() {
                         ) {
                             Icon(Icons.Default.Refresh, "Reset", tint = LuxuryBlack)
                         }
-                    }
-
-                    // Scale slider — bottom left of map
-                    Column(
-                        Modifier
-                            .align(Alignment.BottomStart)
-                            .padding(start = 12.dp, bottom = 12.dp)
-                            .background(Color.Black.copy(alpha = 0.7f), RoundedCornerShape(8.dp))
-                            .padding(horizontal = 10.dp, vertical = 6.dp)
-                            .width(160.dp)
-                    ) {
-                        Text(
-                            text = "Scale: ${"%.2f".format(scaleValue)}x",
-                            color = LuxuryTextGrey,
-                            fontSize = 11.sp
-                        )
-                        Slider(
-                            value = scaleValue,
-                            onValueChange = { newVal ->
-                                scaleValue = newVal
-                                NativeBridge.setScale(newVal.toDouble())
-                            },
-                            valueRange = 0.1f..5.0f,
-                            colors = SliderDefaults.colors(
-                                thumbColor = LuxuryCyan,
-                                activeTrackColor = LuxuryCyan,
-                                inactiveTrackColor = LuxuryDarkGrey
-                            ),
-                            modifier = Modifier.height(28.dp)
-                        )
                     }
 
                     Box(

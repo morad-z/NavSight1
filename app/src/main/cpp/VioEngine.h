@@ -25,7 +25,6 @@ public:
     void setDepthMap(const float* depth_data, int width, int height);
     void setUserScaleCorrection(double correction);
     void setUserHeight(float height_m);
-    void updateDepthScale(double scale, double alpha);
     void reset();
 
     IMUPreintegrator& getIMU() { return imu_; }

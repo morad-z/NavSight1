@@ -47,9 +47,9 @@ morad:
 
 tamir:
   role: "UI/UX, JNI bridge, camera pipeline, feature implementation"
-  branch: "tamir-from-master"
-  agent: "Claude-Opus-4-5"
-  last_session: "2026-04-06"
+  branch: "tamir-dev / tamir-v2"
+  agent: "TBD"
+  last_session: "unknown"
 
 roey:
   role: "Security, API key management, infrastructure"
