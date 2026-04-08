@@ -165,8 +165,9 @@ private:
     void tryInitializeGravityLocked(float ax, float ay, float az);
     void tryInitializeGyroBiasLocked(float ax, float ay, float az);
 
-    // Gyroscope bias correction
+    // Bias estimates
     cv::Point3f gyro_bias_{0.f, 0.f, 0.f};              // Estimated bias in rad/sec
+    cv::Point3f b_a_{0.f, 0.f, 0.f};                    // Accelerometer bias in m/s²
     std::atomic<bool> gyro_bias_initialized_{false};
     int gyro_bias_samples_{0};
     static constexpr int GYRO_BIAS_INIT_SAMPLES = 200;  // ~6-7 frames at 30fps

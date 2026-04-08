@@ -248,14 +248,13 @@ cv::Mat IMUPreintegrator::integrateGyro(int64_t start_ns, int64_t end_ns) {
                            gz * dt);
         cv::Mat R_delta;
         cv::Rodrigues(rvec, R_delta);
-        result = R_delta * result;
+        result = result * R_delta;  // Right-multiplication (consistent with integrate())
     }
 
     // Handle single-sample case: integrate from sample to end_ns
     if (samples.size() == 1) {
         double dt = static_cast<double>(end_ns - samples[0].timestamp_ns) * 1e-9;
         if (dt > 0.0) {
-            // ✅ CRITICAL FIX: Apply gyro bias correction here too
             double gx = static_cast<double>(samples[0].x) - static_cast<double>(gyro_bias_.x);
             double gy = static_cast<double>(samples[0].y) - static_cast<double>(gyro_bias_.y);
             double gz = static_cast<double>(samples[0].z) - static_cast<double>(gyro_bias_.z);
@@ -266,7 +265,7 @@ cv::Mat IMUPreintegrator::integrateGyro(int64_t start_ns, int64_t end_ns) {
                                gz * dt);
             cv::Mat R_delta;
             cv::Rodrigues(rvec, R_delta);
-            result = R_delta * result;
+            result = result * R_delta;  // Right-multiplication
         }
     }
 
@@ -341,48 +340,30 @@ PreintegratedMeasurement IMUPreintegrator::integrate(int64_t start_ns, int64_t e
         if (gi > 0) w = (cv::Mat_<double>(3,1) << g_samples[gi-1].x - gyro_bias_.x, 
                                                  g_samples[gi-1].y - gyro_bias_.y, 
                                                  g_samples[gi-1].z - gyro_bias_.z);
-        if (ai > 0) a = (cv::Mat_<double>(3,1) << a_samples[ai-1].x, a_samples[ai-1].y, a_samples[ai-1].z);
+        // Subtract accel bias (Bug #2: was missing — only gyro bias was subtracted)
+        if (ai > 0) a = (cv::Mat_<double>(3,1) << a_samples[ai-1].x - b_a_.x,
+                                                   a_samples[ai-1].y - b_a_.y,
+                                                   a_samples[ai-1].z - b_a_.z);
 
-        // ── RK4 State Propagation ───────────────────────────────────────────
-        cv::Mat dR, dV, dP;
-        {
-            // k1
-            cv::Mat k1_R_dot = current_R * skewSymmetric(w);
-            cv::Mat k1_V_dot = current_R * a;
-            cv::Mat k1_P_dot = current_V;
-
-            // k2
-            cv::Mat k2_R = current_R + k1_R_dot * (dt * 0.5);
-            cv::Mat k2_V = current_V + k1_V_dot * (dt * 0.5);
-            cv::Mat k2_R_dot = k2_R * skewSymmetric(w);
-            cv::Mat k2_V_dot = k2_R * a;
-            cv::Mat k2_P_dot = k2_V;
-
-            // k3
-            cv::Mat k3_R = current_R + k2_R_dot * (dt * 0.5);
-            cv::Mat k3_V = current_V + k2_V_dot * (dt * 0.5);
-            cv::Mat k3_R_dot = k3_R * skewSymmetric(w);
-            cv::Mat k3_V_dot = k3_R * a;
-            cv::Mat k3_P_dot = k3_V;
-
-            // k4
-            cv::Mat k4_R = current_R + k3_R_dot * dt;
-            cv::Mat k4_V = current_V + k3_V_dot * dt;
-            cv::Mat k4_R_dot = k4_R * skewSymmetric(w);
-            cv::Mat k4_V_dot = k4_R * a;
-            cv::Mat k4_P_dot = k4_V;
-
-            dR = (k1_R_dot + 2.0*k2_R_dot + 2.0*k3_R_dot + k4_R_dot) * (dt / 6.0);
-            dV = (k1_V_dot + 2.0*k2_V_dot + 2.0*k3_V_dot + k4_V_dot) * (dt / 6.0);
-            dP = (k1_P_dot + 2.0*k2_P_dot + 2.0*k3_P_dot + k4_P_dot) * (dt / 6.0);
-        }
-
-        // ── Covariance & Jacobian Propagation (Forster 2017) ────────────────
-        cv::Mat F = cv::Mat::eye(9, 9, CV_64F);
+        // ── Rotation: proper SO(3) via exponential map (Rodrigues) ──────────
+        // Bug #1 fix: never add matrices on SO(3). Use R_new = R * Exp(w*dt).
         cv::Mat w_dt = w * dt;
         cv::Mat dR_step;
         cv::Rodrigues(w_dt, dR_step);
-        
+
+        // ── Velocity & Position: midpoint integration ───────────────────────
+        // Use rotation at midpoint for better accuracy (Forster 2017 §IV.A)
+        cv::Mat w_half = w * (dt * 0.5);
+        cv::Mat dR_half;
+        cv::Rodrigues(w_half, dR_half);
+        cv::Mat R_mid = current_R * dR_half;
+
+        cv::Mat dV = R_mid * a * dt;
+        cv::Mat dP = current_V * dt + 0.5 * R_mid * a * dt * dt;
+
+        // ── Covariance & Jacobian Propagation (Forster 2017) ────────────────
+        cv::Mat F = cv::Mat::eye(9, 9, CV_64F);
+        // w_dt and dR_step already computed above
         cv::Mat dR_step_t = dR_step.t();
         dR_step_t.copyTo(F(cv::Range(0,3), cv::Range(0,3)));
         cv::Mat F30 = -current_R * skewSymmetric(a) * dt;
@@ -412,12 +393,8 @@ PreintegratedMeasurement IMUPreintegrator::integrate(int64_t start_ns, int64_t e
         Jr_inv = cv::Mat::eye(3, 3, CV_64F) - 0.5 * skewSymmetric(w_dt);
         J_R_bg = dR_step.t() * J_R_bg - Jr_inv * dt;
 
-        // Apply state updates
-        current_R += dR; // Note: simplified manifold addition
-        // Re-orthogonalize R
-        cv::SVD svd(current_R);
-        current_R = svd.u * svd.vt;
-        
+        // Apply state updates — rotation via multiplication on SO(3)
+        current_R = current_R * dR_step;
         current_V += dV;
         current_P += dP;
 
@@ -716,7 +693,8 @@ void IMUPreintegrator::reset() {
     last_accel_ts_ns_ = 0;
     sustained_accel_s_ = 0.0;
     in_vehicle_mode_ = false;
-    gyro_bias_ = cv::Point3f(0.f, 0.f, 0.f);  // Reset gyro bias
+    gyro_bias_ = cv::Point3f(0.f, 0.f, 0.f);
+    b_a_ = cv::Point3f(0.f, 0.f, 0.f);
     gyro_bias_initialized_.store(false);
     gyro_bias_samples_ = 0;
     has_mag_heading_.store(false);  // Reset mag heading
@@ -753,10 +731,10 @@ void IMUPreintegrator::tryInitializeGyroBiasLocked(float ax, float ay, float az)
     double avg_gx = 0.0, avg_gy = 0.0, avg_gz = 0.0;
     int count = 0;
 
-    // Get most recent GYRO_BIAS_INIT_SAMPLES from gyro buffer (they should be oldest)
+    // Get most recent GYRO_BIAS_INIT_SAMPLES from gyro buffer
     if (gyro_buf_.size() >= static_cast<size_t>(GYRO_BIAS_INIT_SAMPLES)) {
-        auto it = gyro_buf_.begin();
-        for (int i = 0; i < GYRO_BIAS_INIT_SAMPLES && it != gyro_buf_.end(); ++i, ++it) {
+        auto it = gyro_buf_.end() - GYRO_BIAS_INIT_SAMPLES;
+        for (; it != gyro_buf_.end(); ++it) {
             avg_gx += it->x;
             avg_gy += it->y;
             avg_gz += it->z;
