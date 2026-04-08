@@ -149,5 +149,5 @@ private:
     float mag_heading_{0.f};                            // Yaw from magnetometer (rad)
     std::atomic<bool> has_mag_heading_{false};
     int64_t last_mag_update_ns_{0};
-    static constexpr float HEADING_CORRECTION_DAMPING = 0.95f;  // Smooth fusion
+    static constexpr float HEADING_CORRECTION_DAMPING = 0.80f;  // 80% VIO / 20% magnetometer
 };

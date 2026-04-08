@@ -10,12 +10,12 @@
 ## META
 
 ```yaml
-last_updated: "2026-04-05"
-last_agent: "Claude-Opus-4-6"
-last_developer: "morad"
-branch: "morad"
+last_updated: "2026-04-06"
+last_agent: "Claude-Opus-4-5"
+last_developer: "tamir"
+branch: "tamir-from-master"
 base_branch: "master"
-head_commit: "d90454f"
+head_commit: "2c2f2a7"
 ```
 
 ---
@@ -31,9 +31,9 @@ morad:
 
 tamir:
   role: "UI/UX, JNI bridge, camera pipeline, feature implementation"
-  branch: "tamir-dev / tamir-v2"
-  agent: "TBD"
-  last_session: "unknown"
+  branch: "tamir-from-master"
+  agent: "Claude-Opus-4-5"
+  last_session: "2026-04-06"
 
 roey:
   role: "Security, API key management, infrastructure"
@@ -59,10 +59,12 @@ roey:
 # Mapper runs on a dedicated background thread via std::condition_variable.
 # One-frame-delayed result application (non-blocking).
 #
-# Heading pipeline:
+# Heading pipeline (updated 2026-04-06 — continuous magnetometer fusion):
 #   magnetometer → setInitialHeading(azimuth_rad) → global_R_ = Rz(azimuth)
 #   each frame: global_R_ *= R_fused (camera+gyro blend) or R_corrected (gyro fallback)
 #   heading = atan2(R[1][0], R[0][0])  ← ZYX yaw extraction (pitch-independent)
+#   heading = imu.getCorrectedHeading(heading)  ← 80% VIO / 20% magnetometer fusion
+#   Magnetometer kept registered for continuous updates (was unregistered after init)
 #
 # Scale pipeline:
 #   step detection → speed × time → estimateScaleFromSteps → EKF updateScale
@@ -130,49 +132,36 @@ on_device_testing: "UNTESTED — latest changes from 2026-04-05 need on-device v
 
 - id: "BUG-012"
   title: "Tracking quality drops to 0 when moving — falls back to IMU-only"
-  status: "OPEN"
+  status: "FIXED_UNTESTED"
   severity: "P0"
-  owner: "morad"
+  owner: "tamir"
   file: "app/src/main/cpp/Tracker.cpp"
   reported: "2026-04-05 (on-device test)"
+  fixed: "2026-04-06"
   description: >
-    When walking, tracking quality drops to 0 and system falls to IMU-only mode.
-    Likely causes: (1) Section 8 gate at line 297 requires !is_low_light — check
-    if brightness threshold 0.12 is too high for indoor lighting. (2) FB check
-    (FB_CHECK_THRESH=9.0) may still be too strict for large optical flow during
-    walking. (3) is_low_light clamp at line 253 forces quality=0 even if features
-    are tracked. (4) Possible: all features genuinely lost during motion (replenishment
-    not fast enough). Check GATES log line for diagnostics: flow, blur, motion,
-    parallax, static, rot, pts, gyro, lowlight values during walking.
-  fix_hints: >
-    - Log frame_brightness during walks to verify is_low_light isn't false-triggering.
-    - If brightness is fine, FB_CHECK_THRESH may need raising (try 16.0 = 4px).
-    - If tracked count is fine but quality=0, the is_low_light clamp is the culprit.
-    - Consider removing is_low_light from section 8 gate — let quality handle it.
+    FIXED (2026-04-06): Removed !is_low_light from section 8 gate (line 297).
+    The is_low_light check was preventing essential matrix computation entirely
+    in indoor lighting (brightness < 0.12). Now rotation fusion can still run
+    even in low light — quality=0 clamp at line 253 already prevents scale
+    estimation from using bad quality data. Root cause was the gate being too
+    restrictive, not actual tracking failure.
   test: "Walk in good light — quality should be >30%, pflags should have bit2 (pose_valid=4)."
 
 - id: "BUG-013"
   title: "Heading rotates when standing still"
-  status: "OPEN"
+  status: "FIXED_UNTESTED"
   severity: "P0"
-  owner: "morad"
+  owner: "tamir"
   file: "app/src/main/cpp/Tracker.cpp"
   reported: "2026-04-05 (on-device test)"
+  fixed: "2026-04-06"
   description: >
-    When stationary, heading keeps drifting/rotating. Root cause: Section 9
-    (lines 428-439) applies rotation to global_R_ BEFORE the is_static check
-    at line 443. ZUPT only freezes translation, not rotation. So gyro noise
-    (even bias-corrected) accumulates in heading when standing still. Also:
-    if pose_valid=false (due to BUG-012), gyro fallback at line 432-439 applies
-    raw gyro rotation with imperfect bias correction, causing drift.
-  fix_hints: >
-    - When is_static is true, skip the rotation update entirely (both camera
-      and gyro paths). Heading should be frozen when standing still.
-    - Move the is_static check BEFORE the rotation update block.
-    - Alternative: apply a tiny rotation damping factor when is_static detected
-      (multiply rv by 0.0 or very small alpha).
-    - Also check if ZUPT_GYRO_THRESH (0.04 rad/s) is too low — phone table
-      vibrations can exceed this. Try 0.08.
+    FIXED (2026-04-06): Wrapped rotation update (both camera-fused and gyro
+    fallback paths) inside if (!is_static) block. Previously rotation was
+    applied at lines 428-438 BEFORE the is_static check at line 443. ZUPT
+    only froze translation, not rotation, causing gyro noise to accumulate
+    in heading when standing still. Now both rotation AND translation are
+    frozen when is_static is true.
   test: "Place phone on table — heading should stay constant (±0.5° max over 30s)."
 ```
 
@@ -271,6 +260,35 @@ on_device_testing: "UNTESTED — latest changes from 2026-04-05 need on-device v
 ## RECENT CHANGES (last 5 sessions)
 
 ```yaml
+- session: "10"
+  date: "2026-04-06"
+  developer: "tamir"
+  agent: "Claude-Opus-4-5"
+  branch: "tamir-from-master"
+  summary: >
+    Fixed BUG-012, BUG-013, plus Phase 0.5 and Phase 2.3 improvements.
+    (1) BUG-012: Removed !is_low_light from section 8 gate (line 297). Indoor
+    lighting was being rejected as "low light" (brightness < 0.12), skipping
+    essential matrix entirely. Now rotation fusion runs regardless of lighting.
+    (2) BUG-013: Wrapped rotation update in if (!is_static) block in section 9.
+    Now both rotation and translation frozen when standing still.
+    (3) Phase 0.5: Map camera animation throttle changed from 1000ms to 500ms
+    for better responsiveness while still preventing lag.
+    (4) Phase 2.3: Implemented continuous heading fusion — 80% VIO / 20%
+    magnetometer. Magnetometer kept registered (was unregistered after init).
+    IMUPreintegrator damping changed from 0.95 to 0.80. Tracker now calls
+    imu.getCorrectedHeading() each frame to prevent long-term heading drift.
+    Also: BuildConfig import, gradle.properties cross-platform fix.
+  files_changed:
+    - "app/src/main/cpp/Tracker.cpp (BUG-012, BUG-013, heading fusion call)"
+    - "app/src/main/cpp/IMUPreintegrator.h (HEADING_CORRECTION_DAMPING 0.95→0.80)"
+    - "app/src/main/cpp/IMUPreintegrator.cpp (updated comment)"
+    - "app/src/main/java/.../SensorRepository.kt (keep mag registered, send updates)"
+    - "app/src/main/java/.../MainActivity.kt (map throttle 1000→500ms)"
+    - "app/src/main/java/.../NavSightViewModel.kt (added BuildConfig import)"
+    - "gradle.properties (commented out Windows java.home path)"
+  impact: "Build passes. NEEDS ON-DEVICE TESTING by team member with gyroscope phone."
+
 - session: "0f"
   date: "2026-04-05"
   developer: "morad"
@@ -332,13 +350,6 @@ on_device_testing: "UNTESTED — latest changes from 2026-04-05 need on-device v
   summary: >
     Fixed VIO direction (magnetometer initial heading) and scale (VIO-ready pitch check).
 
-- session: "0b"
-  date: "2026-03-31"
-  developer: "morad"
-  agent: "Claude-Opus-4-6"
-  branch: "morad"
-  summary: >
-    Major VIO accuracy overhaul: 2D heading position, step-based scale, 7 diagnostic fields.
 ```
 
 ---
@@ -346,29 +357,28 @@ on_device_testing: "UNTESTED — latest changes from 2026-04-05 need on-device v
 ## CONVERSATION CONTEXT
 
 ```yaml
-current_task: "Fix BUG-012 (quality=0 when moving) and BUG-013 (heading rotates when still)"
-stopped_at: "Bugs documented. On-device test confirms both issues. Code fixes needed."
+current_task: "Bug fixes + Phase 0.5 + Phase 2.3 complete — awaiting on-device verification"
+stopped_at: "All code changes done, APK builds. PR #10 open. Tamir's phone lacks gyroscope."
 next_action: >
-  1. FIX BUG-012: Check if is_low_light false-triggers indoors. Remove is_low_light
-     from section 8 gate (line 297). Possibly raise FB_CHECK_THRESH. Log brightness.
-  2. FIX BUG-013: Move is_static check BEFORE rotation update in section 9.
-     When static, skip both camera and gyro rotation updates entirely.
-  3. Rebuild APK and re-test: walk (quality >30%, pose_valid), stand (heading frozen).
-  4. If scale/distance still off: consider MiDaS depth integration (TASK-028).
+  1. Team member with gyroscope phone needs to test the APK:
+     - Walk in good light → quality should be >30%, pflags bit2 (pose_valid=4) set
+     - Stand still on table → heading should stay constant (±0.5° max over 30s)
+     - Check heading doesn't drift over extended walks (magnetometer fusion active)
+  2. If scale/distance still off: consider MiDaS depth integration (TASK-028).
+  3. If more bugs found: document in ACTIVE BUGS, update handoff.
 resume_context: >
   Architecture: VisionModule replaced by Tracker+Mapper+VioEngine.
-  VioEngine spawns background thread for Mapper in constructor.
-  Tracker handles fast path (optical flow, essential matrix, rotation fusion).
-  EKF is now 1-state (scale only). Heading from global_R_ accumulation.
-  Key fix: SVD condition 100-50000 = translation_degenerate (rotation valid).
-  Key fix: heading = atan2(R[1][0], R[0][0]) not R[1][1] (pitch-independent).
-  Key fix: FB_CHECK_THRESH = 9.0 (was 2.0), low-light quality = 0.
+  BUG-012 fix: Removed !is_low_light from line 297 gate.
+  BUG-013 fix: Wrapped rotation update in if (!is_static).
+  Phase 0.5: Map camera throttle 1000ms → 500ms for responsiveness.
+  Phase 2.3: Continuous heading fusion — magnetometer (20%) + VIO (80%).
+  Magnetometer now stays registered, SensorRepository sends updates to C++,
+  IMUPreintegrator.getCorrectedHeading() blends heading each frame.
 partial_state: "NONE — all code changes done, build passes"
 warnings:
-  - "BUG-012 and BUG-013 confirmed on device — need code fixes"
-  - "ALL CHANGES FROM 2026-04-05 session 0f ARE UNTESTED ON DEVICE"
+  - "BUG-012, BUG-013, Phase 0.5, Phase 2.3 all FIXED but UNTESTED ON DEVICE"
+  - "Tamir's phone (Samsung SM-A057F) has no gyroscope — another team member must test"
   - "C++ tests reference old VisionModule — need updating for Tracker/Mapper"
-  - "Simulation recordings from 2026-04-05 were made with OLD code (pre-fixes)"
   - "MiDaS depth model suggested but not implemented (TASK-028)"
   - "Phase 3 of parallel VIO (WorldState 200Hz) not yet started"
 ```

@@ -26,6 +26,7 @@ public:
     void setMagnetometerHeading(float yaw_rad);
     void setUserScaleCorrection(double correction);
     void setUserHeight(float height_m);
+    void updateDepthScale(double scale, double alpha);
     void reset();
 
     IMUPreintegrator& getIMU() { return imu_; }
