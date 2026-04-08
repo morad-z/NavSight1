@@ -10,12 +10,12 @@
 ## META
 
 ```yaml
-last_updated: "2026-04-05"
+last_updated: "2026-04-08"
 last_agent: "Claude-Opus-4-6"
 last_developer: "morad"
 branch: "morad"
 base_branch: "master"
-head_commit: "d90454f"
+head_commit: "10fb69a"
 ```
 
 ---
@@ -52,17 +52,36 @@ roey:
 #   VioEngine (orchestrator)
 #     ├── Tracker (fast path: optical flow, essential matrix, rotation fusion, pose update)
 #     ├── Mapper (background thread: ground plane, bundle adjustment, loop closure)
-#     ├── IMUPreintegrator (gyro/accel buffering, step detection, motion mode)
-#     └── EKFState (1-state scalar Kalman filter for scale only)
+#     ├── IMUPreintegrator (gyro/accel buffering, preintegration, step detection, motion mode)
+#     ├── EKFState (15-DOF error-state EKF with MSCKF sliding window support)
+#     ├── UpdaterZeroVelocity (chi-squared ZUPT detector)
+#     ├── UpdaterMSCKF (null-space feature marginalization — scaffolded)
+#     ├── PoseGraph (pose graph optimization for loop closure — scaffolded)
+#     └── InertialInitializer (stationary init — scaffolded)
+#
+# Camera pipeline: CameraX ImageAnalysis (zero-copy via GetDirectBufferAddress)
+#   ImageProxy planes → direct ByteBuffer → JNI processCameraFrameDirect
+#   STRATEGY_KEEP_ONLY_LATEST, YUV_420_888, 640x480 target resolution
 #
 # Tracker fast path runs on camera thread (~10ms).
 # Mapper runs on a dedicated background thread via std::condition_variable.
 # One-frame-delayed result application (non-blocking).
 #
-# Heading pipeline:
-#   magnetometer → setInitialHeading(azimuth_rad) → global_R_ = Rz(azimuth)
-#   each frame: global_R_ *= R_fused (camera+gyro blend) or R_corrected (gyro fallback)
-#   heading = atan2(R[1][0], R[0][0])  ← ZYX yaw extraction (pitch-independent)
+# Heading pipeline (REWRITTEN 2026-04-08):
+#   magnetometer → setInitialHeading(azimuth_rad) → scalar_heading_ = azimuth
+#   each frame: gravity-projected yaw rate from gyro:
+#     grav = getFilteredGravity() (low-pass filtered accel, tracks phone tilt)
+#     yaw_rate = -dot(omega, normalize(grav))
+#     scalar_heading_ += yaw_rate * dt
+#   heading = scalar_heading_ (radians, wraps at ±π)
+#   OLD METHOD REMOVED: Rodrigues vector component blending cross-coupled axes
+#
+# IMU preintegration (FIXED 2026-04-08):
+#   Rotation: proper SO(3) via Exp(w*dt) Rodrigues, NOT matrix addition
+#   Velocity/Position: midpoint integration (Forster 2017 §IV.A)
+#   Gyro bias subtracted before integration (was already done)
+#   Accel bias subtracted before integration (was MISSING, now fixed)
+#   Covariance: Forster 2017 discrete propagation with bias Jacobians
 #
 # Scale pipeline:
 #   step detection → speed × time → estimateScaleFromSteps → EKF updateScale
@@ -79,11 +98,11 @@ roey:
 ### Build Status
 
 ```yaml
-android_build: "PASSES"  # Verified 2026-04-05
-native_cpp_build: "PASSES"  # Tracker, Mapper, VioEngine, EKFState, FeatureManager, LensCorrector
+android_build: "PASSES"  # Verified 2026-04-08
+native_cpp_build: "PASSES"  # All C++ files including new MSCKF, ZUPT, PoseGraph, InertialInit
 kotlin_compile: "PASSES"
 desktop_cpp_tests: "36/36 PASS (tests reference old VisionModule — need update)"
-on_device_testing: "UNTESTED — latest changes from 2026-04-05 need on-device verification"
+on_device_testing: "TESTED 2026-04-08 — 5.4% drift on 22m out-and-back, heading tracks 180° turns"
 ```
 
 ---
@@ -91,89 +110,95 @@ on_device_testing: "UNTESTED — latest changes from 2026-04-05 need on-device v
 ## ACTIVE BUGS
 
 ```yaml
-- id: "BUG-009"
-  title: "Essential matrix always rejected as degenerate for forward walking"
-  status: "FIXED_UNTESTED"
-  severity: "P0"
-  owner: "morad"
-  file: "app/src/main/cpp/Tracker.cpp"
-  description: >
-    FIXED (2026-04-05): SVD condition number >100 rejected ALL frames during
-    forward walking. Restructured: SVD 100-50000 = translation_degenerate
-    (rotation still used for heading, step-based displacement). SVD >50000 =
-    truly degenerate. Now pose_valid=true for most frames with good inliers.
-  test: "Record walking sim — check pflags has bit2 (pose_valid=4) set"
-
-- id: "BUG-010"
-  title: "Heading extraction contaminated by phone pitch"
-  status: "FIXED_UNTESTED"
-  severity: "P0"
-  owner: "morad"
-  file: "app/src/main/cpp/Tracker.cpp"
-  description: >
-    FIXED (2026-04-05): atan2(R[1][0], R[1][1]) is pitch-dependent.
-    Phone bobbing during walking corrupted heading. Changed all 3 extraction
-    points to atan2(R[1][0], R[0][0]) — standard ZYX yaw, pitch-independent.
-  test: "Walk straight line — heading should stay constant (not oscillate)"
-
-- id: "BUG-011"
-  title: "Tracking quality 90% in darkness, <10% in good light"
-  status: "FIXED_UNTESTED"
-  severity: "P1"
-  owner: "morad"
-  file: "app/src/main/cpp/Tracker.cpp"
-  description: >
-    FIXED (2026-04-05): Two causes: (1) FB_CHECK_THRESH=2.0 (1.41px) too strict
-    for real motion — raised to 9.0 (3px). (2) CLAHE amplifies noise in darkness,
-    noise tracks with ~0px flow → false 90% quality. Added: quality=0 when is_low_light.
-  test: "Cover camera — quality should drop to 0%. Good light should show 50%+."
+# BUG-009, BUG-010, BUG-011: RESOLVED (purged — fixed 2026-04-05, verified 2026-04-08)
 
 - id: "BUG-012"
   title: "Tracking quality drops to 0 when moving — falls back to IMU-only"
-  status: "OPEN"
-  severity: "P0"
+  status: "IMPROVED"
+  severity: "P1"
   owner: "morad"
   file: "app/src/main/cpp/Tracker.cpp"
   reported: "2026-04-05 (on-device test)"
   description: >
-    When walking, tracking quality drops to 0 and system falls to IMU-only mode.
-    Likely causes: (1) Section 8 gate at line 297 requires !is_low_light — check
-    if brightness threshold 0.12 is too high for indoor lighting. (2) FB check
-    (FB_CHECK_THRESH=9.0) may still be too strict for large optical flow during
-    walking. (3) is_low_light clamp at line 253 forces quality=0 even if features
-    are tracked. (4) Possible: all features genuinely lost during motion (replenishment
-    not fast enough). Check GATES log line for diagnostics: flow, blur, motion,
-    parallax, static, rot, pts, gyro, lowlight values during walking.
-  fix_hints: >
-    - Log frame_brightness during walks to verify is_low_light isn't false-triggering.
-    - If brightness is fine, FB_CHECK_THRESH may need raising (try 16.0 = 4px).
-    - If tracked count is fine but quality=0, the is_low_light clamp is the culprit.
-    - Consider removing is_low_light from section 8 gate — let quality handle it.
-  test: "Walk in good light — quality should be >30%, pflags should have bit2 (pose_valid=4)."
+    IMPROVED (2026-04-08): CameraX migration with zero-copy frame delivery improved
+    FPS significantly. Sim shows quality oscillates between 0.04 and 0.99 during
+    walking (was always 0 before). Quality still drops during fast turns (expected).
+    Position accuracy 5.4% drift despite quality drops — visual odometry recovers.
+  test: "Walk in good light — quality should average >30% during straight walking."
 
 - id: "BUG-013"
   title: "Heading rotates when standing still"
-  status: "OPEN"
+  status: "FIXED_VERIFIED"
   severity: "P0"
   owner: "morad"
   file: "app/src/main/cpp/Tracker.cpp"
   reported: "2026-04-05 (on-device test)"
   description: >
-    When stationary, heading keeps drifting/rotating. Root cause: Section 9
-    (lines 428-439) applies rotation to global_R_ BEFORE the is_static check
-    at line 443. ZUPT only freezes translation, not rotation. So gyro noise
-    (even bias-corrected) accumulates in heading when standing still. Also:
-    if pose_valid=false (due to BUG-012), gyro fallback at line 432-439 applies
-    raw gyro rotation with imperfect bias correction, causing drift.
-  fix_hints: >
-    - When is_static is true, skip the rotation update entirely (both camera
-      and gyro paths). Heading should be frozen when standing still.
-    - Move the is_static check BEFORE the rotation update block.
-    - Alternative: apply a tiny rotation damping factor when is_static detected
-      (multiply rv by 0.0 or very small alpha).
-    - Also check if ZUPT_GYRO_THRESH (0.04 rad/s) is too low — phone table
-      vibrations can exceed this. Try 0.08.
-  test: "Place phone on table — heading should stay constant (±0.5° max over 30s)."
+    FIXED (2026-04-08): Heading now uses scalar_heading_ with gravity-projected
+    yaw rate instead of global_R_ accumulation. Section 9 skips heading update
+    when is_static=true. Sim shows heading stable at ±0.1° during stationary periods.
+
+- id: "BUG-014"
+  title: "Scale stuck at 0.12-0.20, never calibrates from steps"
+  status: "OPEN"
+  severity: "P1"
+  owner: "morad"
+  file: "app/src/main/cpp/Tracker.cpp"
+  reported: "2026-04-08 (simulation analysis)"
+  description: >
+    Despite 67 steps detected, scale oscillates between 0.12-0.21 and never
+    converges to a meaningful value. Step-based scale estimation may not be
+    feeding the EKF correctly, or the EKF's scale update is too conservative.
+    Position accuracy is OK despite this (visual odometry compensates).
+  test: "Walk 20m — scale should converge toward ~0.5-1.0 after 30+ steps."
+
+- id: "BUG-015"
+  title: "QA: Data race on EKF between Tracker and Mapper threads"
+  status: "OPEN"
+  severity: "P0"
+  owner: "morad"
+  file: "app/src/main/cpp/VioEngine.cpp"
+  reported: "2026-04-08 (QA scan)"
+  description: >
+    Mapper thread reads EKF state (getWindow, isFullInitialized) while Tracker
+    thread concurrently mutates it (propagateIMU, addClone, updateZUPT).
+    No synchronization. UB — can cause crashes or corrupted state.
+  fix_hints: "Deep-copy EKF snapshot before passing to Mapper, or add shared_mutex."
+
+- id: "BUG-016"
+  title: "QA: use-after-free risk in native-lib processCameraFrame"
+  status: "OPEN"
+  severity: "P1"
+  owner: "morad"
+  file: "app/src/main/cpp/native-lib.cpp"
+  reported: "2026-04-08 (QA scan)"
+  description: >
+    Raw pointer snapshot of g_vision used after releasing lock. If stopVIO()
+    deletes it concurrently, use-after-free crash.
+  fix_hints: "Use std::shared_ptr<VioEngine> instead of raw pointer."
+
+- id: "BUG-017"
+  title: "QA: Loop closure adds self-edge (same node ID)"
+  status: "OPEN"
+  severity: "P2"
+  owner: "morad"
+  file: "app/src/main/cpp/Mapper.cpp:608"
+  reported: "2026-04-08 (QA scan)"
+  description: >
+    pose_graph_.addLoopEdge uses last_pose_graph_node_id_ for both source and
+    target. Should use the matched keyframe's node ID as second argument.
+
+- id: "BUG-018"
+  title: "QA: Mapper applyMapperResult is a no-op — entire Mapper thread wasted"
+  status: "OPEN"
+  severity: "P2"
+  owner: "morad"
+  file: "app/src/main/cpp/VioEngine.cpp:100-113"
+  reported: "2026-04-08 (QA scan)"
+  description: >
+    applyMapperResult discards all results with (void)mr; (void)out.
+    Mapper thread runs ORB, RANSAC, BA every frame for nothing.
+  fix_hints: "Either re-enable result application or disable heavy computation."
 ```
 
 ---
@@ -181,89 +206,66 @@ on_device_testing: "UNTESTED — latest changes from 2026-04-05 need on-device v
 ## PENDING WORK
 
 ```yaml
-- id: "TASK-018"
-  title: "Parallel VIO refactor"
-  status: "DONE"
-  owner: "morad"
-  priority: "P1"
-  completed: "2026-04-05"
-  notes: >
-    Phase 2 complete: Tracker on camera thread, Mapper on background thread.
-    VioEngine orchestrates with condition_variable. Phase 3 (WorldState 200Hz)
-    still TODO.
+# TASK-018 through TASK-027: DONE (purged — completed 2026-04-05)
 
-- id: "TASK-022"
-  title: "EKF decoupled to 1-state scale-only filter"
+- id: "TASK-029"
+  title: "CameraX migration + zero-copy frame delivery"
   status: "DONE"
   owner: "morad"
   priority: "P0"
-  completed: "2026-04-05"
+  completed: "2026-04-08"
   notes: >
-    Old 3-state EKF [heading, gyro_bias, scale] had cross-covariance leakage.
-    Rewritten as scalar Kalman filter for scale only. Heading from global_R_
-    accumulation. Gyro bias learned separately in Tracker.
+    Replaced CameraView library with CameraX ImageAnalysis. Zero-copy JNI via
+    GetDirectBufferAddress on direct ByteBuffers from ImageProxy planes.
+    processCameraFrameDirect assembles NV21 from YUV_420_888. Significant FPS improvement.
 
-- id: "TASK-023"
-  title: "Fix essential matrix degenerate rejection (BUG-009)"
+- id: "TASK-030"
+  title: "Fix heading: scalar gravity-projected yaw rate"
   status: "DONE"
   owner: "morad"
   priority: "P0"
-  completed: "2026-04-05"
+  completed: "2026-04-08"
   notes: >
-    SVD condition split: 100-50000 = translation_degenerate (rotation valid),
-    >50000 = truly degenerate. Rotation fusion + gyro bias learning happen for
-    all frames with good inliers. Scale/triangulation only with good translation.
+    Replaced Rodrigues vector component blending (cross-coupled axes) with
+    scalar heading tracker. yaw_rate = -dot(omega, normalize(gravity)).
+    Uses filtered gravity (low-pass accel) to track phone tilt during use.
+    Heading now tracks 180° turns correctly (verified on-device).
 
-- id: "TASK-024"
-  title: "Fix heading extraction pitch contamination (BUG-010)"
+- id: "TASK-031"
+  title: "Fix 6 critical/high bugs from QA scan"
   status: "DONE"
   owner: "morad"
   priority: "P0"
-  completed: "2026-04-05"
-  notes: "atan2(R[1][0], R[1][1]) → atan2(R[1][0], R[0][0]) at all 3 extraction points."
-
-- id: "TASK-025"
-  title: "Fix tracking quality inversion in darkness (BUG-011)"
-  status: "DONE"
-  owner: "morad"
-  priority: "P1"
-  completed: "2026-04-05"
-  notes: "FB_CHECK_THRESH 2.0→9.0. Low-light quality clamped to 0."
-
-- id: "TASK-026"
-  title: "Step speed interpolation for displacement gaps"
-  status: "DONE"
-  owner: "morad"
-  priority: "P1"
-  completed: "2026-04-05"
+  completed: "2026-04-08"
   notes: >
-    Fallback displacement had gaps when step detection paused briefly.
-    Now maintains last_step_speed_ with 2.5s decay. Also removed motion_blur
-    and mean_flow gates from fallback — step detection alone is sufficient.
-
-- id: "TASK-027"
-  title: "Ground plane runs without pose_valid"
-  status: "DONE"
-  owner: "morad"
-  priority: "P1"
-  completed: "2026-04-05"
-  notes: >
-    Mapper ground plane detection now runs every frame (needs only image +
-    features). Provides absolute scale from camera height even during fallback.
+    (1) SO(3) integration: replaced RK4 matrix addition with proper Exp(w*dt).
+    (2) Accel bias: now subtracted during preintegration (was missing).
+    (3) EKF gravity: added g*dt to velocity, 0.5*g*dt² to position propagation.
+    (4) Gyro bias init: use most recent 200 samples (was oldest).
+    (5) integrateGyro: right-multiplication (consistent with integrate).
+    (6) ZUPT covariance: fixed double-dampening to maintain PSD.
+    Result: 5.4% drift (1.2m on 22m out-and-back).
 
 - id: "TASK-028"
-  title: "MiDaS monocular depth for absolute scale (SUGGESTION)"
-  status: "TODO"
-  owner: "unassigned"
+  title: "MiDaS monocular depth for absolute scale"
+  status: "SCAFFOLDED"
+  owner: "morad"
   priority: "P2"
   notes: >
-    SUGGESTED ENHANCEMENT: Integrate MiDaS v2.1 Small (~5MB TFLite model) for
-    monocular depth estimation. Would provide depth at tracked features →
-    absolute scale without step detection or manual calibration. Works on
-    any phone (no ToF sensor needed). Steps: add TFLite dep, bundle .tflite
-    in assets, DepthEstimator class runs inference every N frames, depth fed
-    to EKF for scale. Alternative to ARCore (which requires camera pipeline
-    rewrite). User confirmed interest in AI-based depth.
+    TFLite model bundled in assets/midas_v21_small.tflite. DepthEstimator.kt
+    scaffolded. Not yet wired into VIO pipeline.
+
+- id: "TASK-032"
+  title: "Fix remaining QA scan issues (threading, dead code)"
+  status: "TODO"
+  owner: "morad"
+  priority: "P1"
+  notes: >
+    BUG-015: EKF data race (Tracker vs Mapper threads).
+    BUG-016: use-after-free in native-lib (raw pointer).
+    BUG-017: Loop closure self-edge.
+    BUG-018: applyMapperResult is a no-op (Mapper thread wasted).
+    Plus: duplicate code in native-lib, O(n) IMU buffer scan, RANSAC 0.9999.
 ```
 
 ---
@@ -271,37 +273,60 @@ on_device_testing: "UNTESTED — latest changes from 2026-04-05 need on-device v
 ## RECENT CHANGES (last 5 sessions)
 
 ```yaml
+- session: "0h"
+  date: "2026-04-08"
+  developer: "morad"
+  agent: "Claude-Opus-4-6"
+  branch: "morad"
+  commits: "32d8958, 69a3e28, 5709bd2, 10fb69a"
+  summary: >
+    BREAKTHROUGH SESSION: 27% drift → 5.4% drift. Heading now tracks turns.
+    (1) CameraX migration: replaced CameraView with CameraX ImageAnalysis + zero-copy
+    JNI via GetDirectBufferAddress. New processCameraFrameDirect endpoint.
+    (2) Heading rewrite: scalar_heading_ with gravity-projected yaw rate replaces
+    Rodrigues component blending. Filtered gravity (LP accel) tracks phone tilt.
+    (3) QA scan (29 issues found): fixed 6 critical/high bugs —
+    SO(3) integration (Exp map), accel bias subtraction, EKF gravity term,
+    gyro bias init (most recent samples), integrateGyro convention, ZUPT covariance.
+    (4) New scaffolded files: PoseGraph, UpdaterMSCKF, UpdaterZeroVelocity,
+    InertialInitializer, DepthEstimator.kt. MiDaS TFLite model bundled.
+    (5) EKF expanded to 15-DOF error-state with MSCKF sliding window support.
+    ON-DEVICE VERIFIED: 1.2m return error on 22m out-and-back (5.4% drift).
+  files_changed:
+    - "app/build.gradle.kts (CameraView→CameraX deps, TFLite noCompress)"
+    - "app/src/main/java/.../MainActivity.kt (CameraX ImageAnalysis setup)"
+    - "app/src/main/java/.../SensorRepository.kt (ImageProxy zero-copy dispatch)"
+    - "app/src/main/java/.../NativeBridge.kt (processCameraFrameDirect JNI)"
+    - "app/src/main/java/.../NavSightViewModel.kt (ImageProxy passthrough)"
+    - "app/src/main/cpp/native-lib.cpp (processCameraFrameDirect, NV21 assembly)"
+    - "app/src/main/cpp/Tracker.cpp (scalar heading, filtered gravity, remove double bias)"
+    - "app/src/main/cpp/Tracker.h (scalar_heading_ field)"
+    - "app/src/main/cpp/IMUPreintegrator.cpp (SO(3) fix, accel bias, filtered gravity, gyro bias init)"
+    - "app/src/main/cpp/IMUPreintegrator.h (b_a_, filtered_gravity_, getFilteredGravity)"
+    - "app/src/main/cpp/EKFState.cpp (gravity in propagation, ZUPT covariance fix)"
+    - "app/src/main/cpp/EKFState.h (15-DOF error-state, MSCKF clone support)"
+    - "NEW: UpdaterZeroVelocity.cpp/h, UpdaterMSCKF.cpp/h, PoseGraph.cpp/h"
+    - "NEW: InertialInitializer.cpp/h, DepthEstimator.kt"
+    - "NEW: app/src/main/assets/midas_v21_small.tflite"
+
+- session: "0g"
+  date: "2026-04-08"
+  developer: "morad"
+  agent: "Claude-Opus-4-6"
+  branch: "morad"
+  summary: >
+    VIO accuracy improvement plan created (10 phases). Research into OpenVINS
+    gap analysis. Plan stored at .claude/plans/lexical-squishing-stream.md.
+
 - session: "0f"
   date: "2026-04-05"
   developer: "morad"
   agent: "Claude-Opus-4-6"
   branch: "morad"
   summary: >
-    Major VIO architecture overhaul + 6 critical fixes. NONE TESTED ON DEVICE YET.
-    (1) Parallel VIO: Tracker fast path + Mapper background thread (TASK-018 Phase 2).
-    (2) EKF rewritten as 1-state scale-only filter (removed heading/bias cross-covariance).
-    (3) Essential matrix degenerate handling restructured — rotation valid even when
-    translation is degenerate (SVD 100-50000). Fixes 0% pose_valid in all simulations.
-    (4) Heading extraction bug: atan2(R[1][0],R[1][1]) → atan2(R[1][0],R[0][0]) for
-    pitch-independent yaw. (5) FB_CHECK_THRESH 2.0→9.0 + low-light quality clamp.
-    (6) Step speed interpolation, ground plane without pose_valid, MAX_FLOW_PX 50→150.
-    Deleted: VisionModule.cpp/h, ThreadSafeQueue.h (replaced by Tracker/Mapper/VioEngine).
-    Analyzed 8 simulation recordings — all showed 0 pose_valid, heading drift, scale=1.0.
-  files_changed:
-    - "app/src/main/cpp/Tracker.cpp (degenerate restructure, heading fix, FB threshold, speed interp)"
-    - "app/src/main/cpp/Tracker.h (MAX_FLOW_PX=150, FB_CHECK_THRESH=9.0, step speed fields)"
-    - "app/src/main/cpp/VioEngine.cpp (NEW: parallel orchestrator with background Mapper)"
-    - "app/src/main/cpp/VioEngine.h (NEW: thread management, result passing)"
-    - "app/src/main/cpp/EKFState.cpp (REWRITTEN: 1-state scalar scale filter)"
-    - "app/src/main/cpp/EKFState.h (REWRITTEN: removed heading/bias states)"
-    - "app/src/main/cpp/Mapper.cpp (ground plane without pose_valid, LM lambda fix)"
-    - "app/src/main/cpp/Mapper.h (KeyframeWindow::data() accessor)"
-    - "app/src/main/cpp/IMUPreintegrator.cpp (gyro bias fix in integrate())"
-    - "app/CMakeLists.txt (removed VisionModule comment)"
-    - "app/src/main/cpp/VisionModule.cpp (DELETED)"
-    - "app/src/main/cpp/VisionModule.h (DELETED)"
-    - "app/src/main/cpp/ThreadSafeQueue.h (DELETED)"
-  impact: "All changes build successfully. UNTESTED ON DEVICE. Must rebuild APK and re-record."
+    Major VIO architecture overhaul + 6 critical fixes.
+    Parallel VIO, EKF rewrite, degenerate handling, heading fix, FB threshold.
+    Deleted VisionModule.cpp/h. Analyzed 8 simulation recordings.
 
 - session: "0e"
   date: "2026-04-01"
@@ -310,11 +335,6 @@ on_device_testing: "UNTESTED — latest changes from 2026-04-05 need on-device v
   branch: "morad"
   summary: >
     Fixed heading freeze, geodesic coordinates, ghost walking, simulation save crash.
-  files_changed:
-    - "app/src/main/cpp/VisionModule.cpp (relaxed rotation gates)"
-    - "app/src/main/cpp/IMUPreintegrator.cpp (2s step timeout)"
-    - "app/src/main/java/.../NavSightUtils.kt (geodesic metersToLatLng)"
-    - "app/src/main/java/.../NavSightViewModel.kt (thread-safe save)"
 
 - session: "0d"
   date: "2026-03-31"
@@ -323,22 +343,6 @@ on_device_testing: "UNTESTED — latest changes from 2026-04-05 need on-device v
   branch: "morad"
   summary: >
     Removed Kotlin OpticalFlowProcessor for FPS boost. Camera ~2-3fps → expected ~5fps.
-
-- session: "0c"
-  date: "2026-03-31"
-  developer: "morad"
-  agent: "Claude-Opus-4-6"
-  branch: "morad"
-  summary: >
-    Fixed VIO direction (magnetometer initial heading) and scale (VIO-ready pitch check).
-
-- session: "0b"
-  date: "2026-03-31"
-  developer: "morad"
-  agent: "Claude-Opus-4-6"
-  branch: "morad"
-  summary: >
-    Major VIO accuracy overhaul: 2D heading position, step-based scale, 7 diagnostic fields.
 ```
 
 ---
@@ -346,31 +350,31 @@ on_device_testing: "UNTESTED — latest changes from 2026-04-05 need on-device v
 ## CONVERSATION CONTEXT
 
 ```yaml
-current_task: "Fix BUG-012 (quality=0 when moving) and BUG-013 (heading rotates when still)"
-stopped_at: "Bugs documented. On-device test confirms both issues. Code fixes needed."
+current_task: "Continue QA fixes from scan + improve scale calibration"
+stopped_at: "6 critical/high QA bugs fixed. On-device verified: 5.4% drift, heading works."
 next_action: >
-  1. FIX BUG-012: Check if is_low_light false-triggers indoors. Remove is_low_light
-     from section 8 gate (line 297). Possibly raise FB_CHECK_THRESH. Log brightness.
-  2. FIX BUG-013: Move is_static check BEFORE rotation update in section 9.
-     When static, skip both camera and gyro rotation updates entirely.
-  3. Rebuild APK and re-test: walk (quality >30%, pose_valid), stand (heading frozen).
-  4. If scale/distance still off: consider MiDaS depth integration (TASK-028).
+  1. FIX BUG-015: EKF data race — deep-copy EKF snapshot for Mapper thread.
+  2. FIX BUG-016: use-after-free — switch to shared_ptr<VioEngine>.
+  3. Scale calibration: investigate why scale stuck at 0.12-0.20 despite 67 steps.
+  4. Consider remaining QA items: loop closure self-edge, applyMapperResult no-op.
+  5. VIO accuracy plan phases 2-5 (feature aging, reprojection gating, ZUPT tuning, mag init).
 resume_context: >
-  Architecture: VisionModule replaced by Tracker+Mapper+VioEngine.
-  VioEngine spawns background thread for Mapper in constructor.
-  Tracker handles fast path (optical flow, essential matrix, rotation fusion).
-  EKF is now 1-state (scale only). Heading from global_R_ accumulation.
-  Key fix: SVD condition 100-50000 = translation_degenerate (rotation valid).
-  Key fix: heading = atan2(R[1][0], R[0][0]) not R[1][1] (pitch-independent).
-  Key fix: FB_CHECK_THRESH = 9.0 (was 2.0), low-light quality = 0.
-partial_state: "NONE — all code changes done, build passes"
+  Architecture: Tracker+Mapper+VioEngine. CameraX with zero-copy JNI.
+  Heading: scalar_heading_ with gravity-projected yaw rate (filtered gravity LP accel).
+  IMU preintegration: proper SO(3) Exp map, accel bias subtracted, midpoint V/P.
+  EKF: 15-DOF error-state with MSCKF clone support (legacy 1-state scale still active).
+  Key result: 1.2m return error on 22m out-and-back = 5.4% drift.
+  Key result: heading tracks 180° turns (156° → -37° = ~193° change, expected 180°).
+  QA scan found 29 issues, 6 fixed, 23 remaining (mostly medium/low).
+partial_state: "NONE — all code changes done, build passes, on-device verified"
 warnings:
-  - "BUG-012 and BUG-013 confirmed on device — need code fixes"
-  - "ALL CHANGES FROM 2026-04-05 session 0f ARE UNTESTED ON DEVICE"
+  - "BUG-015 (EKF data race) can cause rare crashes — fix before release"
+  - "BUG-016 (use-after-free) can crash on VIO stop/restart — fix before release"
+  - "Scale never calibrates (0.12-0.20) — position accuracy comes from VO, not scale"
+  - "applyMapperResult is no-op — Mapper thread wastes CPU every frame"
   - "C++ tests reference old VisionModule — need updating for Tracker/Mapper"
-  - "Simulation recordings from 2026-04-05 were made with OLD code (pre-fixes)"
-  - "MiDaS depth model suggested but not implemented (TASK-028)"
-  - "Phase 3 of parallel VIO (WorldState 200Hz) not yet started"
+  - "MiDaS TFLite bundled but not wired into pipeline"
+  - "VIO accuracy plan phases 2-10 not yet started"
 ```
 
 ---
@@ -378,38 +382,39 @@ warnings:
 ## FILE MAP (key files only)
 
 ```yaml
-# C++ VIO Engine (NEW architecture — post-refactor)
-"app/src/main/cpp/VioEngine.h":          "Parallel orchestrator: Tracker + Mapper thread (28 lines)"
-"app/src/main/cpp/VioEngine.cpp":        "processFrame, mapperThreadFunc, applyMapperResult (175 lines)"
-"app/src/main/cpp/Tracker.h":            "Fast path: optical flow, essential matrix, rotation fusion (128 lines)"
-"app/src/main/cpp/Tracker.cpp":          "Core VIO tracking: degenerate handling, heading, scale, pose (580 lines)"
-"app/src/main/cpp/Mapper.h":             "Background: ground plane, BA, loop closure (97 lines)"
-"app/src/main/cpp/Mapper.cpp":           "Ground plane (Canny+Hough), sliding window BA (LM), ORB loop closure (334 lines)"
-"app/src/main/cpp/EKFState.h":           "1-state scalar Kalman filter for scale (46 lines)"
-"app/src/main/cpp/EKFState.cpp":         "updateScale (Mahalanobis gate), updateZUPT, checkConsistency (79 lines)"
-"app/src/main/cpp/IMUPreintegrator.h":   "IMU preintegration + step detection + motion mode (~122 lines)"
-"app/src/main/cpp/IMUPreintegrator.cpp": "Gyro/accel buffering, rotation, step detector, driving mode (~465 lines)"
-"app/src/main/cpp/FeatureManager.h/cpp": "Grid features, sparse replenish, keyframe store/match (~200 lines)"
-"app/src/main/cpp/LensCorrector.h/cpp":  "Lens undistortion for matched points (~100 lines)"
-"app/src/main/cpp/LoopClosureDetector.h/cpp": "ORB-based loop closure detection (~150 lines)"
-"app/src/main/cpp/native-lib.cpp":       "JNI bridge: VioEngine lifecycle, 29-field VioData (~310 lines)"
-"app/CMakeLists.txt":                    "Build: Tracker, Mapper, VioEngine, EKF, FeatureManager, LensCorrector, LoopClosure"
+# C++ VIO Engine
+"app/src/main/cpp/VioEngine.h/cpp":      "Parallel orchestrator: Tracker + Mapper thread"
+"app/src/main/cpp/Tracker.h/cpp":        "Core VIO: optical flow, essential matrix, scalar heading, pose"
+"app/src/main/cpp/Mapper.h/cpp":         "Background: ground plane, BA, loop closure (results currently discarded)"
+"app/src/main/cpp/EKFState.h/cpp":       "15-DOF error-state EKF + legacy 1-state scale filter"
+"app/src/main/cpp/IMUPreintegrator.h/cpp": "SO(3) preintegration, filtered gravity, step detection, motion mode"
+"app/src/main/cpp/UpdaterZeroVelocity.h/cpp": "Chi-squared ZUPT detector (stationary detection)"
+"app/src/main/cpp/UpdaterMSCKF.h/cpp":   "Null-space feature marginalization (scaffolded)"
+"app/src/main/cpp/PoseGraph.h/cpp":      "Pose graph optimization for loop closure (scaffolded)"
+"app/src/main/cpp/InertialInitializer.h/cpp": "Stationary initialization (scaffolded)"
+"app/src/main/cpp/FeatureManager.h/cpp": "Grid features, sparse replenish, keyframe store/match"
+"app/src/main/cpp/LensCorrector.h/cpp":  "Lens undistortion for matched points"
+"app/src/main/cpp/LoopClosureDetector.h/cpp": "ORB-based loop closure detection"
+"app/src/main/cpp/native-lib.cpp":       "JNI bridge: processCameraFrame + processCameraFrameDirect (zero-copy)"
 
-# Kotlin App Layer (unchanged this session)
-"app/src/main/java/.../MainActivity.kt":         "Compose UI, map, radar, AR overlay (805 lines)"
-"app/src/main/java/.../NavSightViewModel.kt":    "MVVM state, meters-to-LatLng (249 lines)"
-"app/src/main/java/.../SensorRepository.kt":     "Sensor registration, camera dispatch, VIO init (394 lines)"
-"app/src/main/java/.../NativeBridge.kt":          "JNI declarations (39 lines)"
-"app/src/main/java/.../VioData.kt":               "VIO data class: 29 fields + JNI sig (~105 lines)"
+# Kotlin App Layer
+"app/src/main/java/.../MainActivity.kt":         "CameraX ImageAnalysis setup, Compose UI, map, radar"
+"app/src/main/java/.../NavSightViewModel.kt":    "MVVM state, simulation recording"
+"app/src/main/java/.../SensorRepository.kt":     "ImageProxy zero-copy dispatch, sensor registration"
+"app/src/main/java/.../NativeBridge.kt":          "JNI declarations (processCameraFrameDirect)"
+"app/src/main/java/.../VioData.kt":               "VIO data class: 29 fields + JNI sig"
+"app/src/main/java/.../DepthEstimator.kt":        "MiDaS TFLite depth estimation (scaffolded)"
+
+# Assets & Models
+"app/src/main/assets/midas_v21_small.tflite":  "MiDaS v2.1 Small depth model (~5MB)"
 
 # Simulation & Analysis
-"simulator/simulation_data_*.json":      "8 recordings (3 pre-fix, 5 post-first-fix, all pre-latest-fix)"
-"simulator/analyze_simulation.py":       "Single-file VIO vs GPS analysis + plot"
+"simulator/simulation_data_*.json":      "Recordings (latest: 1775658313926 = 5.4% drift verified)"
 ```
 
 ---
 
-## KEY CONSTANTS (current values in Tracker.h)
+## KEY CONSTANTS (current values)
 
 ```yaml
 MAX_FEATURES:        400
