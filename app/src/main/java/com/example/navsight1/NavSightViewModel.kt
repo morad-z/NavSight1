@@ -55,11 +55,11 @@ class NavSightViewModel(application: Application) : AndroidViewModel(application
     ))
         private set
 
-    // VIO-derived motion state (replaces removed Kotlin OpticalFlowProcessor)
-    var isMoving by mutableStateOf(false)
-        private set
-    var isDriving by mutableStateOf(false)
-        private set
+    // DEAD CODE: isMoving/isDriving never read from UI — local var in MainScreen() computes isMoving from VIO data instead
+    // var isMoving by mutableStateOf(false)
+    //     private set
+    // var isDriving by mutableStateOf(false)
+    //     private set
 
     var vioState by mutableStateOf(VioData())
         private set
@@ -68,7 +68,15 @@ class NavSightViewModel(application: Application) : AndroidViewModel(application
         private set
     var virtualZ by mutableStateOf(0.0)
         private set
-    val pathHistory = mutableStateListOf<Pair<Float, Float>>()
+
+    // Path history: plain ArrayList + version counter to avoid mutableStateListOf O(n) overhead.
+    // mutableStateListOf wraps every element with Compose state tracking — each add()/removeAt()
+    // triggers structural change notifications that force full list recomposition.
+    // With a plain list + version bump, we control when recomposition happens.
+    private val _pathHistory = ArrayList<Pair<Float, Float>>(512)
+    var pathHistoryVersion by mutableStateOf(0)
+        private set
+    val pathHistory: List<Pair<Float, Float>> get() = _pathHistory
 
     var startLocation by mutableStateOf<LatLng?>(null)
         private set
@@ -141,10 +149,11 @@ class NavSightViewModel(application: Application) : AndroidViewModel(application
         val heading: Double
     )
 
-    data class SimulationData(
-        val startTime: Long,
-        val points: List<SimulationPoint>
-    )
+    // DEAD CODE: SimulationData is never instantiated — saveSimulationData writes JSON manually
+    // data class SimulationData(
+    //     val startTime: Long,
+    //     val points: List<SimulationPoint>
+    // )
     // ──────────────────────────────────────────────────────────────────────────
 
     /** Initial heading in degrees from SensorRepository (captured at VIO init from magnetometer) */
@@ -226,8 +235,9 @@ class NavSightViewModel(application: Application) : AndroidViewModel(application
             if (vio.isInitialized) {
                 virtualX = vio.x
                 virtualZ = vio.z
-                pathHistory.add(Pair(vio.x.toFloat(), vio.z.toFloat()))
-                if (pathHistory.size > 500) pathHistory.removeAt(0)
+                _pathHistory.add(Pair(vio.x.toFloat(), vio.z.toFloat()))
+                if (_pathHistory.size > 500) _pathHistory.removeAt(0)
+                pathHistoryVersion++
             }
         }
 
@@ -412,7 +422,8 @@ class NavSightViewModel(application: Application) : AndroidViewModel(application
 
     fun resetPath() {
         sensorRepository.resetPath()
-        pathHistory.clear()
+        _pathHistory.clear()
+        pathHistoryVersion++
         virtualX = 0.0
         virtualZ = 0.0
         currentSpeedKmh = 0f

@@ -160,8 +160,8 @@ class MainActivity : ComponentActivity() {
             azimuth
         }
 
-        // Snapshot path once per recompose — avoids two separate .toList() copies
-        val historySnapshot = remember(viewModel.pathHistory.size) {
+        // Snapshot path when version bumps (version increments at 5Hz max via UI throttle)
+        val historySnapshot = remember(viewModel.pathHistoryVersion) {
             viewModel.pathHistory.toList()
         }
 
@@ -422,32 +422,33 @@ class MainActivity : ComponentActivity() {
         )
     }
 
-    @Composable
-    fun AROverlay(
-        isMoving: Boolean,
-        orientation: DeviceOrientationTracker.OrientationResult
-    ) {
-        if (isMoving && orientation.isHorizontal) {
-            val infiniteTransition = rememberInfiniteTransition(label = "grid")
-            val gridOffset by infiniteTransition.animateFloat(
-                initialValue = 0f, targetValue = 60f,
-                animationSpec = infiniteRepeatable(tween(800, easing = LinearEasing), RepeatMode.Restart),
-                label = "gridOffset"
-            )
-            Canvas(Modifier.fillMaxSize()) {
-                val startY = size.height * 0.4f
-                val centerX = size.width / 2
-                for (i in 0..10) {
-                    val y = startY + (gridOffset + i * 40f) % (size.height * 0.6f)
-                    val alpha = ((y - startY) / (size.height * 0.6f) * 0.5f).coerceIn(0f, 0.5f)
-                    drawLine(color = LuxuryGreen.copy(alpha = alpha), start = Offset(centerX, y), end = Offset(centerX, y + 30f), strokeWidth = 3f, cap = StrokeCap.Round)
-                }
-            }
-        }
-        Box(Modifier.fillMaxSize(), contentAlignment = Alignment.Center) {
-            AROverlayRenderer.DirectionArrow(isMoving = isMoving, magnitude = if (isMoving) 5f else 0f)
-        }
-    }
+    // DEAD CODE: AROverlay composable is never called from any screen
+    // @Composable
+    // fun AROverlay(
+    //     isMoving: Boolean,
+    //     orientation: DeviceOrientationTracker.OrientationResult
+    // ) {
+    //     if (isMoving && orientation.isHorizontal) {
+    //         val infiniteTransition = rememberInfiniteTransition(label = "grid")
+    //         val gridOffset by infiniteTransition.animateFloat(
+    //             initialValue = 0f, targetValue = 60f,
+    //             animationSpec = infiniteRepeatable(tween(800, easing = LinearEasing), RepeatMode.Restart),
+    //             label = "gridOffset"
+    //         )
+    //         Canvas(Modifier.fillMaxSize()) {
+    //             val startY = size.height * 0.4f
+    //             val centerX = size.width / 2
+    //             for (i in 0..10) {
+    //                 val y = startY + (gridOffset + i * 40f) % (size.height * 0.6f)
+    //                 val alpha = ((y - startY) / (size.height * 0.6f) * 0.5f).coerceIn(0f, 0.5f)
+    //                 drawLine(color = LuxuryGreen.copy(alpha = alpha), start = Offset(centerX, y), end = Offset(centerX, y + 30f), strokeWidth = 3f, cap = StrokeCap.Round)
+    //             }
+    //         }
+    //     }
+    //     Box(Modifier.fillMaxSize(), contentAlignment = Alignment.Center) {
+    //         AROverlayRenderer.DirectionArrow(isMoving = isMoving, magnitude = if (isMoving) 5f else 0f)
+    //     }
+    // }
 
     @Composable
     fun DirectionBadge(isMoving: Boolean, trackingQuality: Float) {
@@ -922,32 +923,45 @@ class MainActivity : ComponentActivity() {
             position = CameraPosition.Builder().target(displayPosition).zoom(targetZoom).bearing(azimuth).tilt(targetTilt).build()
         }
 
-        // FR31: Throttle map camera updates to 1Hz to fix lag
+        // Throttle camera + polyline + marker updates to ~1Hz.
+        // Previous impl: camera at 1Hz but GoogleMap content (Polyline, Marker) recomposed at 5Hz
+        // because displayPosition/history changed at UI throttle rate. Google Maps Compose recreates
+        // overlays from scratch on each content recompose — this was the main lag source.
+        var mapPosition by remember { mutableStateOf(displayPosition) }
+        var mapAzimuth by remember { mutableStateOf(azimuth) }
+        var mapPathLatLngs by remember { mutableStateOf<List<LatLng>>(emptyList()) }
         var lastMapUpdateTime by remember { mutableStateOf(0L) }
-        LaunchedEffect(displayPosition, azimuth, navState) {
+
+        LaunchedEffect(displayPosition, azimuth, navState, history.size) {
             val now = System.currentTimeMillis()
-            // Re-center if enough time passed OR if navigation just became active
             if (now - lastMapUpdateTime >= 1000L || navState is NavigationState.Routing) {
                 lastMapUpdateTime = now
+                mapPosition = displayPosition
+                mapAzimuth = azimuth
+                // Remap polyline at 1Hz (not 5Hz) — 500 trig ops once/sec is fine
+                mapPathLatLngs = history.map {
+                    NavSightUtils.metersToLatLng(start, it.first.toDouble(), it.second.toDouble())
+                }
                 cameraState.animate(com.google.android.gms.maps.CameraUpdateFactory.newCameraPosition(
-                    CameraPosition.Builder().target(displayPosition).zoom(targetZoom).bearing(azimuth).tilt(targetTilt).build()
+                    CameraPosition.Builder().target(mapPosition).zoom(targetZoom).bearing(mapAzimuth).tilt(targetTilt).build()
                 ), durationMs = 800)
             }
         }
-        // Cache LatLng polyline — avoid re-mapping 500 points every recompose
-        val pathLatLngs = remember(history.size) {
-            history.map { NavSightUtils.metersToLatLng(start, it.first.toDouble(), it.second.toDouble()) }
-        }
+
+        // GoogleMap content only recomposes when mapPosition/mapPathLatLngs/mapAzimuth change (1Hz)
         GoogleMap(modifier = Modifier.fillMaxSize(), cameraPositionState = cameraState, uiSettings = MapUiSettings(zoomControlsEnabled = false, compassEnabled = false, myLocationButtonEnabled = false)) {
+            // Cache icons inside GoogleMap scope — BitmapDescriptorFactory requires Maps SDK initialized
+            val navArrowIcon = remember { NavSightUtils.vectorToBitmap(this@MainActivity, R.drawable.navigation_arrow) }
+            val startIcon = remember { BitmapDescriptorFactory.defaultMarker(BitmapDescriptorFactory.HUE_GREEN) }
             if (navState is NavigationState.Active) {
                 Polyline(points = navState.route.polyline, color = LuxuryCyan, width = 12f, zIndex = 10f)
                 Marker(state = MarkerState(navState.route.destination), title = "Destination")
             }
-            if (pathLatLngs.isNotEmpty()) {
-                Polyline(points = pathLatLngs, color = LuxuryGreen, width = 6f, zIndex = 5f)
+            if (mapPathLatLngs.isNotEmpty()) {
+                Polyline(points = mapPathLatLngs, color = LuxuryGreen, width = 6f, zIndex = 5f)
             }
-            Marker(state = MarkerState(displayPosition), rotation = displayAzimuth, flat = true, anchor = Offset(0.5f, 0.5f), icon = NavSightUtils.vectorToBitmap(this@MainActivity, R.drawable.navigation_arrow))
-            Marker(state = MarkerState(start), title = "Start", icon = BitmapDescriptorFactory.defaultMarker(BitmapDescriptorFactory.HUE_GREEN))
+            Marker(state = MarkerState(mapPosition), rotation = mapAzimuth, flat = true, anchor = Offset(0.5f, 0.5f), icon = navArrowIcon)
+            Marker(state = MarkerState(start), title = "Start", icon = startIcon)
         }
     }
 

@@ -26,9 +26,10 @@ object NativeBridge {
 
     external fun startVIO()
     external fun stopVIO()
-    external fun processCameraFrame(
-        frameData: ByteArray, width: Int, height: Int, timestamp: Long
-    ): VioData
+    // DEAD CODE: old ByteArray version — superseded by processCameraFrameDirect (zero-copy ByteBuffer)
+    // external fun processCameraFrame(
+    //     frameData: ByteArray, width: Int, height: Int, timestamp: Long
+    // ): VioData
     // Zero-copy: accepts direct ByteBuffer from CameraX ImageProxy
     external fun processCameraFrameDirect(
         yBuffer: ByteBuffer, uvBuffer: ByteBuffer,
@@ -44,5 +45,6 @@ object NativeBridge {
     external fun setIntrinsics(fx: Double, fy: Double, cx: Double, cy: Double)
     external fun setInitialHeading(azimuthRad: Double)
     external fun setUserHeight(heightM: Float)
-    external fun setMagnetometerHeading(yawRad: Float)
+    // DEAD CODE: never called from Kotlin — mag heading is captured via orientationTracker at init, not via this JNI
+    // external fun setMagnetometerHeading(yawRad: Float)
 }

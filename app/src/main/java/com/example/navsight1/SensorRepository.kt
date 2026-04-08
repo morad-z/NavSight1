@@ -28,7 +28,8 @@ class SensorRepository(private val context: Context) : SensorEventListener {
     private val fusedLocationClient = LocationServices.getFusedLocationProviderClient(context)
 
     private val orientationTracker = DeviceOrientationTracker()
-    private val depthEstimator = DepthEstimator(context)
+    // DISABLED: DepthEstimator — MiDaS depth feeds Mapper pipeline which is disabled (output discarded)
+    // private val depthEstimator = DepthEstimator(context)
 
     // Dedicated VIO processing thread — decouples camera preview from VIO computation.
     // Frame dropping: if VIO is still busy when the next frame arrives, we skip it.
@@ -38,13 +39,13 @@ class SensorRepository(private val context: Context) : SensorEventListener {
     @Volatile private var vioProcessing = false
     @Volatile private var vioFrameCount = 0
 
-    // Dedicated depth estimation thread (TFLite GPU inference)
-    private val depthExecutor = java.util.concurrent.Executors.newSingleThreadExecutor { r ->
-        Thread(r, "NavSight-Depth").apply { isDaemon = true }
-    }
-    @Volatile private var depthProcessing = false
-    private var lastDepthTimeMs = 0L
-    private val DEPTH_THROTTLE_MS = 200L // 5Hz depth updates
+    // DISABLED: Depth estimation thread + state — DepthEstimator/Mapper pipeline disabled
+    // private val depthExecutor = java.util.concurrent.Executors.newSingleThreadExecutor { r ->
+    //     Thread(r, "NavSight-Depth").apply { isDaemon = true }
+    // }
+    // @Volatile private var depthProcessing = false
+    // private var lastDepthTimeMs = 0L
+    // private val DEPTH_THROTTLE_MS = 200L // 5Hz depth updates
 
     private val _orientationState = MutableStateFlow(DeviceOrientationTracker.OrientationResult(
         pitch = 0f, roll = 0f, azimuth = 0f,
@@ -230,8 +231,9 @@ class SensorRepository(private val context: Context) : SensorEventListener {
         locationTokenSource?.cancel()
         stopGpsUpdates()
         vioExecutor.shutdown()
-        depthExecutor.shutdown()
-        depthEstimator.close()
+        // DISABLED: depth cleanup — DepthEstimator/Mapper pipeline disabled
+        // depthExecutor.shutdown()
+        // depthEstimator.close()
         intrinsicsInitialized = false
         repositoryScope.cancel()
         Log.d(TAG, "Repository cleaned up")
@@ -343,45 +345,42 @@ class SensorRepository(private val context: Context) : SensorEventListener {
             }
         }
 
-        // Depth estimation: copy Y plane now (before image is closed by VIO thread)
-        // Throttled to 5Hz. MiDaS corrections are currently disabled but depth
-        // is still computed for future use.
-        if (!depthProcessing && (nowMs - lastDepthTimeMs >= DEPTH_THROTTLE_MS)) {
-            // Copy Y bytes on the calling thread (fast — just a memcpy)
-            val yBytes = ByteArray(w * h)
-            yBuffer.rewind()
-            if (yRowStride == w) {
-                yBuffer.get(yBytes, 0, w * h)
-            } else {
-                for (row in 0 until h) {
-                    yBuffer.position(row * yRowStride)
-                    yBuffer.get(yBytes, row * w, w)
-                }
-            }
-            depthProcessing = true
-            lastDepthTimeMs = nowMs
-            depthExecutor.execute {
-                try {
-                    val bitmap = android.graphics.Bitmap.createBitmap(w, h, android.graphics.Bitmap.Config.ARGB_8888)
-                    val pixels = IntArray(w * h)
-                    for (i in yBytes.indices) {
-                        val lum = yBytes[i].toInt() and 0xFF
-                        pixels[i] = (0xFF shl 24) or (lum shl 16) or (lum shl 8) or lum
-                    }
-                    bitmap.setPixels(pixels, 0, w, 0, 0, w, h)
-                    repositoryScope.launch {
-                        val depthMap = depthEstimator.estimateDepth(bitmap)
-                        if (depthMap != null) {
-                            NativeBridge.setDepthMap(depthMap, 256, 256)
-                        }
-                    }
-                } catch (e: Exception) {
-                    Log.e(TAG, "Depth processing error: ${e.message}")
-                } finally {
-                    depthProcessing = false
-                }
-            }
-        }
+        // DISABLED: Depth estimation — Mapper pipeline disabled, MiDaS output was never applied
+        // if (!depthProcessing && (nowMs - lastDepthTimeMs >= DEPTH_THROTTLE_MS)) {
+        //     val yBytes = ByteArray(w * h)
+        //     yBuffer.rewind()
+        //     if (yRowStride == w) {
+        //         yBuffer.get(yBytes, 0, w * h)
+        //     } else {
+        //         for (row in 0 until h) {
+        //             yBuffer.position(row * yRowStride)
+        //             yBuffer.get(yBytes, row * w, w)
+        //         }
+        //     }
+        //     depthProcessing = true
+        //     lastDepthTimeMs = nowMs
+        //     depthExecutor.execute {
+        //         try {
+        //             val bitmap = android.graphics.Bitmap.createBitmap(w, h, android.graphics.Bitmap.Config.ARGB_8888)
+        //             val pixels = IntArray(w * h)
+        //             for (i in yBytes.indices) {
+        //                 val lum = yBytes[i].toInt() and 0xFF
+        //                 pixels[i] = (0xFF shl 24) or (lum shl 16) or (lum shl 8) or lum
+        //             }
+        //             bitmap.setPixels(pixels, 0, w, 0, 0, w, h)
+        //             repositoryScope.launch {
+        //                 val depthMap = depthEstimator.estimateDepth(bitmap)
+        //                 if (depthMap != null) {
+        //                     NativeBridge.setDepthMap(depthMap, 256, 256)
+        //                 }
+        //             }
+        //         } catch (e: Exception) {
+        //             Log.e(TAG, "Depth processing error: ${e.message}")
+        //         } finally {
+        //             depthProcessing = false
+        //         }
+        //     }
+        // }
     }
 
     private fun handleVioInitialized(vio: VioData) {
@@ -483,7 +482,8 @@ class SensorRepository(private val context: Context) : SensorEventListener {
         accelMagnitudeHistory.clear()
     }
 
-    fun setScale(scale: Double) {
-        NativeBridge.setScale(scale)
-    }
+    // DEAD CODE: never called — ViewModel calls NativeBridge.setScale() directly
+    // fun setScale(scale: Double) {
+    //     NativeBridge.setScale(scale)
+    // }
 }

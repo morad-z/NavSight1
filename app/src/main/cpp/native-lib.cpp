@@ -130,25 +130,24 @@ Java_com_example_navsight1_NativeBridge_stopVIO(JNIEnv*, jobject) {
     LOGI("VIO stopped");
 }
 
-// ── processCameraFrame ────────────────────────────────────────────────────────
-
+// DEAD CODE: processCameraFrame (old ByteArray version) — Kotlin caller commented out,
+// superseded by processCameraFrameDirect (zero-copy CameraX ByteBuffer path)
+/*
 JNIEXPORT jobject JNICALL
 Java_com_example_navsight1_NativeBridge_processCameraFrame(
         JNIEnv* env,
-        jobject /* thiz */,
+        jobject,
         jbyteArray frameData,
         jint width,
         jint height,
         jlong timestamp) {
 
-    // Snapshot g_vision pointer under lock to prevent use-after-free with stopVIO
     VioEngine* vision = nullptr;
     {
         std::lock_guard<std::mutex> lock(state_mutex);
         vision = g_vision;
     }
 
-    // Run VIO pipeline outside the state lock (VioEngine has its own locks)
     VisionOutput output{};
     output.valid = false;
 
@@ -164,27 +163,24 @@ Java_com_example_navsight1_NativeBridge_processCameraFrame(
         }
     }
 
-    // Update accumulated pose under lock
     {
         std::lock_guard<std::mutex> lock(state_mutex);
         if (output.valid && !output.R.empty() && !output.t.empty()) {
             g_x = output.t.at<double>(0);
             g_y = output.t.at<double>(1);
             g_z = output.t.at<double>(2);
-            g_scale = output.estimatedScale; 
-            
-            // RAW VO
+            g_scale = output.estimatedScale;
+
             g_raw_x = output.rawT.empty() ? 0.0 : output.rawT.at<double>(0);
             g_raw_y = output.rawT.empty() ? 0.0 : output.rawT.at<double>(1);
             g_raw_z = output.rawT.empty() ? 0.0 : output.rawT.at<double>(2);
-            
+
             if (!output.rawR.empty()) {
                 cv::Mat rv;
                 cv::Rodrigues(output.rawR, rv);
                 g_raw_yaw = rv.at<double>(1);
             }
 
-            // Diagnostic fields
             g_mean_flow = output.meanFlow;
             g_inlier_count = output.inlierCount;
             g_step_count = output.stepCount;
@@ -193,9 +189,8 @@ Java_com_example_navsight1_NativeBridge_processCameraFrame(
             g_pose_flags = output.poseFlags;
             g_heading = output.heading;
 
-            // Derive Euler angles from the GLOBAL rotation for display
             const cv::Mat& R = output.R;
-            g_pitch = std::asin(-R.at<double>(1, 2)); 
+            g_pitch = std::asin(-R.at<double>(1, 2));
             if (std::abs(std::cos(g_pitch)) > 1e-6) {
                 g_roll = std::atan2(R.at<double>(0, 2), R.at<double>(2, 2));
                 g_yaw  = std::atan2(R.at<double>(1, 0), R.at<double>(1, 1));
@@ -206,14 +201,11 @@ Java_com_example_navsight1_NativeBridge_processCameraFrame(
         }
     }
 
-
-    // ── Build VioData Java object (using cached class/ctor from JNI_OnLoad) ───
     if (!g_viodata_cls || !g_viodata_ctor) {
         LOGE("processCameraFrame: VioData JNI cache not initialized");
         return nullptr;
     }
 
-    // Build the tracked-points float array — null-check before use
     jfloatArray pointsArray = env->NewFloatArray(
             static_cast<jsize>(output.trackedPoints.size()));
     if (!pointsArray) {
@@ -226,7 +218,6 @@ Java_com_example_navsight1_NativeBridge_processCameraFrame(
                                  output.trackedPoints.data());
     }
 
-    // Snapshot state for return
     double ret_x, ret_y, ret_z, ret_roll, ret_pitch, ret_yaw;
     double ret_quality, ret_scale;
     double ret_rx, ret_ry, ret_rz, ret_ryaw;
@@ -275,6 +266,7 @@ Java_com_example_navsight1_NativeBridge_processCameraFrame(
             ret_pose_flags, ret_heading,
             ret_td_imu_cam);
 }
+*/
 
 // ── processCameraFrameDirect (zero-copy CameraX) ────────────────────────────
 // Accepts direct ByteBuffers from CameraX ImageProxy planes.
@@ -599,11 +591,12 @@ Java_com_example_navsight1_NativeBridge_setUserHeight(
     }
 }
 
-// ── setMagnetometerHeading ───────────────────────────────────────────────────
-
+// DEAD CODE: setMagnetometerHeading JNI — Kotlin caller commented out in NativeBridge.kt
+// (IMUPreintegrator::setMagnetometerHeading itself is still live — called by InertialInitializer)
+/*
 JNIEXPORT void JNICALL
 Java_com_example_navsight1_NativeBridge_setMagnetometerHeading(
-        JNIEnv*, jobject /* thiz */, jfloat yawRad) {
+        JNIEnv*, jobject, jfloat yawRad) {
     VioEngine* vision = nullptr;
     {
         std::lock_guard<std::mutex> lock(state_mutex);
@@ -613,6 +606,7 @@ Java_com_example_navsight1_NativeBridge_setMagnetometerHeading(
         vision->setMagnetometerHeading(static_cast<float>(yawRad));
     }
 }
+*/
 
 } // extern "C"
 

@@ -40,9 +40,10 @@ public:
     void initialize(double initial_scale);
     void updateScale(double observed_scale, double confidence);
     void updateZUPT();
-    double checkConsistency(double camera_disp, double step_disp) const;
+    // DEAD CODE: checkConsistency, getScaleStd — never called
+    // double checkConsistency(double camera_disp, double step_disp) const;
     double getScale() const { return scale_; }
-    double getScaleStd() const;
+    // double getScaleStd() const;
     void reset();
 
     // --- Full Error-State MSCKF ---
@@ -78,17 +79,18 @@ public:
     const std::deque<CameraPose>& getWindow() const { return window_; }
     int getLatestCloneId() const;
 
-    // FEJ consistency
-    void getFEJ(int state_id, cv::Mat& R_fej, cv::Mat& p_fej) const;
+    // DEAD CODE: getFEJ — only used by disabled MSCKF updater
+    // void getFEJ(int state_id, cv::Mat& R_fej, cv::Mat& p_fej) const;
 
     // IMU state accessors
     cv::Mat getRotation() const { return R_GtoI_.clone(); }
     cv::Mat getPosition() const { return p_G_.clone(); }
-    cv::Mat getVelocity() const { return v_G_.clone(); }
+    // DEAD CODE: getVelocity — never called
+    // cv::Mat getVelocity() const { return v_G_.clone(); }
     bool isFullInitialized() const { return full_initialized_; }
 
-    // Online Spatiotemporal Calibration
-    void updateTemporal(double observed_scale, double confidence, double H_td);
+    // DEAD CODE: updateTemporal — never called
+    // void updateTemporal(double observed_scale, double confidence, double H_td);
     void setTimeOffset(double td_seconds);
     double getTimeOffset() const { return t_offset_cam_imu_; }
     double getTimeOffsetStd() const { return std::sqrt(std::max(0.0, P_td_)); }

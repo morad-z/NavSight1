@@ -32,16 +32,17 @@ add_library(
         src/main/cpp/native-lib.cpp
         src/main/cpp/VioEngine.cpp
         src/main/cpp/Tracker.cpp
-        src/main/cpp/Mapper.cpp
+        # DISABLED: Mapper pipeline — output was discarded (applyMapperResult was a no-op)
+        # src/main/cpp/Mapper.cpp
+        # src/main/cpp/LoopClosureDetector.cpp
+        # src/main/cpp/PoseGraph.cpp
         src/main/cpp/IMUPreintegrator.cpp
-        src/main/cpp/LoopClosureDetector.cpp
         src/main/cpp/EKFState.cpp
         src/main/cpp/FeatureManager.cpp
         src/main/cpp/LensCorrector.cpp
         src/main/cpp/TrackKLT.cpp
         src/main/cpp/UpdaterZeroVelocity.cpp
         src/main/cpp/UpdaterMSCKF.cpp
-        src/main/cpp/PoseGraph.cpp
         src/main/cpp/InertialInitializer.cpp
 )
 

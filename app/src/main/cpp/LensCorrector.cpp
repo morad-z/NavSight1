@@ -18,20 +18,11 @@ void LensCorrector::setIntrinsics(double fx, double fy, double cx, double cy) {
     has_intrinsics_ = true;
 }
 
-void LensCorrector::setDistortion(double k1, double k2, double p1, double p2, double k3) {
-    dist_coeffs_ = (cv::Mat_<double>(5, 1) << k1, k2, p1, p2, k3);
-    LOGI("Distortion set: k1=%.4f k2=%.4f p1=%.4f p2=%.4f k3=%.4f", k1, k2, p1, p2, k3);
-}
+// DEAD CODE: setDistortion — never called (default zero distortion used)
+// void LensCorrector::setDistortion(double k1, double k2, double p1, double p2, double k3) { ... }
 
-void LensCorrector::undistortPoints(std::vector<cv::Point2f>& points) const {
-    if (!has_intrinsics_ || points.empty()) return;
-
-    // undistortPoints outputs normalized coords; we re-project to pixel coords
-    std::vector<cv::Point2f> undistorted;
-    cv::undistortPoints(points, undistorted, camera_matrix_, dist_coeffs_,
-                        cv::noArray(), camera_matrix_);
-    points = std::move(undistorted);
-}
+// DEAD CODE: undistortPoints (single-set) — never called; only undistortMatchedPoints is used
+// void LensCorrector::undistortPoints(std::vector<cv::Point2f>& points) const { ... }
 
 void LensCorrector::undistortMatchedPoints(std::vector<cv::Point2f>& prev,
                                             std::vector<cv::Point2f>& next) const {

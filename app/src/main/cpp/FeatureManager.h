@@ -44,7 +44,8 @@ public:
                               std::vector<cv::Point2f>& kf_matched,
                               std::vector<cv::Point2f>& cur_matched) const;
 
-    int getKeyframeCount() const { return static_cast<int>(keyframes_.size()); }
+    // DEAD CODE: getKeyframeCount — never called
+    // int getKeyframeCount() const { return static_cast<int>(keyframes_.size()); }
     void reset();
 
     // ── MSCKF Feature Track Management ──────────────────────────────────────
@@ -66,7 +67,8 @@ public:
     // Remove observations referencing clones that have been marginalized.
     void pruneObservations(int min_clone_id);
 
-    int getNextFeatureId() const { return next_feature_id_; }
+    // DEAD CODE: getNextFeatureId — never called
+    // int getNextFeatureId() const { return next_feature_id_; }
 
 private:
     int countInCell(const std::vector<cv::Point2f>& points,

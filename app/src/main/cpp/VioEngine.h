@@ -2,16 +2,14 @@
 #include "VioTypes.h"
 #include "IMUPreintegrator.h"
 #include "Tracker.h"
-#include "Mapper.h"
-#include <thread>
+// DISABLED: Mapper pipeline — applyMapperResult was a no-op (corrections caused teleportation).
+// Mapper, LoopClosureDetector, PoseGraph all run but output is discarded. Disabled to save CPU/battery.
+// #include "Mapper.h"
 #include <mutex>
-#include <condition_variable>
-#include <atomic>
 
 // Top-level VIO orchestrator.
 // Tracker runs on the camera thread (fast path).
-// Mapper runs on a dedicated background thread (heavy optimization).
-// Mapper corrections are applied asynchronously when ready.
+// Mapper pipeline DISABLED — was running but output discarded.
 class VioEngine {
 public:
     VioEngine();
@@ -32,29 +30,30 @@ public:
     IMUPreintegrator& getIMU() { return imu_; }
 
 private:
-    void mapperThreadFunc();
-    void applyMapperResult(const MapperResult& mr, VisionOutput& out);
+    // DISABLED: Mapper pipeline (applyMapperResult was a no-op)
+    // void mapperThreadFunc();
+    // void applyMapperResult(const MapperResult& mr, VisionOutput& out);
 
     IMUPreintegrator imu_;
     Tracker tracker_;
-    Mapper mapper_;
 
-    // Mapper background thread
-    std::thread mapper_thread_;
-    std::mutex mapper_mutex_;
-    std::condition_variable mapper_cv_;
-    std::atomic<bool> mapper_stop_{false};
-    bool mapper_has_work_{false};
-    TrackerFrame mapper_pending_frame_;
-    double mapper_pending_scale_{0.0};
+    // DISABLED: Mapper + background thread — output was discarded via no-op applyMapperResult
+    // Mapper mapper_;
+    // std::thread mapper_thread_;
+    // std::mutex mapper_mutex_;
+    // std::condition_variable mapper_cv_;
+    // std::atomic<bool> mapper_stop_{false};
+    // bool mapper_has_work_{false};
+    // TrackerFrame mapper_pending_frame_;
+    // double mapper_pending_scale_{0.0};
 
-    // Depth map (monocular inference result)
-    std::mutex         depth_mutex_;
-    std::vector<float> latest_depth_map_;
-    int                depth_width_{0}, depth_height_{0};
+    // DISABLED: Depth map storage — only forwarded to Mapper which is disabled
+    // std::mutex         depth_mutex_;
+    // std::vector<float> latest_depth_map_;
+    // int                depth_width_{0}, depth_height_{0};
 
-    // Latest mapper result (consumed by next processFrame)
-    std::mutex result_mutex_;
-    MapperResult latest_mapper_result_{};
-    bool has_mapper_result_{false};
+    // DISABLED: Mapper result pickup
+    // std::mutex result_mutex_;
+    // MapperResult latest_mapper_result_{};
+    // bool has_mapper_result_{false};
 };
