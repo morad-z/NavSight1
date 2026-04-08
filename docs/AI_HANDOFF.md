@@ -113,7 +113,7 @@ on_device_testing: "TESTED 2026-04-08 — app launches, no crash after cleanup"
 # BUG-012: IMPROVED (tracking quality oscillates — acceptable)
 # BUG-013: FIXED_VERIFIED (heading stable when stationary)
 # BUG-015: RESOLVED — Mapper thread disabled, no more data race
-# BUG-016: still exists but mitigated (processCameraFrame ByteArray version commented out)
+# BUG-016: FIXED — PR #11 (Tamir): shared_ptr<VioEngine> in native-lib.cpp
 # BUG-017: RESOLVED — Mapper/LoopClosure disabled
 # BUG-018: RESOLVED — Mapper thread disabled entirely
 
@@ -130,13 +130,11 @@ on_device_testing: "TESTED 2026-04-08 — app launches, no crash after cleanup"
 
 - id: "BUG-016"
   title: "use-after-free risk in native-lib processCameraFrameDirect"
-  status: "OPEN"
+  status: "FIXED"
   severity: "P1"
-  owner: "morad"
+  owner: "tamir"
   file: "app/src/main/cpp/native-lib.cpp"
-  description: >
-    Raw pointer snapshot of g_vision used after releasing lock. If stopVIO()
-    deletes it concurrently, use-after-free. Fix: shared_ptr<VioEngine>.
+  fixed_by: "PR #11 (2026-04-09) — shared_ptr<VioEngine> + snapshot-under-lock pattern"
 ```
 
 ---
@@ -323,7 +321,7 @@ resume_context: >
   REFERENCE COMMIT: 10fb69a = best drift (5.4%, 1.2m on 22m).
 partial_state: "NONE — all changes committed, build passes"
 warnings:
-  - "BUG-016 (use-after-free) can crash on VIO stop/restart — fix before release"
+  - "BUG-016 FIXED by Tamir PR #11 (shared_ptr) — merged 2026-04-09"
   - "V-shape fix not yet tested on device — needs 180° turn simulation"
   - "MiDaS depth constraint hasn't fired in any simulation yet"
   - "Places API search needs Google Cloud billing enabled"
