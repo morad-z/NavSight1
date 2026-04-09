@@ -103,10 +103,17 @@ private:
     // Phase 5: Magnetometer heading used ONCE at startup only
     bool heading_initialized_{false};
 
-    // Scalar heading tracker (gravity-projected yaw rate from gyro)
-    // Fixes coordinate system bug: atan2(R[1,0], R[0,0]) only captures Z-rotation,
-    // but phone yaw is around gravity (Y-axis), so turns were under-reported.
+    // Heading cache. No longer integrated here — derived each frame from
+    // IMUPreintegrator::getHeading() (Madgwick filter) + heading_offset_.
+    // heading_offset_ captures: (a) the initial heading set via mag/GPS
+    // startup bias, and (b) visual keyframe drift corrections. Madgwick
+    // owns the physics; the offset is a small affine correction.
     double scalar_heading_{0.0};
+    double heading_offset_{0.0};
+    // Pending init heading from setInitialHeading() — applied inside
+    // processFrame once Madgwick is live so the offset is rebased correctly.
+    double pending_init_heading_{0.0};
+    bool   pending_init_heading_set_{false};
     double filtered_yaw_rate_{0.0};  // Low-pass filtered yaw rate (removes step oscillation)
 
     // Phase 7: FEJ heading — locked at first pose_valid frame

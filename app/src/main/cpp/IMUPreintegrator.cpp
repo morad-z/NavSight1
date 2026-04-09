@@ -87,12 +87,23 @@ void IMUPreintegrator::addGyroReading(int64_t timestamp_ns, float x, float y, fl
     }
     std::lock_guard<std::mutex> lock(mutex_);
     last_gx = x; last_gy = y; last_gz = z;
+    // Low-pass filtered |gyro| magnitude — used to suppress phantom step
+    // detection and walking classification while the user is rotating in place
+    // or turning during a walk (otherwise arm swing during turns triggers
+    // is_walking_pattern_ and phantom position advance).
+    const float gmag = std::sqrt(x * x + y * y + z * z);
+    constexpr float GYRO_LP_ALPHA = 0.15f;  // ~7 samples time constant at 200 Hz
+    gyro_mag_filtered_ = (1.0f - GYRO_LP_ALPHA) * gyro_mag_filtered_ + GYRO_LP_ALPHA * gmag;
     if (gyro_buf_.size() >= MAX_BUF) {
         // Erase oldest half in one shot to amortise O(n) cost
         gyro_buf_.erase(gyro_buf_.begin(),
                         gyro_buf_.begin() + static_cast<ptrdiff_t>(MAX_BUF / 2));
     }
     gyro_buf_.push_back({timestamp_ns, x, y, z});
+
+    // Madgwick attitude update — driven by every gyro sample so orientation
+    // tracks at full IMU rate regardless of camera frame cadence.
+    updateMadgwickLocked(timestamp_ns, x, y, z);
 }
 
 // ── addAccelReading ───────────────────────────────────────────────────────────
@@ -393,9 +404,15 @@ void IMUPreintegrator::updateMotionMode(int64_t timestamp_ns, float ax, float ay
 
     // ── SMARTER CLASSIFICATION ──────────────────────────────────────────────
     // Use Hysteresis: harder to start walking than to keep walking.
-    if (!is_walking_pattern_ && accel_variance_est_ > 0.20f) {
+    // BUG FIX (V-shape / rotate-in-place): also drop out of walking when the
+    // user is rotating fast (>~46°/s). Arm swing and centripetal accel during
+    // turns produce plenty of accel variance, so without this gate the pattern
+    // latches true and phantom steps keep firing through the turn.
+    const bool rotating_fast = (gyro_mag_filtered_ > 0.8f);
+    if (!is_walking_pattern_ && accel_variance_est_ > 0.20f && !rotating_fast) {
         is_walking_pattern_ = true;
-    } else if (is_walking_pattern_ && accel_variance_est_ < 0.05f) {
+    } else if (is_walking_pattern_ &&
+               (accel_variance_est_ < 0.05f || rotating_fast)) {
         is_walking_pattern_ = false;
     }
 
@@ -452,6 +469,12 @@ void IMUPreintegrator::detectStep(int64_t timestamp_ns, float ax, float ay, floa
 
     // Reject steps if accel pattern doesn't match walking (filters car vibrations)
     if (!is_walking_pattern_) return;
+
+    // Reject steps during fast rotation. Turning in place (or mid-walk turn)
+    // shakes the phone enough to trip peak detection; without this gate the
+    // step counter keeps ticking through a turn and Tracker's PDR fallback
+    // advances global position along the rotating heading → V-shape / arc.
+    if (gyro_mag_filtered_ > 0.8f) return;
 
     // Peak detection with hysteresis
     if (!was_above_thresh_ && accel_mag_filtered_ > STEP_ACCEL_THRESH_HIGH) {
@@ -548,6 +571,7 @@ void IMUPreintegrator::reset() {
     accel_mag_slow_ = 9.81f;
     accel_variance_est_ = 0.0f;
     is_walking_pattern_ = false;
+    gyro_mag_filtered_ = 0.0f;
     vehicle_speed_mps_ = 0.0;
     last_accel_ts_ns_ = 0;
     sustained_accel_s_ = 0.0;
@@ -558,6 +582,214 @@ void IMUPreintegrator::reset() {
     gyro_bias_samples_ = 0;
     has_mag_heading_.store(false);  // Reset mag heading
     mag_heading_ = 0.f;
+    // Madgwick state
+    q0_ = 1.0; q1_ = 0.0; q2_ = 0.0; q3_ = 0.0;
+    madgwick_last_ns_ = 0;
+    madgwick_init_.store(false);
+}
+
+void IMUPreintegrator::resetOrientationFilter() {
+    std::lock_guard<std::mutex> lock(mutex_);
+    q0_ = 1.0; q1_ = 0.0; q2_ = 0.0; q3_ = 0.0;
+    madgwick_last_ns_ = 0;
+    madgwick_init_.store(false);
+}
+
+// ── Madgwick IMU-only attitude filter ───────────────────────────────────────
+//
+// Reference: S. Madgwick, "An efficient orientation filter for inertial and
+// inertial/magnetic sensor arrays", 2010. IMU-only (no magnetometer) branch.
+//
+// State: unit quaternion q = (q0, q1, q2, q3) representing the rotation that
+// takes a vector from the sensor body frame to the world frame. Hamilton
+// convention. World frame is gravity-aligned: +Z up, +X arbitrary horizontal
+// (locked at init), yaw accumulates freely from gyro and is corrected by
+// accelerometer only through roll/pitch (accel cannot constrain yaw alone).
+//
+// Update rule per sample:
+//   1. q̇_ω = 0.5 · q ⊗ (0, gx, gy, gz)             (gyro prediction)
+//   2. If accel in valid window, compute gradient of gravity-alignment
+//      objective ∇f and correct: q̇ = q̇_ω − β · ∇f/|∇f|
+//   3. q ← normalize(q + q̇ · dt)
+//
+// β is the convergence gain — trades drift suppression vs noise bleed-through.
+// Per plan, β = 0.033 for ~200 Hz IMU.
+
+void IMUPreintegrator::tryInitMadgwickLocked() {
+    if (madgwick_init_.load()) return;
+    // Need at least one accel sample to orient the quaternion to gravity.
+    if (!filtered_gravity_init_) return;
+    const float ax = filtered_gravity_.x;
+    const float ay = filtered_gravity_.y;
+    const float az = filtered_gravity_.z;
+    const float amag = std::sqrt(ax * ax + ay * ay + az * az);
+    if (amag < 1e-3f) return;
+
+    // Tait-Bryan roll/pitch from gravity in body frame, yaw=0.
+    // World frame: gravity points along +Z_world (down? — here we define
+    // gravity along +Z_world at +9.81, which matches the existing
+    // filtered_gravity_ convention where a phone held flat reads +Z≈9.81).
+    const double roll  = std::atan2(ay, az);
+    const double pitch = std::atan2(-static_cast<double>(ax),
+                                    std::sqrt(static_cast<double>(ay) * ay +
+                                              static_cast<double>(az) * az));
+    const double yaw   = 0.0;
+
+    // ZYX Euler (yaw-pitch-roll) → quaternion (Hamilton).
+    const double cr = std::cos(roll * 0.5);
+    const double sr = std::sin(roll * 0.5);
+    const double cp = std::cos(pitch * 0.5);
+    const double sp = std::sin(pitch * 0.5);
+    const double cy = std::cos(yaw * 0.5);
+    const double sy = std::sin(yaw * 0.5);
+    q0_ = cr * cp * cy + sr * sp * sy;
+    q1_ = sr * cp * cy - cr * sp * sy;
+    q2_ = cr * sp * cy + sr * cp * sy;
+    q3_ = cr * cp * sy - sr * sp * cy;
+    madgwick_init_.store(true);
+    LOGI("Madgwick: initialized roll=%.1f pitch=%.1f yaw=0 (q=[%.3f %.3f %.3f %.3f])",
+         roll * 180.0 / M_PI, pitch * 180.0 / M_PI, q0_, q1_, q2_, q3_);
+}
+
+void IMUPreintegrator::updateMadgwickLocked(int64_t timestamp_ns,
+                                            float gx_raw, float gy_raw, float gz_raw) {
+    if (!madgwick_init_.load()) {
+        tryInitMadgwickLocked();
+        if (!madgwick_init_.load()) {
+            madgwick_last_ns_ = timestamp_ns;
+            return;
+        }
+        madgwick_last_ns_ = timestamp_ns;
+        return;
+    }
+
+    // dt from consecutive gyro samples
+    double dt = 0.0;
+    if (madgwick_last_ns_ > 0) {
+        dt = static_cast<double>(timestamp_ns - madgwick_last_ns_) * 1e-9;
+    }
+    madgwick_last_ns_ = timestamp_ns;
+    // Guard against clock hiccups and the very first step
+    if (dt <= 0.0 || dt > 0.1) return;
+
+    // Bias-corrected gyro
+    const double gx = static_cast<double>(gx_raw) - gyro_bias_.x;
+    const double gy = static_cast<double>(gy_raw) - gyro_bias_.y;
+    const double gz = static_cast<double>(gz_raw) - gyro_bias_.z;
+
+    // Quaternion derivative from gyro
+    // q̇ω = 0.5 · q ⊗ (0, gx, gy, gz)
+    double qDot0 = 0.5 * (-q1_ * gx - q2_ * gy - q3_ * gz);
+    double qDot1 = 0.5 * ( q0_ * gx + q2_ * gz - q3_ * gy);
+    double qDot2 = 0.5 * ( q0_ * gy - q1_ * gz + q3_ * gx);
+    double qDot3 = 0.5 * ( q0_ * gz + q1_ * gy - q2_ * gx);
+
+    // Accelerometer correction — only if accel is a trustworthy gravity
+    // sample. During fast rotation centripetal accel biases the reference,
+    // during freefall gravity disappears, during shocks the magnitude spikes.
+    const double ax_raw = last_ax;
+    const double ay_raw = last_ay;
+    const double az_raw = last_az;
+    const double aNormSq = ax_raw * ax_raw + ay_raw * ay_raw + az_raw * az_raw;
+    const double aNorm = std::sqrt(aNormSq);
+    if (aNorm > MADGWICK_ACC_MIN && aNorm < MADGWICK_ACC_MAX) {
+        // Normalise accel
+        const double ax = ax_raw / aNorm;
+        const double ay = ay_raw / aNorm;
+        const double az = az_raw / aNorm;
+
+        // Gradient descent correction step (standard Madgwick IMU-only):
+        // objective f = R^T · ĝ − â, where ĝ=(0,0,1), â = normalized accel.
+        // Closed-form ∇f computed below (from Madgwick 2010 eq. 25).
+        const double _2q0 = 2.0 * q0_;
+        const double _2q1 = 2.0 * q1_;
+        const double _2q2 = 2.0 * q2_;
+        const double _2q3 = 2.0 * q3_;
+        const double _4q0 = 4.0 * q0_;
+        const double _4q1 = 4.0 * q1_;
+        const double _4q2 = 4.0 * q2_;
+        const double _8q1 = 8.0 * q1_;
+        const double _8q2 = 8.0 * q2_;
+        const double q0q0 = q0_ * q0_;
+        const double q1q1 = q1_ * q1_;
+        const double q2q2 = q2_ * q2_;
+        const double q3q3 = q3_ * q3_;
+
+        double s0 = _4q0 * q2q2 + _2q2 * ax + _4q0 * q1q1 - _2q1 * ay;
+        double s1 = _4q1 * q3q3 - _2q3 * ax + 4.0 * q0q0 * q1_ - _2q0 * ay
+                    - _4q1 + _8q1 * q1q1 + _8q1 * q2q2 + _4q1 * az;
+        double s2 = 4.0 * q0q0 * q2_ + _2q0 * ax + _4q2 * q3q3 - _2q3 * ay
+                    - _4q2 + _8q2 * q1q1 + _8q2 * q2q2 + _4q2 * az;
+        double s3 = 4.0 * q1q1 * q3_ - _2q1 * ax + 4.0 * q2q2 * q3_ - _2q2 * ay;
+
+        // Normalise gradient (avoid div-by-zero)
+        const double sNorm = std::sqrt(s0 * s0 + s1 * s1 + s2 * s2 + s3 * s3);
+        if (sNorm > 1e-9) {
+            const double inv = 1.0 / sNorm;
+            s0 *= inv; s1 *= inv; s2 *= inv; s3 *= inv;
+
+            // Apply feedback
+            qDot0 -= MADGWICK_BETA * s0;
+            qDot1 -= MADGWICK_BETA * s1;
+            qDot2 -= MADGWICK_BETA * s2;
+            qDot3 -= MADGWICK_BETA * s3;
+        }
+    }
+
+    // Integrate
+    q0_ += qDot0 * dt;
+    q1_ += qDot1 * dt;
+    q2_ += qDot2 * dt;
+    q3_ += qDot3 * dt;
+
+    // Renormalise
+    const double qNormSq = q0_ * q0_ + q1_ * q1_ + q2_ * q2_ + q3_ * q3_;
+    if (qNormSq > 1e-9) {
+        const double invQ = 1.0 / std::sqrt(qNormSq);
+        q0_ *= invQ; q1_ *= invQ; q2_ *= invQ; q3_ *= invQ;
+    } else {
+        // Catastrophic — reinit on next sample
+        madgwick_init_.store(false);
+    }
+}
+
+void IMUPreintegrator::getOrientationQuaternion(double& q0, double& q1,
+                                                double& q2, double& q3) const {
+    std::lock_guard<std::mutex> lock(mutex_);
+    q0 = q0_; q1 = q1_; q2 = q2_; q3 = q3_;
+}
+
+float IMUPreintegrator::getHeading() const {
+    std::lock_guard<std::mutex> lock(mutex_);
+    if (!madgwick_init_.load()) return 0.f;
+    // Extract yaw (ZYX convention) from Hamilton quaternion.
+    //   yaw_math = atan2(2(q0*q3 + q1*q2), 1 - 2(q2² + q3²))  (CCW-positive)
+    // Navigation convention is CW-positive (North=0, East=+π/2), so negate.
+    const double siny_cosp = 2.0 * (q0_ * q3_ + q1_ * q2_);
+    const double cosy_cosp = 1.0 - 2.0 * (q2_ * q2_ + q3_ * q3_);
+    const double yaw_math  = std::atan2(siny_cosp, cosy_cosp);
+    double yaw_nav = -yaw_math;
+    while (yaw_nav >  M_PI) yaw_nav -= 2.0 * M_PI;
+    while (yaw_nav < -M_PI) yaw_nav += 2.0 * M_PI;
+    return static_cast<float>(yaw_nav);
+}
+
+float IMUPreintegrator::getMadgwickRoll() const {
+    std::lock_guard<std::mutex> lock(mutex_);
+    if (!madgwick_init_.load()) return 0.f;
+    const double sinr_cosp = 2.0 * (q0_ * q1_ + q2_ * q3_);
+    const double cosr_cosp = 1.0 - 2.0 * (q1_ * q1_ + q2_ * q2_);
+    return static_cast<float>(std::atan2(sinr_cosp, cosr_cosp));
+}
+
+float IMUPreintegrator::getMadgwickPitch() const {
+    std::lock_guard<std::mutex> lock(mutex_);
+    if (!madgwick_init_.load()) return 0.f;
+    const double sinp = 2.0 * (q0_ * q2_ - q3_ * q1_);
+    if (std::abs(sinp) >= 1.0) {
+        return static_cast<float>(std::copysign(M_PI / 2.0, sinp));
+    }
+    return static_cast<float>(std::asin(sinp));
 }
 
 // ── Gyroscope bias initialization ─────────────────────────────────────────────

@@ -122,6 +122,21 @@ public:
     // Uses recent gyro samples to nudge bias estimate with small alpha
     void refineGyroBiasDuringZUPT();
 
+    // ── Madgwick IMU-only attitude filter ───────────────────────────────────
+    // Full orientation as a unit quaternion (Hamilton, body→world).
+    // Driven from every gyro sample with accelerometer correction toward
+    // gravity. Replaces the scalar gravity-projected-yaw accumulator that
+    // was corrupted by centripetal acceleration during fast rotation.
+    // Returns (q0=w, q1=x, q2=y, q3=z).
+    void getOrientationQuaternion(double& q0, double& q1, double& q2, double& q3) const;
+    // Heading (yaw) in radians, CW-positive (navigation convention,
+    // North=0, East=+π/2). Wraps to [-π, π].
+    float getHeading() const;
+    float getMadgwickRoll() const;
+    float getMadgwickPitch() const;
+    bool  isOrientationInitialized() const { return madgwick_init_.load(); }
+    void  resetOrientationFilter();
+
 private:
     mutable std::mutex mutex_;
     std::vector<GyroSample>  gyro_buf_;
@@ -161,6 +176,8 @@ private:
     float accel_mag_slow_{9.81f};     // Very slow LP for walking detection (alpha ~0.02)
     float accel_variance_est_{0.0f};  // Running variance of accel magnitude
     bool is_walking_pattern_{false};  // True if recent accel matches walking, not vibration
+    float gyro_mag_filtered_{0.0f};   // Low-pass filtered |gyro| in rad/s
+                                      // Used to suppress phantom steps during in-place rotation
 
     // Vehicle motion detection
     double vehicle_speed_mps_{0.0};   // Integrated forward acceleration
@@ -172,6 +189,26 @@ private:
     void updateMotionMode(int64_t timestamp_ns, float ax, float ay, float az);
     void tryInitializeGravityLocked(float ax, float ay, float az);
     void tryInitializeGyroBiasLocked(float ax, float ay, float az);
+
+    // Madgwick: called from addGyroReading under mutex_. Uses bias-corrected
+    // gyro and (when accel magnitude is in [5, 20] m/s²) the last accel
+    // sample as a gravity reference.
+    void updateMadgwickLocked(int64_t timestamp_ns, float gx, float gy, float gz);
+    // Lazy init from current filtered_gravity_ (roll/pitch only; yaw = 0).
+    void tryInitMadgwickLocked();
+
+    // Madgwick state (unit quaternion, Hamilton body→world, w first).
+    double q0_{1.0}, q1_{0.0}, q2_{0.0}, q3_{0.0};
+    int64_t madgwick_last_ns_{0};
+    std::atomic<bool> madgwick_init_{false};
+    // Filter gain — tuned for ~200 Hz IMU. Higher β → faster accel
+    // correction (more drift suppression) but more noise bleed-through.
+    static constexpr float MADGWICK_BETA = 0.033f;
+    // Accel validity gate: reject accel correction when |a| is outside
+    // this window (centripetal accel during fast rotation, freefall, or
+    // shock). Gyro still integrates, so orientation keeps advancing.
+    static constexpr float MADGWICK_ACC_MIN = 5.0f;   // m/s²
+    static constexpr float MADGWICK_ACC_MAX = 20.0f;  // m/s²
 
     // Bias estimates
     cv::Point3f gyro_bias_{0.f, 0.f, 0.f};              // Estimated bias in rad/sec
