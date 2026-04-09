@@ -85,6 +85,17 @@ JNIEXPORT jint JNI_OnLoad(JavaVM* vm, void* /*reserved*/) {
     return JNI_VERSION_1_6;
 }
 
+JNIEXPORT void JNI_OnUnload(JavaVM* vm, void* /*reserved*/) {
+    JNIEnv* env = nullptr;
+    if (vm->GetEnv(reinterpret_cast<void**>(&env), JNI_VERSION_1_6) != JNI_OK) return;
+    if (g_viodata_cls) {
+        env->DeleteGlobalRef(g_viodata_cls);
+        g_viodata_cls  = nullptr;
+        g_viodata_ctor = nullptr;
+    }
+    LOGI("JNI_OnUnload: GlobalRef released");
+}
+
 extern "C" {
 
 // ── startVIO ──────────────────────────────────────────────────────────────────

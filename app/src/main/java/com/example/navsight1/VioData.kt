@@ -70,6 +70,10 @@ data class VioData(
         if (estimatedScale != other.estimatedScale) return false
         if (isInitialized != other.isInitialized) return false
         if (!trackedPoints.contentEquals(other.trackedPoints)) return false
+        if (rawX != other.rawX) return false
+        if (rawY != other.rawY) return false
+        if (rawZ != other.rawZ) return false
+        if (rawYaw != other.rawYaw) return false
         if (accelX != other.accelX) return false
         if (accelY != other.accelY) return false
         if (accelZ != other.accelZ) return false
@@ -83,6 +87,7 @@ data class VioData(
         if (strideLength != other.strideLength) return false
         if (poseFlags != other.poseFlags) return false
         if (heading != other.heading) return false
+        if (tdImuCam != other.tdImuCam) return false
 
         return true
     }
@@ -113,6 +118,7 @@ data class VioData(
         result = 31 * result + strideLength.hashCode()
         result = 31 * result + poseFlags
         result = 31 * result + heading.hashCode()
+        result = 31 * result + tdImuCam.hashCode()
         return result
     }
 }

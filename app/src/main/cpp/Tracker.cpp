@@ -74,28 +74,45 @@ void Tracker::applyDepthScaleConstraint(
         int img_width, int img_height,
         const IMUPreintegrator& imu) {
 
+    LOGI("DEPTH_SCALE: entry pts3d=%zu pts2d=%zu", pts3d.size(), pts2d.size());
+
     std::vector<float> depth_copy;
     int dw, dh;
     {
         std::lock_guard<std::mutex> lock(depth_mutex_);
-        if (depth_map_.empty()) return;
+        if (depth_map_.empty()) {
+            LOGI("DEPTH_SCALE: BAILOUT no depth map");
+            return;
+        }
         depth_copy = depth_map_;
         dw = depth_width_;
         dh = depth_height_;
     }
 
-    if (pts3d.size() < 15 || pts2d.size() != pts3d.size()) return;
-    if (fx_ <= 0 || fy_ <= 0) return;
+    if (pts3d.size() < 15 || pts2d.size() != pts3d.size()) {
+        LOGI("DEPTH_SCALE: BAILOUT too few pts3d=%zu pts2d=%zu (need 15)", pts3d.size(), pts2d.size());
+        return;
+    }
+    if (fx_ <= 0 || fy_ <= 0) {
+        LOGI("DEPTH_SCALE: BAILOUT invalid intrinsics fx=%.1f fy=%.1f", fx_, fy_);
+        return;
+    }
 
     // Camera height from user height (phone held ~0.85 * user_height)
     float user_h = imu.getUserHeight();
     double camera_h = static_cast<double>(user_h) * 0.85;
-    if (camera_h < 0.8 || camera_h > 2.2) return;
+    if (camera_h < 0.8 || camera_h > 2.2) {
+        LOGI("DEPTH_SCALE: BAILOUT camera_h=%.2f out of range [0.8, 2.2]", camera_h);
+        return;
+    }
 
     // Use gravity vector to estimate camera pitch (how much phone tilts down)
     float ax = imu.lastAccelX(), ay = imu.lastAccelY(), az = imu.lastAccelZ();
     double g_mag = std::sqrt(ax*ax + ay*ay + az*az);
-    if (g_mag < 5.0) return; // no valid gravity
+    if (g_mag < 5.0) {
+        LOGI("DEPTH_SCALE: BAILOUT g_mag=%.2f too low (no valid gravity)", g_mag);
+        return;
+    }
     // Pitch: angle between phone's Z-axis and horizontal plane
     double pitch = std::asin(std::min(1.0, std::max(-1.0, static_cast<double>(az) / g_mag)));
 
@@ -136,7 +153,10 @@ void Tracker::applyDepthScaleConstraint(
         }
     }
 
-    if (scale_ratios.size() < 8) return; // not enough confident matches
+    if (scale_ratios.size() < 8) {
+        LOGI("DEPTH_SCALE: BAILOUT only %zu floor matches (need 8)", scale_ratios.size());
+        return;
+    }
 
     // Take median ratio
     std::sort(scale_ratios.begin(), scale_ratios.end());
@@ -687,6 +707,10 @@ VisionOutput Tracker::processFrame(const uint8_t* yuv_data, int width, int heigh
                     if (vo_dist > 0.01 && dt_sec > 0.01 && dt_sec < 1.5
                         && !is_pure_rotation && !is_static) {
                         auto si = imu.getStepInfo();
+                        if (frame_counter_ % 30 == 0) {
+                            LOGI("SCALE_GATE: vo=%.4f dt=%.3f speed=%.3f rot=%d static=%d",
+                                 vo_dist, dt_sec, si.speed_mps, is_pure_rotation, is_static);
+                        }
                         if (si.speed_mps > 0.3) {
                             double step_disp = si.speed_mps * dt_sec;
                             double obs_scale = step_disp / vo_dist;
