@@ -176,9 +176,19 @@ void Tracker::setInitialHeading(double azimuth_rad) {
     std::lock_guard<std::mutex> lock(pose_mutex_);
     double c = std::cos(azimuth_rad), s = std::sin(azimuth_rad);
     global_R_ = (cv::Mat_<double>(3, 3) << c,-s,0, s,c,0, 0,0,1);
+    // Set offset so cached heading matches the requested azimuth even though
+    // Madgwick owns the physics: heading = madgwick.getHeading() + offset.
+    // At the time this is called (app startup), Madgwick is not yet
+    // initialized, so its heading is 0 — offset == azimuth_rad.
+    // If tracking is re-initialized mid-session, the next processFrame will
+    // rebase the offset against the current Madgwick heading (see init path).
+    pending_init_heading_ = azimuth_rad;
+    pending_init_heading_set_ = true;
+    heading_offset_ = azimuth_rad;
     scalar_heading_ = azimuth_rad;
     ekf_.initialize(smooth_scale_);
-    LOGI("setInitialHeading: azimuth=%.1f deg (EKF scale initialized)", azimuth_rad * 180.0 / M_PI);
+    LOGI("setInitialHeading: azimuth=%.1f deg (EKF scale initialized, offset=%.1f deg)",
+         azimuth_rad * 180.0 / M_PI, heading_offset_ * 180.0 / M_PI);
 }
 
 void Tracker::reset() {
@@ -200,6 +210,9 @@ void Tracker::reset() {
     feature_ids_.clear();
     heading_initialized_ = false;
     scalar_heading_ = 0.0;
+    heading_offset_ = 0.0;
+    pending_init_heading_set_ = false;
+    pending_init_heading_ = 0.0;
     filtered_yaw_rate_ = 0.0;
     heading_fej_set_ = false;
     heading_fej_ = 0.0;
@@ -328,10 +341,29 @@ VisionOutput Tracker::processFrame(const uint8_t* yuv_data, int width, int heigh
             cy, -sy, 0,
             sy,  cy, 0,
              0,   0, 1);
+        // Rebase offset so cached heading reads mag_yaw right now, regardless
+        // of where Madgwick's free-running yaw currently sits.
+        heading_offset_ = static_cast<double>(mag_yaw) -
+                          static_cast<double>(imu.getHeading());
         scalar_heading_ = mag_yaw;
         heading_initialized_ = true;
-        LOGI("Tracker: Initial heading set from magnetometer: %.1f deg",
-             mag_yaw * 180.0 / M_PI);
+        LOGI("Tracker: Initial heading set from magnetometer: %.1f deg "
+             "(offset=%.1f deg, madgwick=%.1f deg)",
+             mag_yaw * 180.0 / M_PI,
+             heading_offset_ * 180.0 / M_PI,
+             imu.getHeading() * 180.0 / M_PI);
+    }
+
+    // Apply any pending setInitialHeading() request now that Madgwick is live.
+    if (pending_init_heading_set_ && imu.isOrientationInitialized()) {
+        std::lock_guard<std::mutex> lock(pose_mutex_);
+        heading_offset_ = pending_init_heading_ -
+                          static_cast<double>(imu.getHeading());
+        scalar_heading_ = pending_init_heading_;
+        pending_init_heading_set_ = false;
+        LOGI("Tracker: applied pending init heading=%.1f deg, offset=%.1f deg",
+             pending_init_heading_ * 180.0 / M_PI,
+             heading_offset_ * 180.0 / M_PI);
     }
 
     // ── 4. First-frame: grid-based feature detection ─────────────────────────
@@ -532,7 +564,9 @@ VisionOutput Tracker::processFrame(const uint8_t* yuv_data, int width, int heigh
     
     // Safety overrides (relaxed: KLT has ~0.5-1.5px noise even stationary)
     if (mean_flow > 2.5) is_static = false;
-    if (is_static && imu.getStepInfo().speed_mps > 0.3) is_static = false;
+    // Don't trust step speed to break ZUPT while rotating fast — phantom steps
+    // during in-place rotation used to un-freeze translation and produce arcs.
+    if (is_static && gyro_norm < 0.8 && imu.getStepInfo().speed_mps > 0.3) is_static = false;
     if (is_static) {
         ekf_.updateZUPT();
         // Refine gyro bias while stationary — prevents heading drift during pauses
@@ -737,62 +771,33 @@ VisionOutput Tracker::processFrame(const uint8_t* yuv_data, int width, int heigh
     {
         std::lock_guard<std::mutex> lock(pose_mutex_);
 
-        // ── 9.0 Heading from gravity-projected yaw rate ──────────────────────
-        // The phone's yaw axis is the gravity direction, NOT the Z-axis.
-        // Project the gyro angular velocity onto the gravity vector to get
-        // the true yaw rate. This correctly handles any phone tilt angle.
-        //
-        // OpenVINS approach: maintains full gravity-aligned orientation and
-        // extracts heading by projecting forward onto ground plane.
-        // Our simplified approach: track heading as a scalar, project gyro
-        // onto gravity to get yaw rate. Same result for 2D navigation.
-        // Always update heading from gyro — even during ZUPT.
-        // Turning in place is common (look around, change direction before walking).
-        // Only translation is frozen during ZUPT, not rotation.
-        if (imu_delta.dt > 0.001) {
-            // Get gravity direction in phone body frame (normalized)
-            cv::Point3f grav = imu.getFilteredGravity();
-            double grav_mag = std::sqrt(grav.x*grav.x + grav.y*grav.y + grav.z*grav.z);
-            if (grav_mag > 0.1) {
-                double gn_x = grav.x / grav_mag;
-                double gn_y = grav.y / grav_mag;
-                double gn_z = grav.z / grav_mag;
+        // ── 9.0 Heading from Madgwick IMU-only attitude filter ─────────────
+        // Madgwick runs at full IMU rate inside IMUPreintegrator and returns
+        // a yaw that is NOT corrupted by centripetal accel the way the old
+        // gravity-projection integrator was. heading_offset_ carries initial
+        // mag/GPS bias plus visual keyframe corrections.
+        scalar_heading_ = static_cast<double>(imu.getHeading()) + heading_offset_;
+        while (scalar_heading_ >  M_PI) scalar_heading_ -= 2.0 * M_PI;
+        while (scalar_heading_ < -M_PI) scalar_heading_ += 2.0 * M_PI;
 
-                // Extract angular velocity from deltaR (bias already removed)
-                cv::Mat rv;
-                cv::Rodrigues(imu_delta.deltaR, rv);
-                // rv = rotation vector in rad over the interval
-                double wx = rv.at<double>(0) / imu_delta.dt;
-                double wy = rv.at<double>(1) / imu_delta.dt;
-                double wz = rv.at<double>(2) / imu_delta.dt;
-
-                // Project angular velocity onto gravity axis = yaw rate
-                // Negative sign: rotation around gravity is positive clockwise
-                // when viewed from above (navigation convention)
-                double yaw_rate = -(wx * gn_x + wy * gn_y + wz * gn_z);
-                scalar_heading_ += yaw_rate * imu_delta.dt;
-
-                // Normalize to [-π, π]
-                while (scalar_heading_ > M_PI) scalar_heading_ -= 2.0 * M_PI;
-                while (scalar_heading_ < -M_PI) scalar_heading_ += 2.0 * M_PI;
-            }
-        }
-
-        // Update global_R_ for display/output (keep 3D rotation for Euler angles)
-        if (is_static) {
-            // ZUPT: freeze rotation
-        } else {
+        // Keep global_R_ in sync for existing consumers (step 2 of the plan
+        // will retire this). During ZUPT we still freeze it so downstream
+        // translation-dependent code behaves the same.
+        if (!is_static) {
             global_R_ = global_R_ * imu_delta.deltaR;
         }
 
-        // Use scalar heading for navigation (correctly tracks turns)
         double heading = scalar_heading_;
 
         if (frame_counter_ % 30 == 0) {
-            double old_hdg = std::atan2(global_R_.at<double>(1,0), global_R_.at<double>(0,0));
-            LOGI("HEADING: scalar=%.1f° old_R=%.1f° delta=%.1f°",
-                 heading * 180.0 / M_PI, old_hdg * 180.0 / M_PI,
-                 (heading - old_hdg) * 180.0 / M_PI);
+            const float m_yaw   = imu.getHeading() * 180.0f / static_cast<float>(M_PI);
+            const float m_roll  = imu.getMadgwickRoll()  * 180.0f / static_cast<float>(M_PI);
+            const float m_pitch = imu.getMadgwickPitch() * 180.0f / static_cast<float>(M_PI);
+            LOGI("HEADING: madgwick_yaw=%.1f° roll=%.1f° pitch=%.1f° "
+                 "offset=%.1f° -> heading=%.1f°",
+                 m_yaw, m_roll, m_pitch,
+                 heading_offset_ * 180.0 / M_PI,
+                 heading * 180.0 / M_PI);
         }
 
         // Phase 7: Lock FEJ heading on first valid pose
@@ -845,7 +850,12 @@ VisionOutput Tracker::processFrame(const uint8_t* yuv_data, int width, int heigh
                 }
             }
 
-            if (speed > 0.1) {
+            // BUG FIX (V-shape / rotate-in-place): don't advance position from
+            // step speed while the phone is rotating fast (>~46°/s). Phantom
+            // steps that slip through the IMU gate must not translate the
+            // global pose along a sweeping heading, or the path traces an arc
+            // instead of a sharp turnaround.
+            if (speed > 0.1 && gyro_norm < 0.8) {
                 double d = std::min(std::min(speed, 2.0) * dt_s, 1.0 * dt_s);
                 global_t_.at<double>(0) += d * std::sin(heading);  // +X = East
                 global_t_.at<double>(2) += d * std::cos(heading);  // +Z = North
@@ -951,7 +961,10 @@ VisionOutput Tracker::processFrame(const uint8_t* yuv_data, int width, int heigh
                             double visual_delta_heading = std::atan2(
                                 R_kf.at<double>(1, 0), R_kf.at<double>(0, 0));
 
-                            // Gyro-integrated heading change since keyframe
+                            // Madgwick heading change since keyframe (kf_heading
+                            // was the cached scalar_heading_ at keyframe time,
+                            // which already includes heading_offset_, so the
+                            // difference is a valid angular delta).
                             double gyro_delta_heading = scalar_heading_ - kf_heading;
                             // Normalize to [-pi, pi]
                             while (gyro_delta_heading > M_PI) gyro_delta_heading -= 2.0 * M_PI;
@@ -967,7 +980,13 @@ VisionOutput Tracker::processFrame(const uint8_t* yuv_data, int width, int heigh
                             // Walking oscillation can cause 2-4°/step drift; allow up to 20°
                             // to catch multi-step accumulation between keyframes
                             if (std::abs(drift) < 20.0 * M_PI / 180.0) {
-                                // 30% correction — stronger than before to fight walking drift
+                                // 30% correction — applied to heading_offset_
+                                // (not Madgwick itself). The next frame's
+                                // scalar_heading_ = madgwick + offset will
+                                // reflect the correction automatically.
+                                heading_offset_ -= 0.30 * drift;
+                                while (heading_offset_ >  M_PI) heading_offset_ -= 2.0 * M_PI;
+                                while (heading_offset_ < -M_PI) heading_offset_ += 2.0 * M_PI;
                                 scalar_heading_ -= 0.30 * drift;
                                 while (scalar_heading_ > M_PI) scalar_heading_ -= 2.0 * M_PI;
                                 while (scalar_heading_ < -M_PI) scalar_heading_ += 2.0 * M_PI;
