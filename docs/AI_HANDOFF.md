@@ -16,6 +16,7 @@ last_developer: "morad"
 branch: "morad"
 base_branch: "master"
 head_commit: "pending"
+session: "0k"
 ```
 
 ---
@@ -179,16 +180,69 @@ on_device_testing: "TESTED 2026-04-08 — app launches, no crash after cleanup"
 
 - id: "TASK-035"
   title: "Fix V-shape heading on 180° turns"
-  status: "DONE (needs device test)"
+  status: "DONE_VERIFIED"
   owner: "morad"
   priority: "P1"
   completed: "2026-04-09"
   notes: >
-    Root cause: keyframe heading correction used atan2(R[1,0],R[0,0]) which
-    extracts camera Z-rotation, not yaw. Systematically under-counted heading
-    during turns, removing ~30-40° of real heading via 30% correction.
-    Fix: gate correction on gyro_norm < 0.3 rad/s (skip during turns).
-    Also: magnetic declination correction, ZUPT heading unfreezing.
+    Multi-stage fix completed and verified on device 2026-04-09.
+    Stage 1 (session 0j): gated keyframe correction on gyro_norm < 0.3 —
+    helped but V-shape persisted.
+    Stage 2 (session 0k AM): added gyro_mag_filtered_ LP; step detector
+    and Tracker step-based position fallback both gate on |gyro|>0.8 rad/s.
+    Kills phantom steps during in-place rotation and during walking turns.
+    Stage 3 (session 0k PM — the real fix): replaced the scalar
+    gravity-projected yaw integrator entirely with a Madgwick IMU-only
+    attitude filter (see TASK-036). The old projection was corrupted by
+    centripetal acceleration polluting filtered_gravity_ during fast turns,
+    losing ~16% of yaw magnitude on 180°. Madgwick rejects accel when
+    |a| is outside [5, 20] m/s² (centripetal shock, freefall), so gyro
+    integrates the full rotation unperturbed. User-verified "much much
+    better" on device walk test.
+
+- id: "TASK-036"
+  title: "Madgwick IMU-only attitude filter (production plan step 1)"
+  status: "DONE_VERIFIED"
+  owner: "morad"
+  priority: "P1"
+  completed: "2026-04-09"
+  notes: >
+    First step of docs/PRODUCTION_READINESS_PLAN.md. Replaces the broken
+    scalar heading integrator. Implementation:
+    - IMUPreintegrator: quaternion state (q0..q3, Hamilton body→world),
+      updateMadgwickLocked() driven from every gyro sample. β = 0.033.
+      Lazy init from first accel roll/pitch, yaw=0. Accel correction gated
+      to |a| ∈ [5, 20] m/s². Bias-corrected gyro via existing gyro_bias_.
+    - New public API: getHeading() (CW-positive nav), getMadgwickRoll,
+      getMadgwickPitch, getOrientationQuaternion, isOrientationInitialized,
+      resetOrientationFilter.
+    - Tracker: deleted the yaw_rate = -(w·g) integrator. Heading is now
+      imu.getHeading() + heading_offset_. heading_offset_ carries initial
+      mag/GPS bias + visual keyframe drift corrections (KF nudges offset,
+      not the filter). setInitialHeading stages a pending rebase applied
+      once Madgwick is live. Mag init rebases offset against current
+      Madgwick heading.
+    - HEADING log prints madgwick_yaw / roll / pitch / offset → heading.
+    Build passes. APK installed and tested. global_R_ still maintained
+    for legacy consumers — step 4 of the plan will retire it.
+
+- id: "TASK-037"
+  title: "Production readiness plan (9 steps, no shortcuts)"
+  status: "IN_PROGRESS"
+  owner: "morad"
+  priority: "P0"
+  notes: >
+    See docs/PRODUCTION_READINESS_PLAN.md. GPS is NOT in the hot path
+    (project constraint — GPS-denied navigation). Scale comes from three
+    parallel observers: PDR stride, MiDaS depth constraint, gravity-aided
+    visual-inertial scale bootstrap (Hesch/Martinelli).
+    Steps: 1) Madgwick [DONE], 2) VO keyframe correction in gravity frame,
+    3) three parallel scale observers, 4) single ESKF state [p,v,q,b_g,b_a]
+    retiring global_R_/global_t_, 5) calibration + init gate,
+    6) covariance-aware UI, 7) replay harness + CI, 8) continuous cleanup,
+    9) ADR docs.
+    Acceptance: 50m straight <1m drift, 20×20m square <1.5m loop gap,
+    180° turn parallel within 5°, 100m scooter <5m drift, <15% CPU.
 
 - id: "TASK-032"
   title: "Fix remaining QA scan issues"
@@ -207,6 +261,39 @@ on_device_testing: "TESTED 2026-04-08 — app launches, no crash after cleanup"
 ## RECENT CHANGES (last 5 sessions)
 
 ```yaml
+- session: "0k"
+  date: "2026-04-09"
+  developer: "morad"
+  agent: "Claude-Opus-4-6"
+  branch: "morad"
+  summary: >
+    V-SHAPE ROOT-CAUSE FIX + PRODUCTION PLAN. Two stages.
+    STAGE A (phantom-step gating): added LP gyro magnitude to IMU; step
+    detector and Tracker's step-based position fallback both early-return
+    when |gyro|>0.8 rad/s. Kills phantom steps during in-place rotation
+    and mid-walk turns. Helped but V-shape persisted.
+    STAGE B (Madgwick, the real fix): replaced the broken scalar
+    gravity-projected yaw integrator with a full Madgwick IMU-only
+    attitude filter. Root cause of V-shape: centripetal accel during
+    fast turns polluted the low-pass filtered gravity vector, and
+    yaw_rate = -(ω·ĝ_contaminated) lost ~16% of true yaw magnitude
+    (~30° on 180°). Madgwick carries a unit quaternion, integrates gyro
+    per-sample, and only applies accel correction when |a|∈[5,20] m/s²
+    — so during fast rotation it runs pure gyro and gets the full turn.
+    Tracker heading is now imu.getHeading() + heading_offset_;
+    heading_offset_ carries startup bias and visual keyframe drift
+    corrections. User-verified "much much better" on device walk test.
+    Also: wrote docs/PRODUCTION_READINESS_PLAN.md — 9-step roadmap to
+    production, no shortcuts, GPS excluded from hot path per project
+    constraint. Madgwick is step 1.
+  files_changed:
+    - "app/src/main/cpp/IMUPreintegrator.h (quaternion state + API)"
+    - "app/src/main/cpp/IMUPreintegrator.cpp (Madgwick filter, gyro LP, phantom-step gate, reset state)"
+    - "app/src/main/cpp/Tracker.h (heading_offset_, pending_init_heading_)"
+    - "app/src/main/cpp/Tracker.cpp (delete scalar yaw integrator, wire Madgwick, phantom-step gate on position fallback)"
+    - "docs/PRODUCTION_READINESS_PLAN.md (NEW — 9-step production roadmap)"
+    - ".claude/settings.json (SessionStart/SessionEnd Slack hooks)"
+
 - session: "0j"
   date: "2026-04-09"
   developer: "morad"
@@ -303,27 +390,33 @@ on_device_testing: "TESTED 2026-04-08 — app launches, no crash after cleanup"
 ## CONVERSATION CONTEXT
 
 ```yaml
-current_task: "V-shape heading fix committed. Awaiting real-device test."
-stopped_at: "All session 0j changes committed to morad branch. Build passes."
+current_task: "Madgwick attitude filter done + verified. Step 1 of production plan complete."
+stopped_at: "Session 0k committed to morad and merged to master. Build passes."
 next_action: >
-  1. TEST V-SHAPE FIX: walk straight, 180° turn, walk back. Return path should overlap.
-  2. VERIFY MiDaS: check logcat for DEPTH_SCALE messages during walking.
-  3. FIX BUG-016: use-after-free — switch to shared_ptr<VioEngine>.
-  4. Scale calibration: investigate why scale stuck at 0.12-0.20 despite steps.
-  5. Places API: enable billing on Google Cloud Project to fix search.
+  1. STEP 2 of PRODUCTION_READINESS_PLAN.md: rework visual keyframe drift
+     correction in the gravity-aligned frame (current atan2(R[1,0],R[0,0])
+     assumes phone-Z == world-up, which is wrong in general).
+  2. STEP 3: three parallel scale observers (PDR stride + MiDaS depth +
+     gravity-aided VI scale bootstrap). MiDaS still hasn't fired in any
+     sim — investigate DEPTH_SCALE bailout gates.
+  3. STEP 4: single ESKF state [p,v,q,b_g,b_a], retire global_R_/global_t_.
+  4. Scale calibration (BUG-014): still stuck 0.12–0.20.
+  5. Places API billing for search (unrelated, low-priority).
 resume_context: >
   Architecture: Tracker-only (Mapper disabled). CameraX with zero-copy JNI.
-  Heading: scalar_heading_ with gravity-projected yaw rate + keyframe correction
-  (gated on gyro_norm < 0.3 to prevent turn damage).
+  Heading: Madgwick IMU-only quaternion filter in IMUPreintegrator (β=0.033,
+  accel gate |a|∈[5,20] m/s²). Tracker reads imu.getHeading() + heading_offset_;
+  offset carries startup bias and visual KF drift corrections. global_R_ still
+  updated from deltaR for legacy consumers (step 4 will retire it).
   MiDaS: re-enabled at 1Hz, feeds depth-based scale constraint in Tracker.
   Declination: added at startup via GeomagneticField (~5.5° Haifa).
   Map: 4Hz heading-locked camera, recenter FAB, 1Hz overlays.
-  REFERENCE COMMIT: 10fb69a = best drift (5.4%, 1.2m on 22m).
-partial_state: "NONE — all changes committed, build passes"
+  REFERENCE COMMIT: 10fb69a = best drift (5.4%, 1.2m on 22m) pre-Madgwick.
+partial_state: "NONE — all changes committed, build passes, on-device verified"
 warnings:
-  - "BUG-016 FIXED by Tamir PR #11 (shared_ptr) — merged 2026-04-09"
-  - "V-shape fix not yet tested on device — needs 180° turn simulation"
-  - "MiDaS depth constraint hasn't fired in any simulation yet"
+  - "Madgwick roll/pitch init assumes phone is roughly upright at first accel sample (handled by gravity init gate already)"
+  - "global_R_ and heading are now two sources of rotation truth — keep in sync until step 4 of the plan removes global_R_"
+  - "MiDaS depth constraint STILL hasn't fired in any sim — step 3 of the plan addresses this"
   - "Places API search needs Google Cloud billing enabled"
   - "Scale never calibrates (0.12-0.20) — position accuracy comes from VO, not scale"
 ```
