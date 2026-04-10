@@ -179,7 +179,8 @@ class NavSightViewModel(application: Application) : AndroidViewModel(application
         if (com.google.android.libraries.places.api.Places.isInitialized()) {
             com.google.android.libraries.places.api.Places.createClient(getApplication())
         } else {
-            throw IllegalStateException("Places API not initialized. Check your GOOGLE_MAPS_API_KEY.")
+            android.util.Log.w("NavSightViewModel", "Places API not initialized — GOOGLE_MAPS_API_KEY missing. Place search disabled.")
+            null
         }
     }
 

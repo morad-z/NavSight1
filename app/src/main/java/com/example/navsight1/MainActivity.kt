@@ -1063,8 +1063,13 @@ class MainActivity : ComponentActivity() {
     }
 
     private fun fetchPlacePredictions(query: String, sessionToken: com.google.android.libraries.places.api.model.AutocompleteSessionToken, onResult: (List<PlacePrediction>) -> Unit) {
+        val client = viewModel.placesClient ?: run {
+            Log.w(TAG, "Places client unavailable — no API key")
+            onResult(emptyList())
+            return
+        }
         val request = com.google.android.libraries.places.api.net.FindAutocompletePredictionsRequest.builder().setSessionToken(sessionToken).setQuery(query).build()
-        viewModel.placesClient.findAutocompletePredictions(request).addOnSuccessListener { response ->
+        client.findAutocompletePredictions(request).addOnSuccessListener { response ->
             Log.d(TAG, "Places: got ${response.autocompletePredictions.size} predictions for '$query'")
             onResult(response.autocompletePredictions.map { PlacePrediction(it.placeId, it.getPrimaryText(null).toString(), it.getSecondaryText(null).toString()) })
         }.addOnFailureListener { e ->
@@ -1074,9 +1079,14 @@ class MainActivity : ComponentActivity() {
     }
 
     private fun fetchPlaceLatLng(placeId: String, onResult: (LatLng?) -> Unit) {
+        val client = viewModel.placesClient ?: run {
+            Log.w(TAG, "Places client unavailable — no API key")
+            onResult(null)
+            return
+        }
         val fields = listOf(com.google.android.libraries.places.api.model.Place.Field.LAT_LNG)
         val request = com.google.android.libraries.places.api.net.FetchPlaceRequest.newInstance(placeId, fields)
-        viewModel.placesClient.fetchPlace(request).addOnSuccessListener { onResult(it.place.latLng) }.addOnFailureListener { e ->
+        client.fetchPlace(request).addOnSuccessListener { onResult(it.place.latLng) }.addOnFailureListener { e ->
             Log.e(TAG, "Places fetch failed: ${e.message}", e)
             onResult(null)
         }
