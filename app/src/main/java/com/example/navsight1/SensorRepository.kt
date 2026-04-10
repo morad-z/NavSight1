@@ -43,6 +43,7 @@ class SensorRepository(private val context: Context) : SensorEventListener {
     private val depthExecutor = java.util.concurrent.Executors.newSingleThreadExecutor { r ->
         Thread(r, "NavSight-Depth").apply { isDaemon = true }
     }
+    private val depthDispatcher = depthExecutor.asCoroutineDispatcher()
     @Volatile private var depthProcessing = false
     private var lastDepthTimeMs = 0L
     private val DEPTH_THROTTLE_MS = 1000L // 1Hz depth — conservative for battery
@@ -231,7 +232,7 @@ class SensorRepository(private val context: Context) : SensorEventListener {
         locationTokenSource?.cancel()
         stopGpsUpdates()
         vioExecutor.shutdown()
-        depthExecutor.shutdown()
+        depthDispatcher.close()  // also shuts down the underlying depthExecutor
         depthEstimator.close()
         intrinsicsInitialized = false
         repositoryScope.cancel()
@@ -368,7 +369,7 @@ class SensorRepository(private val context: Context) : SensorEventListener {
         if (yBytesForDepth != null) {
             depthProcessing = true
             lastDepthTimeMs = nowMs
-            depthExecutor.execute {
+            repositoryScope.launch(depthDispatcher) {
                 try {
                     val bitmap = android.graphics.Bitmap.createBitmap(w, h, android.graphics.Bitmap.Config.ARGB_8888)
                     val pixels = IntArray(w * h)
@@ -377,7 +378,7 @@ class SensorRepository(private val context: Context) : SensorEventListener {
                         pixels[i] = (0xFF shl 24) or (lum shl 16) or (lum shl 8) or lum
                     }
                     bitmap.setPixels(pixels, 0, w, 0, 0, w, h)
-                    val depthMap = kotlinx.coroutines.runBlocking { depthEstimator.estimateDepth(bitmap) }
+                    val depthMap = depthEstimator.estimateDepth(bitmap)
                     if (depthMap != null) {
                         NativeBridge.setDepthMap(depthMap, 256, 256)
                     }
