@@ -17,6 +17,7 @@ import kotlinx.coroutines.flow.sample
 import kotlinx.coroutines.launch
 import kotlinx.coroutines.withContext
 import kotlin.math.*
+import java.util.concurrent.atomic.AtomicInteger
 
 class NavSightViewModel(application: Application) : AndroidViewModel(application) {
     data class ScaleCalibrationSession(
@@ -70,6 +71,7 @@ class NavSightViewModel(application: Application) : AndroidViewModel(application
         private set
 
     private val _pathHistory = ArrayList<Pair<Float, Float>>(512)
+    private val _pathHistoryVersion = AtomicInteger(0)
     var pathHistoryVersion by mutableStateOf(0)
         private set
     val pathHistory: List<Pair<Float, Float>> get() = _pathHistory
@@ -197,7 +199,7 @@ class NavSightViewModel(application: Application) : AndroidViewModel(application
                 virtualZ = vio.z
                 _pathHistory.add(Pair(vio.x.toFloat(), vio.z.toFloat()))
                 if (_pathHistory.size > 500) _pathHistory.removeAt(0)
-                pathHistoryVersion++
+                pathHistoryVersion = _pathHistoryVersion.incrementAndGet()
             }
         }
 
@@ -220,19 +222,21 @@ class NavSightViewModel(application: Application) : AndroidViewModel(application
 
             if (isRecordingSimulation) {
                 val gps = currentGpsLocation
-                simulationDataPoints.add(SimulationPoint(
-                    timestamp = System.currentTimeMillis(),
-                    vioX = vio.x, vioY = vio.y, vioZ = vio.z,
-                    vioYaw = vio.yaw, vioScale = vio.estimatedScale, vioQuality = vio.trackingQuality,
-                    rawX = vio.rawX, rawY = vio.rawY, rawZ = vio.rawZ, rawYaw = vio.rawYaw,
-                    accelX = vio.accelX, accelY = vio.accelY, accelZ = vio.accelZ,
-                    gyroX = vio.gyroX, gyroY = vio.gyroY, gyroZ = vio.gyroZ,
-                    gpsLat = gps?.latitude, gpsLng = gps?.longitude,
-                    gpsAlt = gps?.altitude, gpsAcc = gps?.accuracy,
-                    meanFlow = vio.meanFlow, inlierCount = vio.inlierCount,
-                    stepCount = vio.stepCount, stepFreq = vio.stepFreq,
-                    strideLength = vio.strideLength, poseFlags = vio.poseFlags, heading = vio.heading
-                ))
+                synchronized(simulationDataPoints) {
+                    simulationDataPoints.add(SimulationPoint(
+                        timestamp = System.currentTimeMillis(),
+                        vioX = vio.x, vioY = vio.y, vioZ = vio.z,
+                        vioYaw = vio.yaw, vioScale = vio.estimatedScale, vioQuality = vio.trackingQuality,
+                        rawX = vio.rawX, rawY = vio.rawY, rawZ = vio.rawZ, rawYaw = vio.rawYaw,
+                        accelX = vio.accelX, accelY = vio.accelY, accelZ = vio.accelZ,
+                        gyroX = vio.gyroX, gyroY = vio.gyroY, gyroZ = vio.gyroZ,
+                        gpsLat = gps?.latitude, gpsLng = gps?.longitude,
+                        gpsAlt = gps?.altitude, gpsAcc = gps?.accuracy,
+                        meanFlow = vio.meanFlow, inlierCount = vio.inlierCount,
+                        stepCount = vio.stepCount, stepFreq = vio.stepFreq,
+                        strideLength = vio.strideLength, poseFlags = vio.poseFlags, heading = vio.heading
+                    ))
+                }
             }
 
             val prevDist = lastVioForDist
@@ -347,7 +351,7 @@ class NavSightViewModel(application: Application) : AndroidViewModel(application
     fun resetPath() {
         sensorRepository.resetPath()
         _pathHistory.clear()
-        pathHistoryVersion++
+        pathHistoryVersion = _pathHistoryVersion.incrementAndGet()
         virtualX = 0.0
         virtualZ = 0.0
         currentSpeedKmh = 0f
