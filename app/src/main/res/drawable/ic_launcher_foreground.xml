@@ -1,10 +1,97 @@
 <?xml version="1.0" encoding="utf-8"?>
 <vector xmlns:android="http://schemas.android.com/apk/res/android"
+    xmlns:aapt="http://schemas.android.com/aapt"
     android:width="108dp"
     android:height="108dp"
     android:viewportWidth="108"
     android:viewportHeight="108">
+
+    <!-- ── Pin outer shape: teal → purple → orange gradient ── -->
     <path
-        android:fillColor="#00E676"
-        android:pathData="M54,20 L38,88 L54,72 L70,88 Z" />
+        android:pathData="M54,18 C37,18 24,31 24,48 C24,60.5 31.5,71.2 42.5,76.5 L54,94 L65.5,76.5 C76.5,71.2 84,60.5 84,48 C84,31 71,18 54,18 Z">
+        <aapt:attr name="android:fillColor">
+            <gradient
+                android:type="linear"
+                android:startX="54" android:startY="18"
+                android:endX="54"   android:endY="94">
+                <item android:offset="0.00" android:color="#26C6DA"/>
+                <item android:offset="0.30" android:color="#5847B8"/>
+                <item android:offset="0.65" android:color="#9C3FD0"/>
+                <item android:offset="1.00" android:color="#FF5722"/>
+            </gradient>
+        </aapt:attr>
+    </path>
+
+    <!-- Subtle inner shading for depth -->
+    <path
+        android:fillColor="#00000018"
+        android:pathData="M54,24 C40,24 30,34 30,48 C30,58.5 36,67.5 44.8,72.5 L54,88 L63.2,72.5 C72,67.5 78,58.5 78,48 C78,34 68,24 54,24 Z"/>
+
+    <!-- ── Eye background — dark navy almond ── -->
+    <path
+        android:fillColor="#0D1830"
+        android:pathData="M33,48 C38,34 70,34 75,48 C70,62 38,62 33,48 Z"/>
+
+    <!-- Subtle almond inner shadow -->
+    <path
+        android:fillColor="#FFFFFF08"
+        android:pathData="M36,45 C41,36 67,36 72,45 C67,36 41,36 36,45 Z"/>
+
+    <!-- ── Iris background ── -->
+    <path
+        android:fillColor="#0A1428"
+        android:pathData="M43,48 A11,11 0 1,0 65,48 A11,11 0 1,0 43,48"/>
+
+    <!-- Iris outer glow ring (wide, soft) -->
+    <path
+        android:fillColor="#00000000"
+        android:strokeColor="#26C6DA35"
+        android:strokeWidth="4.5"
+        android:pathData="M43,48 A11,11 0 1,0 65,48 A11,11 0 1,0 43,48"/>
+
+    <!-- Iris ring (crisp teal) -->
+    <path
+        android:fillColor="#00000000"
+        android:strokeColor="#26C6DA"
+        android:strokeWidth="1.8"
+        android:pathData="M43,48 A11,11 0 1,0 65,48 A11,11 0 1,0 43,48"/>
+
+    <!-- ── Pupil ── -->
+    <path
+        android:fillColor="#060D1C"
+        android:pathData="M48,48 A6,6 0 1,0 60,48 A6,6 0 1,0 48,48"/>
+
+    <!-- Pupil rim -->
+    <path
+        android:fillColor="#00000000"
+        android:strokeColor="#26C6DA50"
+        android:strokeWidth="1"
+        android:pathData="M48,48 A6,6 0 1,0 60,48 A6,6 0 1,0 48,48"/>
+
+    <!-- ── Tech accent lines: eye corners → iris ── -->
+    <path
+        android:fillColor="#00000000"
+        android:strokeColor="#26C6DA90"
+        android:strokeWidth="1.2"
+        android:strokeLineCap="round"
+        android:pathData="M37,43 L44,47 M37,53 L44,49 M71,43 L64,47 M71,53 L64,49"/>
+
+    <!-- Small corner dots on eye edges -->
+    <path
+        android:fillColor="#26C6DA"
+        android:pathData="M36,46.5 A1.5,1.5 0 1,0 39,46.5 A1.5,1.5 0 1,0 36,46.5"/>
+    <path
+        android:fillColor="#26C6DA"
+        android:pathData="M69,46.5 A1.5,1.5 0 1,0 72,46.5 A1.5,1.5 0 1,0 69,46.5"/>
+
+    <!-- ── Highlight (specular) ── -->
+    <path
+        android:fillColor="#FFFFFFA0"
+        android:pathData="M57,43.5 A2,2 0 1,0 61,43.5 A2,2 0 1,0 57,43.5"/>
+
+    <!-- ── Pin tip inner accent ── -->
+    <path
+        android:fillColor="#FFFFFF18"
+        android:pathData="M51.5,77 L54,93 L56.5,77 Z"/>
+
 </vector>
