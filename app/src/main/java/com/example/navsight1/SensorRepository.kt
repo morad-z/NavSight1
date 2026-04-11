@@ -313,6 +313,26 @@ class SensorRepository(private val context: Context) : SensorEventListener {
         val timestampNs = image.imageInfo.timestamp
         val nowMs = System.currentTimeMillis()
 
+        // Copy yBytes for depth estimation BEFORE submitting to vioExecutor.
+        // This eliminates any ordering dependency between the VIO executor thread
+        // (which reads yBuffer via GetDirectBufferAddress) and the camera thread
+        // reading yBuffer here for depth.
+        val needsDepth = !depthProcessing && (nowMs - lastDepthTimeMs >= DEPTH_THROTTLE_MS)
+        val yBytesForDepth: ByteArray? = if (needsDepth) {
+            ByteArray(w * h).also { bytes ->
+                yBuffer.rewind()
+                if (yRowStride == w) {
+                    yBuffer.get(bytes, 0, w * h)
+                } else {
+                    for (row in 0 until h) {
+                        yBuffer.position(row * yRowStride)
+                        yBuffer.get(bytes, row * w, w)
+                    }
+                }
+                yBuffer.rewind()  // restore position for JNI (GetDirectBufferAddress ignores it, but be explicit)
+            }
+        } else null
+
         // 1. VIO processing — pass direct buffers to JNI (near zero-copy)
         vioProcessing = true
         val frameStartMs = nowMs
@@ -345,25 +365,15 @@ class SensorRepository(private val context: Context) : SensorEventListener {
         }
 
         // Depth estimation at 1Hz — MiDaS feeds Tracker scale constraint
-        if (!depthProcessing && (nowMs - lastDepthTimeMs >= DEPTH_THROTTLE_MS)) {
-            val yBytes = ByteArray(w * h)
-            yBuffer.rewind()
-            if (yRowStride == w) {
-                yBuffer.get(yBytes, 0, w * h)
-            } else {
-                for (row in 0 until h) {
-                    yBuffer.position(row * yRowStride)
-                    yBuffer.get(yBytes, row * w, w)
-                }
-            }
+        if (yBytesForDepth != null) {
             depthProcessing = true
             lastDepthTimeMs = nowMs
             depthExecutor.execute {
                 try {
                     val bitmap = android.graphics.Bitmap.createBitmap(w, h, android.graphics.Bitmap.Config.ARGB_8888)
                     val pixels = IntArray(w * h)
-                    for (i in yBytes.indices) {
-                        val lum = yBytes[i].toInt() and 0xFF
+                    for (i in yBytesForDepth.indices) {
+                        val lum = yBytesForDepth[i].toInt() and 0xFF
                         pixels[i] = (0xFF shl 24) or (lum shl 16) or (lum shl 8) or lum
                     }
                     bitmap.setPixels(pixels, 0, w, 0, 0, w, h)

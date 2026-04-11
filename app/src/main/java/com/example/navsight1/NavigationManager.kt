@@ -149,6 +149,9 @@ class NavigationManager(private val context: Context, private val apiKey: String
         val remainingDistance = calculateRemainingDistance(snappedPosition, route, currentStepIndex)
         val remainingTime = estimateRemainingTime(remainingDistance, route)
 
+        // Re-check state before writing — cancelNavigation() may have fired since we read it
+        if (_navigationState.value !is NavigationState.Active) return
+
         // Update navigation state
         _navigationState.value = NavigationState.Active(
             route = route,
