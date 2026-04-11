@@ -9,10 +9,6 @@ import androidx.compose.runtime.getValue
 import androidx.compose.runtime.setValue
 import androidx.lifecycle.AndroidViewModel
 import androidx.lifecycle.viewModelScope
-import com.google.android.gms.location.LocationCallback
-import com.google.android.gms.location.LocationRequest
-import com.google.android.gms.location.LocationResult
-import com.google.android.gms.location.Priority
 import com.google.android.gms.maps.model.LatLng
 import androidx.camera.core.ImageProxy
 import kotlinx.coroutines.Dispatchers
@@ -49,18 +45,22 @@ class NavSightViewModel(application: Application) : AndroidViewModel(application
     private val roadSnapper = RoadSnapper(apiKey = apiKey)
     private val prefs = application.getSharedPreferences(PREFS_NAME, Application.MODE_PRIVATE)
 
-    // UI States (exposed as Compose State)
+    // ── SENSOR ACTIVE FLAG ────────────────────────────────────────────────────
+    // Used by CameraViewComposable to guard against sending frames to a terminated
+    // ThreadPool (RejectedExecutionException) or a closed buffer (IllegalStateException).
+    @Volatile
+    private var sensorRepositoryActive = false
+
+    /** Returns true only when SensorRepository's ThreadPool is running and accepting frames. */
+    fun isSensorRepositoryActive(): Boolean = sensorRepositoryActive
+    // ──────────────────────────────────────────────────────────────────────────
+
+    // UI States
     var orientationState by mutableStateOf(DeviceOrientationTracker.OrientationResult(
         pitch = 0f, roll = 0f, azimuth = 0f,
         isHorizontal = false, deviationFromHorizontal = 90f, stabilityScore = 0f
     ))
         private set
-
-    // DEAD CODE: isMoving/isDriving never read from UI — local var in MainScreen() computes isMoving from VIO data instead
-    // var isMoving by mutableStateOf(false)
-    //     private set
-    // var isDriving by mutableStateOf(false)
-    //     private set
 
     var vioState by mutableStateOf(VioData())
         private set
@@ -70,10 +70,6 @@ class NavSightViewModel(application: Application) : AndroidViewModel(application
     var virtualZ by mutableStateOf(0.0)
         private set
 
-    // Path history: plain ArrayList + version counter to avoid mutableStateListOf O(n) overhead.
-    // mutableStateListOf wraps every element with Compose state tracking — each add()/removeAt()
-    // triggers structural change notifications that force full list recomposition.
-    // With a plain list + version bump, we control when recomposition happens.
     private val _pathHistory = ArrayList<Pair<Float, Float>>(512)
     private val _pathHistoryVersion = AtomicInteger(0)
     var pathHistoryVersion by mutableStateOf(0)
@@ -121,53 +117,26 @@ class NavSightViewModel(application: Application) : AndroidViewModel(application
 
     data class SimulationPoint(
         val timestamp: Long,
-        val vioX: Double,
-        val vioY: Double,
-        val vioZ: Double,
-        val vioYaw: Double,
-        val vioScale: Double,
-        val vioQuality: Double,
-        val rawX: Double,
-        val rawY: Double,
-        val rawZ: Double,
-        val rawYaw: Double,
-        val accelX: Float,
-        val accelY: Float,
-        val accelZ: Float,
-        val gyroX: Float,
-        val gyroY: Float,
-        val gyroZ: Float,
-        val gpsLat: Double?,
-        val gpsLng: Double?,
-        val gpsAlt: Double?,
-        val gpsAcc: Float?,
-        // Diagnostics
-        val meanFlow: Double,
-        val inlierCount: Int,
-        val stepCount: Int,
-        val stepFreq: Double,
-        val strideLength: Double,
-        val poseFlags: Int,
-        val heading: Double
+        val vioX: Double, val vioY: Double, val vioZ: Double,
+        val vioYaw: Double, val vioScale: Double, val vioQuality: Double,
+        val rawX: Double, val rawY: Double, val rawZ: Double, val rawYaw: Double,
+        val accelX: Float, val accelY: Float, val accelZ: Float,
+        val gyroX: Float, val gyroY: Float, val gyroZ: Float,
+        val gpsLat: Double?, val gpsLng: Double?, val gpsAlt: Double?, val gpsAcc: Float?,
+        val meanFlow: Double, val inlierCount: Int,
+        val stepCount: Int, val stepFreq: Double, val strideLength: Double,
+        val poseFlags: Int, val heading: Double
     )
-
-    // DEAD CODE: SimulationData is never instantiated — saveSimulationData writes JSON manually
-    // data class SimulationData(
-    //     val startTime: Long,
-    //     val points: List<SimulationPoint>
-    // )
     // ──────────────────────────────────────────────────────────────────────────
 
-    /** Initial heading in degrees from SensorRepository (captured at VIO init from magnetometer) */
-    val vioInitAzimuth: Float
-        get() = sensorRepository.vioInitAzimuth
+    val vioInitAzimuth: Float get() = sensorRepository.vioInitAzimuth
 
     private var lastVioForSpeed: VioData? = null
     private var lastVioForDist: VioData? = null
     private var lastSpeedTimeMs = 0L
     private var lastSnapTimeMs = 0L
     private var lastUiUpdateTimeMs = 0L
-    private val UI_UPDATE_THROTTLE_MS = 200L  // 5Hz — halves recomposition load
+    private val UI_UPDATE_THROTTLE_MS = 200L
 
     private var latestVioState: VioData = VioData()
     private var hasLocationPermission = false
@@ -194,14 +163,11 @@ class NavSightViewModel(application: Application) : AndroidViewModel(application
         NativeBridge.setScale(scaleCalibrationFactor)
         NativeBridge.setUserHeight(userHeight)
 
-        // Observe Repository states
         viewModelScope.launch {
             sensorRepository.orientationState.sample(200L).collect { orientationState = it }
         }
         viewModelScope.launch {
-            sensorRepository.vioState.collect { vio ->
-                handleVioUpdate(vio)
-            }
+            sensorRepository.vioState.collect { vio -> handleVioUpdate(vio) }
         }
         viewModelScope.launch {
             sensorRepository.startLocation.collect { startLocation = it }
@@ -209,14 +175,9 @@ class NavSightViewModel(application: Application) : AndroidViewModel(application
         viewModelScope.launch {
             sensorRepository.showCameraBlocked.collect { showCameraBlocked = it }
         }
-
-        // ── FOR SIMULATION ────────────────────────────────────────────────────────
         viewModelScope.launch {
             sensorRepository.currentLocation.collect { currentGpsLocation = it }
         }
-        // ──────────────────────────────────────────────────────────────────────────
-
-        // Observe Navigation states
         viewModelScope.launch {
             navigationManager.navigationState.collect { navigationState = it }
         }
@@ -227,7 +188,6 @@ class NavSightViewModel(application: Application) : AndroidViewModel(application
 
     private fun handleVioUpdate(vio: VioData) {
         latestVioState = vio
-
         val nowMs = System.currentTimeMillis()
         val shouldUpdateUI = (nowMs - lastUiUpdateTimeMs) >= UI_UPDATE_THROTTLE_MS
 
@@ -251,8 +211,7 @@ class NavSightViewModel(application: Application) : AndroidViewModel(application
                 val startDz = vio.z - session.startZ
                 val distanceFromStart = sqrt(startDx * startDx + startDz * startDz)
                 scaleCalibrationSession = session.copy(
-                    lastX = vio.x,
-                    lastZ = vio.z,
+                    lastX = vio.x, lastZ = vio.z,
                     pathLengthMeters = session.pathLengthMeters + sqrt(dx * dx + dz * dz),
                     sampleCount = session.sampleCount + 1,
                     maxDistanceFromStartMeters = max(session.maxDistanceFromStartMeters, distanceFromStart),
@@ -261,37 +220,25 @@ class NavSightViewModel(application: Application) : AndroidViewModel(application
                 )
             }
 
-            // ── FOR SIMULATION ────────────────────────────────────────────────────────
             if (isRecordingSimulation) {
                 val gps = currentGpsLocation
                 synchronized(simulationDataPoints) {
                     simulationDataPoints.add(SimulationPoint(
                         timestamp = System.currentTimeMillis(),
                         vioX = vio.x, vioY = vio.y, vioZ = vio.z,
-                        vioYaw = vio.yaw,
-                        vioScale = vio.estimatedScale,
-                        vioQuality = vio.trackingQuality,
-                        rawX = vio.rawX, rawY = vio.rawY, rawZ = vio.rawZ,
-                        rawYaw = vio.rawYaw,
+                        vioYaw = vio.yaw, vioScale = vio.estimatedScale, vioQuality = vio.trackingQuality,
+                        rawX = vio.rawX, rawY = vio.rawY, rawZ = vio.rawZ, rawYaw = vio.rawYaw,
                         accelX = vio.accelX, accelY = vio.accelY, accelZ = vio.accelZ,
                         gyroX = vio.gyroX, gyroY = vio.gyroY, gyroZ = vio.gyroZ,
-                        gpsLat = gps?.latitude,
-                        gpsLng = gps?.longitude,
-                        gpsAlt = gps?.altitude,
-                        gpsAcc = gps?.accuracy,
-                        meanFlow = vio.meanFlow,
-                        inlierCount = vio.inlierCount,
-                        stepCount = vio.stepCount,
-                        stepFreq = vio.stepFreq,
-                        strideLength = vio.strideLength,
-                        poseFlags = vio.poseFlags,
-                        heading = vio.heading
+                        gpsLat = gps?.latitude, gpsLng = gps?.longitude,
+                        gpsAlt = gps?.altitude, gpsAcc = gps?.accuracy,
+                        meanFlow = vio.meanFlow, inlierCount = vio.inlierCount,
+                        stepCount = vio.stepCount, stepFreq = vio.stepFreq,
+                        strideLength = vio.strideLength, poseFlags = vio.poseFlags, heading = vio.heading
                     ))
                 }
             }
-            // ──────────────────────────────────────────────────────────────────────────
 
-            // Distance accumulation (every frame)
             val prevDist = lastVioForDist
             if (prevDist != null) {
                 val ddx = vio.x - prevDist.x
@@ -300,8 +247,6 @@ class NavSightViewModel(application: Application) : AndroidViewModel(application
             }
             lastVioForDist = vio
 
-            // Speed computation (throttled to 200ms)
-            val nowMs = System.currentTimeMillis()
             val prev = lastVioForSpeed
             if (prev != null) {
                 val dtMs = nowMs - lastSpeedTimeMs
@@ -318,7 +263,6 @@ class NavSightViewModel(application: Application) : AndroidViewModel(application
                 lastSpeedTimeMs = nowMs
             }
 
-            // Road snapping
             if (nowMs - lastSnapTimeMs > 500) {
                 lastSnapTimeMs = nowMs
                 viewModelScope.launch(Dispatchers.IO) {
@@ -327,7 +271,6 @@ class NavSightViewModel(application: Application) : AndroidViewModel(application
                     val recentPath = pathHistory.takeLast(10).map { (x, z) ->
                         NavSightUtils.metersToLatLng(start, x.toDouble(), z.toDouble())
                     }
-
                     val snapped = roadSnapper.snapToRoad(currentLatLng, recentPath)
                     withContext(Dispatchers.Main) {
                         snappedPosition = snapped.toLatLng()
@@ -340,42 +283,28 @@ class NavSightViewModel(application: Application) : AndroidViewModel(application
         }
     }
 
-    // ── FOR SIMULATION ────────────────────────────────────────────────────────
     fun toggleSimulationRecording(getExternalFilesDir: (String?) -> java.io.File?, filesDir: java.io.File) {
         if (!isRecordingSimulation) {
-            // Start recording
             simulationDataPoints.clear()
             sensorRepository.startGpsUpdates(hasLocationPermission)
             isRecordingSimulation = true
-            Log.d("SIMULATION", "Started recording simulation")
         } else {
-            // Stop and save
             isRecordingSimulation = false
             sensorRepository.stopGpsUpdates()
             saveSimulationData(getExternalFilesDir, filesDir)
-            Log.d("SIMULATION", "Stopped recording simulation, points: ${simulationDataPoints.size}")
         }
     }
 
     private fun saveSimulationData(getExternalFilesDir: (String?) -> java.io.File?, filesDir: java.io.File) {
         if (simulationDataPoints.isEmpty()) return
-        
-        // Take a snapshot of the data immediately on the current thread (likely Main)
-        // to avoid ConcurrentModificationException while the camera thread is still active.
-        val snapshot = synchronized(simulationDataPoints) {
-            simulationDataPoints.toList()
-        }
-        
+        val snapshot = synchronized(simulationDataPoints) { simulationDataPoints.toList() }
         viewModelScope.launch(Dispatchers.IO) {
             val startTime = snapshot.firstOrNull()?.timestamp ?: System.currentTimeMillis()
-            
-            // Simple manual JSON conversion to avoid adding heavy libraries
             val sb = StringBuilder()
             sb.append("{\"startTime\":$startTime,\"points\":[")
             snapshot.forEachIndexed { index, p ->
                 if (index > 0) sb.append(",")
-                sb.append("{")
-                sb.append("\"ts\":${p.timestamp},")
+                sb.append("{\"ts\":${p.timestamp},")
                 sb.append("\"vx\":${p.vioX},\"vy\":${p.vioY},\"vz\":${p.vioZ},")
                 sb.append("\"vyaw\":${p.vioYaw},\"vsc\":${p.vioScale},\"vql\":${p.vioQuality},")
                 sb.append("\"rx\":${p.rawX},\"ry\":${p.rawY},\"rz\":${p.rawZ},\"ryaw\":${p.rawYaw},")
@@ -386,32 +315,27 @@ class NavSightViewModel(application: Application) : AndroidViewModel(application
                 sb.append("\"mflow\":${p.meanFlow},\"inl\":${p.inlierCount},")
                 sb.append("\"steps\":${p.stepCount},\"sfreq\":${p.stepFreq},")
                 sb.append("\"stride\":${p.strideLength},\"pflags\":${p.poseFlags},")
-                sb.append("\"hdg\":${p.heading}")
-                sb.append("}")
+                sb.append("\"hdg\":${p.heading}}")
             }
             sb.append("]}")
-
             try {
                 val dir = getExternalFilesDir(null) ?: filesDir
                 val file = java.io.File(dir, "simulation_data_${System.currentTimeMillis()}.json")
                 file.writeText(sb.toString())
-                Log.d("SIMULATION", "Saved simulation data to: ${file.absolutePath}")
             } catch (e: Exception) {
-                Log.e("SIMULATION", "Failed to save simulation data: ${e.message}")
+                Log.e("SIMULATION", "Failed to save: ${e.message}")
             }
         }
     }
-    // ──────────────────────────────────────────────────────────────────────────
 
     fun onResume() {
+        sensorRepositoryActive = true   // ← mark BEFORE starting sensors
         sensorRepository.startSensors()
     }
 
     fun onPause() {
-        if (isRecordingSimulation) {
-            // Stop GPS updates if we leave the app
-            sensorRepository.stopGpsUpdates()
-        }
+        sensorRepositoryActive = false  // ← mark BEFORE stopping sensors so in-flight frames are dropped
+        if (isRecordingSimulation) sensorRepository.stopGpsUpdates()
         sensorRepository.stopSensors()
     }
 
@@ -448,25 +372,16 @@ class NavSightViewModel(application: Application) : AndroidViewModel(application
         }
     }
 
-    fun clearNavigationStartMessage() {
-        navigationStartMessage = null
-    }
+    fun clearNavigationStartMessage() { navigationStartMessage = null }
 
     fun startScaleCalibration(targetDistanceMeters: Double) {
         val current = latestVioState
-        if (!current.isInitialized) {
-            scaleCalibrationMessage = "Tracking is not ready yet."
-            return
-        }
-
+        if (!current.isInitialized) { scaleCalibrationMessage = "Tracking is not ready yet."; return }
         scaleCalibrationSession = ScaleCalibrationSession(
             legDistanceMeters = targetDistanceMeters,
-            startX = current.x,
-            startZ = current.z,
-            lastX = current.x,
-            lastZ = current.z,
-            pathLengthMeters = 0.0,
-            sampleCount = 0,
+            startX = current.x, startZ = current.z,
+            lastX = current.x, lastZ = current.z,
+            pathLengthMeters = 0.0, sampleCount = 0,
             maxDistanceFromStartMeters = 0.0,
             sumQuality = current.trackingQuality,
             lowQualityFrames = if (current.trackingQuality < 0.2) 1 else 0
@@ -478,10 +393,8 @@ class NavSightViewModel(application: Application) : AndroidViewModel(application
         val session = scaleCalibrationSession
         val current = latestVioState
         if (session == null || !current.isInitialized) {
-            scaleCalibrationMessage = "Calibration session is not ready to finish."
-            return
+            scaleCalibrationMessage = "Calibration session is not ready to finish."; return
         }
-
         val dx = current.x - session.startX
         val dz = current.z - session.startZ
         val closureErrorMeters = sqrt(dx * dx + dz * dz)
@@ -489,63 +402,27 @@ class NavSightViewModel(application: Application) : AndroidViewModel(application
         val roundTripTargetMeters = session.legDistanceMeters * 2.0
         val avgQuality = session.sumQuality / max(1, session.sampleCount)
         val lowQualityRatio = session.lowQualityFrames.toDouble() / max(1, session.sampleCount)
-
         scaleCalibrationSession = null
-
-        if (session.sampleCount < 10) {
-            scaleCalibrationMessage = "Calibration was too short. Please try again."
-            return
+        when {
+            session.sampleCount < 10 -> { scaleCalibrationMessage = "Too short. Please try again."; return }
+            session.maxDistanceFromStartMeters < session.legDistanceMeters * 0.7 -> { scaleCalibrationMessage = "Did not walk far enough."; return }
+            avgQuality < 0.35 || lowQualityRatio > 0.35 -> { scaleCalibrationMessage = "Quality too low. Avg ${"%.2f".format(avgQuality)}."; return }
+            pathLengthMeters < roundTripTargetMeters * 0.6 -> { scaleCalibrationMessage = "Round trip too short. Retry."; return }
+            closureErrorMeters > max(2.0, session.legDistanceMeters * 0.4) -> { scaleCalibrationMessage = "Return drift too large (${"%.2f".format(closureErrorMeters)} m)."; return }
         }
-        if (session.maxDistanceFromStartMeters < session.legDistanceMeters * 0.7) {
-            scaleCalibrationMessage = "You did not walk far enough from the start point."
-            return
-        }
-        if (avgQuality < 0.35 || lowQualityRatio > 0.35) {
-            scaleCalibrationMessage =
-                "Tracking quality was too low for calibration. Avg ${"%.2f".format(avgQuality)}."
-            return
-        }
-        if (pathLengthMeters < roundTripTargetMeters * 0.6) {
-            scaleCalibrationMessage = "Measured round trip was too short. Please retry."
-            return
-        }
-        if (closureErrorMeters > max(2.0, session.legDistanceMeters * 0.4)) {
-            scaleCalibrationMessage =
-                "Return-to-start drift was too large (${ "%.2f".format(closureErrorMeters)} m)."
-            return
-        }
-
         val newFactor = NavSightUtils.computeUpdatedScaleCalibrationFactor(
             currentFactor = scaleCalibrationFactor,
             knownDistanceMeters = roundTripTargetMeters,
             measuredDistanceMeters = pathLengthMeters
-        ) ?: run {
-            scaleCalibrationMessage = "Calibration factor could not be computed."
-            return
-        }
+        ) ?: run { scaleCalibrationMessage = "Factor could not be computed."; return }
         saveScaleCalibrationFactor(newFactor)
-        scaleCalibrationMessage =
-            "Saved scale correction ${"%.2f".format(newFactor)}x. Measured ${"%.1f".format(pathLengthMeters)} m, closure ${"%.2f".format(closureErrorMeters)} m."
+        scaleCalibrationMessage = "Saved ${"%.2f".format(newFactor)}x. Measured ${"%.1f".format(pathLengthMeters)} m, closure ${"%.2f".format(closureErrorMeters)} m."
     }
 
-    fun cancelScaleCalibration() {
-        scaleCalibrationSession = null
-        scaleCalibrationMessage = "Calibration cancelled."
-    }
-
-    fun clearScaleCalibrationMessage() {
-        scaleCalibrationMessage = null
-    }
-
-    fun resetScaleCalibration() {
-        scaleCalibrationSession = null
-        saveScaleCalibrationFactor(1.0)
-        scaleCalibrationMessage = "Scale calibration reset to 1.00x."
-    }
-
-    fun stopNavigation() {
-        navigationManager.cancelNavigation()
-    }
+    fun cancelScaleCalibration() { scaleCalibrationSession = null; scaleCalibrationMessage = "Calibration cancelled." }
+    fun clearScaleCalibrationMessage() { scaleCalibrationMessage = null }
+    fun resetScaleCalibration() { scaleCalibrationSession = null; saveScaleCalibrationFactor(1.0); scaleCalibrationMessage = "Scale reset to 1.00x." }
+    fun stopNavigation() { navigationManager.cancelNavigation() }
 
     fun exportPath(getExternalFilesDir: (String?) -> java.io.File?, filesDir: java.io.File) {
         val path = pathHistory.toList()
@@ -558,24 +435,17 @@ class NavSightViewModel(application: Application) : AndroidViewModel(application
             if (start != null) {
                 val latLng = NavSightUtils.metersToLatLng(start, x.toDouble(), z.toDouble())
                 sb.append("{\"lat\":${latLng.latitude},\"lng\":${latLng.longitude},\"x\":$x,\"z\":$z}")
-            } else {
-                sb.append("{\"x\":$x,\"z\":$z}")
-            }
+            } else sb.append("{\"x\":$x,\"z\":$z}")
         }
         sb.append("]}")
         try {
             val dir = getExternalFilesDir(null) ?: filesDir
             val file = java.io.File(dir, "navsight_path_${System.currentTimeMillis()}.json")
             file.writeText(sb.toString())
-        } catch (e: Exception) {
-            // Log error
-        }
+        } catch (e: Exception) { Log.e("NavSight", "Export failed: ${e.message}") }
     }
 
-    override fun onCleared() {
-        super.onCleared()
-        roadSnapper.shutdown()
-    }
+    override fun onCleared() { super.onCleared(); roadSnapper.shutdown() }
 
     private fun saveScaleCalibrationFactor(factor: Double) {
         scaleCalibrationFactor = factor

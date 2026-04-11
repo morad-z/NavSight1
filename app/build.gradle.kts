@@ -32,7 +32,7 @@ android {
         externalNativeBuild {
             cmake {
                 cppFlags.add("-std=c++17")
-                arguments.add("-DANDROID_STL=c++_static")
+                arguments.add("-DANDROID_STL=c++_shared")
             }
         }
     }
@@ -145,4 +145,6 @@ dependencies {
     androidTestImplementation(libs.androidx.compose.ui.test.junit4)
     debugImplementation(libs.androidx.compose.ui.tooling)
     debugImplementation(libs.androidx.compose.ui.test.manifest)
+
+    implementation("androidx.compose.material:material-icons-extended")
 }
