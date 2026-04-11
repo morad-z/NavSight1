@@ -56,6 +56,7 @@ find_library(
 target_link_libraries(
         navsight
         android
+        c++_shared
         ${log-lib}
         ${OpenCV_LIBS}
 )
