@@ -390,8 +390,17 @@ on_device_testing: "TESTED 2026-04-08 — app launches, no crash after cleanup"
 ## CONVERSATION CONTEXT
 
 ```yaml
-current_task: "Madgwick attitude filter done + verified. Step 1 of production plan complete."
-stopped_at: "Session 0k committed to morad and merged to master. Build passes."
+current_task: "Madgwick verified in field. Two sims analyzed with scripts/analyze_sim.py — heading sane, VIO path within 3% of GPS when GPS is clean, scale still underscaled ~10-20%."
+stopped_at: >
+  Morad ended day after sim analysis. Last sim analysis results (for resume):
+  - sim 1775678749710 (32s, GPS clean, acc 7.7m): VIO 34.73m vs GPS 33.84m = 1.03x
+    agreement. Loop return gap 2.39m (6.9%). 240° cumulative turning, no V-shape.
+    Implied stride 0.772 vs configured 0.650 → scale ~19% under.
+  - sim 1775734342506 (18s, GPS jammed, acc 23.3m): VIO 12.14m, GPS 20.83m (trust
+    VIO). Loop return gap 1.29m (10.6%). Scale 0.090±0.054 — wider oscillation,
+    shorter recording. Implied stride 1.10x.
+  Conclusion: Madgwick holds heading, VIO length is correct, scale is still the
+  weakest link and is exactly what Step 3 of the plan targets.
 next_action: >
   1. STEP 2 of PRODUCTION_READINESS_PLAN.md: rework visual keyframe drift
      correction in the gravity-aligned frame (current atan2(R[1,0],R[0,0])
