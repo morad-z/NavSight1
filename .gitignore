@@ -29,6 +29,10 @@ local.properties
 .mcp.json
 .swarm/
 
+# Ignore BMad files
+/_bmad/
+/_bmad-output/
+
 # Ignore test build artifacts
 tests/cpp/build*/
 .slack_last_activity
