@@ -455,35 +455,26 @@ class SensorRepository(private val context: Context) : SensorEventListener {
             val tokenSource = CancellationTokenSource()
             locationTokenSource = tokenSource
             
+            val onLocation = com.google.android.gms.tasks.OnSuccessListener<android.location.Location?> { location ->
+                // Only set startLocation if it hasn't been set yet — never overwrite
+                // after VIO has started tracking, as that would shift the entire path
+                if (location != null && _startLocation.value == null) {
+                    _startLocation.value = LatLng(location.latitude, location.longitude)
+                }
+                locationTokenSource = null
+            }
+            val onFail = com.google.android.gms.tasks.OnFailureListener {
+                Log.w(TAG, "Failed to get current location")
+                locationTokenSource = null
+            }
+
             if (android.os.Build.VERSION.SDK_INT >= android.os.Build.VERSION_CODES.S) {
-                fusedLocationClient.getCurrentLocation(
-                    Priority.PRIORITY_HIGH_ACCURACY, tokenSource.token
-                )
-                    .addOnSuccessListener { location ->
-                        if (location != null) {
-                            _startLocation.value = LatLng(location.latitude, location.longitude)
-                        }
-                        locationTokenSource = null
-                    }
-                    .addOnFailureListener {
-                        Log.w(TAG, "Failed to get current location")
-                        locationTokenSource = null
-                    }
+                fusedLocationClient.getCurrentLocation(Priority.PRIORITY_HIGH_ACCURACY, tokenSource.token)
+                    .addOnSuccessListener(onLocation).addOnFailureListener(onFail)
             } else {
                 @Suppress("MissingPermission")
-                fusedLocationClient.getCurrentLocation(
-                    Priority.PRIORITY_HIGH_ACCURACY, tokenSource.token
-                )
-                    .addOnSuccessListener { location ->
-                        if (location != null) {
-                            _startLocation.value = LatLng(location.latitude, location.longitude)
-                        }
-                        locationTokenSource = null
-                    }
-                    .addOnFailureListener {
-                        Log.w(TAG, "Failed to get current location")
-                        locationTokenSource = null
-                    }
+                fusedLocationClient.getCurrentLocation(Priority.PRIORITY_HIGH_ACCURACY, tokenSource.token)
+                    .addOnSuccessListener(onLocation).addOnFailureListener(onFail)
             }
         } catch (e: SecurityException) {
             Log.e(TAG, "SecurityException requesting location: ${e.message}")
