@@ -1,6 +1,8 @@
 #include "VioEngine.h"
 #include <cmath>
 
+#include "CameraCalibration.h"
+
 #ifdef __ANDROID__
 #include <android/log.h>
 #define TAG "NavSight-VioEngine"
@@ -127,6 +129,20 @@ void VioEngine::setIntrinsics(double fx, double fy, double cx, double cy) {
     tracker_.setIntrinsics(fx, fy, cx, cy);
 }
 
+bool VioEngine::loadCalibration(const std::string& path) {
+    CameraIntrinsics ci;
+    if (!loadCalibrationFromJson(path, ci)) {
+        LOGI("VIO: no calibration found at '%s', running with zero-distortion "
+             "passthrough — accuracy reduced.", path.c_str());
+        return false;
+    }
+    tracker_.setIntrinsics(ci.fx, ci.fy, ci.cx, ci.cy);
+    tracker_.setDistortion(ci.k1, ci.k2, ci.k3, ci.k4, ci.k5, ci.k6,
+                           ci.p1, ci.p2);
+    LOGI("VIO: loaded calibration from %s, RMS=%.3fpx", path.c_str(), ci.rms_px);
+    return true;
+}
+
 void VioEngine::setInitialHeading(double azimuth_rad) {
     tracker_.setInitialHeading(azimuth_rad);
 }
@@ -165,4 +181,70 @@ void VioEngine::reset() {
     // mapper_.reset();
     imu_.reset();
     LOGI("VioEngine reset");
+}
+
+// ── Step 5: Calibration & Initialization ─────────────────────────────────────
+
+int VioEngine::getInitStatus() const {
+    return static_cast<int>(tracker_.getInitStatus());
+}
+
+void VioEngine::clearInitTimeout() {
+    tracker_.clearInitTimeout();
+}
+
+void VioEngine::loadStoredCalibration(const float R_GtoI[9],
+                                       const float gyro_bias[3],
+                                       const float accel_bias[3]) {
+    cv::Mat R(3, 3, CV_64F);
+    for (int r = 0; r < 3; ++r) {
+        for (int c = 0; c < 3; ++c) {
+            R.at<double>(r, c) = static_cast<double>(R_GtoI[r * 3 + c]);
+        }
+    }
+    cv::Point3f gb(gyro_bias[0], gyro_bias[1], gyro_bias[2]);
+    cv::Point3f ab(accel_bias[0], accel_bias[1], accel_bias[2]);
+    tracker_.loadStoredCalibration(R, gb, ab);
+    imu_.setGyroBias(gb.x, gb.y, gb.z);
+    LOGI("VioEngine: stored calibration loaded (gyro_bias=(%.4f,%.4f,%.4f))",
+         gb.x, gb.y, gb.z);
+}
+
+bool VioEngine::getCalibration(float R_GtoI[9],
+                                float gyro_bias[3],
+                                float accel_bias[3]) const {
+    if (tracker_.getInitStatus() == InertialInitializer::Status::WAIT_STATIONARY
+        || tracker_.getInitStatus() == InertialInitializer::Status::TIMEOUT_NEEDS_USER) {
+        return false;
+    }
+    cv::Mat R = tracker_.getInitialRotation();
+    cv::Point3f gb = tracker_.getCalibratedGyroBias();
+    cv::Point3f ab = tracker_.getCalibratedAccelBias();
+    if (R.empty() || R.rows != 3 || R.cols != 3) return false;
+    for (int r = 0; r < 3; ++r) {
+        for (int c = 0; c < 3; ++c) {
+            R_GtoI[r * 3 + c] = static_cast<float>(R.at<double>(r, c));
+        }
+    }
+    gyro_bias[0] = gb.x; gyro_bias[1] = gb.y; gyro_bias[2] = gb.z;
+    accel_bias[0] = ab.x; accel_bias[1] = ab.y; accel_bias[2] = ab.z;
+    return true;
+}
+
+bool VioEngine::getPositionCovarianceXZ(double out[3]) const {
+    return tracker_.getPositionCovarianceXZ(out);
+}
+
+bool VioEngine::getPose(double& x, double& y, double& z, double& yaw_rad) const {
+    const EKFState* ekf = tracker_.getEKF();
+    if (ekf == nullptr || !ekf->isFullInitialized()) return false;
+    cv::Mat p = ekf->getPosition();
+    if (p.empty() || p.rows < 3 || p.type() != CV_64F) return false;
+    x = p.at<double>(0, 0);
+    y = p.at<double>(1, 0);
+    z = p.at<double>(2, 0);
+    // Use the cached scalar_heading_ that the runtime pipeline publishes —
+    // it is the gravity-aligned EKF yaw refreshed each frame by processFrame.
+    yaw_rad = tracker_.getHeading();
+    return true;
 }

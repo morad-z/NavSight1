@@ -4,6 +4,7 @@
 #include <cmath>
 #include <algorithm>
 #include <limits>
+#include <unordered_map>
 
 #include <chrono>
 
@@ -47,7 +48,17 @@ void Tracker::setIntrinsics(double fx, double fy, double cx, double cy) {
     std::lock_guard<std::mutex> lock(mutex_);
     fx_ = fx; fy_ = fy; cx_ = cx; cy_ = cy;
     lens_.setIntrinsics(fx, fy, cx, cy);
+    // Plan Step 3b (ADR-009): mirror intrinsics into EKFState so SLAM
+    // reprojection (pixel-space) sees the live calibration.
+    ekf_.setSlamIntrinsics(fx, fy, cx, cy);
     LOGI("setIntrinsics: fx=%.1f fy=%.1f cx=%.1f cy=%.1f", fx, fy, cx, cy);
+}
+
+void Tracker::setDistortion(double k1, double k2, double k3,
+                            double k4, double k5, double k6,
+                            double p1, double p2) {
+    std::lock_guard<std::mutex> lock(mutex_);
+    lens_.setDistortion(k1, k2, k3, k4, k5, k6, p1, p2);
 }
 
 void Tracker::setUserScaleCorrection(double correction) {
@@ -116,16 +127,56 @@ void Tracker::applyDepthScaleConstraint(
     // Pitch: angle between phone's Z-axis and horizontal plane
     double pitch = std::asin(std::min(1.0, std::max(-1.0, static_cast<double>(az) / g_mag)));
 
-    // For features in the lower 40% of the image (likely floor/ground),
+    // Step 3 Observer B: gravity unit vector in camera/phone frame.
+    // A feature's component along this axis tells us how far below the camera
+    // it sits in world frame — independent of where it lands in the image.
+    // This unlocks scooter mode: camera looks forward, but the road is still
+    // geometrically below the phone, so it should still be treated as floor.
+    const double inv_g = 1.0 / g_mag;
+    const double gxu = static_cast<double>(ax) * inv_g;
+    const double gyu = static_cast<double>(ay) * inv_g;
+    const double gzu = static_cast<double>(az) * inv_g;
+
+    // Snapshot current scale once for the geometric floor test (avoids holding
+    // pose_mutex_ across the whole feature loop).
+    double current_scale_snapshot = scale_fuser_.scale();
+    // A feature is geometrically a "floor" feature if its gravity-projected
+    // metric depth (using current scale) is below the phone, with a margin.
+    // 0.3m margin avoids accepting features at roughly head/torso height as
+    // floor. Note: this is a soft inclusion test — we still bound metric_z
+    // and ratio below before accepting.
+    const double FLOOR_BELOW_PHONE_MARGIN_M = 0.3;
+    const double floor_geom_threshold_m =
+        FLOOR_BELOW_PHONE_MARGIN_M;
+
+    // For features in the lower 40% of the image OR features that geometric
+    // analysis says are below phone height in world frame (scooter case),
     // compute: metric_depth = camera_h / (norm_y * cos(pitch) + sin(pitch))
     // Then compare to VIO triangulated depth → scale ratio
     std::vector<double> scale_ratios;
     float fh = static_cast<float>(img_height);
     float fw = static_cast<float>(img_width);
+    int floor_via_image = 0;
+    int floor_via_geom = 0;
 
     for (size_t i = 0; i < pts3d.size(); i++) {
-        // Only use features in the lower 40% of the image
-        if (pts2d[i].y < fh * 0.6f) continue;
+        // Image-space floor heuristic (handheld walking, phone tilted down)
+        bool is_floor_by_image = (pts2d[i].y >= fh * 0.6f);
+
+        // Gravity-projected floor heuristic (scooter, phone forward-facing).
+        // pts3d[i] is in VIO units (scale-ambiguous); gravity-axis component
+        // gives "depth below camera" in those same units. Convert with the
+        // current scale snapshot to get an approximate metric value.
+        double down_vio = static_cast<double>(pts3d[i].x) * gxu
+                        + static_cast<double>(pts3d[i].y) * gyu
+                        + static_cast<double>(pts3d[i].z) * gzu;
+        double down_metric_est = down_vio * current_scale_snapshot;
+        bool is_floor_by_geom = (down_metric_est > floor_geom_threshold_m);
+
+        if (!is_floor_by_image && !is_floor_by_geom) continue;
+        if (is_floor_by_image) floor_via_image++;
+        else                   floor_via_geom++;
+
         if (pts3d[i].z < 0.3 || pts3d[i].z > 12.0) continue;
 
         // Map 2D point to depth map coordinates
@@ -154,20 +205,38 @@ void Tracker::applyDepthScaleConstraint(
     }
 
     if (scale_ratios.size() < 8) {
-        LOGI("DEPTH_SCALE: BAILOUT only %zu floor matches (need 8)", scale_ratios.size());
+        LOGI("DEPTH_SCALE: BAILOUT only %zu floor matches (need 8) [image=%d geom=%d]",
+             scale_ratios.size(), floor_via_image, floor_via_geom);
         return;
     }
 
     // Take median ratio
     std::sort(scale_ratios.begin(), scale_ratios.end());
-    double median_ratio = scale_ratios[scale_ratios.size() / 2];
+    const size_t N = scale_ratios.size();
+    double median_ratio = scale_ratios[N / 2];
+
+    // Step 3 Observer B: MAD-based confidence. MAD = median(|x - median|).
+    // sigma_robust ≈ 1.4826 * MAD (consistent estimator of stddev under a
+    // normal). Variance of the median itself is sigma_robust² / N. We use
+    // this for two things: (1) modulate the EMA alpha so noisy frames nudge
+    // the scale less, (2) expose to the EKF for proper fusion later.
+    std::vector<double> abs_dev;
+    abs_dev.reserve(N);
+    for (size_t i = 0; i < N; ++i) {
+        abs_dev.push_back(std::abs(scale_ratios[i] - median_ratio));
+    }
+    std::sort(abs_dev.begin(), abs_dev.end());
+    double mad = abs_dev[N / 2];
+    // Floor MAD to avoid divide-by-near-zero when ratios coincidentally line
+    // up; 1% of the median is a sane lower bound for monocular depth.
+    const double mad_floor = std::max(1e-3, 0.01 * std::abs(median_ratio));
+    if (mad < mad_floor) mad = mad_floor;
+    const double sigma_ratio = 1.4826 * mad;
+    const double median_variance =
+        (sigma_ratio * sigma_ratio) / static_cast<double>(N);
 
     // Compute target scale: current_scale * median_ratio
-    double current;
-    {
-        std::lock_guard<std::mutex> slock(pose_mutex_);
-        current = smooth_scale_;
-    }
+    double current = scale_fuser_.scale();
     double target_scale = current * median_ratio;
     target_scale = std::max(0.01, std::min(10.0, target_scale));
 
@@ -178,37 +247,44 @@ void Tracker::applyDepthScaleConstraint(
         return;
     }
 
-    // Conservative blend: alpha=0.03, only nudges the scale gently
-    double alpha = 0.03;
+    // Step 3 Fusion: feed (target_scale, median_variance) into the 1-D Kalman
+    // fuser. Tight ratios (low sigma) → small r → strong update; noisy ratios
+    // → large r → minimal update. Replaces the previous confidence-weighted
+    // alpha-blend so that PDR/MiDaS/VI all share one statistically-grounded
+    // estimator instead of fighting via independent EMAs.
+    bool accepted = scale_fuser_.update(target_scale, median_variance);
     {
         std::lock_guard<std::mutex> slock(pose_mutex_);
-        smooth_scale_ = (1.0 - alpha) * smooth_scale_ + alpha * target_scale;
-        smooth_scale_ = std::max(0.01, std::min(10.0, smooth_scale_));
+        last_depth_scale_variance_ = median_variance;
     }
 
     if (frame_counter_ % 30 == 0) {
-        LOGI("DEPTH_SCALE: applied target=%.4f current=%.4f ratio=%.4f samples=%zu",
-             target_scale, current, median_ratio, scale_ratios.size());
+        LOGI("DEPTH_SCALE: %s target=%.4f smooth=%.4f ratio=%.4f "
+             "samples=%zu (img=%d geom=%d) sigma=%.3f var=%.5f P=%.5f",
+             accepted ? "fused" : "skipped",
+             target_scale, scale_fuser_.scale(), median_ratio, N,
+             floor_via_image, floor_via_geom,
+             sigma_ratio, median_variance, scale_fuser_.variance());
     }
 }
 
 void Tracker::setInitialHeading(double azimuth_rad) {
     std::lock_guard<std::mutex> lock(pose_mutex_);
+    // Step 4: bootstrap-only. After EKF is full-init the EKF owns yaw and
+    // any external mag write would clobber the filter's belief.
+    if (ekf_.isFullInitialized()) {
+        LOGI("setInitialHeading: ignored (EKF already full-init, az=%.1f deg)",
+             azimuth_rad * 180.0 / M_PI);
+        return;
+    }
     double c = std::cos(azimuth_rad), s = std::sin(azimuth_rad);
     global_R_ = (cv::Mat_<double>(3, 3) << c,-s,0, s,c,0, 0,0,1);
-    // Set offset so cached heading matches the requested azimuth even though
-    // Madgwick owns the physics: heading = madgwick.getHeading() + offset.
-    // At the time this is called (app startup), Madgwick is not yet
-    // initialized, so its heading is 0 — offset == azimuth_rad.
-    // If tracking is re-initialized mid-session, the next processFrame will
-    // rebase the offset against the current Madgwick heading (see init path).
     pending_init_heading_ = azimuth_rad;
     pending_init_heading_set_ = true;
-    heading_offset_ = azimuth_rad;
     scalar_heading_ = azimuth_rad;
-    ekf_.initialize(smooth_scale_);
-    LOGI("setInitialHeading: azimuth=%.1f deg (EKF scale initialized, offset=%.1f deg)",
-         azimuth_rad * 180.0 / M_PI, heading_offset_ * 180.0 / M_PI);
+    ekf_.initialize(scale_fuser_.scale());
+    LOGI("setInitialHeading: azimuth=%.1f deg (EKF scale initialized)",
+         azimuth_rad * 180.0 / M_PI);
 }
 
 void Tracker::reset() {
@@ -222,7 +298,7 @@ void Tracker::reset() {
     global_t_ = cv::Mat::zeros(3, 1, CV_64F);
     accel_bias_ = cv::Mat::zeros(3, 1, CV_64F);
     accel_bias_count_ = 0;
-    smooth_scale_ = 0.20;
+    scale_fuser_.reset(0.20, 1.0);
     scale_obs_count_ = 0;
     scale_bootstrap_buf_.clear();
     points_3d_current_.clear();
@@ -230,12 +306,15 @@ void Tracker::reset() {
     feature_ids_.clear();
     heading_initialized_ = false;
     scalar_heading_ = 0.0;
-    heading_offset_ = 0.0;
     pending_init_heading_set_ = false;
     pending_init_heading_ = 0.0;
     filtered_yaw_rate_ = 0.0;
-    heading_fej_set_ = false;
-    heading_fej_ = 0.0;
+    last_visual_yaw_variance_ = -1.0;
+    last_depth_scale_variance_ = -1.0;
+    scale_fuser_.reset(0.20, 1.0);
+    last_scale_predict_ns_ = 0;
+    scale_estimator_vi_.reset();
+    observer_c_pair_count_ = 0;
     td_warmup_done_ = false;
     td_warmup_buf_.clear();
     frames_since_keyframe_ = 0;
@@ -265,11 +344,10 @@ double Tracker::estimateScaleFromSteps(double vision_disp, int64_t dt_ns,
 
     double obs_scale = std::max(0.005, std::min(10.0, real_disp / vision_disp));
 
-    double current_smooth;
+    double current_smooth = scale_fuser_.scale();
     int obs_count;
     {
         std::lock_guard<std::mutex> lock(pose_mutex_);
-        current_smooth = smooth_scale_;
         obs_count = scale_obs_count_;
     }
     if (obs_count >= 30 &&
@@ -284,11 +362,42 @@ double Tracker::estimateScaleFromSteps(double vision_disp, int64_t dt_ns,
 // void Tracker::applyLoopCorrection(double tx, double ty, double tz, ...) { ... }
 
 double Tracker::getSmoothScale() const {
-    std::lock_guard<std::mutex> lock(pose_mutex_); return smooth_scale_;
+    return scale_fuser_.scale();
 }
 double Tracker::getHeading() const {
     std::lock_guard<std::mutex> lock(pose_mutex_);
     return scalar_heading_;
+}
+double Tracker::getLastVisualYawVariance() const {
+    std::lock_guard<std::mutex> lock(pose_mutex_);
+    return last_visual_yaw_variance_;
+}
+double Tracker::getLastDepthScaleVariance() const {
+    std::lock_guard<std::mutex> lock(pose_mutex_);
+    return last_depth_scale_variance_;
+}
+
+bool Tracker::getPositionCovarianceXZ(double out[3]) const {
+    std::lock_guard<std::mutex> lock(pose_mutex_);
+    if (!ekf_.isFullInitialized()) {
+        out[0] = 0.0;
+        out[1] = 0.0;
+        out[2] = 0.0;
+        return false;
+    }
+    cv::Mat P = ekf_.getCovariance();
+    if (P.empty() || P.rows < 15 || P.cols < 15 || P.type() != CV_64F) {
+        out[0] = 0.0;
+        out[1] = 0.0;
+        out[2] = 0.0;
+        return false;
+    }
+    // EKFState 15-DOF error state layout: [δθ(3), δb_g(3), δv(3), δb_a(3), δp(3)].
+    // Position block is at indices 12..14. Horizontal-plane (x, z) sub-block.
+    out[0] = P.at<double>(12, 12);  // σ_xx (m²)
+    out[1] = P.at<double>(12, 14);  // σ_xz (m²)
+    out[2] = P.at<double>(14, 14);  // σ_zz (m²)
+    return true;
 }
 
 void Tracker::addImuData(int64_t ts, float ax, float ay, float az, float gx, float gy, float gz) {
@@ -298,11 +407,43 @@ void Tracker::addImuData(int64_t ts, float ax, float ay, float az, float gx, flo
             std::lock_guard<std::mutex> lock(pose_mutex_);
             global_R_ = initializer_.getInitialRotation();
             // Gyro bias now managed solely by IMUPreintegrator (unified)
-            ekf_.initialize(smooth_scale_);
+            ekf_.initialize(scale_fuser_.scale());
             initialized_ = true;
             LOGI("Tracker: System initialized via InertialInitializer");
         }
     }
+}
+
+InertialInitializer::Status Tracker::getInitStatus() const {
+    return initializer_.getStatus();
+}
+
+void Tracker::clearInitTimeout() {
+    initializer_.clearTimeout();
+}
+
+void Tracker::loadStoredCalibration(const cv::Mat& R_GtoI,
+                                     const cv::Point3f& gyro_bias,
+                                     const cv::Point3f& accel_bias) {
+    initializer_.loadCalibration(R_GtoI, gyro_bias, accel_bias);
+    if (!initialized_) {
+        std::lock_guard<std::mutex> lock(pose_mutex_);
+        global_R_ = initializer_.getInitialRotation();
+        ekf_.initialize(scale_fuser_.scale());
+        initialized_ = true;
+    }
+}
+
+cv::Mat Tracker::getInitialRotation() const {
+    return initializer_.getInitialRotation();
+}
+
+cv::Point3f Tracker::getCalibratedGyroBias() const {
+    return initializer_.getGyroBias();
+}
+
+cv::Point3f Tracker::getCalibratedAccelBias() const {
+    return initializer_.getAccelBias();
 }
 
 // ── processFrame ─────────────────────────────────────────────────────────────
@@ -352,38 +493,36 @@ VisionOutput Tracker::processFrame(const uint8_t* yuv_data, int width, int heigh
     }
 
     // ── 3.1 Apply magnetometer heading ONCE at startup (per project policy)
-    if (!heading_initialized_ && imu.hasMagHeading()) {
+    // Mag is a one-shot bootstrap. Sets global_R_ as a seed for the eventual
+    // ekf_.initializeFull below (no continuous mag fusion — see project rules).
+    if (!heading_initialized_ && imu.hasMagHeading() && !ekf_.isFullInitialized()) {
         std::lock_guard<std::mutex> lock(pose_mutex_);
         float mag_yaw = imu.getMagHeading();
         double cy = std::cos(mag_yaw), sy = std::sin(mag_yaw);
-        // Override yaw in global_R_ while keeping identity pitch/roll
         global_R_ = (cv::Mat_<double>(3,3) <<
             cy, -sy, 0,
             sy,  cy, 0,
              0,   0, 1);
-        // Rebase offset so cached heading reads mag_yaw right now, regardless
-        // of where Madgwick's free-running yaw currently sits.
-        heading_offset_ = static_cast<double>(mag_yaw) -
-                          static_cast<double>(imu.getHeading());
         scalar_heading_ = mag_yaw;
         heading_initialized_ = true;
-        LOGI("Tracker: Initial heading set from magnetometer: %.1f deg "
-             "(offset=%.1f deg, madgwick=%.1f deg)",
-             mag_yaw * 180.0 / M_PI,
-             heading_offset_ * 180.0 / M_PI,
-             imu.getHeading() * 180.0 / M_PI);
+        LOGI("Tracker: Initial heading bootstrap from magnetometer: %.1f deg",
+             mag_yaw * 180.0 / M_PI);
     }
 
-    // Apply any pending setInitialHeading() request now that Madgwick is live.
-    if (pending_init_heading_set_ && imu.isOrientationInitialized()) {
+    // Apply any pending setInitialHeading() — bootstrap-only as well.
+    if (pending_init_heading_set_ && !ekf_.isFullInitialized() &&
+        imu.isOrientationInitialized()) {
         std::lock_guard<std::mutex> lock(pose_mutex_);
-        heading_offset_ = pending_init_heading_ -
-                          static_cast<double>(imu.getHeading());
-        scalar_heading_ = pending_init_heading_;
+        double az = pending_init_heading_;
+        double cy = std::cos(az), sy = std::sin(az);
+        global_R_ = (cv::Mat_<double>(3,3) <<
+            cy, -sy, 0,
+            sy,  cy, 0,
+             0,   0, 1);
+        scalar_heading_ = az;
         pending_init_heading_set_ = false;
-        LOGI("Tracker: applied pending init heading=%.1f deg, offset=%.1f deg",
-             pending_init_heading_ * 180.0 / M_PI,
-             heading_offset_ * 180.0 / M_PI);
+        LOGI("Tracker: bootstrap init heading=%.1f deg",
+             az * 180.0 / M_PI);
     }
 
     // ── 4. First-frame: grid-based feature detection ─────────────────────────
@@ -416,6 +555,17 @@ VisionOutput Tracker::processFrame(const uint8_t* yuv_data, int width, int heigh
     }
 
     frame_counter_++;
+
+    // Step 3 Fusion: time-update the scale fuser once per frame so its
+    // variance grows when no observer fires (allowing future observers to
+    // pull it more strongly). Δt clamped — first frame has no baseline.
+    if (last_scale_predict_ns_ != 0) {
+        double dt_predict = (timestamp_ns - last_scale_predict_ns_) * 1e-9;
+        if (dt_predict > 0.0 && dt_predict < 5.0) {
+            scale_fuser_.predict(dt_predict);
+        }
+    }
+    last_scale_predict_ns_ = timestamp_ns;
 
     // ── 4. IMU integration with TEMPORAL CALIBRATION ────────────────────────
     double td = ekf_.getTimeOffset();
@@ -680,20 +830,59 @@ VisionOutput Tracker::processFrame(const uint8_t* yuv_data, int width, int heigh
                     }
                 }
 
-                // ── Rotation: use gyro directly (bias already subtracted in preintegrator)
-                // IMUPreintegrator subtracts gyro_bias_ during integration (line 227-229),
-                // so imu_delta.deltaR is already bias-corrected. Do NOT subtract again.
+                // ── Rotation handling (Step 2, visual production plan) ────
+                // Per-frame R_fused below stays gyro-derived (imu_delta.deltaR
+                // is already bias-corrected by IMUPreintegrator, lines
+                // ~227-229). It drives the legacy global_R_ mirror, which we
+                // intentionally keep on the gyro path for now.
                 //
-                // CRITICAL: Yaw is UNOBSERVABLE from monocular camera (OpenVINS).
-                // Previous code blended Rodrigues vector components rv[0]/rv[2] from
-                // camera with rv[1] from gyro — but Rodrigues components are NOT
-                // independent Euler angles! Mixing them cross-couples axes and
-                // corrupts heading. Use gyro rotation directly for all axes.
+                // *Absolute* yaw against the world frame is unobservable from
+                // a monocular camera (only gravity + scale give an absolute
+                // reference), but the *relative* rotation between two camera
+                // poses is fully observable from R_vo. So R_vo is fused into
+                // the EKF separately via updateRelativeRotation below for
+                // state-level consistency, instead of being discarded.
                 R_fused = imu_delta.deltaR.clone();
 
+                // Fuse visual relative rotation into the EKF. R_vo from
+                // recoverPose is in the OpenCV camera frame; convert to the
+                // body frame via the same self-inverse extrinsic used for
+                // the keyframe yaw correction (see line ~1325):
+                //     R_b2c = diag(1, -1, -1)   (camera↔body for vertical
+                //     phone, rear camera) is symmetric and self-inverse, so
+                //     R_vo_body = R_b2c * R_vo * R_b2c.
+                // Variance per axis follows the same pixel-noise model used
+                // for the keyframe yaw update (Step 2.4 of the inertial plan):
+                //     σ_axis = RANSAC_THRESH / (focal * sqrt(N_inliers))
+                // Note: pose_valid is set to true at the bottom of this
+                // (inlier_count_out >= MIN_INLIERS && inlier_ratio >= MIN_INLIER_RATIO)
+                // block, so reaching this point implies pose_valid will be true
+                // for the rest of the frame. We gate explicitly on the geometric
+                // conditions instead of forward-referencing the flag.
+                if (!R_vo.empty() && inlier_count_out >= 12 &&
+                    !translation_degenerate && !is_pure_rotation &&
+                    ekf_.isFullInitialized()) {
+                    int prev_clone_id = ekf_.getLatestCloneId();
+                    if (prev_clone_id >= 0) {
+                        const cv::Mat R_b2c = (cv::Mat_<double>(3, 3) <<
+                            1.0,  0.0,  0.0,
+                            0.0, -1.0,  0.0,
+                            0.0,  0.0, -1.0);
+                        cv::Mat R_vo_body = R_b2c * R_vo * R_b2c;
+                        double focal = K.at<double>(0, 0);
+                        double sigma_axis = (focal > 1e-6)
+                            ? (RANSAC_THRESH /
+                               (focal * std::sqrt(static_cast<double>(inlier_count_out))))
+                            : 1e-2;
+                        double sigma_axis_sq = sigma_axis * sigma_axis;
+                        ekf_.updateRelativeRotation(R_vo_body, sigma_axis_sq,
+                                                    prev_clone_id);
+                    }
+                }
+
                 if (frame_counter_ % 90 == 0) {
-                    LOGI("POSE: transDegen=%d q=%.2f rotation=gyro_only scale=%.4f",
-                         translation_degenerate ? 1 : 0, quality, smooth_scale_);
+                    LOGI("POSE: transDegen=%d q=%.2f rotation=gyro_only(mirror)+vo(ekf) scale=%.4f",
+                         translation_degenerate ? 1 : 0, quality, scale_fuser_.scale());
                 }
 
                 // ── Scale estimation from steps (median bootstrap + EMA) ─
@@ -719,45 +908,68 @@ VisionOutput Tracker::processFrame(const uint8_t* yuv_data, int width, int heigh
                             obs_scale = std::max(0.005, std::min(10.0, obs_scale));
 
                             if (scale_obs_count_ < SCALE_BOOTSTRAP_COUNT) {
-                                // Phase 1: Bootstrap — collect observations
+                                // Phase 1: Bootstrap — collect observations.
+                                // Initial fuser variance is large (1.0); we
+                                // seed it once we have a stable median so
+                                // the first cold-start estimate isn't yanked
+                                // around by individual noisy samples.
                                 scale_bootstrap_buf_.push_back(obs_scale);
                                 scale_obs_count_++;
 
                                 if (scale_obs_count_ >= SCALE_BOOTSTRAP_COUNT) {
-                                    // Take median of bootstrap buffer
                                     std::vector<double> sorted = scale_bootstrap_buf_;
                                     std::sort(sorted.begin(), sorted.end());
                                     double median = sorted[sorted.size() / 2];
+                                    // Seed fuser with bootstrap median and a
+                                    // moderate variance (range/2)² so later
+                                    // observers can still steer it.
+                                    double range = sorted.back() - sorted.front();
+                                    double seed_var = std::max(1e-4, (range * 0.5) * (range * 0.5));
+                                    scale_fuser_.reset(median, seed_var);
 
-                                    std::lock_guard<std::mutex> slock(pose_mutex_);
-                                    smooth_scale_ = median;
-                                    estimatedScale = smooth_scale_;
-                                    LOGI("SCALE_BOOTSTRAP: median=%.4f from %d samples (range %.4f-%.4f)",
-                                         median, SCALE_BOOTSTRAP_COUNT, sorted.front(), sorted.back());
+                                    estimatedScale = scale_fuser_.scale();
+                                    LOGI("SCALE_BOOTSTRAP: median=%.4f var=%.5f from %d samples (range %.4f-%.4f)",
+                                         median, seed_var, SCALE_BOOTSTRAP_COUNT, sorted.front(), sorted.back());
                                     scale_bootstrap_buf_.clear();
                                     scale_bootstrap_buf_.shrink_to_fit();
                                 }
                             } else {
-                                // Phase 2: EMA refinement with outlier rejection
-                                bool reject = false;
-                                {
-                                    std::lock_guard<std::mutex> slock(pose_mutex_);
-                                    if (obs_scale > 2.5 * smooth_scale_ || obs_scale < smooth_scale_ / 2.5) {
-                                        reject = true;
+                                // Phase 2: Observer A feeds (z, r) into the
+                                // 1-D Kalman fuser. Variance from step-period
+                                // jitter — smooth gait → tight r → strong
+                                // pull. Outlier rejection retained as a
+                                // safety net beyond what variance alone gates.
+                                double current_smooth = scale_fuser_.scale();
+                                if (obs_scale > 2.5 * current_smooth ||
+                                    obs_scale < current_smooth / 2.5) {
+                                    if (frame_counter_ % 30 == 0) {
+                                        LOGI("SCALE: REJECTED obs=%.4f smooth=%.4f (>2.5× ratio)",
+                                             obs_scale, current_smooth);
                                     }
-                                }
+                                } else {
+                                    // Convert step-period variance σ²_T to a
+                                    // scale variance: speed = stride / T, so
+                                    // σ_v / v ≈ σ_T / T. obs_scale scales
+                                    // linearly with speed, so its CoV equals
+                                    // the speed CoV plus VO uncertainty.
+                                    double mean_period = (si.speed_mps > 0.0 && si.stride_length_m > 0.0)
+                                        ? (si.stride_length_m / si.speed_mps) : 0.5;
+                                    double period_var = (si.step_period_variance_s2 > 0.0)
+                                        ? si.step_period_variance_s2 : 0.0025; // default ~5% CoV
+                                    double cov_period = std::sqrt(period_var) / std::max(0.1, mean_period);
+                                    // Add a 10% VO baseline uncertainty in quadrature.
+                                    double cov_total = std::sqrt(cov_period * cov_period + 0.01);
+                                    double r_var = std::max(1e-6, (cov_total * obs_scale) * (cov_total * obs_scale));
 
-                                if (!reject) {
-                                    double alpha = (scale_obs_count_ < 50) ? 0.08 : 0.03;
-                                    std::lock_guard<std::mutex> slock(pose_mutex_);
-                                    smooth_scale_ = (1.0 - alpha) * smooth_scale_ + alpha * obs_scale;
-                                    smooth_scale_ = std::max(0.01, std::min(10.0, smooth_scale_));
-                                    scale_obs_count_++;
-                                    estimatedScale = smooth_scale_;
+                                    bool accepted = scale_fuser_.update(obs_scale, r_var);
+                                    if (accepted) scale_obs_count_++;
+
+                                    estimatedScale = scale_fuser_.scale();
 
                                     if (frame_counter_ % 30 == 0) {
-                                        LOGI("SCALE: obs=%.4f smooth=%.4f vo=%.4f step_d=%.3f count=%d",
-                                             obs_scale, smooth_scale_, vo_dist, step_disp, scale_obs_count_);
+                                        LOGI("SCALE: obs=%.4f smooth=%.4f vo=%.4f step_d=%.3f r=%.5f P=%.5f count=%d",
+                                             obs_scale, scale_fuser_.scale(), vo_dist, step_disp,
+                                             r_var, scale_fuser_.variance(), scale_obs_count_);
                                     }
                                 }
                             }
@@ -765,11 +977,57 @@ VisionOutput Tracker::processFrame(const uint8_t* yuv_data, int width, int heigh
                     }
                 }
 
-                // Phase 8 (gravity-aided scale) DISABLED:
-                // IMU preintegration deltaP is dominated by gravity subtraction
-                // errors on phone IMUs, producing wildly wrong scale estimates
-                // that fight against the reliable step-based scale.
-                // Step detection + stride estimation is the primary scale source.
+                // Phase 8 (gravity-aided scale) was disabled because IMU
+                // preintegration ΔP was dominated by gravity-subtraction
+                // errors when attitude was wrong. Madgwick (Step 1) produces
+                // clean attitude, so the Hesch/Martinelli closed-form VI
+                // scale path is now well-conditioned and re-enabled here.
+                //
+                // Step 3 Observer C: record one keyframe pair per frame
+                // (R_w_b = global_R_ at frame start; t_vis_body = unit-norm
+                // recoverPose translation; Δp/Δv/dt from imu.integrate over
+                // the frame). Every OBSERVER_C_SOLVE_INTERVAL pairs, run
+                // solve() and feed (s, var) into scale_fuser_ if healthy.
+                if (!is_pure_rotation && !is_static
+                    && imu_delta.dt > 0.005 && imu_delta.dt < 1.0
+                    && !t_vo.empty() && cv::norm(t_vo) > 0.5) {
+                    ScaleEstimatorVI::KeyframePair kp;
+                    kp.R_w_b = global_R_.clone();
+                    kp.dt = imu_delta.dt;
+                    kp.t_vis_body = cv::Vec3d(t_vo.at<double>(0),
+                                              t_vo.at<double>(1),
+                                              t_vo.at<double>(2));
+                    kp.delta_p_body = cv::Vec3d(imu_delta.deltaP.at<double>(0),
+                                                imu_delta.deltaP.at<double>(1),
+                                                imu_delta.deltaP.at<double>(2));
+                    kp.delta_v_body = cv::Vec3d(imu_delta.deltaV.at<double>(0),
+                                                imu_delta.deltaV.at<double>(1),
+                                                imu_delta.deltaV.at<double>(2));
+                    scale_estimator_vi_.addKeyframePair(kp);
+                    observer_c_pair_count_++;
+
+                    if (observer_c_pair_count_ % OBSERVER_C_SOLVE_INTERVAL == 0
+                        && scale_estimator_vi_.size() >= ScaleEstimatorVI::MIN_PAIRS) {
+                        double s_obs = 0.0, var_obs = 0.0;
+                        if (scale_estimator_vi_.solve(s_obs, var_obs)
+                            && std::isfinite(s_obs) && std::isfinite(var_obs)
+                            && s_obs > 0.01 && s_obs < 10.0 && var_obs > 0.0) {
+                            // Inflate variance: per-frame unit-norm visual
+                            // translations are noisy and Hesch/Martinelli
+                            // assumes consistent scale across pairs. Floor
+                            // keeps Observer C from dominating the fuser.
+                            double r_var = std::max(var_obs, 0.04);
+                            if (scale_fuser_.update(s_obs, r_var)) {
+                                if (frame_counter_ % 30 == 0) {
+                                    LOGI("OBS_C: s=%.4f var=%.5f -> "
+                                         "fuser_s=%.4f fuser_P=%.5f",
+                                         s_obs, var_obs, scale_fuser_.scale(),
+                                         scale_fuser_.variance());
+                                }
+                            }
+                        }
+                    }
+                }
 
                 // Depth-based scale constraint (MiDaS): runs every ~30 frames (~1Hz)
                 // Uses floor features + camera height to estimate absolute scale
@@ -783,11 +1041,8 @@ VisionOutput Tracker::processFrame(const uint8_t* yuv_data, int width, int heigh
         }
     }
 
-    // Always report current EKF scale (even if no new observation this frame)
-    {
-        std::lock_guard<std::mutex> slock(pose_mutex_);
-        estimatedScale = smooth_scale_;
-    }
+    // Always report current scale (even if no new observation this frame)
+    estimatedScale = scale_fuser_.scale();
     double appliedScale = estimatedScale;
     { std::lock_guard<std::mutex> lock(mutex_); appliedScale *= user_scale_correction_; }
 
@@ -795,40 +1050,60 @@ VisionOutput Tracker::processFrame(const uint8_t* yuv_data, int width, int heigh
     {
         std::lock_guard<std::mutex> lock(pose_mutex_);
 
-        // ── 9.0 Heading from Madgwick IMU-only attitude filter ─────────────
-        // Madgwick runs at full IMU rate inside IMUPreintegrator and returns
-        // a yaw that is NOT corrupted by centripetal accel the way the old
-        // gravity-projection integrator was. heading_offset_ carries initial
-        // mag/GPS bias plus visual keyframe corrections.
-        scalar_heading_ = static_cast<double>(imu.getHeading()) + heading_offset_;
-        while (scalar_heading_ >  M_PI) scalar_heading_ -= 2.0 * M_PI;
-        while (scalar_heading_ < -M_PI) scalar_heading_ += 2.0 * M_PI;
-
-        // Keep global_R_ in sync for existing consumers (step 2 of the plan
-        // will retire this). During ZUPT we still freeze it so downstream
-        // translation-dependent code behaves the same.
-        if (!is_static) {
-            global_R_ = global_R_ * imu_delta.deltaR;
+        // ── 9.0 Heading & rotation sourced from EKFState (Step 4) ─────────
+        // EKFState owns rotation propagation via propagateIMU and yaw
+        // correction via updateGravityAlignedYaw. scalar_heading_ and
+        // global_R_ are read-only mirrors refreshed each frame so legacy
+        // intra-frame consumers keep working until they are migrated to
+        // direct ekf_ accessors.
+        double heading;
+        if (ekf_.isFullInitialized()) {
+            // Heading: source DIRECTLY from Madgwick (imu.getHeading()),
+            // not from ekf_.getYaw(). 2026-05-03 BUG FIX: a 10-step
+            // forward-and-back sim with a clean 180° turn produced a
+            // V-shape trajectory — GPS confirmed the user walked nearly
+            // straight there and back, but VIO recorded only ~130° of the
+            // 180° turn. EKF's R_GtoI_ is propagated by propagateIMU using
+            // imu_delta.deltaR, which integrates gyro through the
+            // IMUPreintegrator's bias estimate; Madgwick maintains its own
+            // independent gyro bias. When the two diverge, the EKF yaw
+            // captures less rotation than Madgwick's. Sourcing heading
+            // from Madgwick (the same source that gave the
+            // "radar tracks 180° turns correctly" behaviour on the
+            // Madgwick merge) restores correct turn capture. Visual yaw
+            // correction (updateGravityAlignedYaw) still fires and keeps
+            // EKF R_GtoI_ consistent for any downstream consumer; we just
+            // don't read EKF yaw for output.
+            scalar_heading_ = static_cast<double>(imu.getHeading());
+            while (scalar_heading_ >  M_PI) scalar_heading_ -= 2.0 * M_PI;
+            while (scalar_heading_ < -M_PI) scalar_heading_ += 2.0 * M_PI;
+            // global_R_ continues to come from EKF — its rotation is
+            // gravity-corrected by the visual yaw update (Bug C fixed
+            // earlier), and the only output consumer of global_R_ is the
+            // clone storage / camera-pose snapshot, which benefits from
+            // the visual correction. Keeping it.
+            global_R_ = ekf_.getRotation();
+            // global_t_ deliberately NOT mirrored from EKF — see fix
+            // comment near the visual position update below.
+        } else {
+            // Bootstrap-only: before EKF initializeFull, fall back to
+            // Madgwick yaw.
+            scalar_heading_ = static_cast<double>(imu.getHeading());
+            while (scalar_heading_ >  M_PI) scalar_heading_ -= 2.0 * M_PI;
+            while (scalar_heading_ < -M_PI) scalar_heading_ += 2.0 * M_PI;
         }
-
-        double heading = scalar_heading_;
+        heading = scalar_heading_;
 
         if (frame_counter_ % 30 == 0) {
             const float m_yaw   = imu.getHeading() * 180.0f / static_cast<float>(M_PI);
             const float m_roll  = imu.getMadgwickRoll()  * 180.0f / static_cast<float>(M_PI);
             const float m_pitch = imu.getMadgwickPitch() * 180.0f / static_cast<float>(M_PI);
-            LOGI("HEADING: madgwick_yaw=%.1f° roll=%.1f° pitch=%.1f° "
-                 "offset=%.1f° -> heading=%.1f°",
+            LOGI("HEADING: madgwick_yaw=%.1f° roll=%.1f° pitch=%.1f° -> ekf_heading=%.1f°",
                  m_yaw, m_roll, m_pitch,
-                 heading_offset_ * 180.0 / M_PI,
                  heading * 180.0 / M_PI);
         }
 
-        // Phase 7: Lock FEJ heading on first valid pose
-        if (!heading_fej_set_ && pose_valid) {
-            heading_fej_ = heading;
-            heading_fej_set_ = true;
-        }
+        // Step 2.3: Madgwick is the heading reference; FEJ is for position only.
 
         if (is_static) {
             // Translation already frozen (no update)
@@ -844,10 +1119,47 @@ VisionOutput Tracker::processFrame(const uint8_t* yuv_data, int width, int heigh
                 disp = max_disp;
             }
 
-            global_t_.at<double>(0) += disp * std::sin(heading);  // +X = East
-            global_t_.at<double>(2) += disp * std::cos(heading);  // +Z = North
+            double dx_world = disp * std::sin(heading);   // +X = East
+            double dz_world = disp * std::cos(heading);   // +Z = North
+            // dy_world: vertical component. t_vo is in OpenCV camera frame
+            // (Y points DOWN). World Y is UP. Negate the Y component to
+            // bring it into world frame. For flat-ground walking dy ≈ 0;
+            // this matters on stairs / slopes / scooter-on-curb.
+            double dy_world = 0.0;
             if (!t_vo.empty())
-                global_t_.at<double>(1) += appliedScale * t_vo.at<double>(1);
+                dy_world = -appliedScale * t_vo.at<double>(1);
+
+            // Tracker-owned position output (see comment at the top of
+            // section 9 for why). Also fed to EKF below as a measurement
+            // so EKF state i stays consistent with what the UI displays.
+            global_t_.at<double>(0) += dx_world;
+            global_t_.at<double>(1) += dy_world;
+            global_t_.at<double>(2) += dz_world;
+
+            // Step 4 Phase C: mirror VO relative-pose update into EKFState
+            // with refined variance. updateRelativePose constrains
+            // (p_current - p_prev_clone) toward the visual delta. Latest clone
+            // id is the previous frame (current-frame addClone happens below).
+            //
+            // σ_t² has three sources:
+            //   1. Visual reprojection: ~5% of displacement (RANSAC inliers)
+            //   2. Scale uncertainty: scale_fuser_.var() scales with disp²
+            //   3. Floor: 1cm to prevent over-tight fusion when disp~0
+            if (ekf_.isFullInitialized()) {
+                int prev_clone_id = ekf_.getLatestCloneId();
+                if (prev_clone_id >= 0) {
+                    cv::Mat t_world_metric = (cv::Mat_<double>(3, 1)
+                        << dx_world, dy_world, dz_world);
+                    double sigma_visual = 0.05 * disp;
+                    double scale_var = scale_fuser_.variance();
+                    double sigma_scale = std::sqrt(std::max(0.0, scale_var)) * cv::norm(t_vo);
+                    double sigma_floor = 0.01;
+                    double var_t = sigma_visual * sigma_visual
+                                 + sigma_scale * sigma_scale
+                                 + sigma_floor * sigma_floor;
+                    ekf_.updateRelativePose(t_world_metric, prev_clone_id, var_t);
+                }
+            }
         } else if (!is_static) {
             used_fallback = true;
             auto si = imu.getStepInfo();
@@ -881,13 +1193,36 @@ VisionOutput Tracker::processFrame(const uint8_t* yuv_data, int width, int heigh
             // instead of a sharp turnaround.
             if (speed > 0.1 && gyro_norm < 0.8) {
                 double d = std::min(std::min(speed, 2.0) * dt_s, 1.0 * dt_s);
-                global_t_.at<double>(0) += d * std::sin(heading);  // +X = East
-                global_t_.at<double>(2) += d * std::cos(heading);  // +Z = North
+                double dx_step = d * std::sin(heading);   // +X = East
+                double dz_step = d * std::cos(heading);   // +Z = North
+
+                // Tracker-owned position output (visual-degenerate fallback).
+                // Same rationale as the visual path above: EKF position is
+                // unreliable as a display source; Tracker integrates here
+                // and feeds the EKF as a measurement for state consistency.
+                global_t_.at<double>(0) += dx_step;
+                global_t_.at<double>(2) += dz_step;
+
+                // Step 4 Phase C: mirror PDR fallback step into EKFState
+                // with refined per-step variance.
+                // σ ≈ 5cm floor + 10% of step distance:
+                //   dt at 30 Hz ⇒ d ~3-7cm/frame, σ ~5-6cm, var ~3-4e-3
+                //   dt at 1 Hz  ⇒ d ~30-70cm,    σ ~8-12cm, var ~1-2e-2
+                if (ekf_.isFullInitialized()) {
+                    double sigma_step = 0.05 + 0.10 * d;
+                    ekf_.updatePDRStep(dx_step, dz_step, sigma_step * sigma_step);
+                }
             }
         }
 
         // ── 9.1 FEJ & MSCKF: Store Camera Clone ──
-        ekf_.addClone(global_R_, global_t_, timestamp_ns);
+        // Step 4 Phase C: clone the EKF's IMU-state pose, not Tracker's
+        // independently-mutated globals — keeps the sliding window
+        // consistent with the propagated/updated EKF state that subsequent
+        // updateRelativePose calls reference.
+        cv::Mat clone_R = ekf_.isFullInitialized() ? ekf_.getRotation() : global_R_;
+        cv::Mat clone_p = ekf_.isFullInitialized() ? ekf_.getPosition() : global_t_;
+        ekf_.addClone(clone_R, clone_p, timestamp_ns);
         int clone_id = ekf_.getLatestCloneId();
 
         // Record MSCKF observations: feature pixels in normalized coordinates
@@ -899,6 +1234,12 @@ VisionOutput Tracker::processFrame(const uint8_t* yuv_data, int width, int heigh
                         (next_good_buf_[i].x - cx_use) / fx_use,
                         (next_good_buf_[i].y - cy_use) / fy_use);
                     feature_mgr_.addObservation(feature_ids_[i], clone_id, nrm);
+                    // Plan Step 3b (ADR-009): per-feature lifecycle counter
+                    // for SLAM-feature promotion / demotion. Keyframe tag
+                    // is set later in the frame (section 11.5) once the
+                    // keyframe decision lands.
+                    feature_mgr_.noteObservation(feature_ids_[i], timestamp_ns,
+                                                 /*is_keyframe=*/false);
                 }
             }
         }
@@ -938,34 +1279,343 @@ VisionOutput Tracker::processFrame(const uint8_t* yuv_data, int width, int heigh
             }
         }
 
-        // ── 11.1 MSCKF Update: DISABLED ──
-        // The MSCKF EKF state diverges from Tracker's global pose,
-        // causing large position/rotation jumps (seen as 5-11m teleportations).
-        // The full error-state EKF (Phase 9) needs proper convergence before
-        // its corrections can be trusted. For now, Tracker drives pose directly.
+        // ── 11.1 MSCKF Update: RE-ENABLED (Plan Step 3a, supersedes ADR-006) ──
+        // ADR-006 disabled this because corrections produced 5–11 m teleport-
+        // ations: Tracker held its own global pose mirror that the EKF could
+        // not see, so MSCKF residuals injected against a stale state. Step 4
+        // of the inertial plan removed those mirrors (EKF is now the single
+        // pose owner). The remaining failure modes — large outliers and
+        // sudden first-frame corrections — are mitigated by ADR-008's Huber
+        // kernel and damping ramp inside `EKFState::applyMSCKFUpdate`.
         //
-        // Still prune feature observations to prevent memory growth.
+        // Note: this runs AFTER section 9.1 added the new clone for the
+        // current frame and AFTER the Step 2 R_vo fusion in section 6, so
+        // the sliding window has the latest pose and the residual is built
+        // against the post-rotation-update state.
         if (ekf_.isFullInitialized() && !feature_ids_.empty()) {
-            feature_mgr_.extractLostFeatures(feature_ids_, 3);  // discard result
+            auto lost = feature_mgr_.getMSCKFCandidates(feature_ids_, 4);
+            if (!lost.empty()) {
+                int used = msckf_updater_.processLostFeatures(
+                    ekf_, lost, fx_use, fy_use, cx_use, cy_use);
+                if (used > 0) {
+                    LOGI("MSCKF: ran update with %zu lost features, %d used "
+                         "(huber_rejected=%d)",
+                         lost.size(), used,
+                         ekf_.getMSCKFHuberRejectedCount());
+                } else if (lost.size() >= 2) {
+                    LOGI("MSCKF: %zu lost features all rejected (chi²/triang)",
+                         lost.size());
+                }
+            }
             if (!ekf_.getWindow().empty()) {
                 int min_id = ekf_.getWindow().front().state_id;
                 feature_mgr_.pruneObservations(min_id);
             }
         }
 
-        // ── 11.2 Keyframe heading drift correction ──
-        // Every keyframe interval, match current frame against the last keyframe.
-        // The essential matrix R from that match gives the visual heading change.
-        // Compare to gyro-integrated heading change and apply gentle correction.
+        // ── 11.1b SLAM features in EKF state (Plan Step 3b, ADR-009) ─────
         //
-        // BUG FIX: Only apply during slow movement (gyro_norm < 0.3 rad/s ≈ 17°/s).
-        // The visual heading uses atan2(R[1,0], R[0,0]) which extracts rotation
-        // around the camera Z-axis (optical axis), NOT around gravity (true yaw).
-        // During turns, this systematically under-counts heading change, causing
-        // the correction to REMOVE real heading from the gyro integration.
-        // This was the root cause of 180° turns registering as only ~134°.
-        if (frames_since_keyframe_ >= 14 && pose_valid && tracked >= MIN_INLIERS * 2
-            && gyro_norm < 0.3) {
+        // Hybrid SLAM + MSCKF: long-lived features (≥ 12 obs spanning ≥ 2
+        // keyframes) are promoted into the EKF state vector with a 5-DOF
+        // inverse-depth (α, β, ρ + 2 pad) parameterisation anchored at
+        // their first keyframe. They contribute a 2-DOF reprojection
+        // residual every frame, bounding drift between keyframes far
+        // better than transient MSCKF tracks alone.
+        //
+        // Order of operations in this block:
+        //   1. PROMOTE: take getPromotableFeatures(), triangulate the
+        //      first/last observation pair, gate on chirality + RMSE,
+        //      then EKFState::addSlamFeature.
+        //   2. UPDATE:  for each SLAM feature with a current obs, build
+        //      a single-frame updateSlamFeature call. Track per-feature
+        //      RMS; drive markSlamFeatureRMS for the demotion gate.
+        //   3. DEMOTE:  features with rms_bad_consecutive ≥ 3 → remove.
+        //   4. EXPIRE:  features last seen > 1 s ago → remove.
+        //
+        // All of this is gated on isFullInitialized(); the EKF must own
+        // the pose (Step 4 of the inertial plan) before SLAM updates land.
+        if (ekf_.isFullInitialized() && !ekf_.getWindow().empty()) {
+            // Push intrinsics into EKFState so SLAM reprojection (pixel
+            // space) uses the live calibration, not the test default.
+            ekf_.setSlamIntrinsics(fx_use, fy_use, cx_use, cy_use);
+
+            // Build current-observation lookup: feature_id → pixel uv. SLAM
+            // measurement updates run in pixel space (matches the test
+            // contract); the legacy MSCKF path uses normalised coords via
+            // its own intrinsics argument.
+            std::unordered_map<int, cv::Point2f> cur_obs;
+            cur_obs.reserve(feature_ids_.size());
+            for (size_t i = 0; i < feature_ids_.size() &&
+                               i < next_good_buf_.size(); i++) {
+                int fid = feature_ids_[i];
+                if (fid < 0) continue;
+                cur_obs[fid] = next_good_buf_[i];  // pixel coords
+            }
+
+            const int latest_clone_id = ekf_.getLatestCloneId();
+
+            // ── (1) PROMOTE ─────────────────────────────────────────────
+            auto promotable = feature_mgr_.getPromotableFeatures(
+                /*min_obs=*/12, /*min_kf=*/2, /*max_init_rms_px=*/1.5);
+            for (int fid : promotable) {
+                if (ekf_.getSlamFeatureCount() >= EKFState::MAX_SLAM_FEATURES) {
+                    break;  // cap reached this frame; try again next frame
+                }
+                const auto* obs = feature_mgr_.getObservations(fid);
+                if (!obs || obs->size() < 2) continue;
+                // Pick first / last observations whose clones still exist.
+                int   anchor_clone_id = -1;
+                int   far_clone_id    = -1;
+                cv::Point2f obs_anchor, obs_far;
+                cv::Mat R_anchor, p_anchor, R_far, p_far;
+                for (const auto& o : *obs) {
+                    cv::Mat R, p;
+                    if (!ekf_.getClonePose(o.clone_state_id, R, p)) continue;
+                    if (anchor_clone_id < 0) {
+                        anchor_clone_id = o.clone_state_id;
+                        obs_anchor = o.pixel_ud;
+                        R_anchor = R; p_anchor = p;
+                    } else {
+                        far_clone_id = o.clone_state_id;
+                        obs_far = o.pixel_ud;
+                        R_far = R; p_far = p;
+                    }
+                }
+                if (anchor_clone_id < 0 || far_clone_id < 0 ||
+                    anchor_clone_id == far_clone_id) {
+                    continue;
+                }
+                // Two-view midpoint triangulation in world frame.
+                //
+                //   Ray from clone A in world: r_A(t) = p_A + R_A.t() * d_A * t
+                //   where d_A = (u_A, v_A, 1)^T (normalised image coords).
+                //
+                // Solve for the world point closest to both rays in the
+                // least-squares sense:  min || (r_A(t_A) - r_B(t_B)) ||²
+                cv::Mat dA = (cv::Mat_<double>(3, 1) <<
+                               obs_anchor.x, obs_anchor.y, 1.0);
+                cv::Mat dB = (cv::Mat_<double>(3, 1) <<
+                               obs_far.x, obs_far.y, 1.0);
+                cv::Mat dAw = R_anchor.t() * dA;
+                cv::Mat dBw = R_far.t()    * dB;
+                // Normalise the world-frame ray directions.
+                cv::Mat dAw_n = dAw / cv::norm(dAw);
+                cv::Mat dBw_n = dBw / cv::norm(dBw);
+                cv::Mat M(3, 2, CV_64F);
+                dAw_n.copyTo(M(cv::Range::all(), cv::Range(0, 1)));
+                cv::Mat negB = -dBw_n;
+                negB.copyTo(M(cv::Range::all(), cv::Range(1, 2)));
+                cv::Mat rhs = p_far - p_anchor;
+                cv::Mat ts;
+                if (!cv::solve(M, rhs, ts, cv::DECOMP_SVD)) continue;
+                const double tA = ts.at<double>(0, 0);
+                const double tB = ts.at<double>(1, 0);
+                if (tA <= 0.05 || tB <= 0.05) continue;  // chirality gate
+                cv::Mat p_world =
+                    0.5 * ((p_anchor + dAw_n * tA) + (p_far + dBw_n * tB));
+
+                // Reprojection RMSE gate over ALL surviving observations.
+                double rms2 = 0.0;
+                int    n_used = 0;
+                for (const auto& o : *obs) {
+                    cv::Mat R, p;
+                    if (!ekf_.getClonePose(o.clone_state_id, R, p)) continue;
+                    cv::Mat p_C = R * (p_world - p);
+                    const double zC = p_C.at<double>(2, 0);
+                    if (zC < 0.05) { rms2 = 1e9; break; }
+                    const double u = p_C.at<double>(0, 0) / zC;
+                    const double v = p_C.at<double>(1, 0) / zC;
+                    const double du = (u - o.pixel_ud.x) * fx_use;
+                    const double dv = (v - o.pixel_ud.y) * fy_use;
+                    rms2 += du * du + dv * dv;
+                    n_used++;
+                }
+                if (n_used < 2) continue;
+                const double rms = std::sqrt(rms2 / static_cast<double>(n_used));
+                if (rms > 1.5) continue;
+
+                // Build the anchor CameraPose. Use the EKF's stored FEJ.
+                CameraPose anchor;
+                cv::Mat R_anchor_FEJ, p_anchor_FEJ;
+                if (!ekf_.getCloneFEJ(anchor_clone_id,
+                                       R_anchor_FEJ, p_anchor_FEJ)) {
+                    R_anchor_FEJ = R_anchor.clone();
+                    p_anchor_FEJ = p_anchor.clone();
+                }
+                anchor.R_GtoC = R_anchor.clone();
+                anchor.p_G    = p_anchor.clone();
+                anchor.R_FEJ  = R_anchor_FEJ.clone();
+                anchor.p_FEJ  = p_anchor_FEJ.clone();
+                anchor.state_id = anchor_clone_id;
+                anchor.timestamp_ns = timestamp_ns;
+
+                int slot = ekf_.addSlamFeature(fid, p_world, anchor);
+                if (slot >= 0) {
+                    feature_mgr_.setSlamSlot(fid, slot);
+                    feature_mgr_.noteTriangulation(
+                        fid,
+                        cv::Point3f(static_cast<float>(p_world.at<double>(0, 0)),
+                                    static_cast<float>(p_world.at<double>(1, 0)),
+                                    static_cast<float>(p_world.at<double>(2, 0))),
+                        anchor_clone_id);
+                    LOGI("SLAM promote fid=%d slot=%d rms=%.2fpx anchor=%d",
+                         fid, slot, rms, anchor_clone_id);
+                }
+            }
+
+            // ── (2) UPDATE ──────────────────────────────────────────────
+            const int n_slam = ekf_.getSlamFeatureCount();
+            for (int slot = 0; slot < n_slam; slot++) {
+                // Translate slot ↔ feature_id by walking lifecycle map. We
+                // could cache the inverse map, but n_slam ≤ 12 — linear
+                // scan is fine.
+                int slot_fid = -1;
+                for (int fid : feature_ids_) {
+                    const auto* lc = feature_mgr_.getLifecycle(fid);
+                    if (lc && lc->slam_slot == slot) {
+                        slot_fid = fid;
+                        break;
+                    }
+                }
+                if (slot_fid < 0) continue;
+                auto cur_it = cur_obs.find(slot_fid);
+                if (cur_it == cur_obs.end() || latest_clone_id < 0) continue;
+                std::vector<cv::Point2f> obs1{cur_it->second};
+                std::vector<int> ids1{latest_clone_id};
+                if (ekf_.updateSlamFeature(
+                        slot, obs1, ids1,
+                        RANSAC_THRESH * RANSAC_THRESH)) {
+                    // Read back the residual via reprojection check using
+                    // the SLAM feature's current (corrected) global point.
+                    cv::Mat p_world;
+                    if (ekf_.getSlamFeatureGlobalPosition(slot, p_world)) {
+                        cv::Mat R_now, p_now;
+                        if (ekf_.getClonePose(latest_clone_id,
+                                              R_now, p_now)) {
+                            cv::Mat p_C = R_now * (p_world - p_now);
+                            const double zC = p_C.at<double>(2, 0);
+                            double rms_px = 1e9;
+                            if (zC > 0.05) {
+                                const double u_px =
+                                    fx_use * p_C.at<double>(0, 0) / zC + cx_use;
+                                const double v_px =
+                                    fy_use * p_C.at<double>(1, 0) / zC + cy_use;
+                                const double du = u_px - cur_it->second.x;
+                                const double dv = v_px - cur_it->second.y;
+                                rms_px = std::sqrt(du * du + dv * dv);
+                            }
+                            feature_mgr_.markSlamFeatureRMS(slot_fid, rms_px);
+                        }
+                    }
+                }
+            }
+
+            // ── (3) + (4) DEMOTE + EXPIRE in one pass ──────────────────
+            // Snapshot all (fid, slot, reason) tuples from BOTH demote and
+            // expire queues, then sort by slot DESCENDING and process
+            // highest-first. Removing slot N never shifts the index of any
+            // slot < N, so this avoids the stale-slot bug the previous
+            // per-loop reconciliation had: that walk only iterated
+            // `feature_ids_` (current-frame tracks), missing expired SLAM
+            // features whose feature_ids_ row no longer existed — their
+            // lifecycle slot stayed at the pre-removal value and the next
+            // iteration's removeSlamFeature(stale_slot) silently failed.
+            //
+            // After this loop runs, the EKF and lifecycle slot maps are
+            // consistent. No follow-up reconciliation walk required.
+            struct SlamRemoval {
+                int fid;
+                int slot;
+                bool is_demote;  // true = demote, false = expire
+            };
+            std::vector<SlamRemoval> removals;
+
+            for (int fid : feature_mgr_.getDemoteCandidates()) {
+                const auto* lc = feature_mgr_.getLifecycle(fid);
+                if (!lc || lc->slam_slot < 0) continue;
+                removals.push_back({fid, lc->slam_slot, true});
+            }
+            for (int fid : feature_mgr_.getLostSlamFeatures(timestamp_ns)) {
+                const auto* lc = feature_mgr_.getLifecycle(fid);
+                if (!lc || lc->slam_slot < 0) continue;
+                // Skip if already queued by demote (same fid via two paths
+                // would attempt double-removal).
+                bool already = false;
+                for (const auto& r : removals) {
+                    if (r.fid == fid) { already = true; break; }
+                }
+                if (already) continue;
+                removals.push_back({fid, lc->slam_slot, false});
+            }
+
+            // Highest slot first.
+            std::sort(removals.begin(), removals.end(),
+                      [](const SlamRemoval& a, const SlamRemoval& b) {
+                          return a.slot > b.slot;
+                      });
+
+            for (const SlamRemoval& r : removals) {
+                if (ekf_.removeSlamFeature(r.slot)) {
+                    if (r.is_demote) {
+                        LOGI("SLAM demote fid=%d slot=%d (bad RMS streak)",
+                             r.fid, r.slot);
+                    } else {
+                        LOGI("SLAM expire fid=%d slot=%d (≥1s since last obs)",
+                             r.fid, r.slot);
+                    }
+                }
+                feature_mgr_.setSlamSlot(r.fid, -1);
+                feature_mgr_.dropLifecycle(r.fid);
+            }
+
+            // After all higher-slot removals, every lifecycle entry whose
+            // EKF slot was above any removed slot needs decrementing. Walk
+            // all live lifecycles (not just feature_ids_, which is the bug
+            // the previous code had — it missed SLAM features not tracked
+            // this frame). Iterate from lowest removed slot upward; every
+            // surviving slot above each removal slot decrements once.
+            // Since we removed in descending order, and remaining lifecycle
+            // slots are all < the smallest removed slot OR fall in gaps
+            // between, we count for each surviving lifecycle entry how many
+            // removed slots were strictly below its current value.
+            if (!removals.empty()) {
+                std::vector<int> removed_slots;
+                removed_slots.reserve(removals.size());
+                for (const auto& r : removals) removed_slots.push_back(r.slot);
+                std::sort(removed_slots.begin(), removed_slots.end());
+
+                for (int fid : feature_mgr_.getAllLifecycleFeatureIds()) {
+                    const auto* lc = feature_mgr_.getLifecycle(fid);
+                    if (!lc || lc->slam_slot < 0) continue;
+                    int orig = lc->slam_slot;
+                    int shift = 0;
+                    for (int rs : removed_slots) {
+                        if (rs < orig) shift++;
+                    }
+                    if (shift > 0) {
+                        feature_mgr_.setSlamSlot(fid, orig - shift);
+                    }
+                }
+            }
+        }
+
+        // ── 11.2 Keyframe heading drift correction (Step 2.1, 2.2) ──
+        // Every keyframe interval, match current frame against the last keyframe.
+        // The essential matrix R_kf gives the visual rotation between the two
+        // camera poses. We rotate R_kf into the gravity-aligned frame using the
+        // current Madgwick roll/pitch, then extract yaw from the aligned matrix.
+        // This produces a physically-meaningful yaw change (rotation around
+        // world-up) regardless of phone tilt, so the correction is safe to
+        // apply during turns — no gyro_norm gate needed.
+        //
+        // ASSUMPTION (load-bearing): the codebase already treats body-frame
+        // imu_delta.deltaR and camera-frame visual rotation as the same frame
+        // (see line 811: global_R_ = global_R_ * imu_delta.deltaR). The
+        // gravity-alignment below inherits that simplification — Madgwick body
+        // roll/pitch is used to de-tilt the camera-frame R_kf. If a real
+        // body→camera extrinsic is ever introduced, it must be applied
+        // uniformly to both deltaR propagation and R_align below.
+        if (frames_since_keyframe_ >= 14 && pose_valid && tracked >= MIN_INLIERS * 2) {
             double kf_heading = 0.0;
             cv::Point3f kf_pos;
             if (feature_mgr_.getLastKeyframeInfo(kf_heading, kf_pos)) {
@@ -981,9 +1631,94 @@ VisionOutput Tracker::processFrame(const uint8_t* yuv_data, int width, int heigh
                     if (!E.empty()) {
                         int inl = cv::recoverPose(E, kf_matched, cur_matched, K, R_kf, t_kf, mask);
                         if (inl >= 20 && !R_kf.empty()) {
-                            // Extract yaw from visual rotation (atan2 of 2D rotation component)
-                            double visual_delta_heading = std::atan2(
-                                R_kf.at<double>(1, 0), R_kf.at<double>(0, 0));
+                            // Step 2.1: gravity-aligned yaw extraction.
+                            // Build R_align that undoes current Madgwick
+                            // roll/pitch, sandwich R_kf into the gravity-
+                            // aligned frame, then extract yaw via atan2 of
+                            // the (1,0)/(0,0) components.
+                            double visual_delta_heading = 0.0;
+                            // Step 4 Phase B: also extract Y-up navigation yaw delta
+                            // (atan2(R[0,2], R[0,0])) so it can be fed to
+                            // EKFState::updateGravityAlignedYaw, which uses the same
+                            // convention as imu.getHeading() and EKFState::getYaw().
+                            // The Z-up `visual_delta_heading` above is preserved for
+                            // the legacy heading_offset_ blend so its empirical
+                            // behaviour is unchanged during Phase B.
+                            double visual_delta_heading_y_up = 0.0;
+                            double current_roll  = 0.0;
+                            double current_pitch = 0.0;
+                            bool aligned_ok = false;
+                            try {
+                                double roll  = static_cast<double>(imu.getMadgwickRoll());
+                                double pitch = static_cast<double>(imu.getMadgwickPitch());
+                                current_roll = roll;
+                                current_pitch = pitch;
+                                cv::Mat Rx, Ry;
+                                // R_align = R_body_to_world: undoes Madgwick pitch
+                                // then roll. Together with the camera→body
+                                // similarity transform below, this lifts R_kf
+                                // (which recoverPose returns in the OpenCV camera
+                                // frame: X-right, Y-down, Z-forward) into the
+                                // gravity-aligned world frame where Y-up yaw is
+                                // pure rotation about world Y.
+                                cv::Rodrigues(cv::Vec3d(roll, 0.0, 0.0), Rx);
+                                cv::Rodrigues(cv::Vec3d(0.0, pitch, 0.0), Ry);
+                                cv::Mat R_align = Ry * Rx;
+
+                                // Camera→body extrinsic for the rear-camera /
+                                // vertical-phone configuration NavSight runs in:
+                                //   camera +X = body +X (right)
+                                //   camera +Y = body -Y (down vs up)
+                                //   camera +Z = body -Z (forward vs back)
+                                // Hence R_b2c = diag(1, -1, -1). It is symmetric
+                                // and self-inverse, so the similarity transform
+                                // that re-expresses R_kf in body coordinates is
+                                //   R_kf_body = R_b2c · R_kf_camera · R_b2c
+                                // BUG FIX 2026-05-03: previously this conversion
+                                // was missing, so the body-frame Madgwick
+                                // sandwich was applied to a camera-frame R_kf.
+                                // For a body yaw of +θ, the resulting yaw_meas
+                                // came out as -θ (sign inverted), which
+                                // updateGravityAlignedYaw then yanked EKF yaw
+                                // toward the wrong direction every keyframe →
+                                // 47 direction flips per 16 s sim, 3.6× path
+                                // inflation.
+                                const cv::Mat R_b2c = (cv::Mat_<double>(3, 3) <<
+                                    1.0,  0.0,  0.0,
+                                    0.0, -1.0,  0.0,
+                                    0.0,  0.0, -1.0);
+                                cv::Mat R_kf_body = R_b2c * R_kf * R_b2c;
+
+                                cv::Mat R_aligned = R_align * R_kf_body * R_align.t();
+                                visual_delta_heading = std::atan2(
+                                    R_aligned.at<double>(1, 0),
+                                    R_aligned.at<double>(0, 0));
+                                visual_delta_heading_y_up = std::atan2(
+                                    R_aligned.at<double>(0, 2),
+                                    R_aligned.at<double>(0, 0));
+                                aligned_ok = true;
+                            } catch (const cv::Exception& e) {
+                                LOGI("KF_HEADING_CORR: gravity-align failed: %s", e.what());
+                                // Fall back to raw atan2 (legacy behaviour)
+                                visual_delta_heading = std::atan2(
+                                    R_kf.at<double>(1, 0), R_kf.at<double>(0, 0));
+                            }
+
+                            // Step 2.4: visual yaw variance from RANSAC inliers.
+                            // σ_yaw ≈ pixel_noise / (focal · √N), pixel_noise ≈
+                            // 1.0 px (RANSAC inlier threshold). Consumed by
+                            // Step 6 ESKF update.
+                            // Written under pose_mutex_ (matches getSmoothScale/
+                            // getHeading pattern; getter reads under pose_mutex_).
+                            {
+                                double focal = K.at<double>(0, 0);
+                                if (focal > 1e-6) {
+                                    double sigma_yaw = 1.0 /
+                                        (focal * std::sqrt(static_cast<double>(inl)));
+                                    std::lock_guard<std::mutex> slock(pose_mutex_);
+                                    last_visual_yaw_variance_ = sigma_yaw * sigma_yaw;
+                                }
+                            }
 
                             // Madgwick heading change since keyframe (kf_heading
                             // was the cached scalar_heading_ at keyframe time,
@@ -1004,20 +1739,47 @@ VisionOutput Tracker::processFrame(const uint8_t* yuv_data, int width, int heigh
                             // Walking oscillation can cause 2-4°/step drift; allow up to 20°
                             // to catch multi-step accumulation between keyframes
                             if (std::abs(drift) < 20.0 * M_PI / 180.0) {
-                                // 30% correction — applied to heading_offset_
-                                // (not Madgwick itself). The next frame's
-                                // scalar_heading_ = madgwick + offset will
-                                // reflect the correction automatically.
-                                heading_offset_ -= 0.30 * drift;
-                                while (heading_offset_ >  M_PI) heading_offset_ -= 2.0 * M_PI;
-                                while (heading_offset_ < -M_PI) heading_offset_ += 2.0 * M_PI;
-                                scalar_heading_ -= 0.30 * drift;
-                                while (scalar_heading_ > M_PI) scalar_heading_ -= 2.0 * M_PI;
-                                while (scalar_heading_ < -M_PI) scalar_heading_ += 2.0 * M_PI;
+                                // Step 4 Phase B: feed visual yaw measurement into
+                                // EKFState as a mirror of the legacy heading_offset_
+                                // blend. yaw_meas is the absolute world yaw the
+                                // visual evidence wants us to be at, in Y-up
+                                // navigation convention (matches EKFState::getYaw
+                                // and imu.getHeading). The Joseph-form Kalman update
+                                // applies its own gain — the legacy 30%-blend below
+                                // remains untouched until Phase C.
+                                if (aligned_ok && ekf_.isFullInitialized()) {
+                                    double yaw_meas = kf_heading + visual_delta_heading_y_up;
+                                    while (yaw_meas >  M_PI) yaw_meas -= 2.0 * M_PI;
+                                    while (yaw_meas < -M_PI) yaw_meas += 2.0 * M_PI;
+                                    // Step 4 Phase C: refined variance.
+                                    // σ_yaw ≈ pixel_noise / (focal · √N) with
+                                    // pixel_noise = RANSAC_THRESH (=1px). Floor
+                                    // at (0.5°)² to account for residual
+                                    // gravity misalignment Madgwick can't
+                                    // correct (Madgwick steady-state error is
+                                    // ~0.5-1°). Without this floor, large-N
+                                    // observations drive var below 1e-5 and
+                                    // the EKF clamps too tightly to noisy
+                                    // visual yaw at the expense of the IMU.
+                                    double focal = K.at<double>(0, 0);
+                                    double var_yaw = 1e-4;  // ~(0.6°)² floor
+                                    if (focal > 1e-6 && inl > 0) {
+                                        double sigma = RANSAC_THRESH /
+                                            (focal * std::sqrt(
+                                                static_cast<double>(inl)));
+                                        var_yaw = std::max(var_yaw, sigma * sigma);
+                                    }
+                                    ekf_.updateGravityAlignedYaw(
+                                        yaw_meas, var_yaw,
+                                        current_roll, current_pitch);
+                                }
 
+                                // Step 4: legacy 30% heading_offset_ blend
+                                // deleted — EKFState::updateGravityAlignedYaw
+                                // above is the single yaw-correction path.
                                 if (frame_counter_ % 30 == 0) {
-                                    LOGI("KF_HEADING_CORR: drift=%.2f° correction=%.2f° inliers=%d",
-                                         drift * 180.0 / M_PI, 0.30 * drift * 180.0 / M_PI, inl);
+                                    LOGI("KF_HEADING_CORR: drift=%.2f° inliers=%d (EKF-only)",
+                                         drift * 180.0 / M_PI, inl);
                                 }
                             }
                         }
@@ -1035,6 +1797,12 @@ VisionOutput Tracker::processFrame(const uint8_t* yuv_data, int width, int heigh
                 static_cast<float>(global_t_.at<double>(2)));
             feature_mgr_.storeKeyframe(gray_buf_, next_good_buf_, timestamp_ns, frame_counter_,
                                        scalar_heading_, kf_pos);
+            // Plan Step 3b (ADR-009): tag every currently-tracked feature
+            // ID as having spanned this keyframe. SLAM promotion needs
+            // kf_count ≥ 2; without this tick the gate never opens.
+            for (int fid : feature_ids_) {
+                if (fid >= 0) feature_mgr_.noteKeyframe(fid);
+            }
             frames_since_keyframe_ = 0;
         }
 
@@ -1057,9 +1825,25 @@ VisionOutput Tracker::processFrame(const uint8_t* yuv_data, int width, int heigh
     }
 
     // ── 12. Output assembly ──────────────────────────────────────────────────
+    // Rotation: source from EKFState when full-init. EKF rotation is
+    // gravity-aligned and corrected by the keyframe yaw update, so it is
+    // strictly better than the gyro-only global_R_ before EKF init.
+    //
+    // Position: source from Tracker's global_t_, which is incremented by
+    // the heading×scaled-disp formula in section 9 (visual path) and the
+    // PDR fallback below it. This is the OLD working architecture.
+    // Phase C of the plan delegated position output to the EKF, but the
+    // EKF's IMU-only propagation drifts unboundedly during standstill —
+    // the 2026-05-03 sims showed 0.13 m/s position drift with the phone
+    // genuinely stationary because ZUPT cancels v_G_ but residual
+    // accel-bias × Δt² and Madgwick tilt-bleed accumulate in p_G_ before
+    // ZUPT fires each frame. EKF position is still maintained
+    // (updateRelativePose, updatePDRStep are still called) so its
+    // covariance stays meaningful for UI uncertainty reporting, but
+    // it is not the output source.
     {
         std::lock_guard<std::mutex> lock(pose_mutex_);
-        out.R = global_R_.clone();
+        out.R = ekf_.isFullInitialized() ? ekf_.getRotation() : global_R_.clone();
         out.t = global_t_.clone();
     }
     out.rawR = R_vo.clone();
@@ -1083,6 +1867,13 @@ VisionOutput Tracker::processFrame(const uint8_t* yuv_data, int width, int heigh
                   | (pose_valid ? 4 : 0) | (used_fallback ? 8 : 0);
 
     // ── 13. Output heading + export frame data for Mapper ────────────────────
+    // 2026-05-03 BUG FIX: this block previously overwrote scalar_heading_ and
+    // out.heading with ekf_.getYaw(), silently reverting the V-shape fix that
+    // section 9.0 just established (Madgwick is the heading source — see the
+    // long comment block in section 9.0 for why EKF yaw under-rotates fast
+    // turns). Use the Madgwick-sourced scalar_heading_ that section 9.0 set,
+    // and keep position output sourced from Tracker's global_t_ — for the
+    // same architectural reason that EKF position drifts during standstill.
     {
         std::lock_guard<std::mutex> lock(pose_mutex_);
         out.heading = scalar_heading_;

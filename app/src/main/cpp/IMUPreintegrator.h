@@ -92,9 +92,24 @@ public:
         double stride_length_m;   // Estimated stride length in meters
         double speed_mps;         // Estimated walking speed in m/s
         int64_t last_step_ns;     // Timestamp of last detected step
+
+        // Step 3 Observer A: confidence components.
+        // Lower variance + recent step → higher PDR confidence.
+        double step_period_variance_s2;  // var of last N step periods (s²); -1 if unset
+        double accel_variance;           // running variance of |accel| (m²/s⁴)
+        double time_since_last_step_s;   // seconds since last detected step
+        bool   stride_calibrated;        // true if a per-user stride was set
     };
 
     StepInfo getStepInfo() const;
+
+    // Step 3 Observer A: per-user calibrated stride length.
+    // Set after stride-learning walk: stride = distance / steps. Persisted in
+    // SharedPreferences on the Java side; pushed in here on app startup.
+    // <= 0 disables calibration → stride model falls back to height×0.415.
+    void setUserStride(double stride_m);
+    double getUserStride() const;
+    bool hasCalibratedStride() const;
 
     // Motion mode detection: walking vs driving vs stationary
     enum class MotionMode { STATIONARY, WALKING, DRIVING };
@@ -117,6 +132,8 @@ public:
 
     // Gyro bias accessor (unified — Tracker no longer maintains its own)
     cv::Point3f getGyroBias() const;
+    // Step 5: seed gyro bias from stored calibration (skips warmup samples).
+    void setGyroBias(float bx, float by, float bz);
 
     // Refine gyro bias during stationary periods (called by Tracker ZUPT)
     // Uses recent gyro samples to nudge bias estimate with small alpha
@@ -173,13 +190,41 @@ private:
     static constexpr double DEFAULT_STRIDE_M  = 0.65;      // Average human stride
     float user_height_m_{1.70f};                              // User height for stride model
 
+    // Step 3 Observer A: per-user calibrated stride. >0 = calibrated.
+    // Set via setUserStride(). When set, overrides height-based model.
+    double user_stride_m_{-1.0};
+
+    // Step 3 Observer A: rolling buffer of last N step periods (seconds).
+    // Used to compute step_period_variance for PDR confidence.
+    static constexpr size_t STEP_PERIOD_BUF = 8;
+    std::vector<double> step_period_buf_;
+
+    // Step 3 Observer A: rotation gate for step suppression. 0.8 rad/s ≈ 46°/s,
+    // well above normal arm-swing yaw (≈10°/s) but below in-place turn rate
+    // (≈90°/s). Above this, step counter is suppressed to prevent the V-shape
+    // PDR-during-rotation artifact (see project_vio_session_april08 memory).
+    static constexpr float ROTATION_STEP_GATE_RADPS = 0.8f;
+
+    // ── Step 8 Cleanup status (kept, NOT deleted) ───────────────────────────
+    // The production-readiness plan (Step 8) calls for removing the
+    // hand-rolled motion classifier and vehicle-speed integrator in favor of
+    // a unified step detector + explicit rotation gate. The fields below are
+    // retained as a per-user request ("comment, don't delete") because they
+    // still serve as live gates inside detectStep() and updateMotionMode():
+    //   • is_walking_pattern_ — gates peak detection in detectStep so road
+    //     vibrations are not counted as steps.
+    //   • vehicle_speed_mps_ / in_vehicle_mode_ — exposed via
+    //     getVehicleSpeedEstimate() for the scooter-mode UI hint.
+    // If/when Step 3's VI scale observer fully owns these signals, this
+    // block becomes dead code; for now it is legacy-but-live.
     float accel_mag_slow_{9.81f};     // Very slow LP for walking detection (alpha ~0.02)
     float accel_variance_est_{0.0f};  // Running variance of accel magnitude
-    bool is_walking_pattern_{false};  // True if recent accel matches walking, not vibration
+    bool is_walking_pattern_{false};  // LEGACY (Step 8): walking-vs-vibration classifier
     float gyro_mag_filtered_{0.0f};   // Low-pass filtered |gyro| in rad/s
                                       // Used to suppress phantom steps during in-place rotation
 
-    // Vehicle motion detection
+    // Vehicle motion detection — LEGACY (Step 8 cleanup), retained as
+    // commented above. Used by getVehicleSpeedEstimate().
     double vehicle_speed_mps_{0.0};   // Integrated forward acceleration
     int64_t last_accel_ts_ns_{0};     // For dt computation
     double sustained_accel_s_{0.0};   // How long accel has been above threshold

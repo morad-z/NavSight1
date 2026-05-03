@@ -52,6 +52,7 @@ fun MainScreen(viewModel: NavSightViewModel, pal: NavPalette, isNight: Boolean, 
     var gpxPoints           by remember { mutableStateOf<List<Pair<Double, Double>>>(emptyList()) }
     var gpxMessage          by remember { mutableStateOf<String?>(null) }
     var debugVisible        by remember { mutableStateOf(false) }
+    var calibrationVisible  by remember { mutableStateOf(false) }
     var bottomSheetExpanded by rememberSaveable { mutableStateOf(false) }
     val scope               = rememberCoroutineScope()
     val context             = LocalContext.current
@@ -82,9 +83,16 @@ fun MainScreen(viewModel: NavSightViewModel, pal: NavPalette, isNight: Boolean, 
 
     Box(Modifier.fillMaxSize().background(pal.bg)) {
 
-        // Camera — always alive, invisible when not shown
-        Box(modifier = if (cameraVisible) Modifier.fillMaxSize() else Modifier.size(1.dp).alpha(0f)) {
-            CameraViewComposable(viewModel)
+        // Camera — always alive, invisible when not shown.
+        // Step 1 (Visual plan): re-key on `calibrationVisible` so the camera
+        // analyzer rebinds to the activity lifecycle after the calibration
+        // screen unbinds the back camera on dispose.
+        key(calibrationVisible) {
+            Box(modifier = if (cameraVisible && !calibrationVisible) Modifier.fillMaxSize() else Modifier.size(1.dp).alpha(0f)) {
+                if (!calibrationVisible) {
+                    CameraViewComposable(viewModel)
+                }
+            }
         }
 
         // Map
@@ -99,7 +107,10 @@ fun MainScreen(viewModel: NavSightViewModel, pal: NavPalette, isNight: Boolean, 
                     }
                 }
             } else {
-                NavigationMapWrapper(mapStart, fusedHeading, historySnapshot, pal, viewModel, Modifier.fillMaxSize())
+                NavigationMapWrapper(
+                    mapStart, fusedHeading, historySnapshot, pal, viewModel,
+                    Modifier.fillMaxSize()
+                )
             }
         }
 
@@ -146,6 +157,25 @@ fun MainScreen(viewModel: NavSightViewModel, pal: NavPalette, isNight: Boolean, 
                 HeroHeader(viewModel.currentSpeedKmh, compassLabel, fusionMode,
                     (vio.trackingQuality * 100).toFloat(), pal)
                 Spacer(Modifier.height(4.dp))
+                Row(verticalAlignment = Alignment.CenterVertically,
+                    horizontalArrangement = Arrangement.spacedBy(6.dp)) {
+                    VioStatusChip(
+                        isInitialized = vio.isInitialized,
+                        covValid      = viewModel.positionCovValid,
+                        sigmaM        = viewModel.positionSigmaM,
+                        pal           = pal
+                    )
+                    CalibrationStatusPill(
+                        loaded = viewModel.calibrationLoaded,
+                        pal = pal,
+                        onClick = { calibrationVisible = true },
+                    )
+                }
+                if (!viewModel.calibrationLoaded) {
+                    Spacer(Modifier.height(6.dp))
+                    CalibrationFirstLaunchBanner(pal) { calibrationVisible = true }
+                }
+                Spacer(Modifier.height(4.dp))
                 AnimatedVisibility(navState is NavigationState.Active && instruction != null,
                     enter = slideInVertically { -it } + fadeIn(), exit = slideOutVertically { -it } + fadeOut()) {
                     if (navState is NavigationState.Active && instruction != null) {
@@ -174,7 +204,8 @@ fun MainScreen(viewModel: NavSightViewModel, pal: NavPalette, isNight: Boolean, 
                 MapActionStack(pal,
                     onCameraClick  = { cameraVisible = true },
                     onDebugClick   = { debugVisible = !debugVisible },
-                    onExpandSheet  = { bottomSheetExpanded = !bottomSheetExpanded }
+                    onExpandSheet  = { bottomSheetExpanded = !bottomSheetExpanded },
+                    onCalibrateClick = { calibrationVisible = true }
                 )
             }
 
@@ -234,13 +265,49 @@ fun MainScreen(viewModel: NavSightViewModel, pal: NavPalette, isNight: Boolean, 
             onNightToggle   = onToggleNight,
             onToggleExpanded = { bottomSheetExpanded = !bottomSheetExpanded }
         )
+
+        // Step 1 (Visual plan): full-screen camera calibration overlay.
+        AnimatedVisibility(
+            calibrationVisible,
+            enter = fadeIn(tween(200)),
+            exit  = fadeOut(tween(200)),
+            modifier = Modifier.fillMaxSize(),
+        ) {
+            Box(Modifier.fillMaxSize().background(pal.bg)) {
+                CalibrationScreen(
+                    viewModel = viewModel,
+                    pal = pal,
+                    onClose = {
+                        calibrationVisible = false
+                        viewModel.refreshCalibrationLoaded()
+                    },
+                )
+            }
+        }
+
+        // Step 5: prompt user to place phone flat when stationary calibration timed out.
+        if (viewModel.initStatus == SensorRepository.InitStatus.TIMEOUT_NEEDS_USER) {
+            AlertDialog(
+                onDismissRequest = { /* keep modal until user confirms */ },
+                title = { Text("Hold steady") },
+                text = {
+                    Text(
+                        "Place the phone flat on a stable surface for 5 seconds, " +
+                        "then tap OK to calibrate."
+                    )
+                },
+                confirmButton = {
+                    TextButton(onClick = { viewModel.clearInitTimeout() }) { Text("OK") }
+                }
+            )
+        }
     }
 }
 
 @Composable
 fun NavigationMapWrapper(
     start: LatLng, azimuth: Float,
-    history: List<Pair<Float, Float>>, pal: NavPalette,
+    history: List<PathPoint>, pal: NavPalette,
     viewModel: NavSightViewModel, modifier: Modifier = Modifier
 ) {
     val navState   = viewModel.navigationState
@@ -294,7 +361,7 @@ fun NavigationMapWrapper(
         val interval = if (navState is NavigationState.Active) 800L else 1200L
         if (now - lastOverlay >= interval || navState is NavigationState.Routing) {
             lastOverlay = now; mapPos = displayPos; mapAzi = azimuth
-            mapPath = history.map { NavSightUtils.metersToLatLng(start, it.first.toDouble(), it.second.toDouble()) }
+            mapPath = history.map { NavSightUtils.metersToLatLng(start, it.x.toDouble(), it.z.toDouble()) }
         }
     }
 
@@ -314,6 +381,25 @@ fun NavigationMapWrapper(
                 Marker(state = MarkerState(navState.route.destination), title = "Destination")
             }
             if (mapPath.isNotEmpty()) Polyline(points = mapPath, color = pal.orange.copy(0.8f), width = 7f, zIndex = 5f)
+            // Step 6 (Task #29): 1σ horizontal-plane uncertainty ring around the user.
+            // Radius is the sigma reported by the EKF, clamped to [0.5 m, 25 m] so the
+            // overlay stays visible without dominating the screen during a degraded run.
+            val sigma = viewModel.positionSigmaM
+            if (viewModel.positionCovValid && sigma.isFinite() && sigma > 0f) {
+                val ringColor = when {
+                    sigma < 0.5f -> Teal500
+                    sigma < 1.5f -> Orange400
+                    else         -> Color(0xFFEF5350)
+                }
+                Circle(
+                    center      = mapPos,
+                    radius      = sigma.coerceIn(0.5f, 25f).toDouble(),
+                    strokeColor = ringColor.copy(alpha = 0.85f),
+                    strokeWidth = 4f,
+                    fillColor   = ringColor.copy(alpha = 0.12f),
+                    zIndex      = 4f
+                )
+            }
             Marker(state = MarkerState(mapPos), rotation = mapAzi, flat = true, anchor = Offset(0.5f, 0.5f), icon = arrowIcon)
             Marker(state = MarkerState(start), title = "Start", icon = startIcon)
         }
@@ -329,9 +415,9 @@ fun NavigationMapWrapper(
 }
 
 @Composable
-fun SensorRadarWaze(history: List<Pair<Float, Float>>, currentAzimuth: Float, pal: NavPalette) {
+fun SensorRadarWaze(history: List<PathPoint>, currentAzimuth: Float, pal: NavPalette) {
     val dist = if (history.isEmpty()) 0f else sqrt(
-        history.last().first.toDouble().pow(2) + history.last().second.toDouble().pow(2)).toFloat()
+        history.last().x.toDouble().pow(2) + history.last().z.toDouble().pow(2)).toFloat()
 
     val rPaint = remember { android.graphics.Paint().apply {
         color = android.graphics.Color.argb(200, 0, 188, 212)
@@ -363,7 +449,7 @@ fun SensorRadarWaze(history: List<Pair<Float, Float>>, currentAzimuth: Float, pa
                 drawLine(Teal500.copy(0.18f), Offset(cx - maxR, cy), Offset(cx + maxR, cy), 1f)
                 drawCircle(Teal500.copy(0.35f), maxR, Offset(cx, cy), style = Stroke(1.5f))
                 if (history.size >= 2) {
-                    val curX = history.last().first; val curZ = history.last().second
+                    val curX = history.last().x; val curZ = history.last().z
                     val rad  = Math.toRadians((-currentAzimuth).toDouble())
                     val cosA = cos(rad).toFloat(); val sinA = sin(rad).toFloat()
                     fun toC(px: Float, pz: Float): Offset {
@@ -371,16 +457,24 @@ fun SensorRadarWaze(history: List<Pair<Float, Float>>, currentAzimuth: Float, pa
                         return Offset((cx + (dx * cosA - dz * sinA) * mToPx).coerceIn(0f, size.width),
                             (cy - (dx * sinA + dz * cosA) * mToPx).coerceIn(0f, size.height))
                     }
+                    // Step 6 (Task #30): trajectory points colored by EKF position
+                    // uncertainty σ. Bins: σ<0.5m (good)=teal, 0.5–1.5m (caution)=orange,
+                    // ≥1.5m or NaN (degraded/lost)=red. Pre-init samples (NaN) treated
+                    // as the worst class so the user can see the calibration tail.
                     val n = history.size; val si = maxOf(1, n - 120)
                     for (i in si until n) {
-                        val dx = history[i].first - history[i-1].first; val dz = history[i].second - history[i-1].second
-                        val mov = sqrt((dx*dx + dz*dz).toDouble()).toFloat()
-                        val col = when { mov > 0.03f -> Teal500; mov > 0.008f -> Orange400; else -> Color(0xFFEF5350) }
+                        val sig = history[i].sigmaM
+                        val col = when {
+                            sig.isNaN() -> Color(0xFFEF5350)
+                            sig < 0.5f  -> Teal500
+                            sig < 1.5f  -> Orange400
+                            else        -> Color(0xFFEF5350)
+                        }
                         val fade = (0.3f + 0.7f * (i.toFloat() / n)).coerceIn(0.25f, 1f)
-                        drawLine(col.copy(fade), toC(history[i-1].first, history[i-1].second),
-                            toC(history[i].first, history[i].second), strokeWidth = 2.5f, cap = StrokeCap.Round)
+                        drawLine(col.copy(fade), toC(history[i-1].x, history[i-1].z),
+                            toC(history[i].x, history[i].z), strokeWidth = 2.5f, cap = StrokeCap.Round)
                     }
-                    drawCircle(Orange400, 4.5f, toC(history.first().first, history.first().second))
+                    drawCircle(Orange400, 4.5f, toC(history.first().x, history.first().z))
                 }
                 drawCircle(Color.White, 5.5f, Offset(cx, cy))
                 drawCircle(Teal500.copy(0.55f), 12f, Offset(cx, cy), style = Stroke(2.5f))
@@ -438,6 +532,47 @@ fun HeroMiniBadge(icon: androidx.compose.ui.graphics.vector.ImageVector, text: S
     }
 }
 
+/**
+ * Step 6: VIO health chip driven by EKF position covariance.
+ *
+ * - !isInitialized                → red   "VIO LOST — WALK FORWARD TO RE-ACQUIRE"
+ * - covValid && σ <  1.5 m        → teal  "GPS-DENIED — VIO ACTIVE (σ = X.X m)"
+ * - covValid && σ >= 1.5 m        → orange "VIO DEGRADED (σ = X.X m)"
+ * - initialized && !covValid      → gray  "VIO INITIALIZING"
+ */
+@Composable
+fun VioStatusChip(
+    isInitialized: Boolean,
+    covValid: Boolean,
+    sigmaM: Float,
+    pal: NavPalette
+) {
+    val (label, bg) = when {
+        !isInitialized -> "VIO LOST — WALK FORWARD TO RE-ACQUIRE" to Color(0xFFEF5350)
+        !covValid || sigmaM.isNaN() -> "VIO INITIALIZING" to Color(0xFF9E9E9E)
+        sigmaM < 1.5f -> "GPS-DENIED — VIO ACTIVE (σ = ${"%.1f".format(sigmaM)} m)" to Teal500
+        else -> "VIO DEGRADED (σ = ${"%.1f".format(sigmaM)} m)" to Orange400
+    }
+    Surface(
+        color = bg.copy(alpha = 0.92f),
+        shape = RoundedCornerShape(10.dp),
+        shadowElevation = 4.dp
+    ) {
+        Row(
+            Modifier.padding(horizontal = 10.dp, vertical = 4.dp),
+            verticalAlignment = Alignment.CenterVertically
+        ) {
+            Text(
+                label,
+                color = Color.White,
+                fontSize = 10.sp,
+                fontWeight = FontWeight.Bold,
+                letterSpacing = 0.4.sp
+            )
+        }
+    }
+}
+
 @Composable
 fun SpeedLimitCore(speedKmh: Float) {
     Surface(color = Color.White, shape = CircleShape, border = BorderStroke(4.dp, Color(0xFFFF6A5E))) {
@@ -461,11 +596,77 @@ fun SpeedLimitBadge(modifier: Modifier, speedKmh: Float, pal: NavPalette) {
 }
 
 @Composable
-fun MapActionStack(pal: NavPalette, onCameraClick: () -> Unit, onDebugClick: () -> Unit, onExpandSheet: () -> Unit) {
+fun MapActionStack(
+    pal: NavPalette,
+    onCameraClick: () -> Unit,
+    onDebugClick: () -> Unit,
+    onExpandSheet: () -> Unit,
+    onCalibrateClick: () -> Unit = {},
+) {
     Column(verticalArrangement = Arrangement.spacedBy(8.dp), horizontalAlignment = Alignment.CenterHorizontally) {
         FloatingMapButton(Icons.Default.PhotoCamera, onCameraClick)
         FloatingMapButton(Icons.Default.Layers, onExpandSheet)
+        FloatingMapButton(Icons.Default.CenterFocusStrong, onCalibrateClick)
         FloatingMapButton(Icons.Default.Tune, onDebugClick, Color.Black, Color.White)
+    }
+}
+
+/**
+ * Step 1 (Visual plan): main-screen calibration status pill. Shows a green
+ * checkmark + "Calibrated" when camera_calib.json exists at startup, or a grey
+ * "Tap to calibrate" pill when missing — tapping opens the calibration screen.
+ */
+@Composable
+fun CalibrationStatusPill(loaded: Boolean, pal: NavPalette, onClick: () -> Unit) {
+    val bg = if (loaded) Teal500 else Color(0xFF9E9E9E)
+    val label = if (loaded) "Calibrated" else "Tap to calibrate"
+    val icon = if (loaded) Icons.Default.CheckCircle else Icons.Default.CenterFocusStrong
+    Surface(
+        onClick = onClick,
+        color = bg.copy(alpha = 0.92f),
+        shape = RoundedCornerShape(10.dp),
+        shadowElevation = 4.dp,
+    ) {
+        Row(
+            Modifier.padding(horizontal = 8.dp, vertical = 4.dp),
+            verticalAlignment = Alignment.CenterVertically,
+        ) {
+            Icon(icon, null, tint = Color.White, modifier = Modifier.size(12.dp))
+            Spacer(Modifier.width(4.dp))
+            Text(label, color = Color.White, fontSize = 10.sp, fontWeight = FontWeight.Bold,
+                letterSpacing = 0.4.sp)
+        }
+    }
+}
+
+/**
+ * Step 1 (Visual plan): non-dismissable banner shown above the map when
+ * camera_calib.json is missing. Tapping opens the calibration flow. The
+ * banner disappears once [NavSightViewModel.calibrationLoaded] flips to true.
+ */
+@Composable
+fun CalibrationFirstLaunchBanner(pal: NavPalette, onClick: () -> Unit) {
+    Surface(
+        onClick = onClick,
+        color = Color(0xFFFFB300).copy(0.96f),
+        shape = RoundedCornerShape(12.dp),
+        shadowElevation = 4.dp,
+        modifier = Modifier.fillMaxWidth(),
+    ) {
+        Row(
+            Modifier.padding(horizontal = 12.dp, vertical = 8.dp),
+            verticalAlignment = Alignment.CenterVertically,
+        ) {
+            Icon(Icons.Default.Warning, null, tint = Color.White, modifier = Modifier.size(18.dp))
+            Spacer(Modifier.width(8.dp))
+            Column(Modifier.weight(1f)) {
+                Text("Camera not calibrated — tap here to set up (~2 min)",
+                    color = Color.White, fontSize = 12.sp, fontWeight = FontWeight.Bold)
+                Text("VIO accuracy reduced until done.",
+                    color = Color.White.copy(0.85f), fontSize = 10.sp)
+            }
+            Icon(Icons.Default.KeyboardArrowRight, null, tint = Color.White, modifier = Modifier.size(18.dp))
+        }
     }
 }
 

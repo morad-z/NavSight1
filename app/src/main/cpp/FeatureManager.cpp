@@ -19,6 +19,7 @@ FeatureManager::FeatureManager() {
 void FeatureManager::reset() {
     keyframes_.clear();
     active_tracks_.clear();
+    lifecycle_.clear();
     next_feature_id_ = 0;
 }
 
@@ -253,4 +254,120 @@ bool FeatureManager::matchAgainstKeyframe(
     }
 
     return static_cast<int>(kf_matched.size()) >= MIN_KF_MATCHES;
+}
+
+// ──────────────────────────────────────────────────────────────────────────────
+// Plan Step 3b (ADR-009): SLAM feature lifecycle bookkeeping
+// ──────────────────────────────────────────────────────────────────────────────
+
+void FeatureManager::noteObservation(int feature_id, int64_t ts_ns,
+                                     bool is_keyframe) {
+    auto& lc = lifecycle_[feature_id];
+    if (lc.feature_id == -1) {
+        lc.feature_id = feature_id;
+    }
+    lc.age++;
+    if (is_keyframe) lc.kf_count++;
+    lc.last_obs_ns = ts_ns;
+}
+
+void FeatureManager::noteKeyframe(int feature_id) {
+    auto it = lifecycle_.find(feature_id);
+    if (it == lifecycle_.end()) return;
+    it->second.kf_count++;
+}
+
+void FeatureManager::noteTriangulation(int feature_id,
+                                       const cv::Point3f& p_global,
+                                       int anchor_clone_id) {
+    auto& lc = lifecycle_[feature_id];
+    if (lc.feature_id == -1) {
+        lc.feature_id = feature_id;
+    }
+    lc.last_p_global   = p_global;
+    lc.has_p_global    = true;
+    lc.anchor_clone_id = anchor_clone_id;
+}
+
+void FeatureManager::setSlamSlot(int feature_id, int slam_slot) {
+    auto it = lifecycle_.find(feature_id);
+    if (it == lifecycle_.end()) return;
+    it->second.slam_slot = slam_slot;
+    if (slam_slot < 0) {
+        it->second.rms_bad_consecutive = 0;
+    }
+}
+
+std::vector<int> FeatureManager::getPromotableFeatures(
+        int min_obs, int min_kf, double max_init_rms_px) const {
+    std::vector<int> out;
+    out.reserve(8);
+    for (const auto& [fid, lc] : lifecycle_) {
+        if (lc.slam_slot >= 0)               continue;     // already promoted
+        if (lc.age      < min_obs)           continue;
+        if (lc.kf_count < min_kf)            continue;
+        if (!lc.has_p_global)                continue;
+        if (lc.last_rms_px > max_init_rms_px && lc.last_rms_px > 0.0) continue;
+        out.push_back(fid);
+    }
+    return out;
+}
+
+void FeatureManager::markSlamFeatureRMS(int feature_id, double rms_px) {
+    auto it = lifecycle_.find(feature_id);
+    if (it == lifecycle_.end()) return;
+    it->second.last_rms_px = rms_px;
+    if (rms_px > 3.0) {
+        it->second.rms_bad_consecutive++;
+    } else {
+        it->second.rms_bad_consecutive = 0;
+    }
+}
+
+std::vector<int> FeatureManager::getDemoteCandidates() const {
+    std::vector<int> out;
+    for (const auto& [fid, lc] : lifecycle_) {
+        if (lc.slam_slot >= 0 && lc.rms_bad_consecutive >= 3) {
+            out.push_back(fid);
+        }
+    }
+    return out;
+}
+
+std::vector<int> FeatureManager::getLostSlamFeatures(
+        int64_t now_ns, int64_t lost_threshold_ns) const {
+    std::vector<int> out;
+    for (const auto& [fid, lc] : lifecycle_) {
+        if (lc.slam_slot < 0)              continue;
+        if (lc.last_obs_ns == 0)           continue;  // never observed yet
+        if (now_ns - lc.last_obs_ns > lost_threshold_ns) {
+            out.push_back(fid);
+        }
+    }
+    return out;
+}
+
+const FeatureManager::FeatureLifecycle*
+FeatureManager::getLifecycle(int feature_id) const {
+    auto it = lifecycle_.find(feature_id);
+    if (it == lifecycle_.end()) return nullptr;
+    return &it->second;
+}
+
+const std::vector<FeatureObservation>*
+FeatureManager::getObservations(int feature_id) const {
+    auto it = active_tracks_.find(feature_id);
+    if (it == active_tracks_.end()) return nullptr;
+    return &it->second;
+}
+
+void FeatureManager::dropLifecycle(int feature_id) {
+    lifecycle_.erase(feature_id);
+}
+
+std::vector<int> FeatureManager::getAllLifecycleFeatureIds() const {
+    std::vector<int> out;
+    out.reserve(lifecycle_.size());
+    for (const auto& kv : lifecycle_) out.push_back(kv.first);
+    return out;
 }

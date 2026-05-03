@@ -4,6 +4,9 @@ import android.util.Log
 import androidx.camera.core.CameraSelector
 import androidx.camera.core.ImageAnalysis
 import androidx.camera.core.Preview
+import androidx.camera.core.resolutionselector.AspectRatioStrategy
+import androidx.camera.core.resolutionselector.ResolutionSelector
+import androidx.camera.core.resolutionselector.ResolutionStrategy
 import androidx.camera.lifecycle.ProcessCameraProvider
 import androidx.camera.view.PreviewView
 import androidx.compose.animation.*
@@ -45,9 +48,22 @@ fun CameraViewComposable(viewModel: NavSightViewModel) {
             future.addListener({
                 val provider = future.get()
                 val preview  = Preview.Builder().build().also { it.setSurfaceProvider(pv.surfaceProvider) }
-                @Suppress("DEPRECATION")
+                // ResolutionSelector with strict 4:3 + 640×480 target. Must
+                // match the calibration screen's selector so intrinsics
+                // saved during calibration apply 1:1 at runtime. Replaces
+                // the deprecated setTargetResolution which let some
+                // devices deliver a square 1088×1088 crop.
+                val resSelector = ResolutionSelector.Builder()
+                    .setAspectRatioStrategy(AspectRatioStrategy.RATIO_4_3_FALLBACK_AUTO_STRATEGY)
+                    .setResolutionStrategy(
+                        ResolutionStrategy(
+                            android.util.Size(640, 480),
+                            ResolutionStrategy.FALLBACK_RULE_CLOSEST_HIGHER_THEN_LOWER,
+                        )
+                    )
+                    .build()
                 val analysis = ImageAnalysis.Builder()
-                    .setTargetResolution(android.util.Size(640, 480))
+                    .setResolutionSelector(resSelector)
                     .setBackpressureStrategy(ImageAnalysis.STRATEGY_KEEP_ONLY_LATEST)
                     .setOutputImageFormat(ImageAnalysis.OUTPUT_IMAGE_FORMAT_YUV_420_888)
                     .build().also { ia ->
@@ -88,7 +104,7 @@ fun CameraOverlay(
     orientationDeviation: Float,
     stabilityScore: Float,
     fusedHeading: Float,
-    historySnapshot: List<Pair<Float, Float>>,
+    historySnapshot: List<PathPoint>,
     onClose: () -> Unit,
     onDebug: () -> Unit,
     debugVisible: Boolean,

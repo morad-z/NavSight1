@@ -474,7 +474,7 @@ void IMUPreintegrator::detectStep(int64_t timestamp_ns, float ax, float ay, floa
     // shakes the phone enough to trip peak detection; without this gate the
     // step counter keeps ticking through a turn and Tracker's PDR fallback
     // advances global position along the rotating heading → V-shape / arc.
-    if (gyro_mag_filtered_ > 0.8f) return;
+    if (gyro_mag_filtered_ > ROTATION_STEP_GATE_RADPS) return;
 
     // Peak detection with hysteresis
     if (!was_above_thresh_ && accel_mag_filtered_ > STEP_ACCEL_THRESH_HIGH) {
@@ -487,10 +487,19 @@ void IMUPreintegrator::detectStep(int64_t timestamp_ns, float ax, float ay, floa
                 step_count_++;
                 step_period_s_ = period;
                 last_step_ns_ = timestamp_ns;
+                // Step 3 Observer A: track recent periods for variance →
+                // PDR confidence. Big variance = irregular gait = low conf.
+                step_period_buf_.push_back(period);
+                if (step_period_buf_.size() > STEP_PERIOD_BUF) {
+                    step_period_buf_.erase(step_period_buf_.begin());
+                }
             } else if (period > MAX_STEP_PERIOD_S) {
                 step_count_++;
                 step_period_s_ = 0.0;
                 last_step_ns_ = timestamp_ns;
+                // Long gap → gait broke. Reset variance buffer so the next
+                // few periods don't get penalized by the gap.
+                step_period_buf_.clear();
             }
         } else {
             step_count_++;
@@ -509,6 +518,32 @@ IMUPreintegrator::StepInfo IMUPreintegrator::getStepInfo() const {
     info.step_count = step_count_;
     info.stride_length_m = DEFAULT_STRIDE_M;
     info.last_step_ns = last_step_ns_;
+    info.step_period_variance_s2 = -1.0;
+    info.accel_variance = static_cast<double>(accel_variance_est_);
+    info.time_since_last_step_s = -1.0;
+    info.stride_calibrated = (user_stride_m_ > 0.0);
+
+    // Step 3 Observer A: time-since-last-step. Used by Tracker to fade PDR
+    // confidence smoothly as a step ages, instead of a hard cutoff.
+    if (last_step_ns_ > 0 && last_accel_ts_ns_ > 0) {
+        double dt = static_cast<double>(last_accel_ts_ns_ - last_step_ns_) * 1e-9;
+        info.time_since_last_step_s = std::max(0.0, dt);
+    }
+
+    // Step 3 Observer A: variance of recent step periods. Need at least 3
+    // samples to make this meaningful.
+    if (step_period_buf_.size() >= 3) {
+        double mean = 0.0;
+        for (double p : step_period_buf_) mean += p;
+        mean /= static_cast<double>(step_period_buf_.size());
+        double var = 0.0;
+        for (double p : step_period_buf_) {
+            double d = p - mean;
+            var += d * d;
+        }
+        var /= static_cast<double>(step_period_buf_.size());
+        info.step_period_variance_s2 = var;
+    }
 
     // ── SMART STOP DETECTION ────────────────────────────────────────────────
     // We detect a stop by checking if the recent acceleration variance is low.
@@ -521,20 +556,54 @@ IMUPreintegrator::StepInfo IMUPreintegrator::getStepInfo() const {
     double ns_since_last = static_cast<double>(current_time_ns - last_step_ns_);
     bool watchdog_stop = (last_step_ns_ > 0 && ns_since_last > 3'000'000'000.0);
 
-    // Estimate speed from step frequency + user height
+    // Estimate speed from step frequency + stride model
     if (step_period_s_ > 0.0 && !is_stationary && !watchdog_stop) {
         double freq = 1.0 / step_period_s_;
-        // Height-based stride: stride ≈ height * 0.415 at normal walk,
-        // scales with step frequency (faster steps = longer strides)
-        double base_stride = static_cast<double>(user_height_m_) * 0.415;
-        double freq_factor = 0.7 + 0.3 * std::min(2.5, freq);  // 0.7-1.45x
-        info.stride_length_m = std::max(0.3, std::min(1.5, base_stride * freq_factor));
+        double stride;
+        if (user_stride_m_ > 0.0) {
+            // Step 3 Observer A: per-user calibrated stride. We still allow
+            // a small frequency-based modulation (people lengthen strides at
+            // higher cadence) but anchor on the calibrated value.
+            double freq_factor = 0.85 + 0.15 * std::min(2.5, freq);  // 0.85–1.225x
+            stride = user_stride_m_ * freq_factor;
+        } else {
+            // Height-based fallback: stride ≈ height * 0.415 at normal walk,
+            // scales with step frequency (faster steps = longer strides).
+            double base_stride = static_cast<double>(user_height_m_) * 0.415;
+            double freq_factor = 0.7 + 0.3 * std::min(2.5, freq);  // 0.7–1.45x
+            stride = base_stride * freq_factor;
+        }
+        info.stride_length_m = std::max(0.3, std::min(1.5, stride));
         info.speed_mps = info.stride_length_m * freq;
     } else {
         info.speed_mps = 0.0;
     }
 
     return info;
+}
+
+// ── Step 3 Observer A: per-user stride calibration ────────────────────────────
+void IMUPreintegrator::setUserStride(double stride_m) {
+    std::lock_guard<std::mutex> lock(mutex_);
+    if (stride_m > 0.0) {
+        // Sanity-bound to physically plausible stride lengths.
+        user_stride_m_ = std::max(0.3, std::min(1.5, stride_m));
+        LOGI("setUserStride: calibrated stride = %.3f m (clamped from %.3f)",
+             user_stride_m_, stride_m);
+    } else {
+        user_stride_m_ = -1.0;  // Disable calibration → fall back to height model.
+        LOGI("setUserStride: calibration cleared (using height-based fallback)");
+    }
+}
+
+double IMUPreintegrator::getUserStride() const {
+    std::lock_guard<std::mutex> lock(mutex_);
+    return user_stride_m_;
+}
+
+bool IMUPreintegrator::hasCalibratedStride() const {
+    std::lock_guard<std::mutex> lock(mutex_);
+    return user_stride_m_ > 0.0;
 }
 
 // ── User height for stride model ──────────────────────────────────────────────
@@ -565,6 +634,9 @@ void IMUPreintegrator::reset() {
     step_count_ = 0;
     last_step_ns_ = 0;
     step_period_s_ = 0.0;
+    step_period_buf_.clear();
+    // Note: user_stride_m_ deliberately preserved across reset() — it is a
+    // persistent per-user calibration, not a session-local quantity.
     accel_mag_filtered_ = 9.81f;
     accel_mag_prev_ = 9.81f;
     was_above_thresh_ = false;
@@ -868,6 +940,13 @@ void IMUPreintegrator::setMagnetometerHeading(float yaw_rad) {
 cv::Point3f IMUPreintegrator::getGyroBias() const {
     std::lock_guard<std::mutex> lock(mutex_);
     return gyro_bias_;
+}
+
+void IMUPreintegrator::setGyroBias(float bx, float by, float bz) {
+    std::lock_guard<std::mutex> lock(mutex_);
+    gyro_bias_ = cv::Point3f(bx, by, bz);
+    gyro_bias_initialized_.store(true);
+    gyro_bias_samples_ = GYRO_BIAS_INIT_SAMPLES;
 }
 
 void IMUPreintegrator::refineGyroBiasDuringZUPT() {

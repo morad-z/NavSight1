@@ -34,6 +34,14 @@ void EKFState::reset() {
     b_a_ = cv::Mat::zeros(3, 1, CV_64F);
     p_G_ = cv::Mat::zeros(3, 1, CV_64F);
     P_ = cv::Mat();
+
+    // Plan Step 3a (ADR-008): MSCKF damping / Huber state
+    msckf_frames_since_call_ = MSCKF_QUIET_PROPAGATION;  // start "cold" → 0.5x first call
+    msckf_damping_step_ = 0;
+    msckf_huber_rejected_count_ = 0;
+
+    // Plan Step 3b (ADR-009): drop all SLAM features on reset.
+    slam_features_.clear();
 }
 
 void EKFState::initialize(double initial_scale) {
@@ -83,6 +91,16 @@ void EKFState::propagateIMU(const cv::Mat& deltaR, const cv::Mat& deltaV,
                              const cv::Mat& J_V_ba, const cv::Mat& J_P_bg,
                              const cv::Mat& J_P_ba) {
     if (!full_initialized_ || dt <= 0 || P_.empty()) return;
+
+    // Plan Step 3a (ADR-008): tick the "frames since last MSCKF" counter so
+    // the damping ramp resets after a quiet period (≥ MSCKF_QUIET_PROPAGATION
+    // propagation steps without an MSCKF correction).
+    if (msckf_frames_since_call_ < MSCKF_QUIET_PROPAGATION + 1) {
+        msckf_frames_since_call_++;
+    }
+    if (msckf_frames_since_call_ >= MSCKF_QUIET_PROPAGATION) {
+        msckf_damping_step_ = 0;  // cold start on the next MSCKF call
+    }
 
     // Propagate mean state (gravity in global frame: [0, -9.81, 0] for Y-up)
     cv::Mat g = (cv::Mat_<double>(3,1) << 0.0, -9.81, 0.0);
@@ -287,40 +305,101 @@ void EKFState::addClone(const cv::Mat& R_GtoC, const cv::Mat& p_G, int64_t times
         global_fej_initialized_ = true;
     }
 
-    // Augment covariance if full state is initialized
+    // Augment covariance if full state is initialized.
+    //
+    // Plan Step 3b (ADR-009): SLAM features sit at the END of P_, AFTER all
+    // clone blocks. The new clone must be spliced BEFORE the SLAM block,
+    // not appended at the end — otherwise SLAM features lose their cross-
+    // correlations with the IMU state on every clone augmentation, which
+    // is the failure mode ADR-006 documents (5–11 m teleportations after
+    // a clone churn). Layout:
+    //
+    //   old:  [ IMU(15) | C0..C{K-1}(6 each) | S0..S{N-1}(5 each) ]
+    //   new:  [ IMU(15) | C0..C{K-1}(6 each) | C_new(6) | S0..S{N-1}(5 each) ]
+    //
+    // The splice strategy: copy the pre-SLAM block into P_new[0..clone_end),
+    // copy the SLAM block into P_new[clone_end+CLONE_DIM..end), zero the
+    // CLONE_DIM rows/cols inserted in between, then build the new clone's
+    // own covariance and cross-terms via the augmentation Jacobian.
     if (full_initialized_ && !P_.empty()) {
-        int old_dim = P_.rows;
-        int new_dim = old_dim + CLONE_DIM;
+        const int old_dim   = P_.rows;
+        const int slam_n    = static_cast<int>(slam_features_.size());
+        const int slam_block = slam_n * SLAM_FEATURE_DIM;
+        const int clone_end = old_dim - slam_block;     // pre-SLAM end
+        const int new_dim   = old_dim + CLONE_DIM;
 
         cv::Mat P_new = cv::Mat::zeros(new_dim, new_dim, CV_64F);
-        // Copy existing covariance
-        P_.copyTo(P_new(cv::Range(0, old_dim), cv::Range(0, old_dim)));
 
-        // Augmentation Jacobian J_clone: maps IMU state to new clone
-        // Clone rotation = IMU rotation -> dθ_clone/dθ_imu = I
-        // Clone position = IMU position -> dp_clone/dp_imu = I
-        cv::Mat J = cv::Mat::zeros(CLONE_DIM, old_dim, CV_64F);
-        // dθ_c / dθ = I(3x3)
-        cv::Mat I3 = cv::Mat::eye(3, 3, CV_64F);
-        I3.copyTo(J(cv::Range(0,3), cv::Range(0,3)));
-        // dp_c / dp = I(3x3) (position index = 12 in IMU state)
-        if (old_dim >= IMU_STATE_DIM) {
-            I3.copyTo(J(cv::Range(3,6), cv::Range(12,15)));
+        // Copy the [IMU | clones] block into the top-left of P_new.
+        if (clone_end > 0) {
+            P_(cv::Range(0, clone_end), cv::Range(0, clone_end))
+                .copyTo(P_new(cv::Range(0, clone_end), cv::Range(0, clone_end)));
+        }
+        // Copy the SLAM block (and its cross-terms) into the bottom-right,
+        // shifted down/right by CLONE_DIM.
+        if (slam_block > 0) {
+            // SLAM-SLAM block.
+            P_(cv::Range(clone_end, old_dim), cv::Range(clone_end, old_dim))
+                .copyTo(P_new(cv::Range(clone_end + CLONE_DIM, new_dim),
+                              cv::Range(clone_end + CLONE_DIM, new_dim)));
+            // Cross [IMU+clones] ↔ SLAM: shift only the columns.
+            if (clone_end > 0) {
+                P_(cv::Range(0, clone_end), cv::Range(clone_end, old_dim))
+                    .copyTo(P_new(cv::Range(0, clone_end),
+                                  cv::Range(clone_end + CLONE_DIM, new_dim)));
+                P_(cv::Range(clone_end, old_dim), cv::Range(0, clone_end))
+                    .copyTo(P_new(cv::Range(clone_end + CLONE_DIM, new_dim),
+                                  cv::Range(0, clone_end)));
+            }
         }
 
-        // New clone covariance blocks
-        cv::Mat P_sub = cv::Mat(P_(cv::Range(0, std::min(old_dim, J.cols)),
-                                   cv::Range(0, std::min(old_dim, J.cols))));
-        cv::Mat P_cc = cv::Mat(J * P_sub * J.t());
-        P_cc.copyTo(P_new(cv::Range(old_dim, new_dim), cv::Range(old_dim, new_dim)));
+        // Build the augmentation Jacobian J (CLONE_DIM x clone_end). Maps
+        // [IMU + existing_clones] → new clone's δθ_c, δp_c. Note: the
+        // Jacobian columns DO NOT extend into the SLAM block — the new
+        // clone is a function of the IMU state only, and the SLAM block
+        // sits to the right of where the new clone is being inserted, so
+        // there is nothing to read from there even on the source side.
+        cv::Mat J = cv::Mat::zeros(CLONE_DIM, clone_end, CV_64F);
+        cv::Mat I3 = cv::Mat::eye(3, 3, CV_64F);
+        I3.copyTo(J(cv::Range(0,3), cv::Range(0,3)));        // dθ_c/dθ = I
+        if (clone_end >= IMU_STATE_DIM) {
+            I3.copyTo(J(cv::Range(3,6), cv::Range(12,15))); // dp_c/dp = I
+        }
 
-        // Cross-correlation: P_xc = P_old * J^T
-        cv::Mat P_old_sub = cv::Mat(P_(cv::Range(0, old_dim),
-                                       cv::Range(0, std::min(old_dim, J.cols))));
-        cv::Mat P_xc = cv::Mat(P_old_sub * J.t());
-        P_xc.copyTo(P_new(cv::Range(0, old_dim), cv::Range(old_dim, new_dim)));
-        cv::Mat P_cx = cv::Mat(P_xc.t());
-        P_cx.copyTo(P_new(cv::Range(old_dim, new_dim), cv::Range(0, old_dim)));
+        // Insertion column range for the new clone in P_new.
+        const int ins_lo = clone_end;
+        const int ins_hi = clone_end + CLONE_DIM;
+
+        // New clone's own covariance: J * P_old(pre-SLAM) * J^T.
+        if (clone_end > 0) {
+            cv::Mat P_pre = P_(cv::Range(0, clone_end), cv::Range(0, clone_end));
+            cv::Mat P_cc  = J * P_pre * J.t();
+            P_cc.copyTo(P_new(cv::Range(ins_lo, ins_hi),
+                              cv::Range(ins_lo, ins_hi)));
+
+            // Cross-correlation new-clone ↔ pre-SLAM block: P_pre * J^T.
+            cv::Mat P_xc = P_pre * J.t();
+            P_xc.copyTo(P_new(cv::Range(0, clone_end),
+                              cv::Range(ins_lo, ins_hi)));
+            cv::Mat P_cx = P_xc.t();
+            P_cx.copyTo(P_new(cv::Range(ins_lo, ins_hi),
+                              cv::Range(0, clone_end)));
+
+            // Cross-correlation new-clone ↔ SLAM block: J * P_pre_to_SLAM
+            // (the SLAM features were correlated with the IMU/clones via
+            // the same dynamics that generated the new clone, so the new
+            // clone inherits that cross-correlation through J).
+            if (slam_block > 0) {
+                cv::Mat P_pre_slam = P_(cv::Range(0, clone_end),
+                                        cv::Range(clone_end, old_dim));
+                cv::Mat P_cs = J * P_pre_slam;     // CLONE_DIM x slam_block
+                P_cs.copyTo(P_new(cv::Range(ins_lo, ins_hi),
+                                  cv::Range(clone_end + CLONE_DIM, new_dim)));
+                cv::Mat P_sc = P_cs.t();
+                P_sc.copyTo(P_new(cv::Range(clone_end + CLONE_DIM, new_dim),
+                                  cv::Range(ins_lo, ins_hi)));
+            }
+        }
 
         P_ = P_new;
     }
@@ -343,68 +422,160 @@ void EKFState::marginalizeOldestClone() {
     if (window_.empty()) return;
 
     if (full_initialized_ && !P_.empty() && P_.rows > IMU_STATE_DIM) {
-        // Schur complement marginalization of the oldest clone
-        int marg_idx = IMU_STATE_DIM;  // First clone starts at index 15
-        int marg_dim = CLONE_DIM;
-        int total_dim = P_.rows;
-        int remain_dim = total_dim - marg_dim;
+        // Plan Step 3b (ADR-009): the oldest clone sits at rows/cols
+        // [IMU_STATE_DIM, IMU_STATE_DIM + CLONE_DIM). The SLAM block sits at
+        // the END of P_. Drop only the clone rows/cols by copy-splice — IMU,
+        // remaining clones, and SLAM rows/cols all keep their cross-terms
+        // intact. (We do NOT zero out the marginalised clone's contribution
+        // to the remaining state via Schur — for the OpenVINS-style sliding
+        // window the discard-only "drop" is the standard, since the clone
+        // has no measurements yet not folded into IMU/SLAM cross-terms.)
+        const int marg_idx   = IMU_STATE_DIM;  // First clone starts at 15
+        const int marg_dim   = CLONE_DIM;
+        const int total_dim  = P_.rows;
+        const int remain_dim = total_dim - marg_dim;
 
         if (remain_dim > 0) {
-            // Build index mapping: [0..marg_idx-1, marg_idx+marg_dim..total_dim-1]
             cv::Mat P_new = cv::Mat::zeros(remain_dim, remain_dim, CV_64F);
 
-            // Top-left: IMU block (unchanged)
+            // IMU-IMU block (unchanged).
             if (marg_idx > 0) {
                 P_(cv::Range(0, marg_idx), cv::Range(0, marg_idx))
                     .copyTo(P_new(cv::Range(0, marg_idx), cv::Range(0, marg_idx)));
             }
 
-            int after = marg_idx + marg_dim;
-            int after_dim = total_dim - after;
+            const int after     = marg_idx + marg_dim;
+            const int after_dim = total_dim - after;
 
             if (after_dim > 0) {
-                // Top-right: IMU to remaining clones
+                // IMU ↔ {remaining clones + SLAM}.
                 P_(cv::Range(0, marg_idx), cv::Range(after, total_dim))
                     .copyTo(P_new(cv::Range(0, marg_idx),
-                                 cv::Range(marg_idx, remain_dim)));
-                // Bottom-left: remaining clones to IMU
+                                  cv::Range(marg_idx, remain_dim)));
                 P_(cv::Range(after, total_dim), cv::Range(0, marg_idx))
                     .copyTo(P_new(cv::Range(marg_idx, remain_dim),
-                                 cv::Range(0, marg_idx)));
-                // Bottom-right: remaining clones to remaining clones
+                                  cv::Range(0, marg_idx)));
+                // {remaining clones + SLAM} self block.
                 P_(cv::Range(after, total_dim), cv::Range(after, total_dim))
                     .copyTo(P_new(cv::Range(marg_idx, remain_dim),
-                                 cv::Range(marg_idx, remain_dim)));
+                                  cv::Range(marg_idx, remain_dim)));
             }
 
             P_ = P_new;
         }
     }
 
+    // SLAM features that were anchored at the marginalised clone are now
+    // un-anchored. We drop them — keeping them with a stale anchor would
+    // make the FEJ Jacobian reference a pose that no longer exists in the
+    // window, and the chi² test would diverge. This is the conservative
+    // choice; a later optimisation could re-anchor to a surviving clone.
+    //
+    // Order matters: the P_ splice above already shifted the SLAM block
+    // up by CLONE_DIM, so `slamBlockStart()` (which uses window_.size())
+    // is wrong until we pop the front clone. Pop first, then call
+    // removeSlamFeature in reverse-slot order so erase() doesn't shift
+    // the remaining slots out from under the loop.
+    int dropped_id = -1;
+    if (!window_.empty()) dropped_id = window_.front().state_id;
     window_.pop_front();
+    if (dropped_id >= 0) {
+        for (int slot = static_cast<int>(slam_features_.size()) - 1; slot >= 0; --slot) {
+            if (slam_features_[slot].anchor_clone_id == dropped_id) {
+                removeSlamFeature(slot);
+            }
+        }
+    }
 }
 
 // ── MSCKF EKF Update ────────────────────────────────────────────────────────
+
+double EKFState::computeMSCKFDampingFactor() const {
+    // Linear ramp 0.5 → 1.0 over MSCKF_DAMPING_RAMP_FRAMES calls.
+    // call 0 → 0.5, call 1 → 0.6, … call 5+ → 1.0.
+    int s = msckf_damping_step_;
+    if (s < 0) s = 0;
+    if (s >= MSCKF_DAMPING_RAMP_FRAMES) return 1.0;
+    return 0.5 + 0.1 * static_cast<double>(s);
+}
 
 void EKFState::applyMSCKFUpdate(const cv::Mat& H, const cv::Mat& res,
                                  const cv::Mat& R_noise) {
     if (!full_initialized_ || P_.empty()) return;
     int state_dim = P_.rows;
     if (H.cols != state_dim) return;
+    if (H.rows == 0 || res.rows != H.rows) return;
 
-    // S = H * P * H^T + R
-    cv::Mat S = H * P_ * H.t() + R_noise;
+    // ── Plan Step 3a (ADR-008): per-residual Huber kernel ────────────────
+    // δ ≈ 2.4477 = √χ²(0.95, 2 dof). For each row i compute the normalised
+    // residual m_i = |r_i| / sqrt(S_ii), with
+    //     S = H*P*H^T + R_noise.
+    // Weights:
+    //   m_i ≤ δ          : w = 1     (full influence)
+    //   δ < m_i < 3δ     : w = δ/m_i (linear de-weighting, classic Huber)
+    //   m_i ≥ 3δ         : w = 0     (hard reject — outlier kill)
+    //
+    // The weights are folded into H and res (row scaling) so the downstream
+    // S/K/dx computation runs unmodified. This is mathematically the IRLS
+    // form — equivalent (up to weight=0) to scaling R_noise[i,i] by
+    // 1/w² but cleaner when weights collapse to zero.
+    cv::Mat H_w = H.clone();
+    cv::Mat res_w = res.clone();
+    msckf_huber_rejected_count_ = 0;
+    {
+        cv::Mat S_pre = H * P_ * H.t() + R_noise;
+        const double delta = MSCKF_HUBER_DELTA;
+        const double hard_reject = 3.0 * delta;
+        int huber_dampened = 0;
+        for (int i = 0; i < H.rows; i++) {
+            double s_ii = S_pre.at<double>(i, i);
+            if (s_ii <= 1e-12) continue;
+            double m = std::abs(res.at<double>(i, 0)) / std::sqrt(s_ii);
+            double w = 1.0;
+            if (m >= hard_reject) {
+                w = 0.0;
+                msckf_huber_rejected_count_++;
+            } else if (m > delta) {
+                w = delta / m;
+                huber_dampened++;
+            }
+            if (w != 1.0) {
+                H_w.row(i) *= w;
+                res_w.at<double>(i, 0) *= w;
+            }
+        }
+        if (msckf_huber_rejected_count_ > 0 || huber_dampened > 0) {
+            LOGI("MSCKF Huber: rejected=%d dampened=%d total_rows=%d (δ=%.3f)",
+                 msckf_huber_rejected_count_, huber_dampened, H.rows, delta);
+        }
+    }
 
-    // K = P * H^T * S^{-1}
+    // S = H_w * P * H_w^T + R
+    cv::Mat S = H_w * P_ * H_w.t() + R_noise;
+
+    // K = P * H_w^T * S^{-1}
     cv::Mat S_inv;
     if (!cv::invert(S, S_inv, cv::DECOMP_CHOLESKY)) {
         if (!cv::invert(S, S_inv, cv::DECOMP_SVD)) return;
     }
 
-    cv::Mat K = P_ * H.t() * S_inv;
+    cv::Mat K = P_ * H_w.t() * S_inv;
 
-    // State correction: dx = K * res
-    cv::Mat dx = K * res;
+    // State correction: dx = K * res_w
+    cv::Mat dx = K * res_w;
+
+    // ── Plan Step 3a (ADR-008): position-correction damping ──────────────
+    // Scale δp (rows 12..14 of the IMU error-state) by the ramp factor so
+    // the polyline does not jump on the first MSCKF call after a quiet
+    // period. Velocity (6..8), attitude (0..2), and bias (3..5, 9..11)
+    // corrections are unchanged. Clone corrections are also unchanged —
+    // damping is intentionally local to the world-frame body position.
+    double damping = computeMSCKFDampingFactor();
+    if (dx.rows >= 15 && damping < 1.0) {
+        for (int i = 12; i < 15; i++) {
+            dx.at<double>(i, 0) *= damping;
+        }
+    }
 
     // Apply IMU state correction
     if (dx.rows >= IMU_STATE_DIM) {
@@ -436,14 +607,202 @@ void EKFState::applyMSCKFUpdate(const cv::Mat& H, const cv::Mat& res,
         window_[i].p_G += dp_c;
     }
 
-    // Covariance update: P = (I - K*H) * P * (I - K*H)^T + K*R*K^T (Joseph form)
-    cv::Mat I_KH = cv::Mat::eye(state_dim, state_dim, CV_64F) - K * H;
+    // ── Plan Step 3b (ADR-009): apply SLAM-feature mean corrections ─────
+    // The SLAM block sits at the end of P_/dx. Each SLAM feature carries
+    // 5 DOFs `[α, β, ρ, pad0, pad1]`; we apply the dx update to the
+    // active 3 (α, β, ρ) and to the 2 pad rows (which any sane filter
+    // will leave near zero — they have no measurement coupling). The
+    // application is purely additive on the inverse-depth state: SO(3)
+    // wrapping is not needed because (α, β, ρ) lie in flat ℝ³.
+    {
+        const int slam_start = IMU_STATE_DIM
+                             + static_cast<int>(window_.size()) * CLONE_DIM;
+        for (size_t s = 0; s < slam_features_.size(); s++) {
+            const int idx = slam_start + static_cast<int>(s) * SLAM_FEATURE_DIM;
+            if (idx + SLAM_FEATURE_DIM > dx.rows) break;
+            for (int k = 0; k < SLAM_FEATURE_DIM; k++) {
+                slam_features_[s].state.at<double>(k, 0) +=
+                    dx.at<double>(idx + k, 0);
+            }
+        }
+    }
+
+    // Covariance update: P = (I - K*H_w) * P * (I - K*H_w)^T + K*R*K^T (Joseph form)
+    cv::Mat I_KH = cv::Mat::eye(state_dim, state_dim, CV_64F) - K * H_w;
     P_ = I_KH * P_ * I_KH.t() + K * R_noise * K.t();
 
     // Enforce symmetry
     P_ = (P_ + P_.t()) * 0.5;
 
-    LOGI("MSCKF update applied: max_correction=%.4f", cv::norm(dx, cv::NORM_INF));
+    // Plan Step 3a (ADR-008): advance the damping schedule and reset the
+    // quiet-period counter so the next propagateIMU step starts fresh.
+    msckf_frames_since_call_ = 0;
+    if (msckf_damping_step_ < MSCKF_DAMPING_RAMP_FRAMES) {
+        msckf_damping_step_++;
+    }
+
+    LOGI("MSCKF update applied: max_correction=%.4f damping=%.2f huber_rejected=%d",
+         cv::norm(dx, cv::NORM_INF), damping, msckf_huber_rejected_count_);
+}
+
+// ── Step 4: VIO/PDR/Yaw Measurement Updates ─────────────────────────────────
+
+bool EKFState::updateRelativePose(const cv::Mat& t_world_metric,
+                                   int clone_id,
+                                   double var_t) {
+    if (!full_initialized_ || P_.empty()) return false;
+    if (t_world_metric.rows != 3 || t_world_metric.cols != 1) return false;
+
+    int clone_cov_idx = getCloneCovIdx(clone_id);
+    if (clone_cov_idx < 0) return false;
+
+    cv::Mat R_clone, p_clone;
+    if (!getClonePose(clone_id, R_clone, p_clone)) return false;
+
+    int dim = P_.rows;
+    if (clone_cov_idx + CLONE_DIM > dim) return false;
+
+    // Predicted relative position in world frame: z_pred = p_G - p_clone.
+    cv::Mat z_pred = p_G_ - p_clone;
+    cv::Mat res = t_world_metric - z_pred;
+
+    // H (3 x dim): +I on δp current (cols 12..14), -I on δp_clone
+    // (clone_cov_idx + 3 .. +5). δp_clone is the second 3-block of the
+    // clone slot (CLONE_DIM = [δθ_c(3), δp_c(3)]).
+    cv::Mat H = cv::Mat::zeros(3, dim, CV_64F);
+    for (int i = 0; i < 3; i++) {
+        H.at<double>(i, 12 + i) = 1.0;             // ∂z/∂δp_current
+        H.at<double>(i, clone_cov_idx + 3 + i) = -1.0;  // ∂z/∂δp_clone
+    }
+
+    cv::Mat R_noise = cv::Mat::eye(3, 3, CV_64F) * std::max(var_t, 1e-6);
+    applyMSCKFUpdate(H, res, R_noise);
+    return true;
+}
+
+bool EKFState::updateRelativeRotation(const cv::Mat& R_meas_body,
+                                      double sigma_axis_sq,
+                                      int clone_id) {
+    if (!full_initialized_ || P_.empty()) return false;
+    if (R_meas_body.rows != 3 || R_meas_body.cols != 3 ||
+        R_meas_body.type() != CV_64F) {
+        return false;
+    }
+
+    int clone_cov_idx = getCloneCovIdx(clone_id);
+    if (clone_cov_idx < 0) return false;
+
+    cv::Mat R_clone, p_clone;
+    if (!getClonePose(clone_id, R_clone, p_clone)) return false;
+
+    int dim = P_.rows;
+    if (clone_cov_idx + CLONE_DIM > dim) return false;
+    if (R_clone.rows != 3 || R_clone.cols != 3) return false;
+
+    // Predicted body-frame rotation from clone to current:
+    //   R_pred = R_GtoI_(current) * R_GtoC(clone).t()
+    // R_GtoI_ takes world→current-body. R_clone takes world→clone-body
+    // (treating the clone as the body pose at clone-time). So
+    // R_clone.t() takes clone-body→world, and the product takes
+    // clone-body→current-body, matching the convention of R_meas_body.
+    cv::Mat R_pred = R_GtoI_ * R_clone.t();
+
+    // Residual on SO(3) in the Lie algebra:  r = log(R_meas * R_pred^T)
+    cv::Mat R_err = R_meas_body * R_pred.t();
+    cv::Mat r_vec;
+    cv::Rodrigues(R_err, r_vec);     // 3x1
+    if (r_vec.rows != 3 || r_vec.cols != 1) return false;
+
+    // Wrap each axis to [-π, π] (Rodrigues already returns within ±π,
+    // but be defensive against numerical drift on near-π rotations).
+    for (int i = 0; i < 3; i++) {
+        double v = r_vec.at<double>(i, 0);
+        while (v >  M_PI) v -= 2.0 * M_PI;
+        while (v < -M_PI) v += 2.0 * M_PI;
+        r_vec.at<double>(i, 0) = v;
+    }
+
+    // Jacobian (3 x dim) for the small-angle relative-rotation residual.
+    // For δθ (current body) and δθ_c (clone body) the linearisation is
+    //     r ≈ δθ - R_meas_body * δθ_c
+    // i.e. +I on the current-pose δθ block (cols 0..2) and -R_meas_body
+    // on the clone's δθ_c block (the first 3-vector of CLONE_DIM at
+    // clone_cov_idx + 0..2).
+    cv::Mat H = cv::Mat::zeros(3, dim, CV_64F);
+    for (int i = 0; i < 3; i++) {
+        H.at<double>(i, i) = 1.0;
+        for (int j = 0; j < 3; j++) {
+            H.at<double>(i, clone_cov_idx + j) = -R_meas_body.at<double>(i, j);
+        }
+    }
+
+    cv::Mat R_noise = cv::Mat::eye(3, 3, CV_64F) * std::max(sigma_axis_sq, 1e-8);
+    applyMSCKFUpdate(H, r_vec, R_noise);
+    return true;
+}
+
+bool EKFState::updateGravityAlignedYaw(double yaw_meas, double var,
+                                       double roll, double pitch) {
+    if (!full_initialized_ || P_.empty()) return false;
+    int dim = P_.rows;
+
+    // Predicted yaw from current R_GtoI_, gravity-aligned via Madgwick
+    // roll/pitch. Residual normalized to [-π, π].
+    double yaw_pred = getYaw(roll, pitch);
+    double res_val = yaw_meas - yaw_pred;
+    while (res_val >  M_PI) res_val -= 2.0 * M_PI;
+    while (res_val < -M_PI) res_val += 2.0 * M_PI;
+
+    // H_yaw: world-Y axis expressed in body frame. For body-frame error
+    // δθ_body, the induced world-yaw change is (R_GtoI_ * e_y_world) · δθ.
+    cv::Mat e_y_world = (cv::Mat_<double>(3, 1) << 0.0, 1.0, 0.0);
+    cv::Mat h_body = R_GtoI_ * e_y_world;  // 3x1
+
+    cv::Mat H = cv::Mat::zeros(1, dim, CV_64F);
+    H.at<double>(0, 0) = h_body.at<double>(0);
+    H.at<double>(0, 1) = h_body.at<double>(1);
+    H.at<double>(0, 2) = h_body.at<double>(2);
+    (void)roll; (void)pitch;  // alignment carried in yaw_pred, not in H
+
+    cv::Mat res = (cv::Mat_<double>(1, 1) << res_val);
+    cv::Mat R_noise = (cv::Mat_<double>(1, 1) << std::max(var, 1e-6));
+    applyMSCKFUpdate(H, res, R_noise);
+    return true;
+}
+
+bool EKFState::updatePDRStep(double dx_world, double dz_world, double var) {
+    if (!full_initialized_ || P_.empty()) return false;
+    int dim = P_.rows;
+
+    // 2-DOF position constraint on world X and Z (Y handled by gravity).
+    // Treat as direct observation of δp_x and δp_z (state, not delta).
+    // We model the step as observing the absolute world position increment
+    // since the last step, but for simplicity here we apply it as a direct
+    // constraint on δp relative to current state — caller is responsible
+    // for accumulating step displacement into the desired anchor.
+    cv::Mat res = (cv::Mat_<double>(2, 1) << dx_world, dz_world);
+
+    cv::Mat H = cv::Mat::zeros(2, dim, CV_64F);
+    H.at<double>(0, 12) = 1.0;  // ∂(dx)/∂δp_x
+    H.at<double>(1, 14) = 1.0;  // ∂(dz)/∂δp_z
+
+    cv::Mat R_noise = cv::Mat::eye(2, 2, CV_64F) * std::max(var, 1e-6);
+    applyMSCKFUpdate(H, res, R_noise);
+    return true;
+}
+
+double EKFState::getYaw(double roll, double pitch) const {
+    cv::Mat Rx, Ry;
+    cv::Rodrigues(cv::Vec3d(roll, 0.0, 0.0), Rx);
+    cv::Rodrigues(cv::Vec3d(0.0, pitch, 0.0), Ry);
+    cv::Mat R_align = Ry * Rx;  // R_phone_to_world
+    cv::Mat R_aligned = R_align * R_GtoI_ * R_align.t();
+    // Y-up navigation convention (matches IMUPreintegrator::getHeading):
+    // yaw is rotation around world-Y axis, North=0, East=+π/2. Extracted
+    // from the X-Z components of the aligned rotation:
+    //   R_yaw = | cos y, 0, sin y; 0, 1, 0; -sin y, 0, cos y |
+    return std::atan2(R_aligned.at<double>(0, 2),
+                      R_aligned.at<double>(0, 0));
 }
 
 // ── Clone Accessors ─────────────────────────────────────────────────────────
@@ -502,3 +861,599 @@ void EKFState::setTimeOffset(double td_seconds) {
 
 // DEAD CODE: updateTemporal — never called
 // void EKFState::updateTemporal(double observed_scale, double confidence, double H_td) { ... }
+
+// ──────────────────────────────────────────────────────────────────────────────
+// Plan Step 3b (ADR-009): SLAM features in EKF state
+// ──────────────────────────────────────────────────────────────────────────────
+
+void EKFState::setSlamIntrinsics(double fx, double fy, double cx, double cy) {
+    if (fx > 1.0) slam_fx_ = fx;
+    if (fy > 1.0) slam_fy_ = fy;
+    slam_cx_ = cx;
+    slam_cy_ = cy;
+}
+
+int EKFState::slamBlockStart() const {
+    return IMU_STATE_DIM + static_cast<int>(window_.size()) * CLONE_DIM;
+}
+
+int EKFState::slamFeatureCovIdxInternal(int slot) const {
+    if (slot < 0 || slot >= static_cast<int>(slam_features_.size())) return -1;
+    return slamBlockStart() + slot * SLAM_FEATURE_DIM;
+}
+
+int EKFState::getSlamFeatureCovIdx(int slot) const {
+    if (!full_initialized_ || P_.empty()) return -1;
+    return slamFeatureCovIdxInternal(slot);
+}
+
+int EKFState::getSlamFeatureCount() const {
+    return static_cast<int>(slam_features_.size());
+}
+
+int EKFState::getSlamFeatureSlot(int feature_id) const {
+    for (size_t i = 0; i < slam_features_.size(); ++i) {
+        if (slam_features_[i].feature_id == feature_id) {
+            return static_cast<int>(i);
+        }
+    }
+    return -1;
+}
+
+bool EKFState::getSlamFeatureGlobalPosition(int slot, cv::Mat& p_global_out) const {
+    if (slot < 0 || slot >= static_cast<int>(slam_features_.size())) return false;
+    const auto& f = slam_features_[slot];
+    cv::Mat R_anchor, p_anchor;
+    if (!getClonePose(f.anchor_clone_id, R_anchor, p_anchor)) {
+        return false;
+    }
+    const double alpha = f.state.at<double>(0, 0);
+    const double beta  = f.state.at<double>(1, 0);
+    const double rho   = f.state.at<double>(2, 0);
+    if (std::abs(rho) < 1e-9) return false;
+    cv::Mat p_anchor_pt = (cv::Mat_<double>(3, 1) << alpha / rho, beta / rho, 1.0 / rho);
+    // anchor frame → world: world = R_anchor.t() * p_anchor + p_anchor_world
+    p_global_out = R_anchor.t() * p_anchor_pt + p_anchor;
+    return true;
+}
+
+int EKFState::addSlamFeature(int feature_id,
+                             const cv::Mat& p_global_init,
+                             const CameraPose& anchor_clone) {
+    if (!full_initialized_ || P_.empty()) return -1;
+    if (p_global_init.rows != 3 || p_global_init.cols != 1 ||
+        p_global_init.type() != CV_64F) {
+        return -1;
+    }
+    if (anchor_clone.R_GtoC.rows != 3 || anchor_clone.R_GtoC.cols != 3 ||
+        anchor_clone.p_G.rows != 3 || anchor_clone.p_G.cols != 1) {
+        return -1;
+    }
+    if (static_cast<int>(slam_features_.size()) >= MAX_SLAM_FEATURES) {
+        // Cap policy: refuse new promotions when full. The caller (Tracker)
+        // is responsible for first invoking removeSlamFeature on a stale
+        // candidate when it wants to make room.
+        return -1;
+    }
+
+    // Verify the anchor exists in the current sliding window so the
+    // covariance entries we read are real.
+    int anchor_cov_idx = getCloneCovIdx(anchor_clone.state_id);
+    if (anchor_cov_idx < 0) return -1;
+
+    cv::Mat R_anchor_now, p_anchor_now;
+    if (!getClonePose(anchor_clone.state_id, R_anchor_now, p_anchor_now)) {
+        return -1;
+    }
+
+    // Project the global init point into the anchor's camera frame.
+    //     p_anchor_cam = R_anchor * (p_global - p_anchor_world)
+    cv::Mat p_anchor_cam = R_anchor_now * (p_global_init - p_anchor_now);
+    const double Xc = p_anchor_cam.at<double>(0, 0);
+    const double Yc = p_anchor_cam.at<double>(1, 0);
+    const double Zc = p_anchor_cam.at<double>(2, 0);
+    if (Zc < 0.01) {
+        // Behind or too close to the anchor — degenerate inverse depth.
+        return -1;
+    }
+
+    SlamFeature f;
+    f.feature_id      = feature_id;
+    f.anchor_clone_id = anchor_clone.state_id;
+    f.state           = cv::Mat::zeros(SLAM_FEATURE_DIM, 1, CV_64F);
+    f.state.at<double>(0, 0) = Xc / Zc;        // α
+    f.state.at<double>(1, 0) = Yc / Zc;        // β
+    f.state.at<double>(2, 0) = 1.0 / Zc;       // ρ
+    // pad rows 3..4 stay zero — never updated by any measurement.
+
+    f.p_global_FEJ  = p_global_init.clone();
+    f.anchor_R_FEJ  = anchor_clone.R_FEJ.empty() ? R_anchor_now.clone()
+                                                  : anchor_clone.R_FEJ.clone();
+    f.anchor_p_FEJ  = anchor_clone.p_FEJ.empty() ? p_anchor_now.clone()
+                                                  : anchor_clone.p_FEJ.clone();
+
+    // Initial 5x5 SLAM covariance.
+    //
+    // The reasoning: at promotion the (α, β) bearing is essentially as
+    // accurate as one pixel of measurement, σ_uv = √pixel_noise_sq /
+    // focal. Triangulation noise σ_ρ scales with depth squared and
+    // baseline:
+    //
+    //     σ_α ≈ σ_uv,  σ_β ≈ σ_uv,
+    //     σ_ρ ≈ ρ² * σ_uv * sqrt(2) / baseline_estimate
+    //
+    // We don't know the baseline at promotion time; use a conservative
+    // initial σ_ρ = 0.5 * ρ (50% relative depth uncertainty), which the
+    // first few updateSlamFeature calls will quickly tighten. The pad
+    // rows take a small pinned variance — they hold no information but
+    // need to be PSD-positive for the Joseph update to stay PSD.
+    cv::Mat P_ff = cv::Mat::zeros(SLAM_FEATURE_DIM, SLAM_FEATURE_DIM, CV_64F);
+    const double rho       = 1.0 / Zc;
+    const double sigma_uv  = 1.0 / 500.0;  // ≈1px / 500-focal — calibrated trend
+    const double sigma_ab  = std::max(sigma_uv, 1e-3);
+    const double sigma_rho = std::max(0.5 * rho, 1e-3);
+    P_ff.at<double>(0, 0) = sigma_ab  * sigma_ab;
+    P_ff.at<double>(1, 1) = sigma_ab  * sigma_ab;
+    P_ff.at<double>(2, 2) = sigma_rho * sigma_rho;
+    P_ff.at<double>(3, 3) = SLAM_PAD_VARIANCE;
+    P_ff.at<double>(4, 4) = SLAM_PAD_VARIANCE;
+
+    // Augment P_: append SLAM_FEATURE_DIM rows/cols at the END of P_, with
+    // zero cross-correlation to the existing state. Promotion is treated as
+    // a parameter add — the linearisation we'd otherwise propagate through
+    // is captured in P_ff above (depth uncertainty dominates and is
+    // independent of IMU/clone errors at promotion).
+    const int old_dim = P_.rows;
+    const int new_dim = old_dim + SLAM_FEATURE_DIM;
+    cv::Mat P_new = cv::Mat::zeros(new_dim, new_dim, CV_64F);
+    P_.copyTo(P_new(cv::Range(0, old_dim), cv::Range(0, old_dim)));
+    P_ff.copyTo(P_new(cv::Range(old_dim, new_dim),
+                      cv::Range(old_dim, new_dim)));
+    P_ = P_new;
+
+    slam_features_.push_back(std::move(f));
+    LOGI("SLAM: promoted feature %d (slot=%zu) at depth %.2fm anchor=%d",
+         feature_id, slam_features_.size() - 1, Zc, anchor_clone.state_id);
+    return static_cast<int>(slam_features_.size()) - 1;
+}
+
+bool EKFState::removeSlamFeature(int slot) {
+    if (slot < 0 || slot >= static_cast<int>(slam_features_.size())) return false;
+    if (!full_initialized_ || P_.empty()) {
+        // No covariance to splice; just drop the metadata.
+        slam_features_.erase(slam_features_.begin() + slot);
+        return true;
+    }
+
+    const int slam_start = slamBlockStart();
+    const int marg_idx   = slam_start + slot * SLAM_FEATURE_DIM;
+    const int marg_dim   = SLAM_FEATURE_DIM;
+    const int total_dim  = P_.rows;
+
+    if (marg_idx + marg_dim > total_dim) return false;
+
+    // Block-Schur complement marginalisation.
+    //
+    //     P = | P_kk  P_ks |
+    //         | P_sk  P_ss |
+    //
+    // After dropping the SLAM block at position [marg_idx, marg_idx+5):
+    //     P_kk' = P_kk - P_ks * inv(P_ss) * P_sk
+    //
+    // We pull P_ss (5x5), invert, then for each pair (i, j) outside the
+    // marginalised range, subtract the contribution. PSD diagonal sniff
+    // afterwards; if it fails, fall back to the naïve drop (delete rows/
+    // cols only) which is still correct (it's a Schur complement with
+    // P_ss → ∞, i.e. infinitely uncertain feature, no info to subtract).
+    cv::Mat P_ss = P_(cv::Range(marg_idx, marg_idx + marg_dim),
+                      cv::Range(marg_idx, marg_idx + marg_dim)).clone();
+    cv::Mat P_ss_inv;
+    bool inverted = cv::invert(P_ss, P_ss_inv, cv::DECOMP_CHOLESKY);
+    if (!inverted) {
+        inverted = cv::invert(P_ss, P_ss_inv, cv::DECOMP_SVD);
+    }
+
+    // Build the keep-index ranges and the new dimension.
+    const int new_dim = total_dim - marg_dim;
+    cv::Mat P_new = cv::Mat::zeros(new_dim, new_dim, CV_64F);
+
+    auto keep_range_lo = [&](int i) -> int {
+        return (i < marg_idx) ? i : (i + marg_dim);
+    };
+    (void)keep_range_lo;  // helper retained for documentation symmetry
+
+    // Pre-Schur copy of the keep block via row/col splicing.
+    auto copy_keep_block = [&](const cv::Mat& src, cv::Mat& dst) {
+        // Top-left
+        if (marg_idx > 0) {
+            src(cv::Range(0, marg_idx), cv::Range(0, marg_idx))
+                .copyTo(dst(cv::Range(0, marg_idx), cv::Range(0, marg_idx)));
+        }
+        const int after = marg_idx + marg_dim;
+        const int after_dim = total_dim - after;
+        if (after_dim > 0) {
+            // Top-right
+            if (marg_idx > 0) {
+                src(cv::Range(0, marg_idx), cv::Range(after, total_dim))
+                    .copyTo(dst(cv::Range(0, marg_idx),
+                                cv::Range(marg_idx, new_dim)));
+                // Bottom-left
+                src(cv::Range(after, total_dim), cv::Range(0, marg_idx))
+                    .copyTo(dst(cv::Range(marg_idx, new_dim),
+                                cv::Range(0, marg_idx)));
+            }
+            // Bottom-right
+            src(cv::Range(after, total_dim), cv::Range(after, total_dim))
+                .copyTo(dst(cv::Range(marg_idx, new_dim),
+                            cv::Range(marg_idx, new_dim)));
+        }
+    };
+
+    copy_keep_block(P_, P_new);
+
+    if (inverted) {
+        // P_ks: (new_dim x marg_dim). Build it by stacking the rows of P_
+        // at columns [marg_idx, marg_idx + marg_dim), skipping rows in
+        // the marginalised range.
+        cv::Mat P_ks = cv::Mat::zeros(new_dim, marg_dim, CV_64F);
+        if (marg_idx > 0) {
+            P_(cv::Range(0, marg_idx),
+               cv::Range(marg_idx, marg_idx + marg_dim))
+                .copyTo(P_ks(cv::Range(0, marg_idx), cv::Range::all()));
+        }
+        const int after = marg_idx + marg_dim;
+        const int after_dim = total_dim - after;
+        if (after_dim > 0) {
+            P_(cv::Range(after, total_dim),
+               cv::Range(marg_idx, marg_idx + marg_dim))
+                .copyTo(P_ks(cv::Range(marg_idx, new_dim), cv::Range::all()));
+        }
+        cv::Mat correction = P_ks * P_ss_inv * P_ks.t();   // new_dim x new_dim
+        P_new = P_new - correction;
+        // Enforce symmetry
+        P_new = (P_new + P_new.t()) * 0.5;
+
+        // PSD diagonal sniff. If any diagonal went negative, the Schur
+        // step over-corrected (numerical drift on a near-singular P_ss);
+        // fall back to drop-only and warn.
+        bool diag_ok = true;
+        for (int i = 0; i < P_new.rows; i++) {
+            if (P_new.at<double>(i, i) < 0.0) {
+                diag_ok = false;
+                break;
+            }
+        }
+        if (!diag_ok) {
+            LOGE("SLAM remove(slot=%d): Schur produced non-PSD diag — "
+                 "falling back to drop-only marginalisation", slot);
+            P_new = cv::Mat::zeros(new_dim, new_dim, CV_64F);
+            copy_keep_block(P_, P_new);
+        }
+    }
+
+    P_ = P_new;
+    slam_features_.erase(slam_features_.begin() + slot);
+    return true;
+}
+
+bool EKFState::slamReprojectionJacobian(const SlamFeature& f,
+                                        const cv::Mat& clone_R_FEJ,
+                                        const cv::Mat& clone_p_FEJ,
+                                        const cv::Mat& clone_R_now,
+                                        const cv::Mat& clone_p_now,
+                                        cv::Mat& H_feature_2x5,
+                                        cv::Mat& H_clone_2x6,
+                                        cv::Point2d& pred_uv) const {
+    // Layout reminder:
+    //   p_anchor_cam = (1/ρ) * (α, β, 1)
+    //   p_world      = R_anchor_FEJ.t() * p_anchor_cam + p_anchor_FEJ
+    //   p_C          = clone_R * (p_world - clone_p)
+    //   z = (p_C.x / p_C.z, p_C.y / p_C.z)
+    //
+    // The residual builder uses CURRENT anchor & clone poses (so the
+    // residual reflects the current state). The Jacobian uses FEJ poses
+    // (locked at promotion / first observation).
+    const double alpha = f.state.at<double>(0, 0);
+    const double beta  = f.state.at<double>(1, 0);
+    const double rho   = f.state.at<double>(2, 0);
+    if (std::abs(rho) < 1e-9) return false;
+
+    // Predicted image coords using CURRENT poses (residual side).
+    cv::Mat anchor_R_now, anchor_p_now;
+    if (!getClonePose(f.anchor_clone_id, anchor_R_now, anchor_p_now)) {
+        return false;
+    }
+    cv::Mat p_anchor_cam = (cv::Mat_<double>(3, 1) <<
+                            alpha / rho, beta / rho, 1.0 / rho);
+    cv::Mat p_world_now  = anchor_R_now.t() * p_anchor_cam + anchor_p_now;
+    cv::Mat p_C_now      = clone_R_now * (p_world_now - clone_p_now);
+    const double zCn = p_C_now.at<double>(2, 0);
+    if (zCn < 1e-4) return false;
+    // Pixel-space prediction (test fixture uses pixel coords).
+    pred_uv.x = slam_fx_ * p_C_now.at<double>(0, 0) / zCn + slam_cx_;
+    pred_uv.y = slam_fy_ * p_C_now.at<double>(1, 0) / zCn + slam_cy_;
+
+    // FEJ-side projection for the Jacobian.
+    cv::Mat anchor_R_F = f.anchor_R_FEJ.empty() ? anchor_R_now : f.anchor_R_FEJ;
+    cv::Mat anchor_p_F = f.anchor_p_FEJ.empty() ? anchor_p_now : f.anchor_p_FEJ;
+    cv::Mat clone_R_F  = clone_R_FEJ.empty() ? clone_R_now : clone_R_FEJ;
+    cv::Mat clone_p_F  = clone_p_FEJ.empty() ? clone_p_now : clone_p_FEJ;
+
+    cv::Mat p_world_F = anchor_R_F.t() * p_anchor_cam + anchor_p_F;
+    cv::Mat p_C_F     = clone_R_F * (p_world_F - clone_p_F);
+    const double xCf = p_C_F.at<double>(0, 0);
+    const double yCf = p_C_F.at<double>(1, 0);
+    const double zCf = p_C_F.at<double>(2, 0);
+    if (zCf < 1e-4) return false;
+    const double zinv  = 1.0 / zCf;
+    const double zinv2 = zinv * zinv;
+
+    // ∂(u_px, v_px) / ∂p_C  =   |fx/z  0    -fx*x/z²|
+    //                            |0    fy/z  -fy*y/z²|
+    cv::Mat dproj_dpC = (cv::Mat_<double>(2, 3) <<
+                         slam_fx_ * zinv, 0.0,             -slam_fx_ * xCf * zinv2,
+                         0.0,             slam_fy_ * zinv, -slam_fy_ * yCf * zinv2);
+
+    // ∂p_C / ∂p_world = clone_R_F
+    cv::Mat dpC_dpw = clone_R_F;
+
+    // ∂p_world / ∂(α, β, ρ):
+    //   p_world = R_a.t() * (1/ρ) * (α, β, 1) + p_a
+    //   ∂/∂α = R_a.t() * (1/ρ, 0, 0)^T
+    //   ∂/∂β = R_a.t() * (0, 1/ρ, 0)^T
+    //   ∂/∂ρ = R_a.t() * (-α/ρ², -β/ρ², -1/ρ²)^T
+    const double rho_inv  = 1.0 / rho;
+    const double rho_inv2 = rho_inv * rho_inv;
+    cv::Mat dpw_dab = cv::Mat::zeros(3, 3, CV_64F);
+    cv::Mat col_a = anchor_R_F.t() * (cv::Mat_<double>(3, 1) << rho_inv, 0.0, 0.0);
+    cv::Mat col_b = anchor_R_F.t() * (cv::Mat_<double>(3, 1) << 0.0, rho_inv, 0.0);
+    cv::Mat col_r = anchor_R_F.t() * (cv::Mat_<double>(3, 1) <<
+                                       -alpha * rho_inv2,
+                                       -beta  * rho_inv2,
+                                       -rho_inv2);
+    col_a.copyTo(dpw_dab(cv::Range::all(), cv::Range(0, 1)));
+    col_b.copyTo(dpw_dab(cv::Range::all(), cv::Range(1, 2)));
+    col_r.copyTo(dpw_dab(cv::Range::all(), cv::Range(2, 3)));
+
+    // 2x3 chain on (α, β, ρ); pad cols 3..4 stay zero.
+    H_feature_2x5 = cv::Mat::zeros(2, SLAM_FEATURE_DIM, CV_64F);
+    cv::Mat H_active = dproj_dpC * dpC_dpw * dpw_dab;   // 2x3
+    H_active.copyTo(H_feature_2x5(cv::Range::all(), cv::Range(0, 3)));
+
+    // Jacobian w.r.t. observing clone (δθ_c, δp_c):
+    //   ∂p_C / ∂δθ_c = -[clone_R_F * (p_world - clone_p)]_x = -[p_C_F]_x
+    //   ∂p_C / ∂δp_c = -clone_R_F
+    auto skew = [](const cv::Mat& v) {
+        return (cv::Mat_<double>(3, 3) <<
+                0.0,                 -v.at<double>(2, 0),  v.at<double>(1, 0),
+                v.at<double>(2, 0),   0.0,                -v.at<double>(0, 0),
+               -v.at<double>(1, 0),   v.at<double>(0, 0),  0.0);
+    };
+    cv::Mat dpC_dtheta = -skew(p_C_F);              // 3x3
+    cv::Mat dpC_dpc    = -clone_R_F;                 // 3x3
+    H_clone_2x6 = cv::Mat::zeros(2, CLONE_DIM, CV_64F);
+    cv::Mat H_clone_theta = dproj_dpC * dpC_dtheta;  // 2x3
+    cv::Mat H_clone_p     = dproj_dpC * dpC_dpc;     // 2x3
+    H_clone_theta.copyTo(H_clone_2x6(cv::Range::all(), cv::Range(0, 3)));
+    H_clone_p    .copyTo(H_clone_2x6(cv::Range::all(), cv::Range(3, 6)));
+    return true;
+}
+
+bool EKFState::updateSlamFeature(int slot,
+                                 const std::vector<cv::Point2f>& observations,
+                                 const std::vector<int>& clone_ids,
+                                 double pixel_noise_sq) {
+    if (!full_initialized_ || P_.empty()) return false;
+    if (slot < 0 || slot >= static_cast<int>(slam_features_.size())) return false;
+    if (observations.size() != clone_ids.size() || observations.empty()) return false;
+
+    const int dim = P_.rows;
+    const int slam_idx = slamFeatureCovIdxInternal(slot);
+    if (slam_idx < 0 || slam_idx + SLAM_FEATURE_DIM > dim) return false;
+
+    SlamFeature& f = slam_features_[slot];
+
+    // Gather the per-clone reprojection rows. Skip clone IDs that are no
+    // longer in the sliding window — they were marginalised between when
+    // the observation was recorded and when the update fires. If every
+    // clone was marginalised, the update is a no-op (return false).
+    std::vector<cv::Mat> H_rows;
+    std::vector<cv::Mat> r_rows;
+    H_rows.reserve(observations.size());
+    r_rows.reserve(observations.size());
+
+    double rms_acc = 0.0;
+    int rms_n = 0;
+
+    for (size_t k = 0; k < observations.size(); k++) {
+        const int clone_id = clone_ids[k];
+        const int clone_cov = getCloneCovIdx(clone_id);
+        if (clone_cov < 0) continue;
+
+        cv::Mat R_now, p_now;
+        if (!getClonePose(clone_id, R_now, p_now)) continue;
+        cv::Mat R_FEJ, p_FEJ;
+        if (!getCloneFEJ(clone_id, R_FEJ, p_FEJ)) {
+            R_FEJ = R_now.clone();
+            p_FEJ = p_now.clone();
+        }
+
+        cv::Mat H_feat, H_clone;
+        cv::Point2d pred;
+        if (!slamReprojectionJacobian(f, R_FEJ, p_FEJ, R_now, p_now,
+                                      H_feat, H_clone, pred)) {
+            continue;
+        }
+
+        // Sparse 2 x dim Jacobian:
+        //   - clone slot at [clone_cov, clone_cov+6)
+        //   - SLAM slot   at [slam_idx, slam_idx+5)
+        cv::Mat H = cv::Mat::zeros(2, dim, CV_64F);
+        H_clone.copyTo(H(cv::Range::all(),
+                         cv::Range(clone_cov, clone_cov + CLONE_DIM)));
+        H_feat .copyTo(H(cv::Range::all(),
+                         cv::Range(slam_idx, slam_idx + SLAM_FEATURE_DIM)));
+
+        // Residual = obs - predicted (normalised image coords).
+        cv::Mat r = (cv::Mat_<double>(2, 1) <<
+                     observations[k].x - pred.x,
+                     observations[k].y - pred.y);
+
+        rms_acc += r.at<double>(0, 0) * r.at<double>(0, 0)
+                 + r.at<double>(1, 0) * r.at<double>(1, 0);
+        rms_n += 1;
+
+        H_rows.push_back(H);
+        r_rows.push_back(r);
+    }
+
+    if (H_rows.empty()) return false;
+
+    // Stack rows into a single (2K x dim) H and (2K x 1) r.
+    const int K = static_cast<int>(H_rows.size());
+    cv::Mat H_stack = cv::Mat::zeros(2 * K, dim, CV_64F);
+    cv::Mat r_stack = cv::Mat::zeros(2 * K, 1,   CV_64F);
+    for (int k = 0; k < K; k++) {
+        H_rows[k].copyTo(H_stack(cv::Range(2 * k, 2 * k + 2), cv::Range::all()));
+        r_rows[k].copyTo(r_stack(cv::Range(2 * k, 2 * k + 2), cv::Range::all()));
+    }
+    cv::Mat R_noise = cv::Mat::eye(2 * K, 2 * K, CV_64F)
+                      * std::max(pixel_noise_sq, 1e-8);
+
+    // Inherit Step 3a's damping + Huber kernel by going through the
+    // canonical update path.
+    applyMSCKFUpdate(H_stack, r_stack, R_noise);
+
+    // Diagnostics: feature RMS for the lifecycle decision in Tracker.
+    if (rms_n > 0) {
+        f.last_obs_rms = std::sqrt(rms_acc / static_cast<double>(rms_n));
+    }
+    return true;
+}
+
+bool EKFState::applyMSCKFFeature(const std::vector<cv::Point2f>& observations,
+                                 const std::vector<int>& clone_ids,
+                                 const cv::Mat& triangulated_p_global,
+                                 double pixel_noise_sq) {
+    if (!full_initialized_ || P_.empty()) return false;
+    if (observations.size() != clone_ids.size() || observations.empty()) return false;
+    if (triangulated_p_global.rows != 3 || triangulated_p_global.cols != 1 ||
+        triangulated_p_global.type() != CV_64F) {
+        return false;
+    }
+
+    const int dim = P_.rows;
+
+    // Build per-observation residual rows + Jacobians w.r.t. (clone pose,
+    // 3-D point). The point itself is NOT in the EKF state — we project
+    // it onto the left null space of H_f to eliminate the feature DOF
+    // (OpenVINS / Mourikis 2007).
+    //
+    //     z_k = π( R_k * (p_w - p_k) )
+    //
+    // with R_k, p_k taken at the FEJ pose of clone k. The 2K x 3 stack
+    // H_f times the 3-DOF feature update is what we project away.
+    std::vector<cv::Mat> H_x_rows;   // 2 x dim (clone block only)
+    std::vector<cv::Mat> H_f_rows;   // 2 x 3
+    std::vector<cv::Mat> r_rows;     // 2 x 1
+
+    auto skew = [](const cv::Mat& v) {
+        return (cv::Mat_<double>(3, 3) <<
+                0.0,                 -v.at<double>(2, 0),  v.at<double>(1, 0),
+                v.at<double>(2, 0),   0.0,                -v.at<double>(0, 0),
+               -v.at<double>(1, 0),   v.at<double>(0, 0),  0.0);
+    };
+
+    for (size_t k = 0; k < observations.size(); k++) {
+        const int clone_id  = clone_ids[k];
+        const int clone_cov = getCloneCovIdx(clone_id);
+        if (clone_cov < 0) continue;
+
+        cv::Mat R_now, p_now;
+        if (!getClonePose(clone_id, R_now, p_now)) continue;
+        cv::Mat R_FEJ, p_FEJ;
+        if (!getCloneFEJ(clone_id, R_FEJ, p_FEJ)) {
+            R_FEJ = R_now.clone();
+            p_FEJ = p_now.clone();
+        }
+
+        cv::Mat p_C_F = R_FEJ * (triangulated_p_global - p_FEJ);
+        const double zCf = p_C_F.at<double>(2, 0);
+        if (zCf < 1e-4) continue;
+
+        cv::Mat p_C_now = R_now * (triangulated_p_global - p_now);
+        const double zCn = p_C_now.at<double>(2, 0);
+        if (zCn < 1e-4) continue;
+        const double pred_u = slam_fx_ * p_C_now.at<double>(0, 0) / zCn + slam_cx_;
+        const double pred_v = slam_fy_ * p_C_now.at<double>(1, 0) / zCn + slam_cy_;
+
+        const double xCf = p_C_F.at<double>(0, 0);
+        const double yCf = p_C_F.at<double>(1, 0);
+        const double zinv  = 1.0 / zCf;
+        const double zinv2 = zinv * zinv;
+        cv::Mat dproj_dpC = (cv::Mat_<double>(2, 3) <<
+                             slam_fx_ * zinv, 0.0,             -slam_fx_ * xCf * zinv2,
+                             0.0,             slam_fy_ * zinv, -slam_fy_ * yCf * zinv2);
+
+        // ∂p_C / ∂(δθ_c, δp_c) and ∂p_C / ∂p_w:
+        cv::Mat dpC_dtheta = -skew(p_C_F);
+        cv::Mat dpC_dpc    = -R_FEJ;
+        cv::Mat dpC_dpw    =  R_FEJ;
+
+        cv::Mat H_clone = cv::Mat::zeros(2, CLONE_DIM, CV_64F);
+        cv::Mat H_clone_t = dproj_dpC * dpC_dtheta;
+        cv::Mat H_clone_p = dproj_dpC * dpC_dpc;
+        H_clone_t.copyTo(H_clone(cv::Range::all(), cv::Range(0, 3)));
+        H_clone_p.copyTo(H_clone(cv::Range::all(), cv::Range(3, 6)));
+
+        cv::Mat H_x = cv::Mat::zeros(2, dim, CV_64F);
+        H_clone.copyTo(H_x(cv::Range::all(),
+                            cv::Range(clone_cov, clone_cov + CLONE_DIM)));
+
+        cv::Mat H_f = dproj_dpC * dpC_dpw;          // 2x3
+
+        cv::Mat r = (cv::Mat_<double>(2, 1) <<
+                     observations[k].x - pred_u,
+                     observations[k].y - pred_v);
+
+        H_x_rows.push_back(H_x);
+        H_f_rows.push_back(H_f);
+        r_rows  .push_back(r);
+    }
+
+    if (H_x_rows.size() < 2) return false;  // null-space needs ≥ 2 obs
+
+    const int K = static_cast<int>(H_x_rows.size());
+    cv::Mat H_x = cv::Mat::zeros(2 * K, dim, CV_64F);
+    cv::Mat H_f = cv::Mat::zeros(2 * K, 3,   CV_64F);
+    cv::Mat r   = cv::Mat::zeros(2 * K, 1,   CV_64F);
+    for (int k = 0; k < K; k++) {
+        H_x_rows[k].copyTo(H_x(cv::Range(2 * k, 2 * k + 2), cv::Range::all()));
+        H_f_rows[k].copyTo(H_f(cv::Range(2 * k, 2 * k + 2), cv::Range::all()));
+        r_rows  [k].copyTo(r  (cv::Range(2 * k, 2 * k + 2), cv::Range::all()));
+    }
+
+    // QR null-space projection: A^T such that A^T * H_f = 0. SVD-based for
+    // robustness on K = 2 (the QR path requires K > rank(H_f) = 3).
+    cv::Mat U, W, Vt;
+    cv::SVD::compute(H_f, W, U, Vt, cv::SVD::FULL_UV);
+    // U is (2K x 2K). The left null space of H_f is U[:, rank..2K).
+    int rank = 0;
+    if (!W.empty()) {
+        const double tol = 1e-6 * W.at<double>(0, 0);
+        for (int i = 0; i < W.rows; i++) {
+            if (W.at<double>(i, 0) > tol) rank++;
+        }
+    }
+    if (rank >= 2 * K) return false;
+
+    cv::Mat A = U(cv::Range::all(), cv::Range(rank, 2 * K)).clone();
+    // Project: H' = A^T * H_x, r' = A^T * r, R' = A^T * (σ²I) * A = σ² * I.
+    cv::Mat H_proj = A.t() * H_x;
+    cv::Mat r_proj = A.t() * r;
+    cv::Mat R_proj = cv::Mat::eye(H_proj.rows, H_proj.rows, CV_64F)
+                     * std::max(pixel_noise_sq, 1e-8);
+
+    applyMSCKFUpdate(H_proj, r_proj, R_proj);
+    return true;
+}

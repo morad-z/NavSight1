@@ -606,6 +606,146 @@ Java_com_example_navsight1_NativeBridge_setUserHeight(
     }
 }
 
+// ── Step 5: Calibration & Initialization JNI ────────────────────────────────
+
+JNIEXPORT jint JNICALL
+Java_com_example_navsight1_NativeBridge_getInitStatus(JNIEnv*, jobject) {
+    std::shared_ptr<VioEngine> vision;
+    {
+        std::lock_guard<std::mutex> lock(state_mutex);
+        vision = g_vision;
+    }
+    return vision ? vision->getInitStatus() : 0;
+}
+
+JNIEXPORT void JNICALL
+Java_com_example_navsight1_NativeBridge_clearInitTimeout(JNIEnv*, jobject) {
+    std::shared_ptr<VioEngine> vision;
+    {
+        std::lock_guard<std::mutex> lock(state_mutex);
+        vision = g_vision;
+    }
+    if (vision) vision->clearInitTimeout();
+}
+
+JNIEXPORT void JNICALL
+Java_com_example_navsight1_NativeBridge_loadStoredCalibration(
+        JNIEnv* env, jobject,
+        jfloatArray rotation,
+        jfloatArray gyroBias,
+        jfloatArray accelBias) {
+    std::shared_ptr<VioEngine> vision;
+    {
+        std::lock_guard<std::mutex> lock(state_mutex);
+        vision = g_vision;
+    }
+    if (!vision || !rotation || !gyroBias || !accelBias) return;
+
+    if (env->GetArrayLength(rotation) != 9
+        || env->GetArrayLength(gyroBias) != 3
+        || env->GetArrayLength(accelBias) != 3) {
+        LOGE("loadStoredCalibration: bad array sizes");
+        return;
+    }
+
+    jfloat* rot_ptr = env->GetFloatArrayElements(rotation, nullptr);
+    jfloat* gb_ptr  = env->GetFloatArrayElements(gyroBias, nullptr);
+    jfloat* ab_ptr  = env->GetFloatArrayElements(accelBias, nullptr);
+
+    vision->loadStoredCalibration(rot_ptr, gb_ptr, ab_ptr);
+
+    env->ReleaseFloatArrayElements(rotation, rot_ptr, JNI_ABORT);
+    env->ReleaseFloatArrayElements(gyroBias, gb_ptr, JNI_ABORT);
+    env->ReleaseFloatArrayElements(accelBias, ab_ptr, JNI_ABORT);
+}
+
+JNIEXPORT jboolean JNICALL
+Java_com_example_navsight1_NativeBridge_getCalibration(
+        JNIEnv* env, jobject,
+        jfloatArray rotation,
+        jfloatArray gyroBias,
+        jfloatArray accelBias) {
+    std::shared_ptr<VioEngine> vision;
+    {
+        std::lock_guard<std::mutex> lock(state_mutex);
+        vision = g_vision;
+    }
+    if (!vision || !rotation || !gyroBias || !accelBias) return JNI_FALSE;
+
+    if (env->GetArrayLength(rotation) != 9
+        || env->GetArrayLength(gyroBias) != 3
+        || env->GetArrayLength(accelBias) != 3) {
+        return JNI_FALSE;
+    }
+
+    float R[9], gb[3], ab[3];
+    bool ok = vision->getCalibration(R, gb, ab);
+    if (!ok) return JNI_FALSE;
+
+    env->SetFloatArrayRegion(rotation, 0, 9, R);
+    env->SetFloatArrayRegion(gyroBias, 0, 3, gb);
+    env->SetFloatArrayRegion(accelBias, 0, 3, ab);
+    return JNI_TRUE;
+}
+
+// Step 6: Horizontal-plane position covariance [σ_xx, σ_xz, σ_zz] in m².
+// Returns true when the EKF has finished its full init and the covariance is
+// valid; false (zeros) otherwise. Caller passes a length-3 FloatArray.
+JNIEXPORT jboolean JNICALL
+Java_com_example_navsight1_NativeBridge_getPositionCovariance(
+        JNIEnv* env, jobject, jfloatArray out) {
+    std::shared_ptr<VioEngine> vision;
+    {
+        std::lock_guard<std::mutex> lock(state_mutex);
+        vision = g_vision;
+    }
+    if (!vision || !out) return JNI_FALSE;
+    if (env->GetArrayLength(out) != 3) return JNI_FALSE;
+
+    double cov[3] = {0.0, 0.0, 0.0};
+    bool ok = vision->getPositionCovarianceXZ(cov);
+    float cov_f[3] = {
+        static_cast<float>(cov[0]),
+        static_cast<float>(cov[1]),
+        static_cast<float>(cov[2])
+    };
+    env->SetFloatArrayRegion(out, 0, 3, cov_f);
+    return ok ? JNI_TRUE : JNI_FALSE;
+}
+
+// ── nativeLoadCalibration (Step 1, Visual Production Plan) ──────────────────
+// Pushes the in-app calibration JSON into the live VioEngine. Returns true on
+// success, false on any failure (file missing, malformed, validation fails).
+// On false the engine continues with zero-distortion passthrough — caller
+// must NOT block the camera path on this.
+
+JNIEXPORT jboolean JNICALL
+Java_com_example_navsight1_NativeBridge_nativeLoadCalibration(
+        JNIEnv* env, jobject /* thiz */, jstring jpath) {
+    if (!jpath) {
+        LOGE("nativeLoadCalibration: null path");
+        return JNI_FALSE;
+    }
+    const char* c_path = env->GetStringUTFChars(jpath, nullptr);
+    if (!c_path) {
+        LOGE("nativeLoadCalibration: GetStringUTFChars returned null");
+        return JNI_FALSE;
+    }
+    std::string path(c_path);
+    env->ReleaseStringUTFChars(jpath, c_path);
+
+    std::shared_ptr<VioEngine> vision;
+    {
+        std::lock_guard<std::mutex> lock(state_mutex);
+        vision = g_vision;
+    }
+    if (!vision) {
+        LOGI("nativeLoadCalibration: VIO engine not yet started, skipping");
+        return JNI_FALSE;
+    }
+    return vision->loadCalibration(path) ? JNI_TRUE : JNI_FALSE;
+}
+
 // DEAD CODE: setMagnetometerHeading JNI — Kotlin caller commented out in NativeBridge.kt
 // (IMUPreintegrator::setMagnetometerHeading itself is still live — called by InertialInitializer)
 /*

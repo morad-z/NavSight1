@@ -21,6 +21,10 @@ class SensorRepository(private val context: Context) : SensorEventListener {
 
     private val TAG = "SensorRepository"
 
+    // Step 5: VIO initialization status (mirrors C++ InertialInitializer::Status).
+    // Order MUST match native enum: WAIT_STATIONARY=0, WAIT_MOTION=1, READY=2, TIMEOUT_NEEDS_USER=3.
+    enum class InitStatus { WAIT_STATIONARY, WAIT_MOTION, READY, TIMEOUT_NEEDS_USER }
+
     private val sensorManager = context.getSystemService(Context.SENSOR_SERVICE) as SensorManager
     private val accelerometer = sensorManager.getDefaultSensor(Sensor.TYPE_ACCELEROMETER)
     private val magnetometer = sensorManager.getDefaultSensor(Sensor.TYPE_MAGNETIC_FIELD)
@@ -77,15 +81,27 @@ class SensorRepository(private val context: Context) : SensorEventListener {
     private val _showCameraBlocked = MutableStateFlow(false)
     val showCameraBlocked = _showCameraBlocked.asStateFlow()
 
+    // Step 5: Initialization-gate status. Polled from native InertialInitializer.
+    private val _initStatus = MutableStateFlow(InitStatus.WAIT_STATIONARY)
+    val initStatus = _initStatus.asStateFlow()
+    private var initStatusPollerJob: Job? = null
+    // True once we have persisted a fresh calibration during this run, so we don't
+    // repeatedly re-write the same values to SharedPreferences.
+    private var calibrationPersistedThisRun = false
+
     // ── FOR SIMULATION ────────────────────────────────────────────────────────
     private val _currentLocation = MutableStateFlow<Location?>(null)
     val currentLocation = _currentLocation.asStateFlow()
     private var locationCallback: LocationCallback? = null
     // ──────────────────────────────────────────────────────────────────────────
 
-    private val repositoryScope = CoroutineScope(Dispatchers.Main + SupervisorJob())
+    private var repositoryScope = CoroutineScope(Dispatchers.Main + SupervisorJob())
 
     fun startSensors() {
+        // Recreate scope if a previous stopSensors() cancelled it. Idempotent.
+        if (!repositoryScope.isActive) {
+            repositoryScope = CoroutineScope(Dispatchers.Main + SupervisorJob())
+        }
         try {
             accelerometer?.let {
                 sensorManager.registerListener(this, it, SensorManager.SENSOR_DELAY_GAME)
@@ -104,11 +120,121 @@ class SensorRepository(private val context: Context) : SensorEventListener {
             
             if (NativeBridge.isLoaded()) {
                 NativeBridge.startVIO()
+                pushStoredCalibrationToNative()
+                pushCameraIntrinsicsToNative()
+                startInitStatusPoller()
             } else {
                 Log.e(TAG, "Cannot start VIO: native library not loaded")
             }
         } catch (e: Exception) {
             Log.e(TAG, "Error starting sensors: ${e.message}", e)
+        }
+    }
+
+    /**
+     * Plan Step 1b/8b: load `<filesDir>/camera_calib.json` (written by the
+     * in-app calibration screen) and push fx/fy/cx/cy + distortion into
+     * the native runtime via NativeBridge.nativeLoadCalibration.
+     *
+     * Called immediately after startVIO() so the loader runs before the
+     * first camera frame arrives and before SensorRepository's lazy
+     * setIntrinsics fallback kicks in. Without this, the saved JSON sits
+     * on disk unused and LensCorrector stays at zero-distortion.
+     *
+     * No-op if the file doesn't exist (user hasn't calibrated yet).
+     */
+    private fun pushCameraIntrinsicsToNative() {
+        val file = java.io.File(context.filesDir, CALIB_FILE)
+        if (!file.exists()) {
+            Log.i(TAG, "No camera_calib.json — running with default zero-distortion intrinsics")
+            return
+        }
+        try {
+            val ok = NativeBridge.nativeLoadCalibration(file.absolutePath)
+            if (ok) {
+                calibratedIntrinsicsLoaded = true
+                intrinsicsInitialized = true   // suppress first-frame default push
+                Log.i(TAG, "Camera intrinsics loaded from ${file.absolutePath}")
+            } else {
+                Log.w(TAG, "nativeLoadCalibration returned false for ${file.absolutePath}")
+            }
+        } catch (e: Throwable) {
+            Log.e(TAG, "Failed to load camera intrinsics: ${e.message}", e)
+        }
+    }
+
+    /** Step 5: load any previously-saved calibration and push it into the native gate. */
+    private fun pushStoredCalibrationToNative() {
+        val stored = CalibrationStore.load(context) ?: return
+        try {
+            NativeBridge.loadStoredCalibration(
+                stored.rotation, stored.gyroBias, stored.accelBias
+            )
+            Log.i(
+                TAG,
+                "Loaded stored calibration (saved ${System.currentTimeMillis() - stored.savedAtMs}ms ago); skipping stationary gate"
+            )
+            calibrationPersistedThisRun = true
+        } catch (e: Exception) {
+            Log.e(TAG, "Failed to push stored calibration to native: ${e.message}", e)
+        }
+    }
+
+    /** Step 5: poll native init-status at 4 Hz and persist calibration when the gate passes. */
+    private fun startInitStatusPoller() {
+        initStatusPollerJob?.cancel()
+        initStatusPollerJob = repositoryScope.launch {
+            while (isActive) {
+                val raw = try { NativeBridge.getInitStatus() } catch (e: Throwable) {
+                    Log.e(TAG, "getInitStatus failed: ${e.message}"); -1
+                }
+                val status = when (raw) {
+                    0 -> InitStatus.WAIT_STATIONARY
+                    1 -> InitStatus.WAIT_MOTION
+                    2 -> InitStatus.READY
+                    3 -> InitStatus.TIMEOUT_NEEDS_USER
+                    else -> _initStatus.value
+                }
+                if (status != _initStatus.value) {
+                    Log.i(TAG, "InitStatus: ${_initStatus.value} -> $status")
+                    _initStatus.value = status
+                }
+                if (!calibrationPersistedThisRun &&
+                    (status == InitStatus.WAIT_MOTION || status == InitStatus.READY)) {
+                    persistNativeCalibration()
+                }
+                delay(250L)
+            }
+        }
+    }
+
+    /** Step 5: pull calibration from native and write it to SharedPreferences. */
+    private fun persistNativeCalibration() {
+        val rotation = FloatArray(9)
+        val gyroBias = FloatArray(3)
+        val accelBias = FloatArray(3)
+        val ok = try {
+            NativeBridge.getCalibration(rotation, gyroBias, accelBias)
+        } catch (e: Throwable) {
+            Log.e(TAG, "getCalibration failed: ${e.message}", e); false
+        }
+        if (!ok) return
+        CalibrationStore.save(
+            context,
+            CalibrationStore.CalibrationData(
+                rotation = rotation,
+                gyroBias = gyroBias,
+                accelBias = accelBias,
+                savedAtMs = System.currentTimeMillis(),
+            )
+        )
+        calibrationPersistedThisRun = true
+    }
+
+    /** Step 5: invoked by UI when the user dismisses the timeout dialog. */
+    fun clearInitTimeout() {
+        try { NativeBridge.clearInitTimeout() } catch (e: Throwable) {
+            Log.e(TAG, "clearInitTimeout failed: ${e.message}", e)
         }
     }
 
@@ -167,6 +293,11 @@ class SensorRepository(private val context: Context) : SensorEventListener {
     // ──────────────────────────────────────────────────────────────────────────
 
     private var intrinsicsInitialized = false
+    // Plan Step 1b/8b: set true by pushCameraIntrinsicsToNative() when a
+    // valid camera_calib.json is loaded at startup. Suppresses the
+    // first-frame default-intrinsics push so the calibration values
+    // (fx/fy/cx/cy + distortion) survive to the runtime tracker.
+    private var calibratedIntrinsicsLoaded = false
 
     private fun getCameraIntrinsics(targetWidth: Int, targetHeight: Int): FloatArray {
         try {
@@ -219,7 +350,7 @@ class SensorRepository(private val context: Context) : SensorEventListener {
         } catch (e: Exception) {
             Log.e(TAG, "Error unregistering listeners: ${e.message}")
         }
-        
+
         try {
             if (NativeBridge.isLoaded()) {
                 NativeBridge.stopVIO()
@@ -227,13 +358,17 @@ class SensorRepository(private val context: Context) : SensorEventListener {
         } catch (e: Exception) {
             Log.e(TAG, "Error stopping VIO: ${e.message}")
         }
-        
+
+        initStatusPollerJob?.cancel()
+        initStatusPollerJob = null
         locationTokenSource?.cancel()
         stopGpsUpdates()
         vioExecutor.shutdown()
         depthExecutor.shutdown()
         depthEstimator.close()
         intrinsicsInitialized = false
+        calibratedIntrinsicsLoaded = false
+        calibrationPersistedThisRun = false
         repositoryScope.cancel()
         Log.d(TAG, "Repository cleaned up")
     }

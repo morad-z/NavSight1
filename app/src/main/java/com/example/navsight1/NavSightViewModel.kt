@@ -19,6 +19,14 @@ import kotlinx.coroutines.withContext
 import kotlin.math.*
 import java.util.concurrent.atomic.AtomicInteger
 
+/**
+ * One sample on the VIO trajectory in local (x, z) meters with the
+ * 1-sigma horizontal-plane position uncertainty at that sample, in meters.
+ * `sigmaM` is `Float.NaN` when the EKF has not yet exposed a valid covariance
+ * (e.g. before full initialization).
+ */
+data class PathPoint(val x: Float, val z: Float, val sigmaM: Float)
+
 class NavSightViewModel(application: Application) : AndroidViewModel(application) {
     data class ScaleCalibrationSession(
         val legDistanceMeters: Double,
@@ -70,11 +78,22 @@ class NavSightViewModel(application: Application) : AndroidViewModel(application
     var virtualZ by mutableStateOf(0.0)
         private set
 
-    private val _pathHistory = ArrayList<Pair<Float, Float>>(512)
+    private val _pathHistory = ArrayList<PathPoint>(512)
     private val _pathHistoryVersion = AtomicInteger(0)
     var pathHistoryVersion by mutableStateOf(0)
         private set
-    val pathHistory: List<Pair<Float, Float>> get() = _pathHistory
+    val pathHistory: List<PathPoint> get() = _pathHistory
+
+    // Step 6: current 1-sigma horizontal-plane position uncertainty (meters).
+    // NaN until the EKF has finished its full init. Backed by a per-frame read
+    // of NativeBridge.getPositionCovariance(), with sigma = sqrt(σ_xx + σ_zz).
+    var positionSigmaM by mutableStateOf(Float.NaN)
+        private set
+    // True while the EKF is reporting a valid covariance block (full init).
+    var positionCovValid by mutableStateOf(false)
+        private set
+    // Reusable buffer to avoid per-frame allocation when polling covariance.
+    private val covBuf = FloatArray(3)
 
     var startLocation by mutableStateOf<LatLng?>(null)
         private set
@@ -96,6 +115,8 @@ class NavSightViewModel(application: Application) : AndroidViewModel(application
 
     var showCameraBlocked by mutableStateOf(false)
         private set
+    var initStatus by mutableStateOf(SensorRepository.InitStatus.WAIT_STATIONARY)
+        private set
     var navigationStartMessage by mutableStateOf<String?>(null)
         private set
     var scaleCalibrationFactor by mutableStateOf(
@@ -108,6 +129,19 @@ class NavSightViewModel(application: Application) : AndroidViewModel(application
         private set
     var userHeight by mutableStateOf(prefs.getFloat(PREF_USER_HEIGHT, 1.70f))
         private set
+
+    // Step 1 (Visual plan): camera-calibration JSON existence.
+    // True when filesDir/camera_calib.json is present at startup or after the
+    // in-app calibration screen saves a fresh result. Drives the main-screen
+    // status pill and the first-launch banner. Updated synchronously from the
+    // UI layer via [refreshCalibrationLoaded].
+    var calibrationLoaded by mutableStateOf(calibrationExists(application))
+        private set
+
+    /** Re-check whether camera_calib.json exists on disk. */
+    fun refreshCalibrationLoaded() {
+        calibrationLoaded = calibrationExists(getApplication())
+    }
 
     // ── FOR SIMULATION ────────────────────────────────────────────────────────
     var isRecordingSimulation by mutableStateOf(false)
@@ -176,6 +210,9 @@ class NavSightViewModel(application: Application) : AndroidViewModel(application
             sensorRepository.showCameraBlocked.collect { showCameraBlocked = it }
         }
         viewModelScope.launch {
+            sensorRepository.initStatus.collect { initStatus = it }
+        }
+        viewModelScope.launch {
             sensorRepository.currentLocation.collect { currentGpsLocation = it }
         }
         viewModelScope.launch {
@@ -197,9 +234,22 @@ class NavSightViewModel(application: Application) : AndroidViewModel(application
             if (vio.isInitialized) {
                 virtualX = vio.x
                 virtualZ = vio.z
-                _pathHistory.add(Pair(vio.x.toFloat(), vio.z.toFloat()))
+                // Step 6: pull horizontal-plane position covariance from EKF and
+                // derive sigma_h = sqrt(σ_xx + σ_zz). NaN before full init.
+                val covOk = NativeBridge.isLoaded() &&
+                    NativeBridge.getPositionCovariance(covBuf)
+                val sigma = if (covOk) {
+                    val trace = covBuf[0] + covBuf[2]
+                    if (trace > 0f) sqrt(trace) else 0f
+                } else Float.NaN
+                positionCovValid = covOk
+                positionSigmaM = sigma
+                _pathHistory.add(PathPoint(vio.x.toFloat(), vio.z.toFloat(), sigma))
                 if (_pathHistory.size > 500) _pathHistory.removeAt(0)
                 pathHistoryVersion = _pathHistoryVersion.incrementAndGet()
+                // Step 6 (Task #31): publish a compact snapshot for the crash
+                // logger so the report includes the last good VIO state.
+                CrashLogger.updateSnapshot(buildCrashSnapshotJson(vio, sigma, covOk))
             }
         }
 
@@ -268,8 +318,8 @@ class NavSightViewModel(application: Application) : AndroidViewModel(application
                 viewModelScope.launch(Dispatchers.IO) {
                     val start = startLocation ?: return@launch
                     val currentLatLng = NavSightUtils.metersToLatLng(start, vio.x, vio.z)
-                    val recentPath = pathHistory.takeLast(10).map { (x, z) ->
-                        NavSightUtils.metersToLatLng(start, x.toDouble(), z.toDouble())
+                    val recentPath = pathHistory.takeLast(10).map { p ->
+                        NavSightUtils.metersToLatLng(start, p.x.toDouble(), p.z.toDouble())
                     }
                     val snapped = roadSnapper.snapToRoad(currentLatLng, recentPath)
                     withContext(Dispatchers.Main) {
@@ -374,6 +424,9 @@ class NavSightViewModel(application: Application) : AndroidViewModel(application
 
     fun clearNavigationStartMessage() { navigationStartMessage = null }
 
+    /** Step 5: invoked by the "Place phone flat for 5 s" dialog OK button. */
+    fun clearInitTimeout() { sensorRepository.clearInitTimeout() }
+
     fun startScaleCalibration(targetDistanceMeters: Double) {
         val current = latestVioState
         if (!current.isInitialized) { scaleCalibrationMessage = "Tracking is not ready yet."; return }
@@ -430,12 +483,13 @@ class NavSightViewModel(application: Application) : AndroidViewModel(application
         val start = startLocation
         val sb = StringBuilder()
         sb.append("{\"type\":\"navsight_path\",\"points\":[")
-        path.forEachIndexed { idx, (x, z) ->
+        path.forEachIndexed { idx, p ->
             if (idx > 0) sb.append(",")
+            val sigmaJson = if (p.sigmaM.isNaN()) "null" else p.sigmaM.toString()
             if (start != null) {
-                val latLng = NavSightUtils.metersToLatLng(start, x.toDouble(), z.toDouble())
-                sb.append("{\"lat\":${latLng.latitude},\"lng\":${latLng.longitude},\"x\":$x,\"z\":$z}")
-            } else sb.append("{\"x\":$x,\"z\":$z}")
+                val latLng = NavSightUtils.metersToLatLng(start, p.x.toDouble(), p.z.toDouble())
+                sb.append("{\"lat\":${latLng.latitude},\"lng\":${latLng.longitude},\"x\":${p.x},\"z\":${p.z},\"sigma_m\":$sigmaJson}")
+            } else sb.append("{\"x\":${p.x},\"z\":${p.z},\"sigma_m\":$sigmaJson}")
         }
         sb.append("]}")
         try {
@@ -451,5 +505,35 @@ class NavSightViewModel(application: Application) : AndroidViewModel(application
         scaleCalibrationFactor = factor
         prefs.edit().putFloat(PREF_SCALE_CALIBRATION_FACTOR, factor.toFloat()).apply()
         NativeBridge.setScale(factor)
+    }
+
+    /**
+     * Step 6 (Task #31): compact JSON snapshot of the latest VIO state plus
+     * sigma. Embedded into [CrashLogger]'s crash files. Kept allocation-light
+     * because it is called per UI tick on the main thread.
+     */
+    private fun buildCrashSnapshotJson(vio: VioData, sigmaM: Float, covValid: Boolean): String {
+        val sigmaJson = if (sigmaM.isFinite()) sigmaM.toString() else "null"
+        val gps = currentGpsLocation
+        val gpsJson = if (gps != null) {
+            "{\"lat\":${gps.latitude},\"lng\":${gps.longitude},\"alt\":${gps.altitude},\"acc\":${gps.accuracy}}"
+        } else "null"
+        return "{" +
+            "\"now_ms\":${System.currentTimeMillis()}," +
+            "\"vio_initialized\":${vio.isInitialized}," +
+            "\"vio_x\":${vio.x},\"vio_y\":${vio.y},\"vio_z\":${vio.z}," +
+            "\"vio_yaw\":${vio.yaw},\"vio_heading\":${vio.heading}," +
+            "\"vio_quality\":${vio.trackingQuality}," +
+            "\"vio_scale\":${vio.estimatedScale}," +
+            "\"vio_features\":${vio.trackedFeatures}," +
+            "\"vio_inliers\":${vio.inlierCount}," +
+            "\"vio_mean_flow\":${vio.meanFlow}," +
+            "\"sigma_m\":$sigmaJson," +
+            "\"cov_valid\":$covValid," +
+            "\"path_len_m\":$totalDistanceM," +
+            "\"speed_kmh\":$currentSpeedKmh," +
+            "\"init_status\":\"${initStatus.name}\"," +
+            "\"gps\":$gpsJson" +
+            "}"
     }
 }

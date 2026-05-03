@@ -20,6 +20,9 @@ class MainActivity : ComponentActivity() {
 
     override fun onCreate(savedInstanceState: Bundle?) {
         super.onCreate(savedInstanceState)
+        // Step 6 (Task #31): install the JSON crash sink before any UI work so
+        // that an early-startup failure still produces a report.
+        CrashLogger.install(applicationContext)
         enableEdgeToEdge()
         window.addFlags(WindowManager.LayoutParams.FLAG_KEEP_SCREEN_ON)
         setContent { MaterialTheme(colorScheme = darkColorScheme()) { NavSightApp() } }
