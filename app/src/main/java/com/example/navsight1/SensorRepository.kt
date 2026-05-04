@@ -17,6 +17,20 @@ import kotlinx.coroutines.flow.MutableStateFlow
 import kotlinx.coroutines.flow.asStateFlow
 import kotlin.math.sqrt
 
+// Plan Step 7 (ADR-013): on-device filename for the ORB DBoW2 vocabulary.
+// SensorRepository.pushLoopClosureVocabularyToNative decompresses the
+// gzipped ORB vocabulary asset on first launch and points native at the
+// extracted file. Original Step 7 code copied a presumed `ORBvoc.bin`
+// asset; we ship `ORBvoc.txt.gz` instead because no clean .bin source
+// was available and DBoW2 supports both formats. See
+// the same name into <filesDir> on first launch and passes the absolute
+// path to native via NativeBridge.nativeLoadLoopClosureVocabulary.
+// The vocabulary asset ships as ORBvoc.txt.gz (gzip of the text-form
+// ORB vocabulary from ORB-SLAM2). DBoW2's loadFromTextFile reads the
+// extracted .txt; we decompress on first launch into <filesDir>.
+const val ORB_VOCAB_ASSET = "ORBvoc.txt.gz"
+const val ORB_VOCAB_FILE  = "ORBvoc.txt"
+
 class SensorRepository(private val context: Context) : SensorEventListener {
 
     private val TAG = "SensorRepository"
@@ -122,6 +136,7 @@ class SensorRepository(private val context: Context) : SensorEventListener {
                 NativeBridge.startVIO()
                 pushStoredCalibrationToNative()
                 pushCameraIntrinsicsToNative()
+                pushLoopClosureVocabularyToNative()
                 startInitStatusPoller()
             } else {
                 Log.e(TAG, "Cannot start VIO: native library not loaded")
@@ -160,6 +175,61 @@ class SensorRepository(private val context: Context) : SensorEventListener {
             }
         } catch (e: Throwable) {
             Log.e(TAG, "Failed to load camera intrinsics: ${e.message}", e)
+        }
+    }
+
+    /**
+     * Plan Step 7 (ADR-013): copy the ORB DBoW2 vocabulary out of
+     * `assets/ORBvoc.bin` into `<filesDir>/ORBvoc.bin` if not already
+     * present, then push its absolute path into the native runtime via
+     * NativeBridge.nativeLoadLoopClosureVocabulary.
+     *
+     * Why the copy: Android AssetManager does not give a real filesystem
+     * path. DBoW2 / cv::FileStorage need a path they can fopen, so we
+     * stream the asset to internal storage exactly once per install.
+     * Subsequent app launches see the file already present and skip
+     * the copy.
+     *
+     * No-op if the asset doesn't ship with this build (returns silently;
+     * loop closure stays disabled). Failures here MUST NOT block the
+     * camera path — caller catches Throwable and logs.
+     */
+    private fun pushLoopClosureVocabularyToNative() {
+        try {
+            val outFile = java.io.File(context.filesDir, ORB_VOCAB_FILE)
+
+            // One-time decompress + copy. Asset ships as ORBvoc.txt.gz
+            // (~41 MB compressed); we GZIPInputStream it into the
+            // ~145 MB plain-text ORBvoc.txt that DBoW2 reads. If the
+            // gzip asset is missing entirely we silently skip — loop
+            // closure is an optional accuracy boost, not a hard
+            // requirement for the rest of the VIO pipeline.
+            if (!outFile.exists() || outFile.length() == 0L) {
+                val assetExists = try {
+                    context.assets.list("")?.contains(ORB_VOCAB_ASSET) == true
+                } catch (_: Throwable) { false }
+                if (!assetExists) {
+                    Log.i(TAG, "No assets/$ORB_VOCAB_ASSET — loop closure disabled")
+                    return
+                }
+                context.assets.open(ORB_VOCAB_ASSET).use { rawInput ->
+                    java.util.zip.GZIPInputStream(rawInput).use { input ->
+                        java.io.FileOutputStream(outFile).use { output ->
+                            input.copyTo(output)
+                        }
+                    }
+                }
+                Log.i(TAG, "Decompressed $ORB_VOCAB_ASSET to ${outFile.absolutePath} (${outFile.length()} bytes)")
+            }
+
+            val ok = NativeBridge.nativeLoadLoopClosureVocabulary(outFile.absolutePath)
+            if (ok) {
+                Log.i(TAG, "Loop-closure vocabulary loaded from ${outFile.absolutePath}")
+            } else {
+                Log.w(TAG, "nativeLoadLoopClosureVocabulary returned false for ${outFile.absolutePath} — loop closure stays disabled")
+            }
+        } catch (e: Throwable) {
+            Log.e(TAG, "Failed to push loop-closure vocabulary: ${e.message}", e)
         }
     }
 

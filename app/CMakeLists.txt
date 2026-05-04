@@ -26,6 +26,21 @@ if(NOT OpenCV_FOUND)
     message(FATAL_ERROR "OpenCV not found!")
 endif()
 
+# ── Plan Step 7 / ADR-013: vendored DBoW2 for same-session loop closure ──
+# Built as a static lib via add_subdirectory(); it inherits OpenCV from the
+# CMake variable scope set by find_package() above. The vendored copy has
+# its CMakeLists trimmed (no demo, no install rules, NDK-friendly warning
+# flags) — see third_party/DBoW2/CMakeLists.txt for the diff vs upstream.
+set(DBOW2_DIR "${CMAKE_CURRENT_SOURCE_DIR}/../third_party/DBoW2")
+if(NOT EXISTS "${DBOW2_DIR}/include/DBoW2/DBoW2.h")
+    message(FATAL_ERROR "Vendored DBoW2 not found at ${DBOW2_DIR}. "
+                        "Loop closure (Plan Step 7) cannot build.")
+endif()
+# EXCLUDE_FROM_ALL keeps DBoW2's own targets out of the default Android
+# build graph — `navsight` reaches in to link the static lib explicitly
+# via target_link_libraries(... DBoW2) below.
+add_subdirectory("${DBOW2_DIR}" "${CMAKE_BINARY_DIR}/DBoW2" EXCLUDE_FROM_ALL)
+
 add_library(
         navsight
         SHARED
@@ -34,8 +49,8 @@ add_library(
         src/main/cpp/Tracker.cpp
         # DISABLED: Mapper pipeline — output was discarded (applyMapperResult was a no-op)
         # src/main/cpp/Mapper.cpp
-        # src/main/cpp/LoopClosureDetector.cpp
         # src/main/cpp/PoseGraph.cpp
+        src/main/cpp/LoopClosureDetector.cpp
         src/main/cpp/IMUPreintegrator.cpp
         src/main/cpp/EKFState.cpp
         src/main/cpp/FeatureManager.cpp
@@ -50,6 +65,10 @@ add_library(
         src/main/cpp/WindowedBA.cpp
 )
 
+target_include_directories(navsight PRIVATE
+        "${DBOW2_DIR}/include"
+)
+
 find_library(
         log-lib
         log
@@ -62,5 +81,6 @@ target_link_libraries(
         android
         c++_shared
         ${log-lib}
+        DBoW2
         ${OpenCV_LIBS}
 )

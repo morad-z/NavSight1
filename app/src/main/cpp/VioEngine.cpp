@@ -143,6 +143,13 @@ bool VioEngine::loadCalibration(const std::string& path) {
     return true;
 }
 
+bool VioEngine::loadLoopClosureVocabulary(const std::string& vocab_path) {
+    // Plan Step 7 (ADR-013): forward to the Tracker. The Tracker owns the
+    // LoopClosureDetector + the 1 Hz worker thread; on first successful
+    // load it starts the worker.
+    return tracker_.loadLoopClosureVocabulary(vocab_path);
+}
+
 void VioEngine::setInitialHeading(double azimuth_rad) {
     tracker_.setInitialHeading(azimuth_rad);
 }

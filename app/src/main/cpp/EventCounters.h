@@ -44,7 +44,12 @@
 //     "ba_solve_us_max": N,
 //     "ba_iters_sum": N,
 //     "msckf_update_lines": N,
-//     "msckf_huber_rejected_sum": N
+//     "msckf_huber_rejected_sum": N,
+//     "loop_closure_attempts": N,
+//     "loop_closure_accepts": N,
+//     "loop_closure_rejects_low_score": N,
+//     "loop_closure_rejects_pnp": N,
+//     "loop_closure_kf_count_in_db": N
 //   }
 
 #include <atomic>
@@ -101,6 +106,19 @@ struct EventCounters {
     std::atomic<long long> msckf_update_lines{0};
     std::atomic<long long> msckf_huber_rejected_sum{0};
 
+    // Step 7 — Loop closure (LoopClosureDetector.cpp, ADR-013)
+    //   loop_closure_attempts             every tryDetectLoop() entry
+    //   loop_closure_accepts              tryDetectLoop returned true
+    //   loop_closure_rejects_low_score    BoW top score < threshold
+    //   loop_closure_rejects_pnp          PnP failed / too few inliers
+    //   loop_closure_kf_count_in_db       size of the BoW database
+    //                                     (rewritten on every addKeyframe)
+    std::atomic<long long> loop_closure_attempts{0};
+    std::atomic<long long> loop_closure_accepts{0};
+    std::atomic<long long> loop_closure_rejects_low_score{0};
+    std::atomic<long long> loop_closure_rejects_pnp{0};
+    std::atomic<long long> loop_closure_kf_count_in_db{0};
+
     // Reset every counter to 0. Called on simulator-recording start so
     // each sim begins with a clean slate. Cheap atomic stores; safe to
     // call concurrently with hot-path increments (we accept that a few
@@ -132,6 +150,11 @@ struct EventCounters {
         slam_promotions_total.store(0, std::memory_order_relaxed);
         msckf_update_lines.store(0, std::memory_order_relaxed);
         msckf_huber_rejected_sum.store(0, std::memory_order_relaxed);
+        loop_closure_attempts.store(0, std::memory_order_relaxed);
+        loop_closure_accepts.store(0, std::memory_order_relaxed);
+        loop_closure_rejects_low_score.store(0, std::memory_order_relaxed);
+        loop_closure_rejects_pnp.store(0, std::memory_order_relaxed);
+        loop_closure_kf_count_in_db.store(0, std::memory_order_relaxed);
     }
 
     // Monotonic max-update for ba_solve_us_max. Lock-free CAS loop.
@@ -178,9 +201,14 @@ struct EventCounters {
         const long long v_slam_promotions_total         = slam_promotions_total.load(std::memory_order_relaxed);
         const long long v_msckf_update_lines            = msckf_update_lines.load(std::memory_order_relaxed);
         const long long v_msckf_huber_rejected_sum      = msckf_huber_rejected_sum.load(std::memory_order_relaxed);
+        const long long v_loop_closure_attempts         = loop_closure_attempts.load(std::memory_order_relaxed);
+        const long long v_loop_closure_accepts          = loop_closure_accepts.load(std::memory_order_relaxed);
+        const long long v_loop_closure_rejects_low_score= loop_closure_rejects_low_score.load(std::memory_order_relaxed);
+        const long long v_loop_closure_rejects_pnp      = loop_closure_rejects_pnp.load(std::memory_order_relaxed);
+        const long long v_loop_closure_kf_count_in_db   = loop_closure_kf_count_in_db.load(std::memory_order_relaxed);
 
         std::string out;
-        out.reserve(640);
+        out.reserve(800);
         out += '{';
         appendKv(out, "reloc_orb_accepts",            v_reloc_orb_accepts);            out += ',';
         appendKv(out, "reloc_orb_rejects",            v_reloc_orb_rejects);            out += ',';
@@ -205,8 +233,13 @@ struct EventCounters {
         appendKv(out, "ba_skipped_no_intrinsics",     v_ba_skipped_no_intrinsics);     out += ',';
         appendKv(out, "ba_skipped_too_few_landmarks", v_ba_skipped_too_few_landmarks); out += ',';
         appendKv(out, "slam_promotions_total",        v_slam_promotions_total);        out += ',';
-        appendKv(out, "msckf_update_lines",           v_msckf_update_lines);           out += ',';
-        appendKv(out, "msckf_huber_rejected_sum",     v_msckf_huber_rejected_sum);
+        appendKv(out, "msckf_update_lines",            v_msckf_update_lines);            out += ',';
+        appendKv(out, "msckf_huber_rejected_sum",      v_msckf_huber_rejected_sum);      out += ',';
+        appendKv(out, "loop_closure_attempts",         v_loop_closure_attempts);         out += ',';
+        appendKv(out, "loop_closure_accepts",          v_loop_closure_accepts);          out += ',';
+        appendKv(out, "loop_closure_rejects_low_score", v_loop_closure_rejects_low_score); out += ',';
+        appendKv(out, "loop_closure_rejects_pnp",      v_loop_closure_rejects_pnp);      out += ',';
+        appendKv(out, "loop_closure_kf_count_in_db",   v_loop_closure_kf_count_in_db);
         out += '}';
         return out;
     }

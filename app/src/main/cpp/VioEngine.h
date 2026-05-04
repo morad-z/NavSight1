@@ -31,6 +31,12 @@ public:
     // the engine then keeps its existing zero-distortion passthrough.
     bool loadCalibration(const std::string& path);
 
+    // Step 7 (Visual Production Plan, ADR-013) — push the on-device path of
+    // the ORB DBoW2 vocabulary into the Tracker's owned LoopClosureDetector.
+    // Returns true on success. False if the file is missing or parse fails;
+    // the Tracker keeps running with loop closure disabled.
+    bool loadLoopClosureVocabulary(const std::string& vocab_path);
+
     void setInitialHeading(double azimuth_rad);
     void setMagnetometerHeading(float yaw_rad);
     void setDepthMap(const float* depth_data, int width, int height);

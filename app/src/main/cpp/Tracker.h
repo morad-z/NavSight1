@@ -19,6 +19,9 @@
 #include "WindowedBA.h"
 
 #include "InertialInitializer.h"
+#include "LoopClosureDetector.h"
+
+#include <condition_variable>
 
 // ─────────────────────────────────────────────────────────────────────────────
 // Step 8 — Cleanup status (per docs/PRODUCTION_READINESS_PLAN.md §8)
@@ -111,6 +114,28 @@ public:
     // the 2x2 (x, z) sub-block as [σ_xx, σ_xz, σ_zz]. Returns false if EKF is not
     // yet fully initialized; out-array is then filled with zeros.
     bool getPositionCovarianceXZ(double out[3]) const;
+
+    // ── Plan Step 7 (ADR-013): same-session loop closure (DBoW2) ──────────────
+    //
+    // Push the absolute on-device path of the ORB DBoW2 vocabulary into the
+    // Tracker's owned LoopClosureDetector. Called from the JNI startup path
+    // after the engine is created (the Android side copies
+    // assets/ORBvoc.bin → <filesDir>/ORBvoc.bin once and passes the absolute
+    // path here — AssetManager paths are not real filesystem paths and
+    // cv::FileStorage / DBoW2 readers need a path they can fopen).
+    //
+    // Returns true if the vocabulary loaded and the detector is now ready to
+    // accept keyframes / queries. False on missing file, parse error, or
+    // dimension mismatch — the loop-closure worker thread will not run on
+    // false (it gates on `loop_closure_.isReady()` each query tick), so the
+    // rest of the pipeline keeps functioning unchanged.
+    bool loadLoopClosureVocabulary(const std::string& vocab_path);
+
+    // Read accessor used by the JNI shim — exposed because the loop-closure
+    // detector is otherwise a private member of Tracker. The shim only
+    // calls `loadVocabulary` on the returned reference; the worker thread
+    // and addKeyframe path stay strictly internal.
+    LoopClosureDetector& getLoopClosureDetector() { return loop_closure_; }
 
 private:
     double estimateScaleFromSteps(double vision_disp, int64_t dt_ns,
@@ -358,6 +383,112 @@ private:
     // FeatureManager mutexes from being touched after we've started
     // tearing the rest of the Tracker down.
     void shutdownBA();
+
+    // ── Plan Step 7 (ADR-013): same-session loop closure (DBoW2) ──────────
+    //
+    // Owned LoopClosureDetector + 1 Hz worker thread + double-buffered
+    // result handoff. Mirrors the BA worker pattern at section 6 above:
+    //   * Camera thread snapshots the most recent keyframe (descriptors,
+    //     keypoints, clone_id, intrinsics, ts) into `loop_closure_pending_*`
+    //     under `loop_closure_query_mutex_` after every storeKeyframeDescriptors.
+    //   * The worker thread wakes every LOOP_CLOSURE_QUERY_PERIOD_S seconds
+    //     via `loop_closure_cv_`. It snapshots that buffer, calls
+    //     `tryDetectLoop` outside the mutex (the call may be slow under
+    //     dense vocabularies), and on success publishes a LoopMatch under
+    //     `loop_closure_result_mutex_`.
+    //   * The camera thread consumes the result on the next frame via
+    //     `consumeLoopClosureMatchIfReady`, which decays a 10-frame damping
+    //     ramp through `EKFState::updateRelativePose` /
+    //     `updateRelativeRotation`. ADR-006 forbids direct EKF
+    //     mean/covariance writes from a side channel — this is the same
+    //     canonical observation channel Step 2 already uses.
+    LoopClosureDetector       loop_closure_;
+
+    // Worker-thread plumbing.
+    std::thread               loop_closure_thread_;
+    std::atomic<bool>         loop_closure_should_stop_{false};
+    std::atomic<bool>         loop_closure_thread_running_{false};
+    std::condition_variable   loop_closure_cv_;
+    mutable std::mutex        loop_closure_query_mutex_;
+
+    // Latest keyframe snapshot for the worker. Written by the camera thread
+    // in section 11.5 right after each successful `storeKeyframeDescriptors`,
+    // read by the worker thread on each query tick. Cheap copy: descriptors
+    // is at most 250×32 ≈ 8 KB; keypoints is ≤ 250 entries.
+    bool                      loop_closure_query_has_data_{false};
+    cv::Mat                   loop_closure_query_descriptors_;
+    std::vector<cv::KeyPoint> loop_closure_query_keypoints_;
+    int                       loop_closure_query_kf_id_{-1};
+    int64_t                   loop_closure_query_ts_ns_{0};
+    double                    loop_closure_query_fx_{0.}, loop_closure_query_fy_{0.};
+    double                    loop_closure_query_cx_{0.}, loop_closure_query_cy_{0.};
+
+    // Result handoff. The worker writes the latest accepted LoopMatch under
+    // this mutex; the camera thread takes (and clears) it before applying
+    // the EKF correction. `loop_closure_result_pending_` is a plain bool
+    // protected by the mutex (not atomic) because it is only ever read and
+    // cleared by the camera thread under the lock.
+    mutable std::mutex                  loop_closure_result_mutex_;
+    bool                                loop_closure_result_pending_{false};
+    LoopClosureDetector::LoopMatch      loop_closure_pending_match_{};
+
+    // Damping ramp consumed on the camera thread. While > 0, every call to
+    // `consumeLoopClosureMatchIfReady` re-applies the cached match with
+    // diminishing strength (var inflated by 1/strength²) and decrements
+    // the counter. `loop_closure_active_match_` holds the LAST accepted
+    // match while the ramp is in flight — a fresh match arriving mid-ramp
+    // overwrites it, which is the desired "most-recent loop wins" behaviour.
+    int                                  loop_closure_damping_remaining_{0};
+    LoopClosureDetector::LoopMatch       loop_closure_active_match_{};
+    bool                                 loop_closure_active_match_set_{false};
+
+    // Camera thread: cache the latest keyframe's snapshot (descriptors +
+    // keypoints + clone_id + intrinsics + ts) under loop_closure_query_mutex_,
+    // and notify the worker via loop_closure_cv_ that a new tick is ready.
+    // Called from the keyframe-storage block right after addKeyframe.
+    void publishLoopClosureQueryKeyframe(int kf_id, int64_t ts_ns,
+                                         const cv::Mat& descriptors,
+                                         const std::vector<cv::KeyPoint>& keypoints,
+                                         double fx, double fy,
+                                         double cx, double cy);
+
+    // 1 Hz query worker. Wakes on either loop_closure_cv_ or a timeout,
+    // copies the pending query under the query mutex, calls tryDetectLoop,
+    // and on success publishes the LoopMatch under loop_closure_result_mutex_.
+    // Bumps event counters at every gate.
+    void loopClosureWorkerLoop();
+
+    // Camera thread: if the worker has published a fresh LoopMatch since the
+    // last call, copy it into `loop_closure_active_match_` and reset the
+    // damping ramp. Then, while the ramp is non-zero, inject a damped
+    // relative-pose / relative-rotation correction through the canonical
+    // EKF measurement channel (NOT a direct mean / covariance write —
+    // ADR-006). Decrements the ramp counter on each call.
+    void consumeLoopClosureMatchIfReady();
+
+    // Cleanly stop the worker thread. Sets should_stop_, notifies the cv,
+    // and joins. Called from reset() and the destructor.
+    void shutdownLoopClosure();
+
+    // Magic numbers cited inline in the implementation:
+    //   * 1.0 s query period            — Step 7 plan, line 718
+    //   * 30 s temporal exclusion       — Step 7 plan, line 719
+    //   * 10 frames damping ramp        — ADR-006 schedule
+    //   * 0.05 m² translation variance  — Step 7 acceptance criteria
+    //   * (3°)² ≈ 2.74e-3 rad² rotation — typical PnP-inlier σ at N≥30
+    static constexpr double  LOOP_CLOSURE_QUERY_PERIOD_S      = 1.0;
+    static constexpr int64_t LOOP_CLOSURE_TEMPORAL_EXCL_NS    = 30LL * 1'000'000'000LL;
+    static constexpr int     LOOP_CLOSURE_DAMPING_FRAMES      = 10;
+    // Base 1-σ (m) on the world-frame relative-translation injection. 10 cm
+    // is the same order Step 2's keyframe-yaw fusion floors to: a confident
+    // PnP loop closure should pull the EKF strongly, but not hard enough to
+    // teleport when the world points themselves carry residual scale error.
+    static constexpr double  LOOP_CLOSURE_BASE_TRANS_SIGMA_M  = 0.10;
+    // Base 1-σ-axis (rad) on the body-frame relative-rotation injection.
+    // 3° is a defensive ceiling for the rotation we get from solvePnPRansac
+    // with ≥ 30 inliers; the per-call sigma may be tightened by the detector
+    // if it returns one in a future revision.
+    static constexpr double  LOOP_CLOSURE_BASE_ROT_SIGMA_RAD  = 0.05236;  // 3°
 
     // Depth-based scale constraint (MiDaS)
     mutable std::mutex depth_mutex_;

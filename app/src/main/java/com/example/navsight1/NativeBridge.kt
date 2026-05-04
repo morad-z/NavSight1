@@ -73,6 +73,15 @@ object NativeBridge {
     // (engine then keeps the zero-distortion passthrough).
     external fun nativeLoadCalibration(path: String): Boolean
 
+    // Step 7 (Visual Production Plan, ADR-013): pass the absolute filesystem
+    // path of the ORB DBoW2 vocabulary (copied at app startup from
+    // assets/ORBvoc.bin into <filesDir>/ORBvoc.bin — AssetManager paths are
+    // not real filesystem paths and the DBoW2 reader needs to fopen). On
+    // success the native LoopClosureDetector becomes ready and the Tracker
+    // launches its 1 Hz query worker thread; on false the rest of the VIO
+    // pipeline keeps running with loop closure disabled.
+    external fun nativeLoadLoopClosureVocabulary(path: String): Boolean
+
     // EventCounters bridge — used by NavSightViewModel.saveSimulationData to
     // embed a per-event verdict (RELOC_ORB / BLUR / LOWLIGHT / ROT_GATE /
     // KLT / BA / MSCKF counts) into simulation_data_<ts>.json. Replaces the

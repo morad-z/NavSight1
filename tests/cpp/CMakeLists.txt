@@ -49,7 +49,31 @@ add_library(navsight_core STATIC
     ${VIO_SRC_DIR}/VioEngine.cpp
     ${VIO_SRC_DIR}/ScaleEstimatorVI.cpp
     ${VIO_SRC_DIR}/ScaleFuser.cpp
+    # Plan Step 7: same-session loop closure (DBoW2). LoopClosureDetector
+    # is rewritten on top of the vendored DBoW2 source under
+    # third_party/DBoW2/ — Agent A's deliverable. The desktop test build
+    # must compile and link the same TU so test_loop_closure.cpp sees
+    # the new API.
+    ${VIO_SRC_DIR}/LoopClosureDetector.cpp
 )
+
+# Plan Step 7 — vendored DBoW2 dependency. Agent A drops the source
+# under third_party/DBoW2/ and wires it into app/CMakeLists.txt for the
+# Android build; the desktop test build pulls it in via add_subdirectory
+# so navsight_core can resolve LoopClosureDetector's link surface. The
+# directory is gated on existence so a tree without Agent A's
+# contribution still configures (the test would skip on a missing
+# vocabulary path at runtime).
+set(NAVSIGHT_DBOW2_DIR "${CMAKE_CURRENT_SOURCE_DIR}/../../third_party/DBoW2")
+if(EXISTS "${NAVSIGHT_DBOW2_DIR}/CMakeLists.txt")
+    add_subdirectory("${NAVSIGHT_DBOW2_DIR}"
+                     "${CMAKE_CURRENT_BINARY_DIR}/dbow2_build"
+                     EXCLUDE_FROM_ALL)
+    target_link_libraries(navsight_core DBoW2)
+    target_include_directories(navsight_core PUBLIC
+        "${NAVSIGHT_DBOW2_DIR}/include"
+        "${NAVSIGHT_DBOW2_DIR}")
+endif()
 target_compile_definitions(navsight_core PUBLIC NAVSIGHT_DESKTOP_TEST=1)
 # MSVC's <cmath> doesn't expose M_PI by default; the production build uses
 # Clang/GCC where it's available as a POSIX extension. Define it for desktop
@@ -92,6 +116,17 @@ add_executable(navsight_tests
     # API (compiled into navsight_core), no Tracker / EKFState /
     # FeatureManager dependency.
     test_windowed_ba.cpp
+    # Plan Step 7: same-session loop closure (DBoW2). Exercises the
+    # LoopClosureDetector API — vocabulary-load failure surfacing,
+    # addKeyframe count semantics, temporal-exclusion gate, geometric
+    # verification (PnP inlier floor) rejection of BoW-only matches,
+    # and the happy-path accept on a clean re-visit. BoW-dependent
+    # tests skip with GTEST_SKIP() when ORBvoc.{bin,dbow2} is not
+    # staged; structural cases run unconditionally. Self-contained:
+    # depends only on the LoopClosureDetector API (compiled into
+    # navsight_core), no Tracker / EKFState / FeatureManager
+    # dependency.
+    test_loop_closure.cpp
 )
 target_link_libraries(navsight_tests navsight_core GTest::gtest_main)
 

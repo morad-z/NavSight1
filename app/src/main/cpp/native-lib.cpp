@@ -747,6 +747,43 @@ Java_com_example_navsight1_NativeBridge_nativeLoadCalibration(
     return vision->loadCalibration(path) ? JNI_TRUE : JNI_FALSE;
 }
 
+// ── nativeLoadLoopClosureVocabulary (Step 7, Visual Production Plan) ─────────
+// Pushes the on-device path of the ORB DBoW2 vocabulary into the live
+// VioEngine's Tracker. The Android side copies assets/ORBvoc.bin →
+// <filesDir>/ORBvoc.bin once at app startup (AssetManager paths are not
+// real filesystem paths) and passes the absolute path here. Returns true
+// on success; false if the file is missing or the vocabulary fails to
+// parse — the rest of the pipeline keeps running with loop closure
+// disabled (the Tracker's worker thread is never started in that case).
+
+JNIEXPORT jboolean JNICALL
+Java_com_example_navsight1_NativeBridge_nativeLoadLoopClosureVocabulary(
+        JNIEnv* env, jobject /* thiz */, jstring jpath) {
+    if (!jpath) {
+        LOGE("nativeLoadLoopClosureVocabulary: null path");
+        return JNI_FALSE;
+    }
+    const char* c_path = env->GetStringUTFChars(jpath, nullptr);
+    if (!c_path) {
+        LOGE("nativeLoadLoopClosureVocabulary: GetStringUTFChars returned null");
+        return JNI_FALSE;
+    }
+    std::string path(c_path);
+    env->ReleaseStringUTFChars(jpath, c_path);
+
+    std::shared_ptr<VioEngine> vision;
+    {
+        std::lock_guard<std::mutex> lock(state_mutex);
+        vision = g_vision;
+    }
+    if (!vision) {
+        LOGI("nativeLoadLoopClosureVocabulary: VIO engine not yet started, "
+             "skipping (caller should retry after startVIO)");
+        return JNI_FALSE;
+    }
+    return vision->loadLoopClosureVocabulary(path) ? JNI_TRUE : JNI_FALSE;
+}
+
 // ── EventCounters JNI bridge ──────────────────────────────────────────────────
 // Exports two symbols for the simulator-recording path:
 //

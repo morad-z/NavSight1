@@ -295,6 +295,11 @@ void Tracker::reset() {
     // EKF / FeatureManager reset paths reach for them.
     shutdownBA();
 
+    // Plan Step 7 (ADR-013): same protocol for the loop-closure worker —
+    // joined first so the next reset of `loop_closure_` / EKF / camera
+    // intrinsics is uncontested.
+    shutdownLoopClosure();
+
     std::lock_guard<std::mutex> lock(mutex_);
     prev_gray_.release();
     prev_pts_.clear();
@@ -357,12 +362,38 @@ void Tracker::reset() {
         ba_result_pending_ = false;
     }
     ba_round_counter_ = 0;
+
+    // Plan Step 7 (ADR-013): clear the loop-closure handoff buffers so a
+    // stale pending match from the previous session cannot trigger a
+    // correction on the first frame after reset. The detector itself is
+    // NOT cleared here — the vocabulary stays loaded, and the keyframe
+    // database emptiness is restored on the next session naturally
+    // (addKeyframe is only called once a real keyframe is created).
+    {
+        std::lock_guard<std::mutex> qlock(loop_closure_query_mutex_);
+        loop_closure_query_has_data_ = false;
+        loop_closure_query_descriptors_.release();
+        loop_closure_query_keypoints_.clear();
+        loop_closure_query_kf_id_ = -1;
+        loop_closure_query_ts_ns_ = 0;
+    }
+    {
+        std::lock_guard<std::mutex> rlock(loop_closure_result_mutex_);
+        loop_closure_result_pending_ = false;
+        loop_closure_pending_match_ = LoopClosureDetector::LoopMatch{};
+    }
+    loop_closure_damping_remaining_ = 0;
+    loop_closure_active_match_set_ = false;
+    loop_closure_active_match_    = LoopClosureDetector::LoopMatch{};
+
     LOGI("Tracker reset");
 }
 
 // ── Plan Step 6 (ADR-012): destructor — clean BA worker join ────────────────
+// ── Plan Step 7 (ADR-013): also stops the loop-closure worker thread.
 Tracker::~Tracker() {
     shutdownBA();
+    shutdownLoopClosure();
 }
 
 // ── Helpers ──────────────────────────────────────────────────────────────────
@@ -2159,6 +2190,88 @@ VisionOutput Tracker::processFrame(const uint8_t* yuv_data, int width, int heigh
             }
             frames_since_keyframe_ = 0;
 
+            // ── Plan Step 7 (ADR-013): loop-closure database update ─────
+            //
+            // Mirror the keyframe into the loop-closure detector. Use the
+            // EKF clone_id as the loop-closure kf_id so the detector's
+            // returned `matched_kf_id` doubles as a clone_id we can pass
+            // straight into ekf_.getCloneCovIdx / getClonePose / the
+            // updateRelativePose channel without a side-table.
+            //
+            // pts3d_world: SLAM-promoted features in current state. We
+            // do NOT triangulate transient KLT tracks here — the
+            // detector's PnP path uses these world points to verify the
+            // candidate, so passing a partial set is safer than passing
+            // junk. If no SLAM features are promoted yet, an empty
+            // vector is forwarded; the detector falls back to the BoW
+            // score + 2D-2D essential matrix path per its contract.
+            const int latest_clone_for_kf = ekf_.getLatestCloneId();
+            if (loop_closure_.isReady() && latest_clone_for_kf >= 0) {
+                std::vector<cv::Point3f> pts3d_world;
+                pts3d_world.reserve(static_cast<size_t>(ekf_.getSlamFeatureCount()));
+                const int n_slam = ekf_.getSlamFeatureCount();
+                for (int slot = 0; slot < n_slam; ++slot) {
+                    cv::Mat p_w;
+                    if (!ekf_.getSlamFeatureGlobalPosition(slot, p_w)) continue;
+                    if (p_w.empty() || p_w.rows < 3) continue;
+                    pts3d_world.emplace_back(
+                        static_cast<float>(p_w.at<double>(0, 0)),
+                        static_cast<float>(p_w.at<double>(1, 0)),
+                        static_cast<float>(p_w.at<double>(2, 0)));
+                }
+
+                // Pull keypoints + descriptors from the freshly-stored
+                // keyframe descriptor record (so the same ORB output that
+                // FeatureManager built feeds the detector — Step 7 plan
+                // line 716, "BoW vector at keyframe creation"). The deque
+                // back() is the latest entry; not empty because we just
+                // pushed. The clone pose is read back from EKFState via
+                // getClonePose — the same clone we just added in section
+                // 9.1, which keeps this site agnostic to whether Tracker
+                // is mirroring (`global_R_/global_t_`) or whether full-init
+                // has happened.
+                cv::Mat kf_R_mat, kf_p_mat;
+                const bool kf_pose_ok = ekf_.getClonePose(
+                    latest_clone_for_kf, kf_R_mat, kf_p_mat);
+                const auto& kf_ring = feature_mgr_.getKeyframeDescriptors();
+                if (kf_pose_ok && !kf_R_mat.empty() && !kf_p_mat.empty() &&
+                    !kf_ring.empty()) {
+                    const auto& kf_back = kf_ring.back();
+                    cv::Matx33d R_world_cam(
+                        kf_R_mat.at<double>(0, 0), kf_R_mat.at<double>(0, 1), kf_R_mat.at<double>(0, 2),
+                        kf_R_mat.at<double>(1, 0), kf_R_mat.at<double>(1, 1), kf_R_mat.at<double>(1, 2),
+                        kf_R_mat.at<double>(2, 0), kf_R_mat.at<double>(2, 1), kf_R_mat.at<double>(2, 2));
+                    cv::Vec3d t_cam_world(
+                        kf_p_mat.at<double>(0, 0),
+                        kf_p_mat.at<double>(1, 0),
+                        kf_p_mat.at<double>(2, 0));
+
+                    loop_closure_.addKeyframe(
+                        static_cast<uint64_t>(latest_clone_for_kf),
+                        static_cast<double>(timestamp_ns),
+                        kf_back.descriptors,
+                        kf_back.keypoints,
+                        pts3d_world,
+                        R_world_cam,
+                        t_cam_world);
+
+                    // Counter (Agent A): kf-count-in-database. Sample once
+                    // per addKeyframe call to keep cost bounded.
+                    auto& ec = navsight::eventCounters();
+                    ec.loop_closure_kf_count_in_db.store(
+                        static_cast<long long>(loop_closure_.getKeyframeCount()),
+                        std::memory_order_relaxed);
+
+                    // Publish the same descriptors + keypoints to the 1 Hz
+                    // worker thread so its next query tick has a fresh
+                    // most-recent keyframe to fingerprint.
+                    publishLoopClosureQueryKeyframe(
+                        latest_clone_for_kf, timestamp_ns,
+                        kf_back.descriptors, kf_back.keypoints,
+                        fx_, fy_, cx_, cy_);
+                }
+            }
+
             // ── Plan Step 6 (ADR-012): windowed BA at keyframe boundary ──
             // First consume any pending refinement from the previous
             // round (re-seed SLAM features via the canonical add/remove
@@ -2169,6 +2282,15 @@ VisionOutput Tracker::processFrame(const uint8_t* yuv_data, int width, int heigh
             consumeBAResultIfReady();
             kickOffBARound(timestamp_ns);
         }
+
+        // ── Plan Step 7 (ADR-013): apply pending loop-closure correction ──
+        //
+        // Runs UNCONDITIONALLY every frame (not gated on the keyframe
+        // boundary): the damping ramp injects 10 successive frames of
+        // diminishing correction once a fresh match arrives, so we want
+        // to consume on every frame for the smoothest transition.
+        // Internally cheap when no match is pending (atomic-flag check).
+        consumeLoopClosureMatchIfReady();
 
         gray_buf_.copyTo(prev_gray_);
         prev_pts_ = next_good_buf_;
@@ -2819,4 +2941,375 @@ void Tracker::shutdownBA() {
     // released its read locks before we touch those structures.
     if (ba_thread_.joinable()) ba_thread_.join();
     ba_in_flight_.store(false, std::memory_order_release);
+}
+
+// ─────────────────────────────────────────────────────────────────────────────
+// Plan Step 7 (ADR-013): same-session loop closure (DBoW2)
+// ─────────────────────────────────────────────────────────────────────────────
+//
+// Architecture:
+//
+//   Camera thread (processFrame, ~30 Hz)
+//       ├── on every keyframe (~2 Hz):
+//       │     loop_closure_.addKeyframe(...)
+//       │     publishLoopClosureQueryKeyframe(...)  → wakes worker
+//       │
+//       └── on every frame:
+//             consumeLoopClosureMatchIfReady()      → applies damped EKF update
+//
+//   Loop-closure worker thread (loopClosureWorkerLoop, 1 Hz)
+//       └── while (!should_stop_):
+//             cv.wait_for(LOOP_CLOSURE_QUERY_PERIOD_S)
+//             snapshot pending query keyframe under loop_closure_query_mutex_
+//             loop_closure_.tryDetectLoop(...)
+//             on success: publish LoopMatch under loop_closure_result_mutex_
+//
+// Thread-safety invariants:
+//   * loop_closure_ itself is internally synchronised by Agent A's
+//     LoopClosureDetector implementation. The worker thread and the
+//     camera thread both call into it (worker: tryDetectLoop; camera:
+//     addKeyframe + isReady + getKeyframeCount).
+//   * loop_closure_query_mutex_ guards the most-recent query snapshot
+//     buffer. Camera thread writes once per keyframe; worker reads once
+//     per query tick.
+//   * loop_closure_result_mutex_ guards the LoopMatch handoff. Worker
+//     publishes; camera consumes.
+//   * loop_closure_active_match_ / loop_closure_damping_remaining_ are
+//     touched only by the camera thread inside consumeLoopClosureMatchIfReady,
+//     so they need no lock.
+//   * shutdownLoopClosure() joins the worker before any of the above
+//     buffers are torn down (called from reset() and ~Tracker()).
+
+bool Tracker::loadLoopClosureVocabulary(const std::string& vocab_path) {
+    // Forward to the detector. On success we lazily start the worker
+    // thread — until the vocabulary loads `tryDetectLoop` would no-op
+    // anyway (gated on isReady()), so deferring the thread launch keeps
+    // the cold-start path light.
+    const bool ok = loop_closure_.loadVocabulary(vocab_path);
+    if (!ok) {
+        LOGE("Tracker: loop-closure vocabulary load FAILED for %s",
+             vocab_path.c_str());
+        return false;
+    }
+    LOGI("Tracker: loop-closure vocabulary loaded from %s", vocab_path.c_str());
+
+    // Idempotent: if we already started a worker (e.g. reload after
+    // session reset reused the same Tracker instance), leave it running.
+    bool expected = false;
+    if (loop_closure_thread_running_.compare_exchange_strong(
+            expected, true, std::memory_order_acq_rel)) {
+        loop_closure_should_stop_.store(false, std::memory_order_release);
+        loop_closure_thread_ = std::thread(&Tracker::loopClosureWorkerLoop, this);
+        LOGI("Tracker: loop-closure worker thread started (period=%.2fs, "
+             "temporal_excl=%llds, damping_frames=%d)",
+             LOOP_CLOSURE_QUERY_PERIOD_S,
+             static_cast<long long>(LOOP_CLOSURE_TEMPORAL_EXCL_NS / 1'000'000'000LL),
+             LOOP_CLOSURE_DAMPING_FRAMES);
+    }
+    return true;
+}
+
+void Tracker::publishLoopClosureQueryKeyframe(
+        int kf_id, int64_t ts_ns,
+        const cv::Mat& descriptors,
+        const std::vector<cv::KeyPoint>& keypoints,
+        double fx, double fy, double cx, double cy) {
+    {
+        std::lock_guard<std::mutex> lock(loop_closure_query_mutex_);
+        // Cheap deep copy: descriptors at most 250×32 bytes ≈ 8 KB,
+        // keypoints ≤ 250 entries. The worker takes ownership of the
+        // snapshot — we cannot share with FeatureManager's deque
+        // because that deque mutates from the camera thread.
+        descriptors.copyTo(loop_closure_query_descriptors_);
+        loop_closure_query_keypoints_ = keypoints;
+        loop_closure_query_kf_id_     = kf_id;
+        loop_closure_query_ts_ns_     = ts_ns;
+        loop_closure_query_fx_        = fx;
+        loop_closure_query_fy_        = fy;
+        loop_closure_query_cx_        = cx;
+        loop_closure_query_cy_        = cy;
+        loop_closure_query_has_data_  = true;
+    }
+    // Wake the worker. notify_one is correct — the worker is the only
+    // waiter on this cv.
+    loop_closure_cv_.notify_one();
+}
+
+void Tracker::loopClosureWorkerLoop() {
+    using namespace std::chrono;
+    auto& ec = navsight::eventCounters();
+    LOGI("LOOP_CLOSURE: worker thread entered loop");
+
+    // Per-query scratch buffers held outside the mutex so the snapshot
+    // copy under the lock is as short as possible.
+    cv::Mat                   q_descriptors;
+    std::vector<cv::KeyPoint> q_keypoints;
+    int                       q_kf_id = -1;
+    int64_t                   q_ts_ns = 0;
+    double                    q_fx = 0., q_fy = 0., q_cx = 0., q_cy = 0.;
+
+    while (!loop_closure_should_stop_.load(std::memory_order_acquire)) {
+        // Wait either for a fresh keyframe publish or the 1 Hz timeout.
+        // Predicate-form wait avoids the spurious-wakeup pitfall.
+        {
+            std::unique_lock<std::mutex> lock(loop_closure_query_mutex_);
+            const auto wait_dur = duration_cast<steady_clock::duration>(
+                duration<double>(LOOP_CLOSURE_QUERY_PERIOD_S));
+            loop_closure_cv_.wait_for(lock, wait_dur, [this]() {
+                return loop_closure_should_stop_.load(std::memory_order_acquire) ||
+                       loop_closure_query_has_data_;
+            });
+            if (loop_closure_should_stop_.load(std::memory_order_acquire)) break;
+            if (!loop_closure_query_has_data_) continue;  // no keyframe yet
+
+            // Snapshot. Clear the has_data_ flag so we don't re-process the
+            // same keyframe on a spurious wake; a fresh publish will set
+            // it true and notify again.
+            loop_closure_query_descriptors_.copyTo(q_descriptors);
+            q_keypoints = loop_closure_query_keypoints_;
+            q_kf_id     = loop_closure_query_kf_id_;
+            q_ts_ns     = loop_closure_query_ts_ns_;
+            q_fx        = loop_closure_query_fx_;
+            q_fy        = loop_closure_query_fy_;
+            q_cx        = loop_closure_query_cx_;
+            q_cy        = loop_closure_query_cy_;
+            loop_closure_query_has_data_ = false;
+        }
+
+        // Defensive bail: malformed snapshot shouldn't reach here, but
+        // skip it instead of feeding the detector a degenerate input.
+        if (q_descriptors.empty() || q_keypoints.empty() ||
+            q_fx <= 1.0 || q_fy <= 1.0 || q_kf_id < 0) {
+            continue;
+        }
+
+        ec.loop_closure_attempts.fetch_add(1, std::memory_order_relaxed);
+
+        LoopClosureDetector::LoopMatch match;
+        const bool detected = loop_closure_.tryDetectLoop(
+            static_cast<uint64_t>(q_kf_id),
+            q_ts_ns,
+            q_descriptors, q_keypoints,
+            q_fx, q_fy, q_cx, q_cy,
+            LOOP_CLOSURE_TEMPORAL_EXCL_NS,
+            match);
+
+        if (!detected) {
+            // 2026-05-04 cpp-reviewer HIGH-1 fix: detector now owns BOTH
+            // rejection counters (rejects_low_score + rejects_pnp), so the
+            // worker no longer bumps them. Otherwise PnP rejections were
+            // double-counted (detector bumped rejects_pnp inside, then
+            // worker bumped rejects_low_score on the false return). attempts
+            // and accepts stay here at the worker tick boundary because
+            // they are tick-level accounting, not per-rejection-reason.
+            continue;
+        }
+
+        ec.loop_closure_accepts.fetch_add(1, std::memory_order_relaxed);
+        LOGI("LOOP_CLOSURE: ACCEPT now_kf=%d match_kf=%llu bow=%.3f pnp_inl=%d",
+             q_kf_id,
+             static_cast<unsigned long long>(match.matched_kf_id),
+             match.bow_score, match.pnp_inliers);
+
+        // Publish under the result mutex. Camera thread reads + clears
+        // pending=true on its next consume call.
+        {
+            std::lock_guard<std::mutex> rlock(loop_closure_result_mutex_);
+            loop_closure_pending_match_ = match;
+            loop_closure_result_pending_ = true;
+        }
+    }
+
+    LOGI("LOOP_CLOSURE: worker thread exiting cleanly");
+}
+
+void Tracker::consumeLoopClosureMatchIfReady() {
+    // Step 1 — pull any newly-published match into the active slot. We
+    // explicitly do NOT block when no match is pending: the lock is taken
+    // for at most a few atomic loads / a single struct copy, all O(1).
+    bool fresh_match_picked_up = false;
+    {
+        std::lock_guard<std::mutex> rlock(loop_closure_result_mutex_);
+        if (loop_closure_result_pending_) {
+            loop_closure_active_match_     = loop_closure_pending_match_;
+            loop_closure_active_match_set_ = true;
+            loop_closure_damping_remaining_ = LOOP_CLOSURE_DAMPING_FRAMES;
+            loop_closure_result_pending_ = false;
+            loop_closure_pending_match_  = LoopClosureDetector::LoopMatch{};
+            fresh_match_picked_up = true;
+        }
+    }
+
+    if (!loop_closure_active_match_set_ ||
+        loop_closure_damping_remaining_ <= 0) {
+        return;
+    }
+
+    // Step 2 — apply a damped relative-pose / relative-rotation update
+    // through the canonical EKF measurement channel. ADR-006 forbids
+    // direct mean / covariance writes from a side channel; updateRelativePose
+    // and updateRelativeRotation are the same observation channels
+    // Step 2 (visual relative pose) and Step 3a (MSCKF) already use.
+    if (!ekf_.isFullInitialized()) {
+        // Cannot inject through the EKF until full-init. Drop the ramp
+        // counter so we don't accumulate 10 frames of waiting state.
+        loop_closure_damping_remaining_ = 0;
+        loop_closure_active_match_set_  = false;
+        return;
+    }
+
+    const int matched_clone_id = static_cast<int>(
+        loop_closure_active_match_.matched_kf_id);
+
+    // Sanity: the matched keyframe's clone may have been marginalised
+    // out of the EKF window (LOOP_CLOSURE_TEMPORAL_EXCL_NS = 30 s but
+    // the EKF window only carries the most recent ~11 clones — so most
+    // matches WILL be against a clone outside the window). When the
+    // clone is gone we cannot inject a relative-pose constraint against
+    // it, so drop the ramp here and log once per fresh match. A future
+    // refinement (gated on a "world-frame absolute pose" measurement
+    // channel in EKFState) would let us close the loop without needing
+    // the matched clone in the live window.
+    cv::Mat R_match_now, p_match_now;
+    if (!ekf_.getClonePose(matched_clone_id, R_match_now, p_match_now)) {
+        // ────────────────────────────────────────────────────────────────────
+        // KNOWN GAP — Step 7 effective-correction blocker
+        //
+        // The temporal exclusion window (30 s) is by design larger than the
+        // EKF clone window (~11 clones × 0.5-1 s keyframe interval ≈ 5-10 s).
+        // Therefore EVERY accepted loop match has matched_clone_id older
+        // than what the EKF can reach via getClonePose, and we drop the
+        // correction here every time. **Loop closure currently fires
+        // detection but never injects a correction.**
+        //
+        // Fix path (next session): add EKFState::updateAbsolutePose(
+        //   R_world_cam_target, t_cam_world_target, var_R, var_t)
+        // — a new measurement channel that consumes the matched keyframe's
+        // STORED world-frame pose (we already carry it in
+        // LoopMatch::R_world_cam_match / t_cam_world_match) plus the
+        // relative R/t from the LoopMatch, computes the implied current
+        // world pose, and runs an EKF update against the IMU-frame state
+        // directly — independent of the clone window. Same Joseph form +
+        // damping schedule as updateRelativeRotation. ~80 LOC + tests.
+        //
+        // Until then: BoW match detection IS working (event_summary
+        // loop_closure_accepts > 0 confirms recognition), but drift
+        // reduction from loop closure stays at 0. ADR-013 documents this
+        // gap explicitly. Do not call this a regression — the rest of
+        // the VIO pipeline is unaffected.
+        // ────────────────────────────────────────────────────────────────────
+        if (fresh_match_picked_up) {
+            LOGI("LOOP_CLOSURE: matched_clone=%d outside EKF window — "
+                 "DETECTION OK but correction injection blocked pending "
+                 "EKFState::updateAbsolutePose (see ADR-013).",
+                 matched_clone_id);
+        }
+        loop_closure_damping_remaining_ = 0;
+        loop_closure_active_match_set_  = false;
+        return;
+    }
+
+    // Step 3 — damping schedule. strength on frame `k` of N (N=10):
+    //     strength_k = 1 - k/N    →  k=0: 1.0,  k=9: 0.1
+    // Inflate the measurement variance by 1/strength² so the EKF gain
+    // shrinks with strength — same pattern as ADR-006 / Step 3a damping.
+    const int    k          = LOOP_CLOSURE_DAMPING_FRAMES -
+                              loop_closure_damping_remaining_;  // 0..N-1
+    const double strength   = 1.0 - static_cast<double>(k) /
+                                    static_cast<double>(LOOP_CLOSURE_DAMPING_FRAMES);
+    const double strength_sq = strength * strength;
+    // Floor strength_sq so the divide can never explode (k=N-1 gives
+    // 0.01; the floor of 0.01 keeps var inflation bounded at 100×).
+    const double damping_inv = 1.0 / std::max(1e-2, strength_sq);
+
+    // Step 4 — relative translation, world frame. The detector returns
+    //   t_now_to_match : translation (in match-camera frame) from
+    //                     current pose to matched pose.
+    // The EKF channel expects the world-frame delta from matched-clone
+    // position to current-clone position: ΔP_world = p_now - p_match.
+    // We don't have p_now directly here (consumed before processFrame
+    // overwrites it), so reconstruct from the LoopMatch:
+    //   p_match_should_be = R_world_cam_match * (-t_now_to_match) + p_now
+    // ...which is more brittle than reading the EKF state directly. The
+    // robust path: t_world_metric = current EKF position − matched-clone
+    // position, then add a residual term that pulls the current position
+    // toward the SAME relative offset the matched keyframe had. The
+    // simplest expression: target the relative-pose update so that the
+    // EKF current pose snaps to (p_match + R_world_cam_match * (-t_now_to_match)).
+    // But updateRelativePose's H matrix is +I on δp_current and −I on
+    // δp at clone_id, so the natural measurement is ΔP_world we WANT
+    // the filter to converge toward — which is exactly the loop-closure
+    // residual. Build it from the match's stored matched-clone pose and
+    // the rotation between now and match.
+    cv::Mat t_world_metric(3, 1, CV_64F);
+    {
+        // Convert the camera-frame relative translation to world frame.
+        // R_world_cam_match takes match-camera-frame vectors into world
+        // frame. The detector's `t_now_to_match` lives in the match's
+        // camera frame. World-frame delta from match-clone to now:
+        //     ΔP_world = R_world_cam_match * (-t_now_to_match)
+        const auto& R_wc = loop_closure_active_match_.R_world_cam_match;
+        const auto& t_n2m = loop_closure_active_match_.t_now_to_match;
+        const cv::Vec3d delta_world = R_wc * (-t_n2m);
+        t_world_metric.at<double>(0) = delta_world[0];
+        t_world_metric.at<double>(1) = delta_world[1];
+        t_world_metric.at<double>(2) = delta_world[2];
+    }
+
+    const double var_t = (LOOP_CLOSURE_BASE_TRANS_SIGMA_M *
+                          LOOP_CLOSURE_BASE_TRANS_SIGMA_M) * damping_inv;
+    const bool t_ok = ekf_.updateRelativePose(t_world_metric,
+                                               matched_clone_id, var_t);
+
+    // Step 5 — relative rotation. R_now_to_match is body-frame for
+    // NavSight's pinhole pipeline (the Step 2 R_vo path treats body and
+    // camera frames as coincident; the IMU↔camera extrinsic correction
+    // is reserved for Step 8). updateRelativeRotation expects a body-
+    // frame R from clone_id's body to current body — flip the sign of
+    // the rotation axis to swap "now→match" → "match→now".
+    cv::Mat R_meas_body(3, 3, CV_64F);
+    {
+        const auto& R = loop_closure_active_match_.R_now_to_match;
+        // Transpose to invert the rotation (now→match becomes match→now).
+        for (int r = 0; r < 3; ++r) {
+            for (int c = 0; c < 3; ++c) {
+                R_meas_body.at<double>(r, c) = R(c, r);
+            }
+        }
+    }
+    const double sigma_axis_sq = (LOOP_CLOSURE_BASE_ROT_SIGMA_RAD *
+                                  LOOP_CLOSURE_BASE_ROT_SIGMA_RAD) * damping_inv;
+    const bool r_ok = ekf_.updateRelativeRotation(R_meas_body, sigma_axis_sq,
+                                                   matched_clone_id);
+
+    // Log every step of the ramp at INFO so a real loop closure shows
+    // up in the trace as a coherent 10-line sequence.
+    LOGI("LOOP_CLOSURE: damp k=%d/%d strength=%.2f var_t=%.4f var_R=%.4e "
+         "t_world=[%.3f %.3f %.3f] match_clone=%d t_ok=%d R_ok=%d",
+         k + 1, LOOP_CLOSURE_DAMPING_FRAMES, strength,
+         var_t, sigma_axis_sq,
+         t_world_metric.at<double>(0),
+         t_world_metric.at<double>(1),
+         t_world_metric.at<double>(2),
+         matched_clone_id,
+         t_ok ? 1 : 0, r_ok ? 1 : 0);
+
+    --loop_closure_damping_remaining_;
+    if (loop_closure_damping_remaining_ <= 0) {
+        loop_closure_active_match_set_ = false;
+        loop_closure_active_match_     = LoopClosureDetector::LoopMatch{};
+    }
+}
+
+void Tracker::shutdownLoopClosure() {
+    // Step 7 (ADR-013): mirror shutdownBA. Set should_stop, notify the
+    // cv so the worker drops out of wait_for, then join. We do NOT
+    // detach: the worker reads loop_closure_ / ekf_ which may be torn
+    // down right after this call returns.
+    loop_closure_should_stop_.store(true, std::memory_order_release);
+    loop_closure_cv_.notify_all();
+    if (loop_closure_thread_.joinable()) loop_closure_thread_.join();
+    // Reset the running flag so a subsequent loadLoopClosureVocabulary
+    // can re-launch the worker (e.g. after an in-place reset()).
+    loop_closure_thread_running_.store(false, std::memory_order_release);
 }

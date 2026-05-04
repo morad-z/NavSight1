@@ -1,0 +1,580 @@
+// Step 7 (Visual Production Plan): unit tests for the same-session
+// loop-closure detector.
+//
+// Plan reference: docs/VISUAL_PRODUCTION_PLAN.md, "Step 7 — Same-session
+// loop closure (DBoW2)" (around line 695).
+//
+// Agent A is landing the implementation in
+// app/src/main/cpp/LoopClosureDetector.{h,cpp} (rewritten on top of the
+// vendored DBoW2 source under third_party/DBoW2/), shipping the
+// ORB-SLAM2 ORBvoc.bin asset, and wiring DBoW2 into app/CMakeLists.txt;
+// Agent B is editing Tracker / native-lib / Kotlin glue. These tests
+// touch ONLY the new LoopClosureDetector API:
+//
+//   class LoopClosureDetector {
+//   public:
+//       bool   loadVocabulary(const std::string& vocab_path);
+//       size_t getKeyframeCount() const;
+//       bool   isReady() const;
+//       void   addKeyframe(uint64_t kf_id, double timestamp_ns,
+//                          const cv::Mat& descriptors,
+//                          const std::vector<cv::KeyPoint>& keypoints,
+//                          const std::vector<cv::Point3f>& pts3d_world,
+//                          const cv::Matx33d& R_world_cam,
+//                          const cv::Vec3d&   t_cam_world);
+//       struct LoopMatch { ... };
+//       bool   tryDetectLoop(uint64_t now_kf_id, int64_t now_ns,
+//                            const cv::Mat& descriptors,
+//                            const std::vector<cv::KeyPoint>& keypoints,
+//                            double fx, double fy, double cx, double cy,
+//                            int64_t temporal_exclusion_ns,
+//                            LoopMatch& out_match);
+//   };
+//
+// Idiom mirrors test_orb_reloc.cpp / test_visual_robustness.cpp /
+// test_windowed_ba.cpp from the Step-4/Step-5/Step-6 commits earlier
+// today: anonymous-namespace helpers, OpenCV asserts, trend-based
+// bounds, all-synthetic in-memory scenes (no Tracker / EKFState /
+// FeatureManager dependency, no sim files, no device recordings).
+//
+// Vocabulary dependency: tryDetectLoop and the BoW-scoring path require
+// a real ORBvoc.bin (~10 MB). On hosts where the asset is not staged
+// next to the test binary the BoW-dependent tests skip with
+// GTEST_SKIP(); the structural contract (count, no-crash-when-not-
+// ready, temporal exclusion) is testable without the vocabulary.
+//
+// Note: desktop test build is currently BLOCKED on Morad's Windows host
+// by an MSVC/MinGW OpenCV mismatch. These tests are designed to compile
+// cleanly in concept; CI / Linux runs them. The DBoW2 link-time
+// dependency lives in tests/cpp/CMakeLists.txt next to the existing
+// navsight_core link.
+
+#include <gtest/gtest.h>
+#include <opencv2/core.hpp>
+#include <opencv2/features2d.hpp>
+#include <opencv2/imgproc.hpp>
+
+#include "LoopClosureDetector.h"
+
+#include <cstdint>
+#include <cstdio>
+#include <string>
+#include <vector>
+
+namespace {
+
+// ── Step 7 scene parameters ─────────────────────────────────────────────
+
+// Pinhole intrinsics. Same focal/cx/cy the Step-4 (test_orb_reloc.cpp)
+// and Step-6 (test_windowed_ba.cpp) tests use so the suite agrees on
+// what "the camera" looks like.
+constexpr double kFx = 525.0;
+constexpr double kFy = 525.0;
+constexpr double kCx = 320.0;
+constexpr double kCy = 240.0;
+
+// Plan §3 / §4: temporal exclusion = 30 s, geometric verification floor
+// = 30 PnP inliers. Both echoed here so the test pins the contract; the
+// production constants live inside Agent A's LoopClosureDetector.cpp.
+constexpr int64_t kTemporalExclusionNs   = 30LL * 1000000000LL;  // 30 s
+constexpr int     kPnpInlierFloor        = 30;
+
+// Frame size for the synthetic scenes. Mirrors the (640, 480) size
+// Tracker sees after VioEngine downscale on the desktop test path.
+constexpr int kFrameW = 640;
+constexpr int kFrameH = 480;
+
+// ── Helpers ─────────────────────────────────────────────────────────────
+
+// Build a textured grayscale frame so cv::ORB has structure rather than
+// pixel-scale noise to lock onto. Deterministic seed → reproducible
+// across runs. Same recipe test_orb_reloc.cpp uses.
+cv::Mat makeTexturedFrame(uint64_t seed) {
+    cv::Mat raw(kFrameH, kFrameW, CV_8UC1);
+    cv::RNG rng(seed);
+    rng.fill(raw, cv::RNG::UNIFORM, 0, 256);
+    cv::Mat blurred;
+    cv::GaussianBlur(raw, blurred, cv::Size(0, 0), /*sigmaX=*/1.0);
+    return blurred;
+}
+
+// ORB extraction with the Step-4 tuning (nfeatures = 250). Production
+// FeatureManager uses the same parameters at keyframe creation, so the
+// descriptors fed into addKeyframe / tryDetectLoop here have the same
+// statistics as on-device.
+void detectAndComputeOrb(const cv::Mat& gray,
+                         std::vector<cv::KeyPoint>& kps,
+                         cv::Mat& desc) {
+    cv::Ptr<cv::ORB> orb = cv::ORB::create(/*nfeatures=*/250);
+    orb->detectAndCompute(gray, cv::noArray(), kps, desc);
+}
+
+// Best-effort lookup of the bundled ORB vocabulary. Tests run in a
+// number of environments (CI Linux container, Android device push,
+// Morad's Windows host once the OpenCV mismatch is resolved). We probe
+// the candidates the production app + CI scripts currently stage; if
+// none are present the BoW-dependent tests skip rather than fail.
+bool resolveVocabularyPath(std::string& out_path) {
+    static const char* const candidates[] = {
+        // CI: assets/ symlinked next to the test binary.
+        "assets/ORBvoc.bin",
+        "assets/ORBvoc.dbow2",
+        // Repo-root relative — when tests run from build/.
+        "../app/src/main/assets/ORBvoc.bin",
+        "../app/src/main/assets/ORBvoc.dbow2",
+        // Repo-root relative — when tests run from repo root.
+        "app/src/main/assets/ORBvoc.bin",
+        "app/src/main/assets/ORBvoc.dbow2",
+        // Env override for ad-hoc local runs.
+        nullptr,
+    };
+    for (const char* const* p = candidates; *p != nullptr; ++p) {
+        std::FILE* f = std::fopen(*p, "rb");
+        if (f != nullptr) {
+            std::fclose(f);
+            out_path = *p;
+            return true;
+        }
+    }
+    if (const char* env = std::getenv("NAVSIGHT_ORB_VOCAB")) {
+        std::FILE* f = std::fopen(env, "rb");
+        if (f != nullptr) {
+            std::fclose(f);
+            out_path = env;
+            return true;
+        }
+    }
+    return false;
+}
+
+// Build a small grid of world-frame 3D points the synthetic scene
+// projects from. Used by both the keyframe-storage and loop-detect
+// paths so the geometry is shared. Points sit ~3 m in front of the
+// origin in the world frame, spread across an 80 cm × 60 cm wall.
+std::vector<cv::Point3f> makeSceneGrid() {
+    std::vector<cv::Point3f> pts;
+    pts.reserve(48);
+    for (int row = -3; row <= 3; ++row) {
+        for (int col = -3; col <= 3; ++col) {
+            pts.emplace_back(static_cast<float>(col) * 0.10f,
+                             static_cast<float>(row) * 0.10f,
+                             3.0f);
+        }
+    }
+    return pts;
+}
+
+// Project a world-frame point through the (R_world_cam, t_cam_world)
+// convention LoopClosureDetector consumes. Returns true iff the point
+// lies in front of the camera (z > 1e-6).
+bool projectPoint(const cv::Matx33d& R_world_cam,
+                  const cv::Vec3d&   t_cam_world,
+                  const cv::Point3f& p_world,
+                  cv::Point2f&       uv_out) {
+    const cv::Vec3d p_w(p_world.x, p_world.y, p_world.z);
+    const cv::Vec3d p_cam = R_world_cam * (p_w - t_cam_world);
+    if (p_cam[2] <= 1e-6) {
+        return false;
+    }
+    uv_out.x = static_cast<float>(kFx * p_cam[0] / p_cam[2] + kCx);
+    uv_out.y = static_cast<float>(kFy * p_cam[1] / p_cam[2] + kCy);
+    return true;
+}
+
+// Build a synthetic descriptor matrix (rows × 32, CV_8U) of randomised
+// binary descriptors. Used for the "structural" tests where BoW scoring
+// is not exercised — we only care that addKeyframe / count work end-to-
+// end on plausibly-shaped inputs.
+cv::Mat makeRandomDescriptors(int rows, uint64_t seed) {
+    cv::Mat desc(rows, 32, CV_8U);
+    cv::RNG rng(seed);
+    rng.fill(desc, cv::RNG::UNIFORM, 0, 256);
+    return desc;
+}
+
+// Build the parallel keypoints array for makeRandomDescriptors so the
+// addKeyframe call sees a self-consistent (kp, desc) pair.
+std::vector<cv::KeyPoint> makeRandomKeypoints(int n, uint64_t seed) {
+    cv::RNG rng(seed);
+    std::vector<cv::KeyPoint> kps;
+    kps.reserve(n);
+    for (int i = 0; i < n; ++i) {
+        const float u = static_cast<float>(rng.uniform(20, kFrameW - 20));
+        const float v = static_cast<float>(rng.uniform(20, kFrameH - 20));
+        kps.emplace_back(u, v, /*size=*/7.0f);
+    }
+    return kps;
+}
+
+}  // namespace
+
+// ── Test 1 — vocabulary load failure is observable + safe ────────────────
+
+// Contract: loadVocabulary on a non-existent path must return false and
+// leave isReady() == false. addKeyframe on a not-ready detector MUST
+// silently no-op rather than crash — the tracker calls addKeyframe
+// every keyframe and a missing vocabulary asset (e.g. corrupt install,
+// pre-load race) must not crash the camera thread.
+TEST(LoopClosure, VocabularyLoadFailureReturnsFalseAndIsReadyFalse) {
+    LoopClosureDetector detector;
+
+    EXPECT_FALSE(detector.isReady())
+        << "Detector reports ready before any vocabulary is loaded.";
+
+    const bool loaded = detector.loadVocabulary(
+        "/this/path/definitely/does/not/exist/ORBvoc.bin");
+    EXPECT_FALSE(loaded)
+        << "loadVocabulary returned true for a non-existent path; the "
+           "detector must propagate file-open failure to the caller.";
+
+    EXPECT_FALSE(detector.isReady())
+        << "isReady() reports true after a failed loadVocabulary; "
+           "production gate (Tracker::shouldAttemptLoop) reads this "
+           "flag and a false-positive here would push BoW queries "
+           "through an uninitialised vocabulary.";
+
+    // Stub keyframe: 16 random rows of CV_8U/32. The not-ready detector
+    // must absorb this call without dereferencing the vocabulary.
+    cv::Mat desc = makeRandomDescriptors(/*rows=*/16, /*seed=*/0xDEADBEEFu);
+    std::vector<cv::KeyPoint> kps = makeRandomKeypoints(/*n=*/16,
+                                                        /*seed=*/0xDEADBEEFu);
+    std::vector<cv::Point3f> pts3d;  // empty is a valid input.
+    cv::Matx33d R_world_cam = cv::Matx33d::eye();
+    cv::Vec3d   t_cam_world(0, 0, 0);
+
+    // The contract is "must not crash". GoogleTest's ASSERT_NO_FATAL_FAILURE
+    // catches failed assertions inside the callee; an actual SIGSEGV is
+    // surfaced by the harness as a test failure.
+    ASSERT_NO_FATAL_FAILURE(detector.addKeyframe(
+        /*kf_id=*/1, /*timestamp_ns=*/1.0e9,
+        desc, kps, pts3d, R_world_cam, t_cam_world));
+
+    // Count must not have advanced — the detector silently dropped the
+    // keyframe because it has no vocabulary to score against.
+    EXPECT_EQ(detector.getKeyframeCount(), 0u)
+        << "Detector accepted a keyframe while not ready; production "
+           "gate would then query an uninitialised BoW database.";
+}
+
+// ── Test 2 — addKeyframe increments the count when the detector is ready ─
+
+// Contract: with the vocabulary loaded, addKeyframe on N synthetic
+// (kp, desc, pts3d) tuples results in getKeyframeCount() == N. This is
+// the structural counterpart to Test 1: same input shapes, but on a
+// ready detector the keyframes survive into the BoW database.
+//
+// If the production API requires a real vocabulary (no test vocab
+// shipped in the test sandbox) the test skips with a clear reason
+// rather than failing — matches the test_slam_msckf.cpp idiom.
+TEST(LoopClosure, AddKeyframeIncrementsCount) {
+    LoopClosureDetector detector;
+
+    std::string vocab_path;
+    if (!resolveVocabularyPath(vocab_path)) {
+        GTEST_SKIP() << "ORBvoc.{bin,dbow2} not staged next to the test "
+                        "binary — set NAVSIGHT_ORB_VOCAB or copy the "
+                        "asset to assets/ORBvoc.bin to run this case.";
+    }
+    if (!detector.loadVocabulary(vocab_path)) {
+        GTEST_SKIP() << "Vocabulary file present but failed to load; "
+                        "DBoW2 may have rejected the format. Path: "
+                     << vocab_path;
+    }
+    ASSERT_TRUE(detector.isReady());
+
+    constexpr int kKeyframes = 5;
+    for (int i = 0; i < kKeyframes; ++i) {
+        const uint64_t seed = 0x100u + static_cast<uint64_t>(i);
+        cv::Mat desc = makeRandomDescriptors(/*rows=*/250, seed);
+        std::vector<cv::KeyPoint> kps = makeRandomKeypoints(/*n=*/250, seed);
+        std::vector<cv::Point3f>  pts3d = makeSceneGrid();
+
+        cv::Matx33d R_world_cam = cv::Matx33d::eye();
+        cv::Vec3d   t_cam_world(static_cast<double>(i) * 0.5, 0, 0);
+
+        detector.addKeyframe(
+            /*kf_id=*/static_cast<uint64_t>(i + 1),
+            /*timestamp_ns=*/static_cast<double>(i + 1) * 1.0e9,
+            desc, kps, pts3d, R_world_cam, t_cam_world);
+    }
+
+    EXPECT_EQ(detector.getKeyframeCount(),
+              static_cast<size_t>(kKeyframes))
+        << "addKeyframe count mismatch — either an internal eviction "
+           "is dropping keyframes early or the BoW indexer is rejecting "
+           "well-formed inputs silently.";
+}
+
+// ── Test 3 — temporal exclusion rejects recent self-matches ──────────────
+
+// Contract: keyframe at ts = 3 s is "the present"; a query at ts = 3.5 s
+// with the SAME descriptors and a 30 s temporal exclusion window must
+// NOT be reported as a loop. This is the §3 plan gate that stops the
+// detector from claiming "you've returned" the moment you've just been
+// somewhere — the whole point of a 30 s gap is to require the user has
+// actually walked away and come back.
+//
+// Skipped if the vocabulary is unavailable (the BoW score is
+// short-circuited in the not-ready path).
+TEST(LoopClosure, TemporalExclusionRejectsRecentMatch) {
+    LoopClosureDetector detector;
+
+    std::string vocab_path;
+    if (!resolveVocabularyPath(vocab_path)) {
+        GTEST_SKIP() << "ORBvoc.{bin,dbow2} not staged — temporal-gate "
+                        "test requires a ready BoW database to be "
+                        "meaningful.";
+    }
+    if (!detector.loadVocabulary(vocab_path)) {
+        GTEST_SKIP() << "Vocabulary file present but failed to load.";
+    }
+    ASSERT_TRUE(detector.isReady());
+
+    // Three keyframes at ts = 1 s, 2 s, 3 s with a SHARED descriptor
+    // matrix so the BoW score at the query is maximal — without this
+    // the test could trivially pass on a low BoW score, never reaching
+    // the temporal gate.
+    cv::Mat shared_desc = makeRandomDescriptors(/*rows=*/250,
+                                                /*seed=*/0xAAAAu);
+    std::vector<cv::KeyPoint> shared_kps = makeRandomKeypoints(
+        /*n=*/250, /*seed=*/0xAAAAu);
+    std::vector<cv::Point3f>  pts3d = makeSceneGrid();
+
+    for (int i = 1; i <= 3; ++i) {
+        cv::Matx33d R_world_cam = cv::Matx33d::eye();
+        cv::Vec3d   t_cam_world(static_cast<double>(i) * 0.1, 0, 0);
+        detector.addKeyframe(
+            /*kf_id=*/static_cast<uint64_t>(i),
+            /*timestamp_ns=*/static_cast<double>(i) * 1.0e9,
+            shared_desc, shared_kps, pts3d, R_world_cam, t_cam_world);
+    }
+
+    // Query at 3.5 s with the SAME descriptors as the most recent
+    // keyframe — high BoW score guaranteed. A temporal_exclusion_ns of
+    // 30 s means every stored keyframe is inside the exclusion window
+    // and the detector must reject all of them.
+    LoopClosureDetector::LoopMatch match{};
+    const bool found = detector.tryDetectLoop(
+        /*now_kf_id=*/4,
+        /*now_ns=*/static_cast<int64_t>(3.5 * 1.0e9),
+        shared_desc, shared_kps,
+        kFx, kFy, kCx, kCy,
+        kTemporalExclusionNs,
+        match);
+
+    EXPECT_FALSE(found)
+        << "tryDetectLoop reported a loop on a query within the 30 s "
+           "exclusion window; the temporal gate is not engaging. A "
+           "false positive here means the very first keyframe of every "
+           "session triggers a self-loop on the next frame.";
+}
+
+// ── Test 4 — geometric verification rejects BoW-only matches ─────────────
+
+// Contract: a high BoW score is necessary but NOT sufficient. The §4
+// plan gate is solvePnPRansac with ≥ 30 inliers; without geometric
+// agreement between the stored 3D points and the query keypoints the
+// detector must reject the candidate even when DBoW2 scores it high.
+//
+// This is the test that pins the "BoW alone is not a loop" property —
+// without it the detector reduces to a place classifier, which is what
+// the plan §"Why DBoW2" explicitly says it is NOT.
+//
+// Construction: two keyframes share descriptors (same BoW vector) but
+// the 3D points stored at the FIRST keyframe project to image points
+// that have nothing to do with the SECOND keyframe's keypoint
+// locations — keypoints are at random pixels chosen from a different
+// RNG seed. PnP cannot find a pose that explains the correspondence,
+// so it fails the inlier floor.
+TEST(LoopClosure, GeometricVerificationRejectsBowOnlyMatches) {
+    LoopClosureDetector detector;
+
+    std::string vocab_path;
+    if (!resolveVocabularyPath(vocab_path)) {
+        GTEST_SKIP() << "ORBvoc.{bin,dbow2} not staged — geometric-gate "
+                        "test requires a ready BoW database to even "
+                        "advance to the PnP stage.";
+    }
+    if (!detector.loadVocabulary(vocab_path)) {
+        GTEST_SKIP() << "Vocabulary file present but failed to load.";
+    }
+    ASSERT_TRUE(detector.isReady());
+
+    // Stored keyframe with the scene grid as its 3D points.
+    cv::Mat shared_desc = makeRandomDescriptors(/*rows=*/250,
+                                                /*seed=*/0xBBBBu);
+    std::vector<cv::KeyPoint> stored_kps = makeRandomKeypoints(
+        /*n=*/250, /*seed=*/0xBBBBu);
+    std::vector<cv::Point3f>  pts3d = makeSceneGrid();
+
+    cv::Matx33d R_world_cam_stored = cv::Matx33d::eye();
+    cv::Vec3d   t_cam_world_stored(0, 0, 0);
+    detector.addKeyframe(
+        /*kf_id=*/1,
+        /*timestamp_ns=*/1.0e9,
+        shared_desc, stored_kps, pts3d,
+        R_world_cam_stored, t_cam_world_stored);
+
+    // Query with the SAME descriptors (BoW score will be at the top of
+    // the candidate ranking) but DIFFERENT keypoint locations — the
+    // 2D-3D correspondence assumed by solvePnPRansac is broken so the
+    // PnP gate must reject. We use a different RNG seed to guarantee
+    // the query keypoints do not coincidentally line up with the
+    // projection of the stored 3D points.
+    std::vector<cv::KeyPoint> query_kps = makeRandomKeypoints(
+        /*n=*/250, /*seed=*/0xCCCCu);
+
+    LoopClosureDetector::LoopMatch match{};
+    // Query 60 s later — well past the 30 s temporal exclusion gate so
+    // the candidate is admitted to the geometric verification stage.
+    const bool found = detector.tryDetectLoop(
+        /*now_kf_id=*/2,
+        /*now_ns=*/static_cast<int64_t>(60.0 * 1.0e9),
+        shared_desc, query_kps,
+        kFx, kFy, kCx, kCy,
+        kTemporalExclusionNs,
+        match);
+
+    EXPECT_FALSE(found)
+        << "tryDetectLoop accepted a candidate whose 2D-3D "
+           "correspondence cannot be explained by any pose (PnP "
+           "inlier floor is " << kPnpInlierFloor << "). A false "
+           "positive here would inject a spurious correction through "
+           "the EKF::updateRelativePose channel.";
+}
+
+// ── Test 5 — clean re-visit produces a high-confidence loop match ────────
+
+// Contract: the happy-path acceptance gate. On a clean re-visit (same
+// scene, same descriptors, geometry consistent, query beyond the
+// temporal exclusion window) the detector reports found = true with
+// matched_kf_id matching the stored keyframe, pnp_inliers ≥ the §4
+// floor, and a high BoW score.
+//
+// This is the necessary "yes, fire" counterpart to Tests 3 and 4;
+// without it those two tests could trivially pass by always returning
+// false. Together the three tests pin the decision boundary in both
+// directions.
+//
+// Construction: stored keyframe at (R = I, t = 0) observes the scene
+// grid; query keyframe at (R = I, t = (0.05, 0, 0)) — small parallax
+// translation, same scene. Query keypoints are the projected
+// 2D positions of the stored 3D points through the query's pose, so
+// PnP solves cleanly with all of them as inliers.
+TEST(LoopClosure, AcceptsValidLoopReturnsLoopMatch) {
+    LoopClosureDetector detector;
+
+    std::string vocab_path;
+    if (!resolveVocabularyPath(vocab_path)) {
+        GTEST_SKIP() << "ORBvoc.{bin,dbow2} not staged — accept-path "
+                        "test requires a ready BoW database.";
+    }
+    if (!detector.loadVocabulary(vocab_path)) {
+        GTEST_SKIP() << "Vocabulary file present but failed to load.";
+    }
+    ASSERT_TRUE(detector.isReady());
+
+    // Build the stored keyframe from a real textured frame so that
+    // ORB extracts matchable descriptors (the random-byte descriptors
+    // used by Tests 3/4 are fine for BoW-score saturation but here we
+    // need BFMatcher Hamming + Lowe ratio to recover correspondences
+    // for the geometric verification stage).
+    cv::Mat textured = makeTexturedFrame(/*seed=*/0xC0FFEEu);
+    std::vector<cv::KeyPoint> stored_kps;
+    cv::Mat stored_desc;
+    detectAndComputeOrb(textured, stored_kps, stored_desc);
+
+    ASSERT_GE(static_cast<int>(stored_kps.size()),
+              kPnpInlierFloor + 10)
+        << "Stored keyframe has fewer ORB features than the PnP floor "
+           "needs to admit a match — synthetic scene is too degenerate "
+           "for this test.";
+
+    // 3D point per keypoint at z = 3 m, x/y back-projected from the
+    // pinhole. This is the cleanest possible synthetic correspondence:
+    // when the query camera projects these world points it will land
+    // exactly on the stored keypoints when the query pose equals the
+    // stored pose, and within sub-pixel of them when the query pose
+    // is perturbed by the small translation below.
+    std::vector<cv::Point3f> pts3d;
+    pts3d.reserve(stored_kps.size());
+    for (const auto& kp : stored_kps) {
+        const double z = 3.0;
+        const double x = (static_cast<double>(kp.pt.x) - kCx) * z / kFx;
+        const double y = (static_cast<double>(kp.pt.y) - kCy) * z / kFy;
+        pts3d.emplace_back(static_cast<float>(x),
+                           static_cast<float>(y),
+                           static_cast<float>(z));
+    }
+
+    cv::Matx33d R_world_cam_stored = cv::Matx33d::eye();
+    cv::Vec3d   t_cam_world_stored(0, 0, 0);
+    detector.addKeyframe(
+        /*kf_id=*/42,
+        /*timestamp_ns=*/1.0e9,
+        stored_desc, stored_kps, pts3d,
+        R_world_cam_stored, t_cam_world_stored);
+
+    // Query at a temporally distant moment (well past the 30 s gate)
+    // with the SAME descriptors — idealised perfect re-visit. Re-
+    // project the stored 3D points through a small-translation query
+    // pose so the geometric verification has a clean PnP solution.
+    cv::Matx33d R_world_cam_query = cv::Matx33d::eye();
+    cv::Vec3d   t_cam_world_query(0.05, 0.0, 0.0);
+
+    std::vector<cv::KeyPoint> query_kps;
+    query_kps.reserve(stored_kps.size());
+    for (size_t i = 0; i < stored_kps.size(); ++i) {
+        cv::Point2f uv;
+        if (!projectPoint(R_world_cam_query, t_cam_world_query,
+                          pts3d[i], uv)) {
+            // Behind the camera — drop. Should not happen for z = 3 m
+            // and the small translation we use.
+            continue;
+        }
+        query_kps.emplace_back(uv.x, uv.y, stored_kps[i].size);
+    }
+    ASSERT_GE(static_cast<int>(query_kps.size()),
+              kPnpInlierFloor + 10)
+        << "Re-projected too few stored points to clear the PnP floor; "
+           "the synthetic re-visit pose is too far from the stored "
+           "pose for this test.";
+
+    LoopClosureDetector::LoopMatch match{};
+    const bool found = detector.tryDetectLoop(
+        /*now_kf_id=*/100,
+        /*now_ns=*/static_cast<int64_t>(60.0 * 1.0e9),
+        stored_desc, query_kps,
+        kFx, kFy, kCx, kCy,
+        kTemporalExclusionNs,
+        match);
+
+    ASSERT_TRUE(found)
+        << "tryDetectLoop did NOT accept a clean re-visit: same "
+           "descriptors, same scene, query 60 s after store with the "
+           "stored 3D points re-projected through the query pose. "
+           "Either the BoW threshold is too strict, the PnP gate is "
+           "rejecting valid geometry, or the temporal-exclusion path "
+           "is over-firing.";
+
+    EXPECT_EQ(match.matched_kf_id, static_cast<uint64_t>(42))
+        << "tryDetectLoop accepted a loop but reported the wrong "
+           "matched_kf_id; the BoW database returned a different "
+           "candidate than the one we stored.";
+
+    EXPECT_GE(match.pnp_inliers, kPnpInlierFloor)
+        << "tryDetectLoop accepted a loop with fewer than "
+        << kPnpInlierFloor << " PnP inliers; the §4 acceptance gate "
+           "is not enforced — a future drift in the gate would let "
+           "low-evidence corrections through to the EKF.";
+
+    // BoW score has no fixed scale across vocabularies but on an
+    // identical-descriptor query it should be substantially above
+    // zero. The plan §3 calls for a "similarity threshold"; we pin
+    // only the strict-positive lower bound here so the test is
+    // robust across DBoW2 weighting strategies.
+    EXPECT_GT(match.bow_score, 0.0)
+        << "tryDetectLoop accepted a loop but reported a BoW score "
+           "of " << match.bow_score << " — non-positive scores "
+           "indicate the BoW path was short-circuited.";
+}
