@@ -2629,23 +2629,47 @@ bool Tracker::kickOffBARound(int64_t timestamp_ns) {
         WindowedBA solver;
         auto result = solver.solve(poses_in, features_in,
                                     fx, fy, cx, cy,
-                                    /*max_iters=*/10,
+                                    // Bumped 10 -> 25 on 2026-05-04
+                                    // after the first real BA solves
+                                    // (sim 1777919741934) all hit
+                                    // max_iters=10 with avg_iters=10.0
+                                    // and got rejected. 25 is still
+                                    // well within the 200 ms wall-clock
+                                    // budget at K=5/N=20 (~5-8 ms per
+                                    // iter -> ~125-200 ms p99).
+                                    /*max_iters=*/25,
                                     /*huber_thresh_px=*/1.5);
 
         const auto t_done = std::chrono::steady_clock::now();
         const int64_t wall_us = std::chrono::duration_cast<std::chrono::microseconds>(
                                     t_done - t_launch).count();
 
-        // Plan Step 6 (ADR-012): acceptance gate is conservative because a
-        // bad BA result is strictly worse than no BA result.
-        //   - converged                  → solver actually iterated to a fixed point
-        //   - residual halved            → the step bought us something
-        //   - solve_us < 200 ms          → thermal-headroom budget; reject slow rounds
-        const bool residual_halved =
+        // Plan Step 6 (ADR-012): acceptance gate is permissive enough to
+        // capture genuine improvements without blessing pathological
+        // results. A bad BA result is strictly worse than no BA result,
+        // so we still reject slow rounds and degenerate residuals.
+        //   - converged                                 → solver hit one of its convergence criteria
+        //   - residual decreased by ≥ 10% OR final ≤ 4 px² avg → step bought us something
+        //   - solve_us < 200 ms                         → thermal-headroom budget
+        // The original "residual halved" gate (50%) was too strict on
+        // real device data: when the SLAM landmarks were already roughly
+        // correct (two-view midpoint triangulation seed is decent),
+        // residual_halved required the step to undo work that wasn't
+        // wrong. 10% improvement is the smallest signal that meaningfully
+        // separates "BA helped" from "BA noise". The absolute floor
+        // (4 px² avg per 2-DOF residual ≈ 2 px reproj RMS) catches the
+        // case where the seed is already inside the chi² gate so the
+        // relative improvement is small but absolute is fine.
+        const double n_residual_pairs = std::max(
+            1.0, static_cast<double>(features_in.size()));
+        const double avg_final_per_residual = result.final_residual_sq /
+            (2.0 * n_residual_pairs);  // 2 = u,v components
+        const bool residual_improved =
             result.initial_residual_sq > 0.0 &&
-            result.final_residual_sq < 0.5 * result.initial_residual_sq;
+            (result.final_residual_sq < 0.9 * result.initial_residual_sq ||
+             avg_final_per_residual < 4.0);
         const bool fast_enough = result.solve_us < BA_MAX_SOLVE_US;
-        const bool accept = result.converged && residual_halved && fast_enough;
+        const bool accept = result.converged && residual_improved && fast_enough;
 
         LOGI("BA: solve_us=%d iters=%d initial_r2=%.3f final_r2=%.3f huber=%d accept=%s wall_us=%lld round=%d",
              result.solve_us, result.iterations,
