@@ -96,15 +96,43 @@ public:
 
     // Match payload returned by tryDetectLoop. Identical layout to the
     // one declared in Tracker.h's loop_closure_pending_match_.
+    //
+    // Frame conventions (Tracker::consumeLoopClosureMatchIfReady →
+    // EKFState::updateAbsolutePose depends on getting these right):
+    //
+    //   R_now_to_match : 3x3 rotation taking now-cam-frame VECTORS into
+    //                    match-cam-frame. For any 3-D point X expressed
+    //                    in now-cam coordinates X_now,
+    //                        X_match = R_now_to_match * X_now
+    //                                + t_now_to_match.
+    //   t_now_to_match : translation expressed in MATCH-CAM coordinates
+    //                    so the equation above holds. NOT a "camera
+    //                    position difference" — it is the OpenCV-tvec-
+    //                    style translation component of the homogeneous
+    //                    now→match transform. Built in
+    //                    LoopClosureDetector.cpp:450 as
+    //                        t_match_world - R_now_to_match * t_now_world
+    //                    where the inputs are world→cam translations.
+    //   R_world_cam_match : cam→world rotation for the matched keyframe.
+    //                       X_world = R_world_cam_match * X_match
+    //                              + t_cam_world_match.
+    //   t_cam_world_match : matched-camera POSITION in world frame (a
+    //                       world-frame point, NOT a homogeneous tvec).
+    //                       Composes correctly for the now-cam world
+    //                       position as
+    //                         p_now_world = R_world_cam_match *
+    //                                       t_now_to_match
+    //                                     + t_cam_world_match.
     struct LoopMatch {
         uint64_t    matched_kf_id        = 0;
         double      bow_score            = 0.0;
         int         pnp_inliers          = 0;
-        // cam-now → cam-match relative transform from PnP.
+        // Homogeneous now-cam → match-cam transform from PnP, applied as
+        //   X_match = R_now_to_match * X_now + t_now_to_match.
         cv::Matx33d R_now_to_match       = cv::Matx33d::eye();
         cv::Vec3d   t_now_to_match       = cv::Vec3d(0, 0, 0);
-        // The matched keyframe's stored world pose (so the EKF correction
-        // path can compose absolute world poses without re-querying us).
+        // The matched keyframe's stored world pose (cam→world rotation +
+        // camera position in world).
         cv::Matx33d R_world_cam_match    = cv::Matx33d::eye();
         cv::Vec3d   t_cam_world_match    = cv::Vec3d(0, 0, 0);
     };

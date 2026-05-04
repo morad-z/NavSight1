@@ -55,6 +55,7 @@
 #include <opencv2/imgproc.hpp>
 
 #include "LoopClosureDetector.h"
+#include "EKFState.h"
 
 #include <cstdint>
 #include <cstdio>
@@ -577,4 +578,231 @@ TEST(LoopClosure, AcceptsValidLoopReturnsLoopMatch) {
         << "tryDetectLoop accepted a loop but reported a BoW score "
            "of " << match.bow_score << " — non-positive scores "
            "indicate the BoW path was short-circuited.";
+}
+
+// ── Test 6 — absolute-pose update applies a real correction ──────────────
+//
+// ADR-013 §"Correction injection — absolute pose path": when the matched
+// keyframe is older than the EKF clone window (always the case under the
+// 30 s temporal exclusion vs. ~5–10 s clone window) the only correction
+// channel that can reach it is updateAbsolutePose. This test pins the
+// channel: drift the EKF position by 5 m, then call updateAbsolutePose
+// with the pre-drift pose as the target. Post-update position must move
+// toward the target by a measurable fraction. We do NOT assert full
+// convergence — one EKF update with finite covariance lands somewhere
+// short of the target; the damping ramp + repeated updates close the
+// rest of the gap in production.
+//
+// Self-contained: builds an EKFState from scratch, no Tracker /
+// LoopClosureDetector dependency. The contract is purely about the new
+// EKFState measurement channel.
+TEST(LoopClosure, AbsolutePoseUpdateAppliesCorrection) {
+    EKFState ekf;
+    cv::Mat R_eye = cv::Mat::eye(3, 3, CV_64F);
+    ekf.initializeFull(R_eye, cv::Point3f(0, 0, 0), cv::Point3f(0, 0, 0));
+    // Add one clone so the EKF is in the same shape as production. The
+    // absolute-pose channel does NOT consume the clone — it operates on
+    // the IMU state directly — but adding it pins the test against the
+    // real state-vector layout.
+    ekf.addClone(R_eye, cv::Mat::zeros(3, 1, CV_64F), 1'000'000'000LL);
+
+    // Inject a 5 m drift into the EKF position via a tight measurement
+    // through updatePDRStep (X/Z axes). PDR's H is +I on δp_x/δp_z so a
+    // measurement of (5, 0, 0) plus tight variance pulls the position
+    // toward (5, 0, 0). Run the update twice with very tight variance
+    // so the EKF lands close to the target — we want a meaningful drift,
+    // not a 1 cm nudge dominated by the prior.
+    for (int i = 0; i < 4; ++i) {
+        ASSERT_TRUE(ekf.updatePDRStep(/*dx_world=*/5.0,
+                                       /*dz_world=*/0.0,
+                                       /*var=*/1e-6));
+    }
+    cv::Mat p_drifted = ekf.getPosition();
+    const double drifted_x = p_drifted.at<double>(0);
+    ASSERT_GT(drifted_x, 1.0)
+        << "Pre-condition: EKF position should have drifted noticeably "
+           "before the absolute-pose update. Got x="
+        << drifted_x;
+
+    // Target: pre-drift origin pose. Apply updateAbsolutePose with
+    // moderate variance — same scale loop closure uses (~3° rot, 10 cm
+    // pos, no damping inflation).
+    cv::Mat target_R = cv::Mat::eye(3, 3, CV_64F);
+    cv::Mat target_p = cv::Mat::zeros(3, 1, CV_64F);
+    const double sigma_axis_sq_R = 0.05236 * 0.05236;  // (3°)² in rad²
+    const double var_p           = 0.10 * 0.10;        // 10 cm² in m²
+    const bool ok = ekf.updateAbsolutePose(target_R, target_p,
+                                            sigma_axis_sq_R, var_p);
+    ASSERT_TRUE(ok)
+        << "updateAbsolutePose returned false on a well-formed input. "
+           "Either the chi² gate is over-tight (5 m residual @ 10 cm² "
+           "var should be inside the χ²(0.999, 6 DOF) ≈ 22.5 outer gate "
+           "after the EKF prior is folded in) or input validation is "
+           "rejecting valid Mat shapes.";
+
+    cv::Mat p_after = ekf.getPosition();
+    const double after_x = p_after.at<double>(0);
+    const double moved   = drifted_x - after_x;          // positive if
+                                                          // moved toward 0
+    const double moved_frac = moved / drifted_x;
+
+    // Soft assertion: the correction must move us meaningfully toward
+    // the target. A single EKF update with finite covariance + damping
+    // doesn't snap to the target; >30% closure is the bar this test
+    // pins. A regression that flips the rotation sign or zeroes the
+    // position Jacobian would land moved_frac near 0 — caught here.
+    EXPECT_GT(moved_frac, 0.30)
+        << "updateAbsolutePose moved the EKF position by only "
+        << (moved_frac * 100.0) << "% of the drift toward the target. "
+        << "Drifted x=" << drifted_x << " m → after x=" << after_x
+        << " m. A regression that zeros the position Jacobian or flips "
+           "the residual sign would surface here as a near-zero or "
+           "negative fraction.";
+    EXPECT_GT(moved, 0.0)
+        << "updateAbsolutePose moved the EKF position AWAY from the "
+           "target (moved=" << moved << " m). Sign of the position "
+           "residual or Jacobian is wrong.";
+}
+
+// ── Test 7 — absolute-pose update rotates toward target ──────────────────
+//
+// Pins the rotation Jacobian sign that the foreground reviewer flagged.
+// Initialize the EKF with R_GtoI_ = Rodrigues(0.5 rad about world-Z),
+// call updateAbsolutePose with target_R = identity, assert the resulting
+// R_GtoI_ has rotated toward identity (axis-angle norm strictly less than
+// the starting 0.5 rad). A sign flip in H_R or in the residual Lie
+// algebra would *increase* the rotation magnitude — caught here.
+//
+// Self-contained: pure EKFState contract test, no Tracker /
+// LoopClosureDetector dependency.
+TEST(LoopClosure, AbsolutePoseUpdateRotatesTowardTarget) {
+    EKFState ekf;
+    // Start with R_GtoI_ rotated by 0.5 rad (~28.6°) about world-Z. This
+    // is a pure-yaw drift, the same shape loop closure typically corrects.
+    cv::Mat R_initial;
+    cv::Rodrigues(cv::Vec3d(0.0, 0.0, 0.5), R_initial);
+    ekf.initializeFull(R_initial, cv::Point3f(0, 0, 0), cv::Point3f(0, 0, 0));
+    ekf.addClone(R_initial, cv::Mat::zeros(3, 1, CV_64F), 1'000'000'000LL);
+
+    cv::Mat R_before = ekf.getRotation();
+    cv::Mat r_before;
+    cv::Rodrigues(R_before, r_before);
+    const double mag_before = cv::norm(r_before);
+    ASSERT_NEAR(mag_before, 0.5, 1e-6)
+        << "Pre-condition: starting rotation magnitude should be 0.5 rad. "
+           "Got " << mag_before;
+
+    // Target: identity rotation. Use loose position variance because we
+    // don't care about p — we only want the rotation to converge.
+    cv::Mat target_R = cv::Mat::eye(3, 3, CV_64F);
+    cv::Mat target_p = cv::Mat::zeros(3, 1, CV_64F);
+    // Tight rotation variance (1°² in rad²) to make the gain large enough
+    // that the correction is meaningful in one shot — same scale loop
+    // closure uses with strength = 1.0.
+    const double sigma_axis_sq_R = (1.0 * M_PI / 180.0) *
+                                    (1.0 * M_PI / 180.0);
+    const double var_p           = 1.0;  // wide — don't constrain p
+
+    ASSERT_TRUE(ekf.updateAbsolutePose(target_R, target_p,
+                                        sigma_axis_sq_R, var_p))
+        << "updateAbsolutePose returned false on a well-formed input. "
+           "0.5 rad residual at 1° measurement noise should be inside "
+           "the χ² gate after the EKF prior is folded in.";
+
+    cv::Mat R_after = ekf.getRotation();
+    cv::Mat r_after;
+    cv::Rodrigues(R_after, r_after);
+    const double mag_after = cv::norm(r_after);
+
+    // The correction must reduce the rotation magnitude. A sign flip in
+    // H_R or in the Lie-algebra residual would *increase* it.
+    EXPECT_LT(mag_after, mag_before)
+        << "updateAbsolutePose ROTATED AWAY from the target. "
+        << "Initial |R|=" << mag_before << " rad, after |R|="
+        << mag_after << " rad. Rotation Jacobian sign is wrong: a +I_3 / "
+           "−I_3 mismatch on the δθ rows would surface exactly like "
+           "this. See the H_R derivation in EKFState::updateAbsolutePose.";
+
+    // Soft assertion on convergence: with high gain we expect to close
+    // most of the gap. Loose threshold (>20% closure) so the test isn't
+    // sensitive to small changes in the EKF prior covariance.
+    const double closure_frac = (mag_before - mag_after) / mag_before;
+    EXPECT_GT(closure_frac, 0.20)
+        << "updateAbsolutePose only closed " << (closure_frac * 100.0)
+        << "% of the rotation gap with tight measurement variance — "
+           "expected at least 20%. Either H_R is wrong magnitude or the "
+           "Joseph update is starving the rotation block.";
+}
+
+// ── Test 8 — Tracker-style world-pose composition round-trip ─────────────
+//
+// Pins the translation composition convention the foreground reviewer
+// flagged. Build a synthetic LoopMatch from two known camera world
+// poses (now and match) and verify that the Tracker-side composition
+//
+//     target_t_cam_world = R_world_cam_match * t_now_to_match
+//                        + t_cam_world_match
+//
+// recovers the now-camera's known world position. A convention mismatch
+// in either field would produce a wildly different position (the
+// reviewer's failure mode).
+//
+// We mirror the LoopClosureDetector::tryDetectLoop construction
+// (LoopClosureDetector.cpp:440-451) so this test pins the SAME formulas
+// the production path uses.
+TEST(LoopClosure, LoopMatchTranslationConventionRoundTrip) {
+    // Two cameras in world frame:
+    //   match cam at world position (5, 0, 0), pure-yaw 30° about world-Y
+    //   now   cam at world position (8, 0, 4), pure-yaw 60° about world-Y
+    cv::Mat R_world_cam_match_cv;
+    cv::Rodrigues(cv::Vec3d(0.0, 30.0 * M_PI / 180.0, 0.0),
+                  R_world_cam_match_cv);
+    cv::Matx33d R_world_cam_match(R_world_cam_match_cv);
+    cv::Vec3d   t_cam_world_match(5.0, 0.0, 0.0);   // match cam pos in world
+
+    cv::Mat R_world_cam_now_cv;
+    cv::Rodrigues(cv::Vec3d(0.0, 60.0 * M_PI / 180.0, 0.0),
+                  R_world_cam_now_cv);
+    cv::Matx33d R_world_cam_now(R_world_cam_now_cv);
+    cv::Vec3d   t_cam_world_now(8.0, 0.0, 4.0);     // now cam pos in world
+
+    // Build R_now_to_match / t_now_to_match using the EXACT formulas in
+    // LoopClosureDetector.cpp:440-451 (PnP convention, match-cam frame
+    // translation). PnP returns world→now-cam:
+    //     R_now_world = R_world_cam_now.t()
+    //     t_now_world = -R_now_world * t_cam_world_now    (world origin
+    //                                                       in now-cam)
+    const cv::Matx33d R_now_world  = R_world_cam_now.t();
+    const cv::Vec3d   t_now_world  = -(R_now_world * t_cam_world_now);
+    const cv::Matx33d R_match_world = R_world_cam_match.t();
+    const cv::Vec3d   t_match_world = -(R_match_world * t_cam_world_match);
+    const cv::Matx33d R_now_to_match = R_match_world * R_now_world.t();
+    const cv::Vec3d   t_now_to_match =
+        t_match_world - R_now_to_match * t_now_world;
+
+    // Tracker-side composition (mirror of consumeLoopClosureMatchIfReady):
+    const cv::Matx33d target_R_world_cam = R_world_cam_match * R_now_to_match;
+    const cv::Vec3d   target_t_cam_world = R_world_cam_match * t_now_to_match
+                                          + t_cam_world_match;
+
+    // Round-trip: target_R_world_cam must equal R_world_cam_now and
+    // target_t_cam_world must equal t_cam_world_now (within float noise).
+    for (int r = 0; r < 3; ++r) {
+        for (int c = 0; c < 3; ++c) {
+            EXPECT_NEAR(target_R_world_cam(r, c), R_world_cam_now(r, c), 1e-9)
+                << "Composed target_R_world_cam mismatch at (" << r
+                << ", " << c << "). Either R_now_to_match's convention is "
+                   "different from what Tracker assumes, or the production "
+                   "composition order is wrong.";
+        }
+    }
+    for (int i = 0; i < 3; ++i) {
+        EXPECT_NEAR(target_t_cam_world[i], t_cam_world_now[i], 1e-9)
+            << "Composed target_t_cam_world mismatch at axis " << i
+            << ". Reviewer flagged exactly this — a convention mismatch "
+               "between t_now_to_match (claimed world→cam tvec) and "
+               "t_cam_world_match (cam-pos-in-world). Round-trip from "
+               "synthetic world poses confirms the formula in "
+               "Tracker::consumeLoopClosureMatchIfReady is correct.";
+    }
 }

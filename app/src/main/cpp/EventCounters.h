@@ -49,7 +49,9 @@
 //     "loop_closure_accepts": N,
 //     "loop_closure_rejects_low_score": N,
 //     "loop_closure_rejects_pnp": N,
-//     "loop_closure_kf_count_in_db": N
+//     "loop_closure_kf_count_in_db": N,
+//     "loop_closure_chi2_rejected": N,
+//     "loop_closure_corrections_applied": N
 //   }
 
 #include <atomic>
@@ -118,6 +120,13 @@ struct EventCounters {
     std::atomic<long long> loop_closure_rejects_low_score{0};
     std::atomic<long long> loop_closure_rejects_pnp{0};
     std::atomic<long long> loop_closure_kf_count_in_db{0};
+    // Step 7 absolute-pose injection (ADR-013 §"Correction injection —
+    // absolute pose path"). Completes accounting from detection to
+    // correction: chi²_rejected counts wildly-wrong matches caught by
+    // the outer gate; corrections_applied counts every successful
+    // updateAbsolutePose injection through the EKF.
+    std::atomic<long long> loop_closure_chi2_rejected{0};
+    std::atomic<long long> loop_closure_corrections_applied{0};
 
     // Reset every counter to 0. Called on simulator-recording start so
     // each sim begins with a clean slate. Cheap atomic stores; safe to
@@ -155,6 +164,8 @@ struct EventCounters {
         loop_closure_rejects_low_score.store(0, std::memory_order_relaxed);
         loop_closure_rejects_pnp.store(0, std::memory_order_relaxed);
         loop_closure_kf_count_in_db.store(0, std::memory_order_relaxed);
+        loop_closure_chi2_rejected.store(0, std::memory_order_relaxed);
+        loop_closure_corrections_applied.store(0, std::memory_order_relaxed);
     }
 
     // Monotonic max-update for ba_solve_us_max. Lock-free CAS loop.
@@ -206,6 +217,8 @@ struct EventCounters {
         const long long v_loop_closure_rejects_low_score= loop_closure_rejects_low_score.load(std::memory_order_relaxed);
         const long long v_loop_closure_rejects_pnp      = loop_closure_rejects_pnp.load(std::memory_order_relaxed);
         const long long v_loop_closure_kf_count_in_db   = loop_closure_kf_count_in_db.load(std::memory_order_relaxed);
+        const long long v_loop_closure_chi2_rejected    = loop_closure_chi2_rejected.load(std::memory_order_relaxed);
+        const long long v_loop_closure_corrections_applied = loop_closure_corrections_applied.load(std::memory_order_relaxed);
 
         std::string out;
         out.reserve(800);
@@ -239,7 +252,9 @@ struct EventCounters {
         appendKv(out, "loop_closure_accepts",          v_loop_closure_accepts);          out += ',';
         appendKv(out, "loop_closure_rejects_low_score", v_loop_closure_rejects_low_score); out += ',';
         appendKv(out, "loop_closure_rejects_pnp",      v_loop_closure_rejects_pnp);      out += ',';
-        appendKv(out, "loop_closure_kf_count_in_db",   v_loop_closure_kf_count_in_db);
+        appendKv(out, "loop_closure_kf_count_in_db",   v_loop_closure_kf_count_in_db);   out += ',';
+        appendKv(out, "loop_closure_chi2_rejected",    v_loop_closure_chi2_rejected);    out += ',';
+        appendKv(out, "loop_closure_corrections_applied", v_loop_closure_corrections_applied);
         out += '}';
         return out;
     }

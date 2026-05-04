@@ -3161,54 +3161,6 @@ void Tracker::consumeLoopClosureMatchIfReady() {
     const int matched_clone_id = static_cast<int>(
         loop_closure_active_match_.matched_kf_id);
 
-    // Sanity: the matched keyframe's clone may have been marginalised
-    // out of the EKF window (LOOP_CLOSURE_TEMPORAL_EXCL_NS = 30 s but
-    // the EKF window only carries the most recent ~11 clones — so most
-    // matches WILL be against a clone outside the window). When the
-    // clone is gone we cannot inject a relative-pose constraint against
-    // it, so drop the ramp here and log once per fresh match. A future
-    // refinement (gated on a "world-frame absolute pose" measurement
-    // channel in EKFState) would let us close the loop without needing
-    // the matched clone in the live window.
-    cv::Mat R_match_now, p_match_now;
-    if (!ekf_.getClonePose(matched_clone_id, R_match_now, p_match_now)) {
-        // ────────────────────────────────────────────────────────────────────
-        // KNOWN GAP — Step 7 effective-correction blocker
-        //
-        // The temporal exclusion window (30 s) is by design larger than the
-        // EKF clone window (~11 clones × 0.5-1 s keyframe interval ≈ 5-10 s).
-        // Therefore EVERY accepted loop match has matched_clone_id older
-        // than what the EKF can reach via getClonePose, and we drop the
-        // correction here every time. **Loop closure currently fires
-        // detection but never injects a correction.**
-        //
-        // Fix path (next session): add EKFState::updateAbsolutePose(
-        //   R_world_cam_target, t_cam_world_target, var_R, var_t)
-        // — a new measurement channel that consumes the matched keyframe's
-        // STORED world-frame pose (we already carry it in
-        // LoopMatch::R_world_cam_match / t_cam_world_match) plus the
-        // relative R/t from the LoopMatch, computes the implied current
-        // world pose, and runs an EKF update against the IMU-frame state
-        // directly — independent of the clone window. Same Joseph form +
-        // damping schedule as updateRelativeRotation. ~80 LOC + tests.
-        //
-        // Until then: BoW match detection IS working (event_summary
-        // loop_closure_accepts > 0 confirms recognition), but drift
-        // reduction from loop closure stays at 0. ADR-013 documents this
-        // gap explicitly. Do not call this a regression — the rest of
-        // the VIO pipeline is unaffected.
-        // ────────────────────────────────────────────────────────────────────
-        if (fresh_match_picked_up) {
-            LOGI("LOOP_CLOSURE: matched_clone=%d outside EKF window — "
-                 "DETECTION OK but correction injection blocked pending "
-                 "EKFState::updateAbsolutePose (see ADR-013).",
-                 matched_clone_id);
-        }
-        loop_closure_damping_remaining_ = 0;
-        loop_closure_active_match_set_  = false;
-        return;
-    }
-
     // Step 3 — damping schedule. strength on frame `k` of N (N=10):
     //     strength_k = 1 - k/N    →  k=0: 1.0,  k=9: 0.1
     // Inflate the measurement variance by 1/strength² so the EKF gain
@@ -3222,77 +3174,97 @@ void Tracker::consumeLoopClosureMatchIfReady() {
     // 0.01; the floor of 0.01 keeps var inflation bounded at 100×).
     const double damping_inv = 1.0 / std::max(1e-2, strength_sq);
 
-    // Step 4 — relative translation, world frame. The detector returns
-    //   t_now_to_match : translation (in match-camera frame) from
-    //                     current pose to matched pose.
-    // The EKF channel expects the world-frame delta from matched-clone
-    // position to current-clone position: ΔP_world = p_now - p_match.
-    // We don't have p_now directly here (consumed before processFrame
-    // overwrites it), so reconstruct from the LoopMatch:
-    //   p_match_should_be = R_world_cam_match * (-t_now_to_match) + p_now
-    // ...which is more brittle than reading the EKF state directly. The
-    // robust path: t_world_metric = current EKF position − matched-clone
-    // position, then add a residual term that pulls the current position
-    // toward the SAME relative offset the matched keyframe had. The
-    // simplest expression: target the relative-pose update so that the
-    // EKF current pose snaps to (p_match + R_world_cam_match * (-t_now_to_match)).
-    // But updateRelativePose's H matrix is +I on δp_current and −I on
-    // δp at clone_id, so the natural measurement is ΔP_world we WANT
-    // the filter to converge toward — which is exactly the loop-closure
-    // residual. Build it from the match's stored matched-clone pose and
-    // the rotation between now and match.
-    cv::Mat t_world_metric(3, 1, CV_64F);
-    {
-        // Convert the camera-frame relative translation to world frame.
-        // R_world_cam_match takes match-camera-frame vectors into world
-        // frame. The detector's `t_now_to_match` lives in the match's
-        // camera frame. World-frame delta from match-clone to now:
-        //     ΔP_world = R_world_cam_match * (-t_now_to_match)
-        const auto& R_wc = loop_closure_active_match_.R_world_cam_match;
-        const auto& t_n2m = loop_closure_active_match_.t_now_to_match;
-        const cv::Vec3d delta_world = R_wc * (-t_n2m);
-        t_world_metric.at<double>(0) = delta_world[0];
-        t_world_metric.at<double>(1) = delta_world[1];
-        t_world_metric.at<double>(2) = delta_world[2];
-    }
+    // ────────────────────────────────────────────────────────────────────
+    // ADR-013 §"Correction injection — absolute pose path":
+    //
+    // The matched keyframe's clone is almost always older than the EKF
+    // sliding window (temporal exclusion 30 s vs. ~5–10 s clone window).
+    // updateRelativePose / updateRelativeRotation both REQUIRE the
+    // matched clone to live in the window — when it doesn't, the
+    // correction would silently drop. Use the world-frame absolute-pose
+    // channel instead: it consumes a target world-frame IMU pose and
+    // applies the correction directly, independent of clone availability.
+    //
+    // Compose the target IMU pose from the match payload:
+    //
+    //   target_R_world_cam = R_world_cam_match * R_now_to_match
+    //   target_t_cam_world = R_world_cam_match * t_now_to_match
+    //                      + t_cam_world_match
+    //
+    // (`R_world_cam_match` is camera→world; composing with `R_now_to_match`
+    // — the cam-now → cam-match relative — chains "now-cam → match-cam →
+    // world", which is the world pose of the now-camera the loop closure
+    // says we should be at.)
+    //
+    // Convert camera→world to world→IMU using the symmetric self-inverse
+    // body↔camera extrinsic R_b2c = diag(1, -1, -1) used elsewhere in
+    // Tracker (line ~1127 / ~2063):
+    //
+    //   target_R_GtoI = R_b2c * target_R_world_cam.t()
+    //
+    // Position: handheld phone, body and camera are co-located (lever
+    // arm absorbed into the per-frame R_vo path; Step 8 is where the
+    // proper extrinsic translation lands). So the world-frame IMU
+    // position equals the world-frame camera position.
+    // ────────────────────────────────────────────────────────────────────
+    const auto& R_wc_match = loop_closure_active_match_.R_world_cam_match;
+    const auto& t_cw_match = loop_closure_active_match_.t_cam_world_match;
+    const auto& R_n2m      = loop_closure_active_match_.R_now_to_match;
+    const auto& t_n2m      = loop_closure_active_match_.t_now_to_match;
 
-    const double var_t = (LOOP_CLOSURE_BASE_TRANS_SIGMA_M *
-                          LOOP_CLOSURE_BASE_TRANS_SIGMA_M) * damping_inv;
-    const bool t_ok = ekf_.updateRelativePose(t_world_metric,
-                                               matched_clone_id, var_t);
+    // target_R_world_cam (cam→world for now-cam)
+    const cv::Matx33d target_R_world_cam = R_wc_match * R_n2m;
+    // target world position of now-cam
+    const cv::Vec3d   target_t_cam_world = R_wc_match * t_n2m + t_cw_match;
 
-    // Step 5 — relative rotation. R_now_to_match is body-frame for
-    // NavSight's pinhole pipeline (the Step 2 R_vo path treats body and
-    // camera frames as coincident; the IMU↔camera extrinsic correction
-    // is reserved for Step 8). updateRelativeRotation expects a body-
-    // frame R from clone_id's body to current body — flip the sign of
-    // the rotation axis to swap "now→match" → "match→now".
-    cv::Mat R_meas_body(3, 3, CV_64F);
-    {
-        const auto& R = loop_closure_active_match_.R_now_to_match;
-        // Transpose to invert the rotation (now→match becomes match→now).
-        for (int r = 0; r < 3; ++r) {
-            for (int c = 0; c < 3; ++c) {
-                R_meas_body.at<double>(r, c) = R(c, r);
-            }
+    // R_b2c — same self-inverse extrinsic Tracker uses elsewhere
+    static const cv::Matx33d R_b2c(1.0,  0.0,  0.0,
+                                   0.0, -1.0,  0.0,
+                                   0.0,  0.0, -1.0);
+    // target world→IMU rotation. R_world_cam takes cam→world; transpose
+    // gives world→cam; pre-multiply by R_b2c (body↔camera, self-inverse)
+    // to land in body/IMU frame.
+    const cv::Matx33d target_R_GtoI_mx = R_b2c * target_R_world_cam.t();
+
+    cv::Mat target_R_GtoI(3, 3, CV_64F);
+    cv::Mat target_p_world(3, 1, CV_64F);
+    for (int r = 0; r < 3; ++r) {
+        for (int c = 0; c < 3; ++c) {
+            target_R_GtoI.at<double>(r, c) = target_R_GtoI_mx(r, c);
         }
+        target_p_world.at<double>(r, 0) = target_t_cam_world[r];
     }
-    const double sigma_axis_sq = (LOOP_CLOSURE_BASE_ROT_SIGMA_RAD *
-                                  LOOP_CLOSURE_BASE_ROT_SIGMA_RAD) * damping_inv;
-    const bool r_ok = ekf_.updateRelativeRotation(R_meas_body, sigma_axis_sq,
-                                                   matched_clone_id);
+
+    // Variance: same damping schedule as the original relative-pose
+    // attempt — sigma_axis_sq_R inflated by 1/strength², var_p too.
+    const double sigma_axis_sq_R = (LOOP_CLOSURE_BASE_ROT_SIGMA_RAD *
+                                     LOOP_CLOSURE_BASE_ROT_SIGMA_RAD) * damping_inv;
+    const double var_p           = (LOOP_CLOSURE_BASE_TRANS_SIGMA_M *
+                                     LOOP_CLOSURE_BASE_TRANS_SIGMA_M) * damping_inv;
+
+    const bool ok = ekf_.updateAbsolutePose(target_R_GtoI, target_p_world,
+                                             sigma_axis_sq_R, var_p);
+    if (ok) {
+        navsight::eventCounters().loop_closure_corrections_applied.fetch_add(
+            1, std::memory_order_relaxed);
+    }
 
     // Log every step of the ramp at INFO so a real loop closure shows
     // up in the trace as a coherent 10-line sequence.
-    LOGI("LOOP_CLOSURE: damp k=%d/%d strength=%.2f var_t=%.4f var_R=%.4e "
-         "t_world=[%.3f %.3f %.3f] match_clone=%d t_ok=%d R_ok=%d",
+    LOGI("LOOP_CLOSURE: damp k=%d/%d strength=%.2f var_p=%.4f var_R=%.4e "
+         "target_p=[%.3f %.3f %.3f] match_kf=%d ok=%d (abs-pose channel)",
          k + 1, LOOP_CLOSURE_DAMPING_FRAMES, strength,
-         var_t, sigma_axis_sq,
-         t_world_metric.at<double>(0),
-         t_world_metric.at<double>(1),
-         t_world_metric.at<double>(2),
+         var_p, sigma_axis_sq_R,
+         target_p_world.at<double>(0),
+         target_p_world.at<double>(1),
+         target_p_world.at<double>(2),
          matched_clone_id,
-         t_ok ? 1 : 0, r_ok ? 1 : 0);
+         ok ? 1 : 0);
+    if (fresh_match_picked_up) {
+        LOGI("LOOP_CLOSURE: fresh match picked up (kf=%d) — beginning "
+             "%d-frame damped absolute-pose ramp.",
+             matched_clone_id, LOOP_CLOSURE_DAMPING_FRAMES);
+    }
 
     --loop_closure_damping_remaining_;
     if (loop_closure_damping_remaining_ <= 0) {

@@ -215,6 +215,39 @@ public:
                                 double sigma_axis_sq,
                                 int clone_id);
 
+    // Plan Step 7 (ADR-013 §"Correction injection — absolute pose path"):
+    // absolute world-frame pose measurement. Used by loop-closure when
+    // the matched keyframe's clone has been marginalised out of the
+    // sliding window — the clone-based relative-pose channels can't
+    // reach those references, so this channel applies the correction
+    // directly to the IMU-state's world-frame position and attitude.
+    //
+    //   target_R_world_imu : 3x3 CV_64F, world->imu rotation the loop
+    //                        closure says we should be at. Caller is
+    //                        responsible for composing the matched
+    //                        keyframe's stored R_world_cam with the
+    //                        relative R_now_to_match and the camera-IMU
+    //                        extrinsic to land in IMU frame.
+    //   target_p_world     : 3x1 CV_64F, world-frame IMU position the
+    //                        loop closure says we should be at. Same
+    //                        composition responsibility.
+    //   sigma_axis_sq_R    : per-axis variance of the rotation
+    //                        measurement (rad²). Loop closure derives
+    //                        this from PnP inlier count + damping
+    //                        schedule.
+    //   var_p              : per-axis variance of the position
+    //                        measurement (m²). Same source.
+    //
+    // Returns true on success (Joseph-form update applied). False on
+    // (a) EKF not full-init, (b) malformed Mat inputs, (c) the chi²
+    // gate trips (residual > a generous outer threshold — protects
+    // against wildly wrong loop matches before damping has a chance
+    // to fade them in).
+    bool updateAbsolutePose(const cv::Mat& target_R_world_imu,
+                            const cv::Mat& target_p_world,
+                            double sigma_axis_sq_R,
+                            double var_p);
+
     // PDR step constraint: world-frame XZ position increment from a step
     // event. var is variance of each component (m²).
     bool updatePDRStep(double dx_world, double dz_world, double var);

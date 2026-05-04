@@ -313,3 +313,19 @@ damping window) from its current default, the following must hold:
    simulation_data JSON. A clean walk that visibly closes a loop
    but reports zero accepts means the runtime gates are too tight
    and the parameters need re-tuning before this ADR ships.
+
+## 2026-05-04 (later) — Absolute-pose injection channel landed
+
+Step 7's original integration assumed every accepted loop match would
+have its matched clone still in the EKF window. In practice the
+temporal exclusion (30 s) is always larger than the clone window
+(~5-10 s), so the relative-pose / relative-rotation channels never
+fired. `EKFState::updateAbsolutePose` closes the gap: it consumes a
+target world-frame IMU pose and corrects IMU-state directly via the
+existing `applyMSCKFUpdate` primitive (Joseph form, ADR-008 damping +
+Huber inherited). Outer χ² gate at 22.5 (wide) protects against
+wildly wrong loop matches before damping fades them in.
+
+Two new event_summary fields: `loop_closure_chi2_rejected` and
+`loop_closure_corrections_applied` — completes the accounting from
+detection through correction.

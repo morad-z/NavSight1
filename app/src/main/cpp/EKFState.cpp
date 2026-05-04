@@ -793,6 +793,136 @@ bool EKFState::updateRelativeRotation(const cv::Mat& R_meas_body,
     return true;
 }
 
+// Plan Step 7 (ADR-013 §"Correction injection — absolute pose path"):
+// World-frame absolute pose measurement. Independent of the clone window —
+// loop-closure's matched keyframe is almost always older than the EKF
+// sliding window (temporal exclusion 30 s vs. ~5–10 s clone window), so
+// the relative-pose channels cannot reach it. This channel composes the
+// 6-DOF residual on the IMU state directly:
+//
+//   r_R = log(target_R_world_imu * R_GtoI_.t())   (rotation residual,
+//                                                   3 DOF, world frame)
+//   r_p = target_p_world - p_G_                   (translation residual)
+//
+// Sign convention (matches updateRelativeRotation, line 760+):
+//   H_R = +I on δθ (rows 0..2)  — derivation below
+//   H_p = +I on δp (rows 12..14)
+//
+// Why H_R = +I (not −I): the EKF uses the OpenVINS / MSCKF error-state
+// convention R_estimate = exp(−[δθ]×) · R_true with the state update
+// applied as R_GtoI_ ← Rodrigues(dθ) · R_GtoI_ (line 613). Substituting
+// R_GtoI_(true) = exp([δθ]×) · R_GtoI_(estimate) into r_R, with R_target
+// being noise-free truth, gives r_R ≈ +δθ — so the Kalman gain with
+// H = +I drives dθ in the direction that zeroes the residual. This is
+// the same derivation that makes updateRelativeRotation's H = +I correct
+// for its current-pose δθ block. A reviewer reading the code as if it
+// used the right-perturbation convention would expect H = −I; we have
+// chosen left-perturbation in the body frame, so +I is correct.
+//
+// The χ² gate is intentionally wide (≈ 22.5 = χ²(0.999, 6 DOF)). Loop
+// closures are tolerant by design: damping fades a wrong match across
+// 10 frames; a tight χ² would defeat that. We only reject *wildly*
+// wrong matches before damping kicks in.
+bool EKFState::updateAbsolutePose(const cv::Mat& target_R_world_imu,
+                                  const cv::Mat& target_p_world,
+                                  double sigma_axis_sq_R,
+                                  double var_p) {
+    if (!full_initialized_ || P_.empty()) return false;
+    if (target_R_world_imu.rows != 3 || target_R_world_imu.cols != 3 ||
+        target_R_world_imu.type() != CV_64F) {
+        return false;
+    }
+    if (target_p_world.rows != 3 || target_p_world.cols != 1 ||
+        target_p_world.type() != CV_64F) {
+        return false;
+    }
+
+    const int dim = P_.rows;
+    if (dim < IMU_STATE_DIM) return false;
+
+    // ── Residual (6×1) ────────────────────────────────────────────────
+    // Rotation residual on SO(3), expressed in world frame, exactly the
+    // pattern updateRelativeRotation uses. Both R_GtoI_ and the target
+    // are world→imu; their composition target * R_GtoI_.t() lives on
+    // SO(3) and Rodrigues linearises it to a 3-vector axis-angle.
+    //   r_R = log(target * R_pred.t())
+    // With H_R = +I on δθ (rows 0..2) the Kalman gain produces a
+    // correction dθ that, applied as dR = Rodrigues(dθ); R_GtoI_ =
+    // dR * R_GtoI_, drives R_GtoI_ toward target. Sign-cross-checked
+    // against updateRelativeRotation's identical structure.
+    cv::Mat R_err = target_R_world_imu * R_GtoI_.t();
+    cv::Mat r_R;
+    cv::Rodrigues(R_err, r_R);  // 3x1
+    if (r_R.rows != 3 || r_R.cols != 1) return false;
+    // Wrap each axis to [-π, π] (defensive — Rodrigues already returns
+    // within ±π, but numerical drift on near-π rotations can leak).
+    for (int i = 0; i < 3; i++) {
+        double v = r_R.at<double>(i, 0);
+        while (v >  M_PI) v -= 2.0 * M_PI;
+        while (v < -M_PI) v += 2.0 * M_PI;
+        r_R.at<double>(i, 0) = v;
+    }
+
+    cv::Mat r_p = target_p_world - p_G_;  // 3x1
+
+    cv::Mat r = cv::Mat::zeros(6, 1, CV_64F);
+    for (int i = 0; i < 3; i++) {
+        r.at<double>(i, 0)     = r_R.at<double>(i, 0);
+        r.at<double>(3 + i, 0) = r_p.at<double>(i, 0);
+    }
+
+    // ── Jacobian (6 × dim) ───────────────────────────────────────────
+    // IMU error-state layout: [δθ(0..2), δb_g(3..5), δv(6..8),
+    // δb_a(9..11), δp(12..14)]. With r_R = log(R_target * R_pred.t())
+    // the Jacobian rows are +I on δθ (current rotation) and +I on δp
+    // (current position) — same structure updateRelativeRotation uses
+    // for its current-pose block, just without the "minus on the clone"
+    // that channel needs because we have no clone reference here.
+    cv::Mat H = cv::Mat::zeros(6, dim, CV_64F);
+    for (int i = 0; i < 3; i++) {
+        H.at<double>(i, i)         = 1.0;        // ∂r_R / ∂δθ
+        H.at<double>(3 + i, 12 + i) = 1.0;        // ∂r_p / ∂δp
+    }
+
+    // ── Measurement noise (6×6) ─────────────────────────────────────
+    cv::Mat R_noise = cv::Mat::zeros(6, 6, CV_64F);
+    const double sR = std::max(sigma_axis_sq_R, 1e-8);
+    const double sp = std::max(var_p, 1e-6);
+    for (int i = 0; i < 3; i++) {
+        R_noise.at<double>(i, i)         = sR;
+        R_noise.at<double>(3 + i, 3 + i) = sp;
+    }
+
+    // ── Outer χ² gate ───────────────────────────────────────────────
+    // χ²(0.999, 6 DOF) ≈ 22.458. Wide gate: loop closures are
+    // intentionally tolerant. A residual that fails this gate is
+    // effectively a teleportation request the filter would never
+    // recover from; rejecting it preserves the existing state.
+    static constexpr double kChi2Threshold = 22.5;
+    cv::Mat S = H * P_ * H.t() + R_noise;
+    cv::Mat S_inv;
+    if (!cv::invert(S, S_inv, cv::DECOMP_CHOLESKY)) {
+        if (!cv::invert(S, S_inv, cv::DECOMP_SVD)) return false;
+    }
+    cv::Mat m_mat = r.t() * S_inv * r;
+    const double m2 = m_mat.at<double>(0, 0);
+    if (m2 > kChi2Threshold) {
+        LOGI("LC_ABS: chi2_reject m=%.3f thresh=%.1f", m2, kChi2Threshold);
+        navsight::eventCounters().loop_closure_chi2_rejected.fetch_add(
+            1, std::memory_order_relaxed);
+        return false;
+    }
+
+    LOGI("LC_ABS: r_R=[%.3f %.3f %.3f] r_p=[%.3f %.3f %.3f] "
+         "var_R=%.4e var_p=%.4f m2=%.3f applied",
+         r_R.at<double>(0, 0), r_R.at<double>(1, 0), r_R.at<double>(2, 0),
+         r_p.at<double>(0, 0), r_p.at<double>(1, 0), r_p.at<double>(2, 0),
+         sR, sp, m2);
+
+    applyMSCKFUpdate(H, r, R_noise);
+    return true;
+}
+
 bool EKFState::updateGravityAlignedYaw(double yaw_meas, double var,
                                        double roll, double pitch) {
     if (!full_initialized_ || P_.empty()) return false;
