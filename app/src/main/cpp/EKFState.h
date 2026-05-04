@@ -1,6 +1,7 @@
 #pragma once
 #include <vector>
 #include <deque>
+#include <mutex>
 #include <cstdint>
 #include <opencv2/core.hpp>
 
@@ -234,6 +235,30 @@ public:
     const std::deque<CameraPose>& getWindow() const { return window_; }
     int getLatestCloneId() const;
 
+    // ── Plan Step 6 (ADR-012): thread-safe snapshot for windowed BA ─────────
+    //
+    // Read-only copy of the most-recent `max_clones` camera poses, ordered
+    // oldest first so the BA gauge-fix pick (oldest = anchor) is unambiguous.
+    // Designed to be called from the BA worker thread; the camera thread
+    // mutates `window_` exclusively through addClone / marginalizeOldestClone /
+    // pruneWindow, and those mutators take the same `snapshot_mutex_` while
+    // splicing the deque so the snapshot reader never observes a torn state.
+    //
+    // The lock is held only for the duration of the deque walk + a per-pose
+    // 3x3 + 3x1 matrix clone — i.e. O(max_clones) work, no allocations beyond
+    // the returned vector. Camera-thread writers see ≤ a few microseconds of
+    // lock contention per frame, which is negligible against the per-frame
+    // budget. The snapshot returns the CURRENT mean (not FEJ); BA refines
+    // poses against pixel observations, so the mean is the correct linearisation
+    // point and FEJ values are not needed.
+    struct CloneSnapshot {
+        int          clone_id   = -1;   // matches CameraPose::state_id
+        int64_t      timestamp_ns = 0;
+        cv::Matx33d  R;                 // 3x3 world -> camera (row-major)
+        cv::Vec3d    t;                 // camera-in-world
+    };
+    std::vector<CloneSnapshot> getCloneSnapshot(int max_clones = 5) const;
+
     // DEAD CODE: getFEJ — only used by disabled MSCKF updater
     // void getFEJ(int state_id, cv::Mat& R_fej, cv::Mat& p_fej) const;
 
@@ -279,6 +304,13 @@ private:
     std::deque<CameraPose> window_;
     int next_state_id_{0};
     bool full_initialized_{false};
+
+    // ── Plan Step 6 (ADR-012): snapshot mutex ────────────────────────────────
+    // Guards `window_` against torn reads from the BA worker thread. Camera-
+    // thread writers (addClone, marginalizeOldestClone, pruneWindow) take it
+    // briefly while splicing; getCloneSnapshot takes it for the deque walk.
+    // mutable because getCloneSnapshot is const and locks for read.
+    mutable std::mutex snapshot_mutex_;
 
     // Online calibration
     double t_offset_cam_imu_{0.010};
@@ -345,6 +377,11 @@ private:
     double slam_fy_{500.0};
     double slam_cx_{320.0};
     double slam_cy_{240.0};
+
+    // Plan Step 6 (ADR-012): caller already holds `snapshot_mutex_`. Public
+    // marginalizeOldestClone / pruneWindow / addClone delegate here so the
+    // single-locking discipline doesn't deadlock against itself.
+    void marginalizeOldestCloneNoLock();
 
     // Returns starting row/col of `slot` in the full P_. -1 on invalid slot.
     int slamFeatureCovIdxInternal(int slot) const;

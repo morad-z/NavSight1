@@ -1,4 +1,6 @@
 #!/usr/bin/env bash
+# DEPRECATED for routine validation: simulation_data JSON now embeds event_summary directly. Use python scripts/analyze_sim.py <sim>.json. Keep this script for live-streaming logcat during debug sessions.
+#
 # Capture adb logcat for an UNTETHERED sim recording so we can verify
 # Step 4 (ORB relocalization), Step 5 (BLUR / LOWLIGHT / ROT_GATE), and
 # Step 3a/3b (MSCKF + SLAM) actually fired and how they performed.

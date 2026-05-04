@@ -7,6 +7,7 @@
 #include <cmath>
 #include <opencv2/calib3d.hpp>
 #include "VioEngine.h"
+#include "EventCounters.h"
 
 #define TAG "NavSight-Native"
 #define LOGI(...) __android_log_print(ANDROID_LOG_INFO,  TAG, __VA_ARGS__)
@@ -744,6 +745,36 @@ Java_com_example_navsight1_NativeBridge_nativeLoadCalibration(
         return JNI_FALSE;
     }
     return vision->loadCalibration(path) ? JNI_TRUE : JNI_FALSE;
+}
+
+// ── EventCounters JNI bridge ──────────────────────────────────────────────────
+// Exports two symbols for the simulator-recording path:
+//
+//   nativeGetEventCountersJson() : returns the EventCounters snapshot as a
+//       single-line JSON object string. Called from
+//       NavSightViewModel.saveSimulationData just before the
+//       simulation_data_<ts>.json file is serialised, so the recording
+//       can embed an "event_summary" key alongside "startTime" / "points".
+//
+//   nativeResetEventCounters()   : zeroes every counter. Called from
+//       NavSightViewModel.toggleSimulationRecording on the START leg, so
+//       each recording begins with a clean slate.
+//
+// No mutex needed: EventCounters is a struct of std::atomic<> fields and
+// the singleton has process lifetime.
+
+JNIEXPORT jstring JNICALL
+Java_com_example_navsight1_NativeBridge_nativeGetEventCountersJson(
+        JNIEnv* env, jobject) {
+    const std::string json = navsight::eventCounters().serializeAsJsonString();
+    return env->NewStringUTF(json.c_str());
+}
+
+JNIEXPORT void JNICALL
+Java_com_example_navsight1_NativeBridge_nativeResetEventCounters(
+        JNIEnv*, jobject) {
+    navsight::eventCounters().reset();
+    LOGI("EventCounters reset");
 }
 
 // DEAD CODE: setMagnetometerHeading JNI — Kotlin caller commented out in NativeBridge.kt

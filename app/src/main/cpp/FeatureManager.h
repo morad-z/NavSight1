@@ -1,6 +1,7 @@
 #pragma once
 #include <vector>
 #include <deque>
+#include <mutex>
 #include <unordered_map>
 #include <opencv2/core.hpp>
 #include <opencv2/imgproc.hpp>
@@ -222,6 +223,43 @@ public:
     // map bounded. O(1).
     size_t getLifecycleSize() const { return lifecycle_.size(); }
 
+    // ── Plan Step 6 (ADR-012): thread-safe SLAM-landmark snapshot for BA ───
+    //
+    // Read-only copy of every SLAM-promoted feature (slam_slot >= 0) along
+    // with its world-frame seed point (`last_p_global`) and its per-clone
+    // pixel observation history. Designed for the BA worker thread.
+    //
+    // The observations here are returned in PIXEL space. The internal
+    // `active_tracks_` stores normalised (un-distorted) camera-frame uv,
+    // because the legacy MSCKF path consumes them that way; the BA worker
+    // wants pixels so reprojection error is in pixel units. The caller
+    // supplies the live intrinsics (fx, fy, cx, cy) so the snapshot is
+    // independent of any state-cached intrinsics.
+    //
+    // The min_obs gate filters out landmarks that would be observed by < 2
+    // poses in the BA window — those contribute no information to the
+    // joint solve. The caller passes its own clone-id whitelist (the
+    // CloneSnapshot result from EKFState::getCloneSnapshot) so we only
+    // emit observations that align to a pose actually being optimised.
+    //
+    // Snapshot lock protects `lifecycle_` and `active_tracks_` against
+    // concurrent mutation from the camera thread (addObservation,
+    // noteObservation, noteTriangulation, setSlamSlot, markSlamFeatureRMS,
+    // pruneStaleLifecycle, dropLifecycle, reset). The lock is taken only
+    // for the duration of the read-and-copy.
+    struct LandmarkSnapshot {
+        int        feature_id = -1;
+        int        slam_slot  = -1;
+        cv::Vec3d  p_world;                         // world-frame seed point
+        // Per-clone pixel observations. The `int` keys correspond to
+        // EKFState::CloneSnapshot::clone_id (== CameraPose::state_id).
+        std::vector<std::pair<int, cv::Vec2d>> obs;
+    };
+    std::vector<LandmarkSnapshot>
+    getLandmarkSnapshot(const std::vector<int>& clone_id_whitelist,
+                         double fx, double fy, double cx, double cy,
+                         int min_obs = 2) const;
+
     // Garbage-collect lifecycle records that are no longer useful. An
     // entry is kept only if (a) its feature_id is in `active_ids` (still
     // tracked this frame), OR (b) it is currently promoted as a SLAM
@@ -277,6 +315,16 @@ private:
     // feature_id; populated by noteObservation / noteTriangulation /
     // markSlamFeatureRMS from the Tracker hot loop. O(1) per call.
     std::unordered_map<int, FeatureLifecycle> lifecycle_;
+
+    // ── Plan Step 6 (ADR-012): snapshot mutex ──────────────────────────────
+    // Guards `active_tracks_` and `lifecycle_` against torn reads from the
+    // BA worker thread. Camera-thread writers (addObservation,
+    // noteObservation, noteKeyframe, noteTriangulation, setSlamSlot,
+    // markSlamFeatureRMS, pruneObservations, pruneStaleLifecycle,
+    // dropLifecycle, extractLostFeatures, reset) take it briefly while
+    // mutating; getLandmarkSnapshot takes it for the read-and-copy.
+    // mutable so the const snapshot accessor can lock for read.
+    mutable std::mutex snapshot_mutex_;
 
     static constexpr int GRID_ROWS = 4;
     static constexpr int GRID_COLS = 5;

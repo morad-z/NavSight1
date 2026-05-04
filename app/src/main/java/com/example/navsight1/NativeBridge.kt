@@ -72,4 +72,13 @@ object NativeBridge {
     // true on success; false if the file is missing or fails validation
     // (engine then keeps the zero-distortion passthrough).
     external fun nativeLoadCalibration(path: String): Boolean
+
+    // EventCounters bridge — used by NavSightViewModel.saveSimulationData to
+    // embed a per-event verdict (RELOC_ORB / BLUR / LOWLIGHT / ROT_GATE /
+    // KLT / BA / MSCKF counts) into simulation_data_<ts>.json. Replaces the
+    // old adb-logcat capture pipeline so untethered walks still produce a
+    // verifiable per-step breakdown. See app/src/main/cpp/EventCounters.h
+    // for the JSON schema.
+    external fun nativeGetEventCountersJson(): String
+    external fun nativeResetEventCounters()
 }

@@ -84,6 +84,14 @@ add_executable(navsight_tests
     # exercises the same OpenCV primitives + formulas the Tracker /
     # FeatureManager impls use, no Tracker / FeatureManager dependency.
     test_visual_robustness.cpp
+    # Plan Step 6: local windowed bundle adjustment. Exercises the
+    # WindowedBA::solve API on synthetic 5-KF scenes — residual reduction
+    # on a noise-free scene, anchor pose held fixed, Huber outlier
+    # rejection, sub-100 ms timing soft-gate, and degenerate-scene
+    # failure reporting. Self-contained: depends only on the WindowedBA
+    # API (compiled into navsight_core), no Tracker / EKFState /
+    # FeatureManager dependency.
+    test_windowed_ba.cpp
 )
 target_link_libraries(navsight_tests navsight_core GTest::gtest_main)
 

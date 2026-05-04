@@ -1,4 +1,5 @@
 #include "FeatureManager.h"
+#include "EventCounters.h"
 #include <opencv2/video/tracking.hpp>
 #include <algorithm>
 #include <cmath>
@@ -17,6 +18,10 @@ FeatureManager::FeatureManager() {
 }
 
 void FeatureManager::reset() {
+    // Plan Step 6 (ADR-012): hold snapshot_mutex_ across the active_tracks_
+    // and lifecycle_ clear so the BA worker thread can never observe a
+    // half-cleared map.
+    std::lock_guard<std::mutex> lock(snapshot_mutex_);
     keyframes_.clear();
     keyframe_descriptors_.clear();
     active_tracks_.clear();
@@ -152,9 +157,16 @@ void FeatureManager::replenishSparse(const cv::Mat& gray,
         if (low_light_state_) {
             eff_max_total = REPLENISH_TARGET_LOWLIGHT;
             eff_quality   = REPLENISH_QUALITY_LOWLIGHT;
+            // Every replenish call while the committed low-light state is
+            // active counts as one active frame. This is the per-frame
+            // metric, not the per-log-line one.
+            navsight::eventCounters().lowlight_state_active_frames.fetch_add(
+                1, std::memory_order_relaxed);
             if ((low_light_log_counter_++ % 30) == 0) {
                 LOGI("LOWLIGHT: brightness=%.3f target=%d quality=%.2f",
                      mean_brightness, eff_max_total, eff_quality);
+                navsight::eventCounters().lowlight_log_lines.fetch_add(
+                    1, std::memory_order_relaxed);
             }
         } else {
             // Reset the logging cadence when we leave low-light so the
@@ -240,11 +252,19 @@ std::vector<int> FeatureManager::assignIds(int count) {
 
 void FeatureManager::addObservation(int feature_id, int clone_state_id,
                                      const cv::Point2f& pixel_ud) {
+    // Plan Step 6 (ADR-012): camera-thread writer of `active_tracks_`. Lock
+    // briefly so getLandmarkSnapshot from the BA worker thread cannot see a
+    // mid-push_back std::vector. Lock is held only across the O(1) hashmap
+    // emplace + vector append.
+    std::lock_guard<std::mutex> lock(snapshot_mutex_);
     active_tracks_[feature_id].push_back({clone_state_id, pixel_ud});
 }
 
 std::vector<LostFeature> FeatureManager::extractLostFeatures(
         const std::vector<int>& current_ids, int min_obs) {
+    // Plan Step 6 (ADR-012): mutates active_tracks_ (erases lost entries).
+    // Lock so the BA snapshot reader cannot iterate a partially-erased map.
+    std::lock_guard<std::mutex> lock(snapshot_mutex_);
     // Build set of currently tracked IDs
     std::unordered_set<int> current_set(current_ids.begin(), current_ids.end());
 
@@ -268,6 +288,9 @@ std::vector<LostFeature> FeatureManager::extractLostFeatures(
 }
 
 void FeatureManager::pruneObservations(int min_clone_id) {
+    // Plan Step 6 (ADR-012): writes through active_tracks_ — lock against
+    // BA snapshot reader.
+    std::lock_guard<std::mutex> lock(snapshot_mutex_);
     for (auto& [fid, obs] : active_tracks_) {
         obs.erase(std::remove_if(obs.begin(), obs.end(),
             [min_clone_id](const FeatureObservation& o) {
@@ -330,6 +353,8 @@ bool FeatureManager::matchAgainstKeyframe(
 
 void FeatureManager::noteObservation(int feature_id, int64_t ts_ns,
                                      bool is_keyframe) {
+    // Plan Step 6 (ADR-012): writes lifecycle_ on the camera thread.
+    std::lock_guard<std::mutex> lock(snapshot_mutex_);
     auto& lc = lifecycle_[feature_id];
     if (lc.feature_id == -1) {
         lc.feature_id = feature_id;
@@ -340,6 +365,8 @@ void FeatureManager::noteObservation(int feature_id, int64_t ts_ns,
 }
 
 void FeatureManager::noteKeyframe(int feature_id) {
+    // Plan Step 6 (ADR-012): writes lifecycle_ on the camera thread.
+    std::lock_guard<std::mutex> lock(snapshot_mutex_);
     auto it = lifecycle_.find(feature_id);
     if (it == lifecycle_.end()) return;
     it->second.kf_count++;
@@ -348,6 +375,8 @@ void FeatureManager::noteKeyframe(int feature_id) {
 void FeatureManager::noteTriangulation(int feature_id,
                                        const cv::Point3f& p_global,
                                        int anchor_clone_id) {
+    // Plan Step 6 (ADR-012): writes lifecycle_ on the camera thread.
+    std::lock_guard<std::mutex> lock(snapshot_mutex_);
     auto& lc = lifecycle_[feature_id];
     if (lc.feature_id == -1) {
         lc.feature_id = feature_id;
@@ -358,6 +387,8 @@ void FeatureManager::noteTriangulation(int feature_id,
 }
 
 void FeatureManager::setSlamSlot(int feature_id, int slam_slot) {
+    // Plan Step 6 (ADR-012): writes lifecycle_ on the camera thread.
+    std::lock_guard<std::mutex> lock(snapshot_mutex_);
     auto it = lifecycle_.find(feature_id);
     if (it == lifecycle_.end()) return;
     it->second.slam_slot = slam_slot;
@@ -374,7 +405,19 @@ std::vector<int> FeatureManager::getPromotableFeatures(
         if (lc.slam_slot >= 0)               continue;     // already promoted
         if (lc.age      < min_obs)           continue;
         if (lc.kf_count < min_kf)            continue;
-        if (!lc.has_p_global)                continue;
+        // NOTE 2026-05-04: removed `has_p_global` requirement here.
+        // It was a chicken-and-egg block: has_p_global is only set by
+        // noteTriangulation (FeatureManager.cpp:385), which is only
+        // called from inside the SLAM-promotion path (Tracker.cpp:1763)
+        // AFTER addSlamFeature succeeds. So no fresh feature could ever
+        // satisfy the gate without first being promoted, and no feature
+        // could be promoted without first satisfying the gate. Result:
+        // slam_promotions_total stayed at 0 across two 100 m walks.
+        // The promotion path in Tracker.cpp:1684-1721 does its own
+        // two-view triangulation + chirality + RMS-gate every time, so
+        // the has_p_global field here was redundant defence. Letting
+        // un-triangulated candidates through means the promotion path
+        // gets a chance to triangulate them itself.
         if (lc.last_rms_px > max_init_rms_px && lc.last_rms_px > 0.0) continue;
         out.push_back(fid);
     }
@@ -382,6 +425,8 @@ std::vector<int> FeatureManager::getPromotableFeatures(
 }
 
 void FeatureManager::markSlamFeatureRMS(int feature_id, double rms_px) {
+    // Plan Step 6 (ADR-012): writes lifecycle_ on the camera thread.
+    std::lock_guard<std::mutex> lock(snapshot_mutex_);
     auto it = lifecycle_.find(feature_id);
     if (it == lifecycle_.end()) return;
     it->second.last_rms_px = rms_px;
@@ -415,6 +460,14 @@ std::vector<int> FeatureManager::getLostSlamFeatures(
     return out;
 }
 
+// CAMERA THREAD ONLY. Returns a pointer into lifecycle_, which would be
+// invalidated by any concurrent writer. Locking snapshot_mutex_ inside
+// is insufficient because the pointer outlives the lock; the caller
+// would still race with writers after the function returns. Step 6
+// (ADR-012) BA worker thread MUST NOT call this — it reads lifecycle
+// state via the LandmarkSnapshot path which copies-by-value under the
+// mutex. A future caller that needs access from a non-camera thread
+// should use a std::optional<FeatureLifecycle> by-value variant.
 const FeatureManager::FeatureLifecycle*
 FeatureManager::getLifecycle(int feature_id) const {
     auto it = lifecycle_.find(feature_id);
@@ -422,6 +475,7 @@ FeatureManager::getLifecycle(int feature_id) const {
     return &it->second;
 }
 
+// CAMERA THREAD ONLY — same caveat as getLifecycle above.
 const std::vector<FeatureObservation>*
 FeatureManager::getObservations(int feature_id) const {
     auto it = active_tracks_.find(feature_id);
@@ -430,10 +484,16 @@ FeatureManager::getObservations(int feature_id) const {
 }
 
 void FeatureManager::dropLifecycle(int feature_id) {
+    // Plan Step 6 (ADR-012): writes lifecycle_ on the camera thread.
+    std::lock_guard<std::mutex> lock(snapshot_mutex_);
     lifecycle_.erase(feature_id);
 }
 
+// Returns by VALUE (vector copy under the mutex), so it is safe to call
+// from any thread — the snapshot is decoupled from lifecycle_ before the
+// lock drops.
 std::vector<int> FeatureManager::getAllLifecycleFeatureIds() const {
+    std::lock_guard<std::mutex> lock(snapshot_mutex_);
     std::vector<int> out;
     out.reserve(lifecycle_.size());
     for (const auto& kv : lifecycle_) out.push_back(kv.first);
@@ -528,6 +588,8 @@ void FeatureManager::storeKeyframeDescriptors(
 
 int FeatureManager::pruneStaleLifecycle(const std::vector<int>& active_ids,
                                         int64_t now_ns) {
+    // Plan Step 6 (ADR-012): mutates both lifecycle_ and active_tracks_.
+    std::lock_guard<std::mutex> lock(snapshot_mutex_);
     if (lifecycle_.empty()) return 0;
 
     // Hash-set the active IDs once for O(1) membership tests inside the
@@ -566,4 +628,81 @@ int FeatureManager::pruneStaleLifecycle(const std::vector<int>& active_ids,
         }
     }
     return dropped;
+}
+
+// ── Plan Step 6 (ADR-012): SLAM-landmark snapshot for windowed BA ────────────
+//
+// Walks the lifecycle map for promoted SLAM landmarks (`slam_slot >= 0`)
+// that own a triangulated world point (`has_p_global`), then for each such
+// landmark walks its active observation history and emits the entries whose
+// `clone_state_id` is in the caller's whitelist. The whitelist is the set
+// of clone IDs returned by EKFState::getCloneSnapshot, so the produced
+// observation pairs always reference a pose the BA solver will be optimising.
+//
+// Pixel conversion: active_tracks_ stores normalised (un-distorted) camera-
+// frame uv (see Tracker.cpp section 9.1, where addObservation receives
+// (px - cx) / fx). The BA worker wants pixel-space residuals so the Huber
+// threshold (1.5 px) is meaningful; we multiply back through with the live
+// intrinsics.
+//
+// Filter: a landmark with fewer than `min_obs` observations on the pose
+// whitelist is dropped — it cannot constrain the joint pose+landmark solve
+// (need at least 2 views to triangulate, 3+ to refine). min_obs=2 matches
+// the Step 6 plan's "≥ 2 of 5 KFs" criterion.
+//
+// Lock: held only for the duration of the read-and-copy. Camera-thread
+// writers (addObservation, noteTriangulation, setSlamSlot, etc.) take the
+// same mutex briefly when mutating; the snapshot copy is bounded
+// O(N_promoted × N_obs_per) which is < 1 ms on phone-class hardware.
+std::vector<FeatureManager::LandmarkSnapshot>
+FeatureManager::getLandmarkSnapshot(const std::vector<int>& clone_id_whitelist,
+                                     double fx, double fy,
+                                     double cx, double cy,
+                                     int min_obs) const {
+    std::vector<LandmarkSnapshot> out;
+    if (clone_id_whitelist.empty() || fx <= 1.0 || fy <= 1.0) return out;
+
+    std::lock_guard<std::mutex> lock(snapshot_mutex_);
+
+    if (lifecycle_.empty() || active_tracks_.empty()) return out;
+
+    // Hash-set the whitelist for O(1) membership tests.
+    std::unordered_set<int> kf_set;
+    kf_set.reserve(clone_id_whitelist.size() * 2);
+    for (int id : clone_id_whitelist) {
+        if (id >= 0) kf_set.insert(id);
+    }
+    if (kf_set.empty()) return out;
+
+    out.reserve(8);  // EKFState::MAX_SLAM_FEATURES is 12; reserve upper-ish
+
+    for (const auto& [fid, lc] : lifecycle_) {
+        if (lc.slam_slot < 0)    continue;   // not promoted
+        if (!lc.has_p_global)    continue;   // no seed point yet
+
+        auto track_it = active_tracks_.find(fid);
+        if (track_it == active_tracks_.end()) continue;
+        const auto& track = track_it->second;
+
+        LandmarkSnapshot snap;
+        snap.feature_id = fid;
+        snap.slam_slot  = lc.slam_slot;
+        snap.p_world    = cv::Vec3d(static_cast<double>(lc.last_p_global.x),
+                                    static_cast<double>(lc.last_p_global.y),
+                                    static_cast<double>(lc.last_p_global.z));
+        snap.obs.reserve(track.size());
+
+        for (const auto& obs : track) {
+            if (kf_set.count(obs.clone_state_id) == 0) continue;
+            // active_tracks_ stores normalised camera-frame uv. BA needs
+            // pixels for the 1.5-px Huber gate to be meaningful.
+            const double u_px = static_cast<double>(obs.pixel_ud.x) * fx + cx;
+            const double v_px = static_cast<double>(obs.pixel_ud.y) * fy + cy;
+            snap.obs.emplace_back(obs.clone_state_id, cv::Vec2d(u_px, v_px));
+        }
+
+        if (static_cast<int>(snap.obs.size()) < min_obs) continue;
+        out.push_back(std::move(snap));
+    }
+    return out;
 }

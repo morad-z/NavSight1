@@ -336,6 +336,11 @@ class NavSightViewModel(application: Application) : AndroidViewModel(application
     fun toggleSimulationRecording(getExternalFilesDir: (String?) -> java.io.File?, filesDir: java.io.File) {
         if (!isRecordingSimulation) {
             simulationDataPoints.clear()
+            // Zero the native EventCounters so this recording's
+            // event_summary reflects only what happened during the walk.
+            // The native singleton survives process lifetime, so leftover
+            // counts from a prior recording would otherwise carry over.
+            runCatching { NativeBridge.nativeResetEventCounters() }
             sensorRepository.startGpsUpdates(hasLocationPermission)
             isRecordingSimulation = true
         } else {
@@ -348,10 +353,20 @@ class NavSightViewModel(application: Application) : AndroidViewModel(application
     private fun saveSimulationData(getExternalFilesDir: (String?) -> java.io.File?, filesDir: java.io.File) {
         if (simulationDataPoints.isEmpty()) return
         val snapshot = synchronized(simulationDataPoints) { simulationDataPoints.toList() }
+        // Snapshot the native EventCounters now (recording-stop time) so the
+        // embedded event_summary covers exactly the same window as the
+        // points array. The native call is lock-free; failure (library not
+        // loaded) falls back to an empty object so the rest of the JSON is
+        // still well-formed.
+        val eventSummaryJson: String = runCatching {
+            NativeBridge.nativeGetEventCountersJson()
+        }.getOrNull()?.takeIf { it.isNotBlank() } ?: "{}"
         viewModelScope.launch(Dispatchers.IO) {
             val startTime = snapshot.firstOrNull()?.timestamp ?: System.currentTimeMillis()
             val sb = StringBuilder()
-            sb.append("{\"startTime\":$startTime,\"points\":[")
+            sb.append("{\"startTime\":$startTime,\"event_summary\":")
+            sb.append(eventSummaryJson)
+            sb.append(",\"points\":[")
             snapshot.forEachIndexed { index, p ->
                 if (index > 0) sb.append(",")
                 sb.append("{\"ts\":${p.timestamp},")

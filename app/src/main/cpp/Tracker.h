@@ -1,6 +1,8 @@
 #pragma once
 #include <vector>
 #include <mutex>
+#include <atomic>
+#include <thread>
 #include <cstdint>
 #include <opencv2/core.hpp>
 #include <opencv2/imgproc.hpp>
@@ -14,6 +16,7 @@
 #include "TrackKLT.h"
 #include "UpdaterZeroVelocity.h"
 #include "UpdaterMSCKF.h"
+#include "WindowedBA.h"
 
 #include "InertialInitializer.h"
 
@@ -52,6 +55,7 @@ struct TrackerFrame {
 class Tracker {
 public:
     Tracker();
+    ~Tracker();
 
     // Core tracking: optical flow, essential matrix, rotation fusion, pose update.
     // Exports intermediate data in frame_out for Mapper.
@@ -289,6 +293,71 @@ private:
     // future multi-threaded callers don't trip the C++11 function-
     // static-init race, and so reset() can clear it cleanly if needed.
     cv::Ptr<cv::ORB> reloc_orb_;
+
+    // ── Plan Step 6 (ADR-012): windowed BA off-thread runner ──────────────
+    //
+    // Each new keyframe (1) consumes the previous BA round's refined
+    // landmarks (if any) by re-seeding via removeSlamFeature + addSlamFeature
+    // on the EKF, and (2) kicks off the next BA round in a detached worker
+    // thread. The BA thread pulls a snapshot of the most-recent 5 EKF clones
+    // and the SLAM landmarks observed by ≥ 2 of them, runs hand-rolled
+    // Gauss-Newton with Huber loss in WindowedBA::solve, and publishes the
+    // refined landmark positions back through ba_result_*_ below. The
+    // camera thread reads + clears ba_result_pending_ on the next
+    // keyframe; if the previous round is still in flight we LOG a "skipped"
+    // line and do not start a new round (the plan §6 ordering — "one BA
+    // round at a time").
+    //
+    // Thread-safety invariant: ba_thread_ writes ba_result_* under
+    // ba_result_mutex_ exactly once per launched round, then sets
+    // ba_in_flight_ = false. The camera thread holds ba_result_mutex_
+    // while moving the result out and clearing ba_result_pending_.
+    // ba_in_flight_ is std::atomic so the camera thread can cheaply
+    // check it without taking the mutex.
+    struct BARefinedLandmark {
+        int       feature_id   = -1;
+        int       slam_slot    = -1;     // slot at the time the BA was launched
+        int       anchor_clone_id = -1;  // anchor when re-seeding via addSlamFeature
+        cv::Mat   p_world_refined;       // 3x1 CV_64F, BA output
+    };
+    std::thread             ba_thread_;
+    std::atomic<bool>       ba_in_flight_{false};
+    bool                    ba_result_pending_{false};
+    mutable std::mutex      ba_result_mutex_;
+    std::vector<BARefinedLandmark> ba_result_landmarks_;
+    int                     ba_round_counter_{0};
+
+    // Plan Step 6 (ADR-012): hard cap on accepted BA solve wall time.
+    // 2x the plan's 100 ms target so a single throttled solve under
+    // thermal pressure can still publish; anything past this is a sign
+    // the LM is thrashing on a degenerate scene and the result is
+    // discarded rather than fed back into the EKF.
+    static constexpr int BA_MAX_SOLVE_US = 200'000;
+
+    // Plan Step 6 (ADR-012): launch the next BA round in a detached worker.
+    // Cheaply snapshots EKF clones + FeatureManager landmarks from the
+    // camera thread via the new thread-safe accessors, then std::thread's
+    // its way through WindowedBA::solve. Returns true if a round was
+    // launched, false if a previous round is still in flight (we skip
+    // and LOGI "skipped"). Caller is the keyframe storage block in
+    // processFrame.
+    bool kickOffBARound(int64_t timestamp_ns);
+
+    // Plan Step 6 (ADR-012): consume the result of the previous BA round
+    // (if it has finished) and re-seed the corresponding SLAM features in
+    // the EKF via removeSlamFeature + addSlamFeature with the BA-refined
+    // world point. ADR-006 forbids direct EKF mean / covariance mutation
+    // from side channels; this re-seeding goes through the canonical
+    // EKFState API which sets up covariance correctly. Called from the
+    // keyframe storage block, BEFORE kickOffBARound for the new keyframe.
+    void consumeBAResultIfReady();
+
+    // Plan Step 6 (ADR-012): terminate the BA worker cleanly. Called from
+    // reset() and the destructor. Joins the thread (no detach) so any
+    // in-flight round finishes before we return — that keeps the EKF /
+    // FeatureManager mutexes from being touched after we've started
+    // tearing the rest of the Tracker down.
+    void shutdownBA();
 
     // Depth-based scale constraint (MiDaS)
     mutable std::mutex depth_mutex_;

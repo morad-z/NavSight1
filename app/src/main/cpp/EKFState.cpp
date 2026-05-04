@@ -1,4 +1,5 @@
 #include "EKFState.h"
+#include "EventCounters.h"
 #include <cmath>
 #include <algorithm>
 #include <chrono>
@@ -16,6 +17,9 @@
 EKFState::EKFState() { reset(); }
 
 void EKFState::reset() {
+    // Plan Step 6 (ADR-012): hold snapshot_mutex_ across the window clear so
+    // a concurrent BA reader cannot iterate a half-cleared deque.
+    std::lock_guard<std::mutex> lock(snapshot_mutex_);
     scale_ = 0.20;
     scale_fej_ = -1.0;
     P_scale_ = 0.5 * 0.5;
@@ -292,6 +296,11 @@ void EKFState::updateZUPT() {
 // ── Clone Management ────────────────────────────────────────────────────────
 
 void EKFState::addClone(const cv::Mat& R_GtoC, const cv::Mat& p_G, int64_t timestamp_ns) {
+    // Plan Step 6 (ADR-012): hold the snapshot mutex around the whole splice
+    // so the BA worker thread cannot observe a torn `window_` mid-augmentation.
+    // Internal `marginalizeOldestClone` call below MUST go through the
+    // private no-lock variant to avoid deadlocking against this same lock.
+    std::lock_guard<std::mutex> lock(snapshot_mutex_);
     CameraPose pose;
     pose.R_GtoC = R_GtoC.clone();
     pose.p_G = p_G.clone();
@@ -407,19 +416,34 @@ void EKFState::addClone(const cv::Mat& R_GtoC, const cv::Mat& p_G, int64_t times
 
     window_.push_back(std::move(pose));
 
-    // Prune if over limit
+    // Prune if over limit. We already hold snapshot_mutex_ at this point
+    // (taken at the top of addClone), so call the no-lock variant.
     if (static_cast<int>(window_.size()) > MAX_CLONES) {
-        marginalizeOldestClone();
+        marginalizeOldestCloneNoLock();
     }
 }
 
 void EKFState::pruneWindow(size_t max_poses) {
+    // Plan Step 6 (ADR-012): single lock around the whole prune loop. Calling
+    // the public marginalizeOldestClone in a loop would re-acquire the
+    // snapshot mutex on every iteration; one outer lock + the no-lock body is
+    // both cheaper and ensures the BA reader observes a coherent post-prune
+    // window rather than possibly mid-prune.
+    std::lock_guard<std::mutex> lock(snapshot_mutex_);
     while (window_.size() > max_poses) {
-        marginalizeOldestClone();
+        marginalizeOldestCloneNoLock();
     }
 }
 
 void EKFState::marginalizeOldestClone() {
+    // Plan Step 6 (ADR-012): public entry takes the lock; the body is the
+    // no-lock variant so the addClone / pruneWindow paths can call it
+    // directly without re-locking.
+    std::lock_guard<std::mutex> lock(snapshot_mutex_);
+    marginalizeOldestCloneNoLock();
+}
+
+void EKFState::marginalizeOldestCloneNoLock() {
     if (window_.empty()) return;
 
     if (full_initialized_ && !P_.empty() && P_.rows > IMU_STATE_DIM) {
@@ -661,6 +685,16 @@ void EKFState::applyMSCKFUpdate(const cv::Mat& H, const cv::Mat& res,
     }
     LOGI("MSCKF update applied: max_correction=%.4f damping=%.2f huber_rejected=%d",
          cv::norm(dx, cv::NORM_INF), damping, msckf_huber_rejected_count_);
+    // EventCounters: one applied update = one log line. Sum the huber
+    // rejections across every applied update so the total tells us how
+    // many measurement rows the robust kernel rejected over the recording.
+    navsight::eventCounters().msckf_update_lines.fetch_add(
+        1, std::memory_order_relaxed);
+    if (msckf_huber_rejected_count_ > 0) {
+        navsight::eventCounters().msckf_huber_rejected_sum.fetch_add(
+            static_cast<long long>(msckf_huber_rejected_count_),
+            std::memory_order_relaxed);
+    }
 }
 
 // ── Step 4: VIO/PDR/Yaw Measurement Updates ─────────────────────────────────
@@ -1162,6 +1196,36 @@ bool EKFState::slamReprojectionJacobian(const SlamFeature& f,
                                         cv::Mat& H_feature_2x5,
                                         cv::Mat& H_clone_2x6,
                                         cv::Point2d& pred_uv) const {
+    // Defensive empty-checks. Crash on 2026-05-04 (Step 6 first real
+    // SLAM features after the chicken-and-egg fix): cv::operator- threw
+    // here. Either clone_R_now or clone_R_FEJ was empty/wrong shape.
+    // Without these guards the throw propagates through __cxa_throw and
+    // aborts the process. Returning false here is the documented
+    // skip-this-observation contract — caller continues with the
+    // remaining observations.
+    if (clone_R_now.empty() || clone_R_now.rows != 3 || clone_R_now.cols != 3 ||
+        clone_p_now.empty() || clone_p_now.rows != 3 || clone_p_now.cols != 1 ||
+        f.state.empty()     || f.state.rows < 3) {
+        LOGI("slamReprojectionJacobian: malformed input "
+             "(clone_R_now=%dx%d clone_p_now=%dx%d state=%dx%d)",
+             clone_R_now.rows, clone_R_now.cols,
+             clone_p_now.rows, clone_p_now.cols,
+             f.state.rows, f.state.cols);
+        return false;
+    }
+
+    // Belt-and-braces: catch ANY cv::Exception thrown from inside the
+    // function body and convert to the skip-this-observation return
+    // value. The defensive checks above and below catch the known
+    // empty-input cases, but the function does ~30 cv::Mat operations
+    // and a thrown exception from any of them aborts the process via
+    // libc++_shared's terminate handler. The function's documented
+    // contract is "either succeed or return false"; catch+return false
+    // is the only way to honour that contract under unexpected input.
+    // The body is moved into an inner lambda solely so the catch can
+    // wrap it — semantically identical to the pre-2026-05-04 body.
+    int step = 0;  // diagnostic checkpoint — incremented after each Mat op
+    try {
     // Layout reminder:
     //   p_anchor_cam = (1/ρ) * (α, β, 1)
     //   p_world      = R_anchor_FEJ.t() * p_anchor_cam + p_anchor_FEJ
@@ -1171,6 +1235,7 @@ bool EKFState::slamReprojectionJacobian(const SlamFeature& f,
     // The residual builder uses CURRENT anchor & clone poses (so the
     // residual reflects the current state). The Jacobian uses FEJ poses
     // (locked at promotion / first observation).
+    step = 1;
     const double alpha = f.state.at<double>(0, 0);
     const double beta  = f.state.at<double>(1, 0);
     const double rho   = f.state.at<double>(2, 0);
@@ -1181,10 +1246,14 @@ bool EKFState::slamReprojectionJacobian(const SlamFeature& f,
     if (!getClonePose(f.anchor_clone_id, anchor_R_now, anchor_p_now)) {
         return false;
     }
+    step = 2;
     cv::Mat p_anchor_cam = (cv::Mat_<double>(3, 1) <<
                             alpha / rho, beta / rho, 1.0 / rho);
+    step = 3;
     cv::Mat p_world_now  = anchor_R_now.t() * p_anchor_cam + anchor_p_now;
+    step = 4;
     cv::Mat p_C_now      = clone_R_now * (p_world_now - clone_p_now);
+    step = 5;
     const double zCn = p_C_now.at<double>(2, 0);
     if (zCn < 1e-4) return false;
     // Pixel-space prediction (test fixture uses pixel coords).
@@ -1197,8 +1266,11 @@ bool EKFState::slamReprojectionJacobian(const SlamFeature& f,
     cv::Mat clone_R_F  = clone_R_FEJ.empty() ? clone_R_now : clone_R_FEJ;
     cv::Mat clone_p_F  = clone_p_FEJ.empty() ? clone_p_now : clone_p_FEJ;
 
+    step = 6;
     cv::Mat p_world_F = anchor_R_F.t() * p_anchor_cam + anchor_p_F;
+    step = 7;
     cv::Mat p_C_F     = clone_R_F * (p_world_F - clone_p_F);
+    step = 8;
     const double xCf = p_C_F.at<double>(0, 0);
     const double yCf = p_C_F.at<double>(1, 0);
     const double zCf = p_C_F.at<double>(2, 0);
@@ -1223,12 +1295,16 @@ bool EKFState::slamReprojectionJacobian(const SlamFeature& f,
     const double rho_inv  = 1.0 / rho;
     const double rho_inv2 = rho_inv * rho_inv;
     cv::Mat dpw_dab = cv::Mat::zeros(3, 3, CV_64F);
+    step = 9;
     cv::Mat col_a = anchor_R_F.t() * (cv::Mat_<double>(3, 1) << rho_inv, 0.0, 0.0);
+    step = 10;
     cv::Mat col_b = anchor_R_F.t() * (cv::Mat_<double>(3, 1) << 0.0, rho_inv, 0.0);
+    step = 11;
     cv::Mat col_r = anchor_R_F.t() * (cv::Mat_<double>(3, 1) <<
                                        -alpha * rho_inv2,
                                        -beta  * rho_inv2,
                                        -rho_inv2);
+    step = 12;
     col_a.copyTo(dpw_dab(cv::Range::all(), cv::Range(0, 1)));
     col_b.copyTo(dpw_dab(cv::Range::all(), cv::Range(1, 2)));
     col_r.copyTo(dpw_dab(cv::Range::all(), cv::Range(2, 3)));
@@ -1247,14 +1323,54 @@ bool EKFState::slamReprojectionJacobian(const SlamFeature& f,
                 v.at<double>(2, 0),   0.0,                -v.at<double>(0, 0),
                -v.at<double>(1, 0),   v.at<double>(0, 0),  0.0);
     };
-    cv::Mat dpC_dtheta = -skew(p_C_F);              // 3x3
-    cv::Mat dpC_dpc    = -clone_R_F;                 // 3x3
+    // Final defensive sanity on clone_R_F before unary minus — the
+    // crash on 2026-05-04 hit cv::operator- here and the abort came
+    // from an empty Mat. The top-of-function gate above should make
+    // this unreachable; assert-and-return rather than UB if it ever
+    // fires.
+    if (clone_R_F.empty() || clone_R_F.rows != 3 || clone_R_F.cols != 3) {
+        LOGI("slamReprojectionJacobian: clone_R_F malformed "
+             "(rows=%d cols=%d empty=%d) — aborting jacobian",
+             clone_R_F.rows, clone_R_F.cols, clone_R_F.empty() ? 1 : 0);
+        return false;
+    }
+    // Use `mat * -1.0` instead of `-mat` to avoid OpenCV 4.5.3's unary
+    // operator- bug. The unary operator internally constructs a MatExpr
+    // with an empty placeholder operand, which then trips
+    // checkOperandsExist (matrix_expressions.cpp:24) and throws
+    // "Matrix operand is an empty matrix" — observed every frame after
+    // 12 SLAM features were promoted (2026-05-04). `Mat * scalar` is a
+    // separate operator that takes only one Mat operand and bypasses
+    // the broken path entirely.
+    step = 13;
+    cv::Mat dpC_dtheta = skew(p_C_F) * -1.0;        // 3x3
+    step = 14;
+    cv::Mat dpC_dpc    = clone_R_F * -1.0;          // 3x3
+    step = 15;
     H_clone_2x6 = cv::Mat::zeros(2, CLONE_DIM, CV_64F);
     cv::Mat H_clone_theta = dproj_dpC * dpC_dtheta;  // 2x3
     cv::Mat H_clone_p     = dproj_dpC * dpC_dpc;     // 2x3
     H_clone_theta.copyTo(H_clone_2x6(cv::Range::all(), cv::Range(0, 3)));
     H_clone_p    .copyTo(H_clone_2x6(cv::Range::all(), cv::Range(3, 6)));
     return true;
+    } catch (const cv::Exception& e) {
+        // Dump every Mat dimension so we can spot which operand is empty.
+        // f.anchor_R_FEJ / f.anchor_p_FEJ / f.state are SlamFeature fields;
+        // clone_R_now/p_now/R_FEJ/p_FEJ are caller-passed.
+        LOGI("slamReprojectionJacobian: cv::Exception at step=%d: %s", step, e.what());
+        LOGI("  state=%dx%d anchor_R_FEJ=%dx%d anchor_p_FEJ=%dx%d "
+             "clone_R_FEJ=%dx%d clone_p_FEJ=%dx%d "
+             "clone_R_now=%dx%d clone_p_now=%dx%d anchor_id=%d",
+             f.state.rows, f.state.cols,
+             f.anchor_R_FEJ.rows, f.anchor_R_FEJ.cols,
+             f.anchor_p_FEJ.rows, f.anchor_p_FEJ.cols,
+             clone_R_FEJ.rows, clone_R_FEJ.cols,
+             clone_p_FEJ.rows, clone_p_FEJ.cols,
+             clone_R_now.rows, clone_R_now.cols,
+             clone_p_now.rows, clone_p_now.cols,
+             f.anchor_clone_id);
+        return false;
+    }
 }
 
 bool EKFState::updateSlamFeature(int slot,
@@ -1474,4 +1590,56 @@ bool EKFState::applyMSCKFFeature(const std::vector<cv::Point2f>& observations,
 
     applyMSCKFUpdate(H_proj, r_proj, R_proj);
     return true;
+}
+
+// ── Plan Step 6 (ADR-012): thread-safe clone snapshot for windowed BA ────────
+//
+// Returns the up-to-`max_clones` most-recent CameraPose entries, ordered
+// oldest first so the BA caller can pick window[0] as the gauge-fix anchor.
+// Locks `snapshot_mutex_` for the deque walk; addClone / pruneWindow /
+// marginalizeOldestClone / reset all hold the same mutex while mutating
+// `window_`, so the snapshot can never observe a torn state.
+//
+// The returned snapshot copies CameraPose::R_GtoC and ::p_G into cv::Matx33d /
+// cv::Vec3d so the BA worker can move the data off-thread without retaining
+// pointers into the EKF's internal cv::Mat storage. State_id and timestamp_ns
+// pass through unchanged so the BA can later reconcile its refined poses
+// against the EKF's clones by id.
+std::vector<EKFState::CloneSnapshot>
+EKFState::getCloneSnapshot(int max_clones) const {
+    std::vector<CloneSnapshot> out;
+    if (max_clones <= 0) return out;
+
+    std::lock_guard<std::mutex> lock(snapshot_mutex_);
+
+    if (window_.empty()) return out;
+
+    const int n_clones = static_cast<int>(window_.size());
+    const int n_take   = std::min(max_clones, n_clones);
+    const int start    = n_clones - n_take;  // oldest of the take-window
+
+    out.reserve(static_cast<size_t>(n_take));
+    for (int i = start; i < n_clones; ++i) {
+        const CameraPose& p = window_[static_cast<size_t>(i)];
+        if (p.R_GtoC.rows != 3 || p.R_GtoC.cols != 3 ||
+            p.p_G.rows    != 3 || p.p_G.cols    != 1) {
+            // Skip malformed clones rather than crash the BA thread; in
+            // practice this never fires because addClone always writes 3x3
+            // and 3x1 cv::Mat instances.
+            continue;
+        }
+        CloneSnapshot s;
+        s.clone_id     = p.state_id;
+        s.timestamp_ns = p.timestamp_ns;
+        s.R = cv::Matx33d(
+            p.R_GtoC.at<double>(0, 0), p.R_GtoC.at<double>(0, 1), p.R_GtoC.at<double>(0, 2),
+            p.R_GtoC.at<double>(1, 0), p.R_GtoC.at<double>(1, 1), p.R_GtoC.at<double>(1, 2),
+            p.R_GtoC.at<double>(2, 0), p.R_GtoC.at<double>(2, 1), p.R_GtoC.at<double>(2, 2));
+        s.t = cv::Vec3d(
+            p.p_G.at<double>(0, 0),
+            p.p_G.at<double>(1, 0),
+            p.p_G.at<double>(2, 0));
+        out.push_back(s);
+    }
+    return out;
 }

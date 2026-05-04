@@ -47,6 +47,7 @@ add_library(
         src/main/cpp/InertialInitializer.cpp
         src/main/cpp/ScaleEstimatorVI.cpp
         src/main/cpp/ScaleFuser.cpp
+        src/main/cpp/WindowedBA.cpp
 )
 
 find_library(

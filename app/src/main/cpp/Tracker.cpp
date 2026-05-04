@@ -1,4 +1,5 @@
 #include "Tracker.h"
+#include "EventCounters.h"
 #include <opencv2/video/tracking.hpp>
 #include <opencv2/calib3d.hpp>
 #include <cmath>
@@ -288,6 +289,12 @@ void Tracker::setInitialHeading(double azimuth_rad) {
 }
 
 void Tracker::reset() {
+    // Plan Step 6 (ADR-012): join the BA worker BEFORE we lock mutex_ or
+    // reset ekf_ / feature_mgr_, so the worker is guaranteed to have
+    // released its read locks on the snapshot mutexes by the time the
+    // EKF / FeatureManager reset paths reach for them.
+    shutdownBA();
+
     std::lock_guard<std::mutex> lock(mutex_);
     prev_gray_.release();
     prev_pts_.clear();
@@ -298,7 +305,16 @@ void Tracker::reset() {
     global_t_ = cv::Mat::zeros(3, 1, CV_64F);
     accel_bias_ = cv::Mat::zeros(3, 1, CV_64F);
     accel_bias_count_ = 0;
-    scale_fuser_.reset(0.20, 1.0);
+    // Lowered from (0.20, 1.0) on 2026-05-04: every walk's vsc trace
+    // converged to 0.025-0.075 within ~15 PDR steps, so 0.20 wasted
+    // ~10 s of early frames at a 4x over-scaled state. 0.10 is a
+    // less-biased prior for typical phone (focal ~525 px) + walking
+    // (~0.65 m stride), and the wider initial variance (4.0 vs 1.0)
+    // lets the first PDR/MiDaS/VI observation pull strongly so the
+    // bootstrap median reset (Tracker.cpp:1139) still wins on real
+    // device-specific differences. Per-device persistence is a future
+    // step (would land in camera_calib.json or a sibling file).
+    scale_fuser_.reset(0.10, 4.0);
     scale_obs_count_ = 0;
     scale_bootstrap_buf_.clear();
     points_3d_current_.clear();
@@ -311,7 +327,16 @@ void Tracker::reset() {
     filtered_yaw_rate_ = 0.0;
     last_visual_yaw_variance_ = -1.0;
     last_depth_scale_variance_ = -1.0;
-    scale_fuser_.reset(0.20, 1.0);
+    // Lowered from (0.20, 1.0) on 2026-05-04: every walk's vsc trace
+    // converged to 0.025-0.075 within ~15 PDR steps, so 0.20 wasted
+    // ~10 s of early frames at a 4x over-scaled state. 0.10 is a
+    // less-biased prior for typical phone (focal ~525 px) + walking
+    // (~0.65 m stride), and the wider initial variance (4.0 vs 1.0)
+    // lets the first PDR/MiDaS/VI observation pull strongly so the
+    // bootstrap median reset (Tracker.cpp:1139) still wins on real
+    // device-specific differences. Per-device persistence is a future
+    // step (would land in camera_calib.json or a sibling file).
+    scale_fuser_.reset(0.10, 4.0);
     last_scale_predict_ns_ = 0;
     scale_estimator_vi_.reset();
     observer_c_pair_count_ = 0;
@@ -324,7 +349,20 @@ void Tracker::reset() {
     last_step_speed_ns_ = 0;
     ekf_.reset();
     feature_mgr_.reset();
+    // Plan Step 6 (ADR-012): drop any pending BA result so the next session
+    // does not consume a stale refinement.
+    {
+        std::lock_guard<std::mutex> rlock(ba_result_mutex_);
+        ba_result_landmarks_.clear();
+        ba_result_pending_ = false;
+    }
+    ba_round_counter_ = 0;
     LOGI("Tracker reset");
+}
+
+// ── Plan Step 6 (ADR-012): destructor — clean BA worker join ────────────────
+Tracker::~Tracker() {
+    shutdownBA();
 }
 
 // ── Helpers ──────────────────────────────────────────────────────────────────
@@ -524,11 +562,16 @@ VisionOutput Tracker::processFrame(const uint8_t* yuv_data, int width, int heigh
     if (frame_is_blurry) {
         const int prev_streak = blur_skipped_streak_;
         blur_skipped_streak_++;
+        // Every blurry frame is a frame the pipeline skipped; record it.
+        navsight::eventCounters().blur_total_skip_frames.fetch_add(
+            1, std::memory_order_relaxed);
         // Rate-limit: log only on entry to a blur burst (avoids 30 lines/s
         // during a 1 s head-turn). The exit transition is logged in the
         // else branch below when a non-trivial streak ends.
         if (prev_streak == 0) {
             LOGI("BLUR: enter var=%.1f thresh=%.1f", blur_var, BLUR_VAR_THRESH);
+            navsight::eventCounters().blur_enter_events.fetch_add(
+                1, std::memory_order_relaxed);
         }
     } else {
         if (blur_skipped_streak_ > 0) {
@@ -694,9 +737,13 @@ VisionOutput Tracker::processFrame(const uint8_t* yuv_data, int width, int heigh
     int win_sz = static_cast<int>(2.0 * expected_disp_px + 11.0);
     win_sz = std::max(21, std::min(41, win_sz));
     if ((win_sz & 1) == 0) win_sz += 1;  // KLT requires an odd window
-    if (win_sz > 21 && frame_counter_ % 30 == 0) {
-        LOGI("KLT: adaptive win=%d gyro=%.2f rad/s expected_disp=%.1f px",
-             win_sz, gyro_norm, expected_disp_px);
+    if (win_sz > 21) {
+        navsight::eventCounters().klt_adaptive_window_hits.fetch_add(
+            1, std::memory_order_relaxed);
+        if (frame_counter_ % 30 == 0) {
+            LOGI("KLT: adaptive win=%d gyro=%.2f rad/s expected_disp=%.1f px",
+                 win_sz, gyro_norm, expected_disp_px);
+        }
     }
 
     int64_t t_klt_start = now_us();
@@ -810,10 +857,16 @@ VisionOutput Tracker::processFrame(const uint8_t* yuv_data, int width, int heigh
             // rotation". Uniform flow (R/N < reject threshold) → confirm
             // pure rotation.
             is_pure_rotation = (r_n < FLOW_RAYLEIGH_REJECT);
+            if (is_pure_rotation) {
+                navsight::eventCounters().rot_gate_pure_rot_confirmed.fetch_add(
+                    1, std::memory_order_relaxed);
+            }
             if (frame_counter_ % 30 == 0) {
                 LOGI("ROT_GATE: gyro=%.2f R/N=%.2f thresh=%.2f -> pure_rot=%d",
                      gyro_norm, r_n, FLOW_RAYLEIGH_REJECT,
                      is_pure_rotation ? 1 : 0);
+                navsight::eventCounters().rot_gate_log_lines.fetch_add(
+                    1, std::memory_order_relaxed);
             }
         }
     }
@@ -1601,8 +1654,15 @@ VisionOutput Tracker::processFrame(const uint8_t* yuv_data, int width, int heigh
 
             // ── (1) PROMOTE ─────────────────────────────────────────────
             int64_t t_promote_start = now_us();
+            // min_obs lowered 12 -> 8 on 2026-05-04: an outdoor 100 m walk
+            // showed BA never fired because msckf_update_lines was 3517 (KLT
+            // tracks were dying at <12 obs and feeding MSCKF instead of
+            // surviving long enough to qualify for SLAM). 8 obs ~ 0.6 s of
+            // tracking at 14 Hz is still long enough for two-view
+            // triangulation to be well-conditioned, and unlocks BA on
+            // realistic motion.
             auto promotable = feature_mgr_.getPromotableFeatures(
-                /*min_obs=*/12, /*min_kf=*/2, /*max_init_rms_px=*/1.5);
+                /*min_obs=*/8, /*min_kf=*/2, /*max_init_rms_px=*/1.5);
             for (int fid : promotable) {
                 if (ekf_.getSlamFeatureCount() >= EKFState::MAX_SLAM_FEATURES) {
                     break;  // cap reached this frame; try again next frame
@@ -1698,6 +1758,8 @@ VisionOutput Tracker::processFrame(const uint8_t* yuv_data, int width, int heigh
                 int slot = ekf_.addSlamFeature(fid, p_world, anchor);
                 if (slot >= 0) {
                     feature_mgr_.setSlamSlot(fid, slot);
+                    navsight::eventCounters().slam_promotions_total.fetch_add(
+                        1, std::memory_order_relaxed);
                     feature_mgr_.noteTriangulation(
                         fid,
                         cv::Point3f(static_cast<float>(p_world.at<double>(0, 0)),
@@ -2096,6 +2158,16 @@ VisionOutput Tracker::processFrame(const uint8_t* yuv_data, int width, int heigh
                 if (fid >= 0) feature_mgr_.noteKeyframe(fid);
             }
             frames_since_keyframe_ = 0;
+
+            // ── Plan Step 6 (ADR-012): windowed BA at keyframe boundary ──
+            // First consume any pending refinement from the previous
+            // round (re-seed SLAM features via the canonical add/remove
+            // EKF channel), then kick off the next round on the worker
+            // thread. The order matters: consuming first means the new
+            // round optimises against the already-refined state instead
+            // of layering refinements on top of stale ones.
+            consumeBAResultIfReady();
+            kickOffBARound(timestamp_ns);
         }
 
         gray_buf_.copyTo(prev_gray_);
@@ -2311,6 +2383,8 @@ bool Tracker::tryRelocalizeWithORB(const cv::Mat& gray,
     if (best_inliers < RELOC_MIN_INLIERS || best_kf_idx < 0) {
         LOGI("RELOC_ORB: no keyframe accepted (best=%d need=%d, scanned=%d)",
              best_inliers, RELOC_MIN_INLIERS, scanned);
+        navsight::eventCounters().reloc_orb_rejects.fetch_add(
+            1, std::memory_order_relaxed);
         return false;
     }
 
@@ -2330,6 +2404,8 @@ bool Tracker::tryRelocalizeWithORB(const cv::Mat& gray,
         // counts as a successful diagnosis (logs above).
         LOGI("RELOC_ORB: id/pts size mismatch (%zu vs %zu) — skipping re-adopt",
              feature_ids_.size(), current_pts.size());
+        navsight::eventCounters().reloc_orb_size_skipped.fetch_add(
+            1, std::memory_order_relaxed);
         return true;
     }
 
@@ -2387,5 +2463,336 @@ bool Tracker::tryRelocalizeWithORB(const cv::Mat& gray,
          static_cast<unsigned long long>(matched_kfd.keyframe_id),
          best_inliers, static_cast<int>(best_matches_kept.size()),
          reattached, slam_guarded);
+    navsight::eventCounters().reloc_orb_accepts.fetch_add(
+        1, std::memory_order_relaxed);
+    if (slam_guarded > 0) {
+        navsight::eventCounters().reloc_orb_slam_guarded.fetch_add(
+            static_cast<long long>(slam_guarded),
+            std::memory_order_relaxed);
+    }
     return true;
+}
+
+// ──────────────────────────────────────────────────────────────────────────────
+// Plan Step 6 (ADR-012): Local windowed bundle adjustment — off-thread runner
+// ──────────────────────────────────────────────────────────────────────────────
+//
+// On each new keyframe the Tracker:
+//   1. Consumes the previous round's BA result (if it has finished) by
+//      re-seeding the corresponding SLAM features in the EKF — remove the
+//      old slot, add a new slot anchored at the same clone with the
+//      BA-refined world point. The EKF reconstructs covariance through
+//      addSlamFeature, so the canonical observation channel stays in
+//      charge of mean/covariance updates (ADR-006: no side-channel mean
+//      mutation).
+//   2. Kicks off the next BA round on a single worker thread. The worker
+//      cheap-copies a CloneSnapshot (≤ 5 most recent EKF clones) plus a
+//      LandmarkSnapshot (SLAM-promoted features observed by ≥ 2 of those
+//      clones). Both snapshot APIs are mutex-protected and copy the data
+//      out, so the camera thread is freed as soon as the snapshots return.
+//
+// Magic numbers cited inline:
+//   * max_clones=5          — Step 6 plan, "5 most recent keyframes".
+//   * min_obs=2             — landmark must be visible in ≥ 2 of the 5
+//                             clones to constrain the joint solve.
+//   * huber_thresh_px=1.5   — matches Tracker::RANSAC_THRESH; Step 6 plan.
+//   * max_iters=10          — Ceres-style cap for small problems; Step 6.
+//   * 200 ms wall-clock cap — 2× the plan's 100 ms target; thermal headroom
+//                             before the result is rejected as too slow.
+//
+// Threading invariant: at most one round in flight at a time (ba_in_flight_).
+// If the previous round hasn't finished by the next keyframe we LOGI a
+// "skipped" line and do not start a new round — the next keyframe will
+// retry. The result buffer is published under ba_result_mutex_ before
+// ba_in_flight_ is cleared, so the camera thread reading
+// ba_result_pending_ → ba_result_landmarks_ is always coherent.
+
+bool Tracker::kickOffBARound(int64_t timestamp_ns) {
+    // Each early-return path bumps a dedicated counter (and rate-limited
+    // LOGI every 30 hits) so the next sim's event_summary tells us
+    // exactly which gate failed if BA didn't fire. Pre-2026-05-04
+    // versions returned silently and we had no way to distinguish "EKF
+    // not initialised" from "no SLAM features yet" in the JSON.
+    auto& ec = navsight::eventCounters();
+
+    if (!ekf_.isFullInitialized()) {
+        const long long n = ec.ba_skipped_no_init.fetch_add(
+            1, std::memory_order_relaxed) + 1;
+        if (n % 30 == 1) LOGI("BA: skipped (ekf not full-init) count=%lld", n);
+        return false;
+    }
+    if (ba_in_flight_.load(std::memory_order_acquire)) {
+        LOGI("BA: skipped (prev_round_in_flight)");
+        ec.ba_skipped_in_flight.fetch_add(1, std::memory_order_relaxed);
+        return false;
+    }
+
+    // Step 6 plan magic numbers — 5 most-recent clones, ≥ 2 obs per landmark.
+    constexpr int kMaxClones = 5;
+    constexpr int kMinObs    = 2;
+    auto clone_snap = ekf_.getCloneSnapshot(kMaxClones);
+    if (static_cast<int>(clone_snap.size()) < 2) {
+        // BA needs at least one anchor + one free pose.
+        const long long n = ec.ba_skipped_too_few_clones.fetch_add(
+            1, std::memory_order_relaxed) + 1;
+        if (n % 30 == 1) LOGI("BA: skipped (clones=%d<2) count=%lld",
+                              static_cast<int>(clone_snap.size()), n);
+        return false;
+    }
+
+    // Build the clone-id whitelist for the landmark snapshot.
+    std::vector<int> clone_ids;
+    clone_ids.reserve(clone_snap.size());
+    for (const auto& c : clone_snap) clone_ids.push_back(c.clone_id);
+
+    // Live intrinsics — must be valid (setIntrinsics has run before the EKF
+    // is full-init, so this is normally redundant, but stay defensive).
+    double fx = fx_, fy = fy_, cx = cx_, cy = cy_;
+    if (fx <= 1.0 || fy <= 1.0) {
+        const long long n = ec.ba_skipped_no_intrinsics.fetch_add(
+            1, std::memory_order_relaxed) + 1;
+        if (n % 30 == 1) LOGI("BA: skipped (intrinsics fx=%.1f fy=%.1f) count=%lld",
+                              fx, fy, n);
+        return false;
+    }
+
+    auto lm_snap = feature_mgr_.getLandmarkSnapshot(clone_ids, fx, fy, cx, cy,
+                                                     kMinObs);
+    if (lm_snap.size() < 3) {
+        // < 3 landmarks → solver is under-determined. The most common cause
+        // (per the 100 m walk on 2026-05-04) is that SLAM-promotion is
+        // bottlenecked: KLT tracks die before reaching min_obs, never get
+        // promoted, never reach BA. The slam_promotions_total counter
+        // tells us how many features have ever been promoted across the
+        // whole session.
+        const long long n = ec.ba_skipped_too_few_landmarks.fetch_add(
+            1, std::memory_order_relaxed) + 1;
+        if (n % 30 == 1) LOGI("BA: skipped (landmarks=%zu<3) count=%lld promoted_total=%lld",
+                              lm_snap.size(), n,
+                              ec.slam_promotions_total.load(std::memory_order_relaxed));
+        return false;
+    }
+
+    // ── Translate snapshots into the WindowedBA contract ────────────────
+    // CloneSnapshot.R / .t are already in world->cam / camera-in-world,
+    // which is exactly WindowedBA::PoseObs's convention.
+    std::vector<WindowedBA::PoseObs> poses;
+    poses.reserve(clone_snap.size());
+    for (size_t i = 0; i < clone_snap.size(); ++i) {
+        WindowedBA::PoseObs p;
+        p.keyframe_id = clone_snap[i].clone_id;
+        p.R_in        = clone_snap[i].R;
+        p.t_in        = clone_snap[i].t;
+        // Gauge fix: oldest clone (snapshot is ordered oldest first).
+        p.is_anchor   = (i == 0);
+        poses.push_back(p);
+    }
+
+    std::vector<WindowedBA::FeatureObs> features;
+    features.reserve(lm_snap.size());
+    // Parallel array so we can write the refined world points back to the
+    // right (feature_id, slam_slot, anchor_clone_id) tuples after solve.
+    struct Meta { int feature_id; int slam_slot; int anchor_clone_id; };
+    std::vector<Meta> meta;
+    meta.reserve(lm_snap.size());
+
+    // Lifecycle holds the original anchor; we need it for re-seeding.
+    for (const auto& l : lm_snap) {
+        const auto* lc = feature_mgr_.getLifecycle(l.feature_id);
+        if (!lc) continue;
+        WindowedBA::FeatureObs f;
+        f.feature_id = l.feature_id;
+        f.p_w_in     = l.p_world;
+        f.obs        = l.obs;  // already (clone_id, pixel_uv) pairs
+        features.push_back(std::move(f));
+        meta.push_back({l.feature_id, l.slam_slot, lc->anchor_clone_id});
+    }
+    if (features.size() < 3) return false;
+
+    const int round_id = ++ba_round_counter_;
+
+    // Mark in-flight BEFORE launching so a racing camera-thread call sees
+    // the busy state immediately.
+    ba_in_flight_.store(true, std::memory_order_release);
+
+    // Join any previously joinable thread before re-launching. We only ever
+    // launch when ba_in_flight_ was false (checked above), so the thread
+    // body has finished and only awaits a join.
+    if (ba_thread_.joinable()) ba_thread_.join();
+
+    ba_thread_ = std::thread([this, poses_in = std::move(poses),
+                                features_in = std::move(features),
+                                meta_in = std::move(meta),
+                                fx, fy, cx, cy, round_id]() mutable {
+        const auto t_launch = std::chrono::steady_clock::now();
+
+        WindowedBA solver;
+        auto result = solver.solve(poses_in, features_in,
+                                    fx, fy, cx, cy,
+                                    /*max_iters=*/10,
+                                    /*huber_thresh_px=*/1.5);
+
+        const auto t_done = std::chrono::steady_clock::now();
+        const int64_t wall_us = std::chrono::duration_cast<std::chrono::microseconds>(
+                                    t_done - t_launch).count();
+
+        // Plan Step 6 (ADR-012): acceptance gate is conservative because a
+        // bad BA result is strictly worse than no BA result.
+        //   - converged                  → solver actually iterated to a fixed point
+        //   - residual halved            → the step bought us something
+        //   - solve_us < 200 ms          → thermal-headroom budget; reject slow rounds
+        const bool residual_halved =
+            result.initial_residual_sq > 0.0 &&
+            result.final_residual_sq < 0.5 * result.initial_residual_sq;
+        const bool fast_enough = result.solve_us < BA_MAX_SOLVE_US;
+        const bool accept = result.converged && residual_halved && fast_enough;
+
+        LOGI("BA: solve_us=%d iters=%d initial_r2=%.3f final_r2=%.3f huber=%d accept=%s wall_us=%lld round=%d",
+             result.solve_us, result.iterations,
+             result.initial_residual_sq, result.final_residual_sq,
+             result.huber_rejects,
+             accept ? "Y" : "N",
+             static_cast<long long>(wall_us),
+             round_id);
+        // EventCounters: every completed solve counts toward total; the
+        // accept gate above (converged && residual_halved && fast_enough)
+        // decides accepted vs rejected. Timing fields are summed across
+        // all solves, max is monotonic via CAS.
+        auto& ec = navsight::eventCounters();
+        ec.ba_solves_total.fetch_add(1, std::memory_order_relaxed);
+        if (accept) {
+            ec.ba_solves_accepted.fetch_add(1, std::memory_order_relaxed);
+        } else {
+            ec.ba_solves_rejected.fetch_add(1, std::memory_order_relaxed);
+        }
+        ec.ba_solve_us_sum.fetch_add(
+            static_cast<long long>(result.solve_us),
+            std::memory_order_relaxed);
+        ec.update_ba_solve_us_max(static_cast<long long>(result.solve_us));
+        ec.ba_iters_sum.fetch_add(
+            static_cast<long long>(result.iterations),
+            std::memory_order_relaxed);
+
+        if (accept) {
+            std::vector<BARefinedLandmark> refined;
+            refined.reserve(features_in.size());
+            for (size_t i = 0; i < features_in.size() && i < meta_in.size(); ++i) {
+                BARefinedLandmark r;
+                r.feature_id      = meta_in[i].feature_id;
+                r.slam_slot       = meta_in[i].slam_slot;
+                r.anchor_clone_id = meta_in[i].anchor_clone_id;
+                r.p_world_refined = (cv::Mat_<double>(3, 1)
+                    << features_in[i].p_w_out[0],
+                       features_in[i].p_w_out[1],
+                       features_in[i].p_w_out[2]);
+                refined.push_back(std::move(r));
+            }
+            std::lock_guard<std::mutex> lock(ba_result_mutex_);
+            ba_result_landmarks_ = std::move(refined);
+            ba_result_pending_   = true;
+        }
+
+        // Release the in-flight gate AFTER publishing the result so the
+        // camera thread sees pending=true before it sees in_flight=false.
+        ba_in_flight_.store(false, std::memory_order_release);
+    });
+
+    return true;
+}
+
+void Tracker::consumeBAResultIfReady() {
+    // Cheap atomic check — avoid taking the mutex on the (common) "no
+    // result this keyframe" path. Camera thread is otherwise hot here.
+    if (ba_in_flight_.load(std::memory_order_acquire)) return;
+
+    std::vector<BARefinedLandmark> refined;
+    {
+        std::lock_guard<std::mutex> lock(ba_result_mutex_);
+        if (!ba_result_pending_) return;
+        refined = std::move(ba_result_landmarks_);
+        ba_result_landmarks_.clear();
+        ba_result_pending_ = false;
+    }
+
+    if (!ekf_.isFullInitialized()) return;
+
+    // Re-seed each refined landmark by removing its old slot and adding a
+    // new one anchored at the same clone. addSlamFeature rebuilds the
+    // covariance entries cleanly, so the EKF observation channel stays in
+    // charge of state mutation. ADR-006 forbids overwriting EKF mean /
+    // covariance from a side channel; remove + add is the canonical
+    // re-promotion path.
+    int reseeded = 0;
+    int skipped  = 0;
+    for (const auto& r : refined) {
+        if (r.feature_id < 0 || r.anchor_clone_id < 0) { skipped++; continue; }
+
+        // Re-look up the slot — it may have changed since the BA was
+        // launched (other features removed/added between rounds shift slot
+        // indices). Use the lifecycle's current slot, not the stashed one.
+        const auto* lc = feature_mgr_.getLifecycle(r.feature_id);
+        if (!lc || lc->slam_slot < 0) { skipped++; continue; }
+        const int cur_slot = lc->slam_slot;
+
+        // The anchor clone may have been marginalised. Validate first.
+        cv::Mat R_anchor_now, p_anchor_now;
+        if (!ekf_.getClonePose(r.anchor_clone_id,
+                                R_anchor_now, p_anchor_now)) {
+            // Anchor gone; the EKF will retire this SLAM slot through its
+            // existing demotion path. Skip.
+            skipped++;
+            continue;
+        }
+        cv::Mat R_anchor_FEJ, p_anchor_FEJ;
+        if (!ekf_.getCloneFEJ(r.anchor_clone_id,
+                               R_anchor_FEJ, p_anchor_FEJ)) {
+            R_anchor_FEJ = R_anchor_now.clone();
+            p_anchor_FEJ = p_anchor_now.clone();
+        }
+
+        // Drop the old slot, then re-add with the BA-refined world point.
+        if (!ekf_.removeSlamFeature(cur_slot)) { skipped++; continue; }
+        feature_mgr_.setSlamSlot(r.feature_id, -1);
+
+        CameraPose anchor;
+        anchor.R_GtoC       = R_anchor_now;
+        anchor.p_G          = p_anchor_now;
+        anchor.R_FEJ        = R_anchor_FEJ;
+        anchor.p_FEJ        = p_anchor_FEJ;
+        anchor.state_id     = r.anchor_clone_id;
+        anchor.timestamp_ns = 0;  // unused by addSlamFeature
+
+        const int new_slot = ekf_.addSlamFeature(
+            r.feature_id, r.p_world_refined, anchor);
+        if (new_slot < 0) {
+            // Re-add failed (max features reached, depth degenerate, etc.).
+            // Lifecycle slot stays at -1 so the next promotion gate run can
+            // re-promote the feature normally.
+            skipped++;
+            continue;
+        }
+        feature_mgr_.setSlamSlot(r.feature_id, new_slot);
+        // Re-cache the refined world point on the lifecycle so the next
+        // promotion gate (if this slot ever gets demoted again) starts
+        // from the BA-improved position.
+        cv::Point3f p_refined(
+            static_cast<float>(r.p_world_refined.at<double>(0, 0)),
+            static_cast<float>(r.p_world_refined.at<double>(1, 0)),
+            static_cast<float>(r.p_world_refined.at<double>(2, 0)));
+        feature_mgr_.noteTriangulation(r.feature_id, p_refined,
+                                       r.anchor_clone_id);
+        reseeded++;
+    }
+
+    LOGI("BA: consumed refined=%d reseeded=%d skipped=%d",
+         static_cast<int>(refined.size()), reseeded, skipped);
+}
+
+void Tracker::shutdownBA() {
+    // Step 6 (ADR-012): wait for any in-flight round; do NOT detach. The
+    // BA worker reads from ekf_ / feature_mgr_, which the destructor /
+    // reset path is about to tear down — joining ensures the worker has
+    // released its read locks before we touch those structures.
+    if (ba_thread_.joinable()) ba_thread_.join();
+    ba_in_flight_.store(false, std::memory_order_release);
 }

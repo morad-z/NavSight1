@@ -118,10 +118,10 @@ def analyze(path):
     turns = 0
     last_sign = 0
     for i in range(1, n):
-        d = unwrapped[i] - unwrapped[i - 1]
-        if abs(d) < TURN_EPS / 100:
+        dh = unwrapped[i] - unwrapped[i - 1]
+        if abs(dh) < TURN_EPS / 100:
             continue
-        sign = 1 if d > 0 else -1
+        sign = 1 if dh > 0 else -1
         if sign != last_sign and last_sign != 0:
             turns += 1
         last_sign = sign
@@ -235,6 +235,52 @@ def analyze(path):
     else:
         print("GPS: no GPS fixes in this recording")
     print()
+
+    # --- EVENT SUMMARY (from native EventCounters embedded in the JSON) ---
+    # Replaces the old scripts/record_with_logcat.sh adb-pairing pipeline:
+    # the simulator now embeds atomic per-event counts directly under
+    # event_summary at recording-stop time. See app/src/main/cpp/EventCounters.h
+    # for the schema.
+    es = d.get("event_summary")
+    if isinstance(es, dict) and es:
+        print("EVENT SUMMARY (from event_summary in JSON):")
+
+        def g(k):
+            v = es.get(k)
+            return int(v) if isinstance(v, (int, float)) else 0
+
+        ba_total = g("ba_solves_total")
+        ba_iters = g("ba_iters_sum")
+        avg_iters = (ba_iters / ba_total) if ba_total > 0 else 0.0
+
+        print(f"  Step 4 RELOC_ORB        : accepts={g('reloc_orb_accepts')} "
+              f"rejects={g('reloc_orb_rejects')} "
+              f"(size_skip={g('reloc_orb_size_skipped')} "
+              f"slam_guarded={g('reloc_orb_slam_guarded')})")
+        print(f"  Step 5 BLUR             : enter={g('blur_enter_events')} "
+              f"total_skip_frames={g('blur_total_skip_frames')}")
+        print(f"  Step 5 LOWLIGHT         : active_frames={g('lowlight_state_active_frames')} "
+              f"log_lines={g('lowlight_log_lines')}")
+        print(f"  Step 5 ROT_GATE         : pure_rot={g('rot_gate_pure_rot_confirmed')} "
+              f"log_lines={g('rot_gate_log_lines')}")
+        print(f"  Step 5 KLT adaptive     : hits={g('klt_adaptive_window_hits')}")
+        print(f"  Step 6 BA               : total={ba_total} "
+              f"accepted={g('ba_solves_accepted')} "
+              f"rejected={g('ba_solves_rejected')} "
+              f"skipped_inflight={g('ba_skipped_in_flight')}")
+        print(f"  Step 6 BA skip reasons  : no_init={g('ba_skipped_no_init')} "
+              f"few_clones={g('ba_skipped_too_few_clones')} "
+              f"no_intrinsics={g('ba_skipped_no_intrinsics')} "
+              f"few_landmarks={g('ba_skipped_too_few_landmarks')}")
+        print(f"  Step 6 BA timing        : sum_us={g('ba_solve_us_sum')} "
+              f"max_us={g('ba_solve_us_max')} avg_iters={avg_iters:.2f}")
+        print(f"  Step 3b SLAM promotions : total={g('slam_promotions_total')}")
+        print(f"  Step 3 MSCKF            : updates={g('msckf_update_lines')} "
+              f"huber_rej={g('msckf_huber_rejected_sum')}")
+        print()
+    else:
+        print("EVENT SUMMARY: (no event_summary — pre-counter sim)")
+        print()
 
 
 def main():
