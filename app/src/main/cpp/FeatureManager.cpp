@@ -22,6 +22,13 @@ void FeatureManager::reset() {
     active_tracks_.clear();
     lifecycle_.clear();
     next_feature_id_ = 0;
+    // Plan Step 5 (ADR-011): clear the low-light hysteresis state so a
+    // mid-session reset does not carry the prior bootstrap's gate decision
+    // forward into the new one.
+    low_light_low_streak_    = 0;
+    low_light_normal_streak_ = 0;
+    low_light_state_         = false;
+    low_light_log_counter_   = 0;
 }
 
 int FeatureManager::countInCell(const std::vector<cv::Point2f>& points,
@@ -96,10 +103,70 @@ void FeatureManager::replenishSparse(const cv::Mat& gray,
     out_new.clear();
     if (gray.empty()) return;
 
+    // ── Plan Step 5 (ADR-011): adaptive low-light feature replenish ────────
+    //
+    // Probe centre-crop mean brightness so the goodFeaturesToTrack budget
+    // can be relaxed in regimes where strong corners are physically scarce
+    // (parking garages, indoor halls under dim LED, night corridors). The
+    // crop matches Tracker's blur detector ROI so motion-blur skips and
+    // low-light replenish see the same patch. A small two-state hysteresis
+    // (BRIGHTNESS_HYSTERESIS_FRAMES) prevents feature-count thrashing when
+    // auto-exposure ramps cause the mean to oscillate around the gate.
+    //
+    // Steady-state Tracker::MAX_FEATURES (200) and Tracker::QUALITY_LEVEL
+    // (0.05) are intentionally NOT mutated. Only the local effective
+    // targets used inside this call swap to the low-light pair.
+    int eff_max_total      = max_total;
+    double eff_quality     = quality_level;
+
+    {
+        // Centre-crop using the same integer-division pattern Tracker's
+        // measureBlur uses (Tracker.cpp ~line 342: cols/2, rows/2). On
+        // odd-dimension frames the BRIGHTNESS_CENTRE_FRAC=0.5 multiply
+        // could drift by one pixel vs Tracker; integer-divide unifies
+        // the two crops bit-for-bit.
+        const int cw = gray.cols / 2;
+        const int ch = gray.rows / 2;
+        const int cx = (gray.cols - cw) / 2;
+        const int cy = (gray.rows - ch) / 2;
+        const cv::Rect centre(cx, cy, cw, ch);
+        const double mean_brightness = cv::mean(gray(centre))[0] / 255.0;
+
+        if (mean_brightness < BRIGHTNESS_LOW_THRESH) {
+            low_light_low_streak_    = std::min(low_light_low_streak_ + 1, 1000);
+            low_light_normal_streak_ = 0;
+        } else {
+            low_light_normal_streak_ = std::min(low_light_normal_streak_ + 1, 1000);
+            low_light_low_streak_    = 0;
+        }
+        // Hysteresis flip: only commit the new state after N consecutive
+        // observations. Prevents AE-ramp thrashing on the boundary.
+        if (!low_light_state_ &&
+            low_light_low_streak_ >= BRIGHTNESS_HYSTERESIS_FRAMES) {
+            low_light_state_ = true;
+        } else if (low_light_state_ &&
+                   low_light_normal_streak_ >= BRIGHTNESS_HYSTERESIS_FRAMES) {
+            low_light_state_ = false;
+        }
+
+        if (low_light_state_) {
+            eff_max_total = REPLENISH_TARGET_LOWLIGHT;
+            eff_quality   = REPLENISH_QUALITY_LOWLIGHT;
+            if ((low_light_log_counter_++ % 30) == 0) {
+                LOGI("LOWLIGHT: brightness=%.3f target=%d quality=%.2f",
+                     mean_brightness, eff_max_total, eff_quality);
+            }
+        } else {
+            // Reset the logging cadence when we leave low-light so the
+            // next entry logs immediately rather than at a stale offset.
+            low_light_log_counter_ = 0;
+        }
+    }
+
     int cell_w = gray.cols / GRID_COLS;
     int cell_h = gray.rows / GRID_ROWS;
-    int target_per_cell = max_total / (GRID_ROWS * GRID_COLS);
-    int remaining = max_total - static_cast<int>(existing.size());
+    int target_per_cell = eff_max_total / (GRID_ROWS * GRID_COLS);
+    int remaining = eff_max_total - static_cast<int>(existing.size());
     if (remaining <= 0) return;
 
     std::vector<cv::Point2f> cell_pts;
@@ -121,7 +188,7 @@ void FeatureManager::replenishSparse(const cv::Mat& gray,
             cell_pts.clear();
             cv::goodFeaturesToTrack(cell, cell_pts,
                                     std::min(deficit, remaining),
-                                    quality_level, min_dist);
+                                    eff_quality, min_dist);
 
             for (auto& pt : cell_pts) {
                 pt.x += static_cast<float>(x0);

@@ -9,7 +9,7 @@ public:
 
     /**
      * @brief Performs KLT tracking from prev frame to current frame.
-     * 
+     *
      * @param prev_gray Previous frame (grayscale)
      * @param curr_gray Current frame (grayscale)
      * @param prev_pts Points in the previous frame
@@ -17,12 +17,17 @@ public:
      * @param status Status of each point (1 if tracked, 0 otherwise)
      * @param delta_R Inter-frame rotation from IMU (optional, eye(3,3) if none)
      * @param K Camera intrinsics matrix
+     * @param win_size Optional KLT window size (must be odd). Pass <= 0 to use
+     *                 the class default WINDOW_SIZE. Plan Step 5: Tracker uses
+     *                 this to grow the window when expected per-frame pixel
+     *                 displacement (from gyro) exceeds the static budget.
      */
     void track(const cv::Mat& prev_gray, const cv::Mat& curr_gray,
                const std::vector<cv::Point2f>& prev_pts,
                std::vector<cv::Point2f>& curr_pts,
                std::vector<uchar>& status,
-               const cv::Mat& delta_R, const cv::Mat& K);
+               const cv::Mat& delta_R, const cv::Mat& K,
+               int win_size = -1);
 
     /**
      * @brief Performs geometric outlier rejection using the 5-point algorithm (RANSAC).

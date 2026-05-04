@@ -128,6 +128,19 @@ private:
     bool tryRelocalizeWithORB(const cv::Mat& gray,
                               const std::vector<cv::Point2f>& current_pts);
 
+    // ── Plan Step 5: motion-blur detector ─────────────────────────────────
+    // Variance of Laplacian on the centre 50%×50% crop of `gray`. Below
+    // BLUR_VAR_THRESH the frame is too blurry to support reliable visual
+    // measurement updates; the EKF prediction (propagateIMU + ZUPT) still
+    // runs, but SLAM-feature updates, the MSCKF processLostFeatures call,
+    // and the ORB relocalization trigger are skipped for that frame so the
+    // filter does not consume high-noise residuals.
+    //
+    // Returns the variance (so callers can log it). A non-positive return
+    // value indicates an empty / undersized input — treat that as
+    // "not blurry" because it means we cannot make a measurement either way.
+    double measureBlur(const cv::Mat& gray) const;
+
     mutable std::mutex mutex_;
     mutable std::mutex pose_mutex_;
 
@@ -252,6 +265,15 @@ private:
     // Keyframe tracking state
     int frames_since_keyframe_{0};
 
+    // ── Plan Step 5: motion-blur skip counter ─────────────────────────────
+    // Counts consecutive frames that have been classified as blurry
+    // (variance of Laplacian < BLUR_VAR_THRESH) and therefore had their
+    // visual measurement updates suppressed. Reset to 0 on the first frame
+    // that survives the blur gate. Logged once per blur event so a sustained
+    // blur (e.g. a whole-second head turn) is visible in the trace without
+    // spamming a line per frame.
+    int blur_skipped_streak_{0};
+
     // ── Plan Step 4 (ADR-010): ORB relocalization debounce ─────────────────
     // Counts consecutive frames where the geometric-verification inlier
     // count fell below MIN_INLIERS / 2 (= 4). When it reaches
@@ -296,6 +318,25 @@ private:
                   "RELOC_LOW_INLIER_BAR assumes MIN_INLIERS is even");
     static constexpr double MIN_INLIER_RATIO   = 0.25;
     static constexpr double GYRO_ROT_ONLY_THRESH = 2.0;
+    // Plan Step 5: Rayleigh resultant cutoff for the dual-gate pure-rotation
+    // detector. R/N is the mean resultant length of the per-feature optical-
+    // flow direction vectors on the unit circle. R/N < 0.3 means the flow
+    // directions are statistically uniform (Mardia 1972 — "Statistics of
+    // Directional Data" §3.4), which is strong evidence the camera is
+    // rotating rather than translating; under translation the flow points
+    // of a static scene radiate from / converge to the focus-of-expansion
+    // and concentrate strongly. Used in conjunction with the gyro-magnitude
+    // gate — the Rayleigh test alone over-fires in the presence of
+    // independent moving objects, so it only ARMS the existing gyro gate.
+    static constexpr double FLOW_RAYLEIGH_REJECT = 0.3;
+    // Plan Step 5: motion-blur acceptance threshold. Variance of Laplacian
+    // is the OpenCV community heuristic for blur scoring (Pech-Pacheco et al.
+    // 2000 — "Diatom autofocusing in brightfield microscopy: a comparative
+    // study"); below ~80 a printed page becomes unreadable. Tuned on
+    // synthetic Gaussian σ=5 blur in tests/cpp/test_visual_robustness.cpp;
+    // re-tune from real Haifa head-turn sims if observed false-positive
+    // rate climbs.
+    static constexpr double BLUR_VAR_THRESH    = 80.0;
     static constexpr double ZUPT_GYRO_THRESH   = 0.04;
     static constexpr int    ACCEL_BIAS_WARMUP  = 150;
     static constexpr double ACCEL_BIAS_ALPHA   = 0.005;

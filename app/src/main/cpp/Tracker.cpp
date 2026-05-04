@@ -319,6 +319,7 @@ void Tracker::reset() {
     td_warmup_buf_.clear();
     frames_since_keyframe_ = 0;
     low_inlier_streak_ = 0;
+    blur_skipped_streak_ = 0;
     last_step_speed_ = 0.0;
     last_step_speed_ns_ = 0;
     ekf_.reset();
@@ -327,6 +328,31 @@ void Tracker::reset() {
 }
 
 // ── Helpers ──────────────────────────────────────────────────────────────────
+
+double Tracker::measureBlur(const cv::Mat& gray) const {
+    // Plan Step 5: variance of Laplacian on the centre 50%×50% crop. The
+    // crop bounds the cost (we never look at the whole frame) and avoids
+    // edge artefacts (vignetting / motion-induced edge darkening) that
+    // would inflate the score when the scene-content middle is actually
+    // soft. Returns -1 for unusable inputs so the caller can treat that
+    // case as "do not skip" (we cannot tell either way).
+    if (gray.empty() || gray.cols < 8 || gray.rows < 8) {
+        return -1.0;
+    }
+    const int crop_w = gray.cols / 2;
+    const int crop_h = gray.rows / 2;
+    const int x0     = (gray.cols - crop_w) / 2;
+    const int y0     = (gray.rows - crop_h) / 2;
+    cv::Mat roi = gray(cv::Rect(x0, y0, crop_w, crop_h));
+
+    cv::Mat lap;
+    cv::Laplacian(roi, lap, CV_32F);
+
+    cv::Scalar mean, stddev;
+    cv::meanStdDev(lap, mean, stddev);
+    const double sigma = stddev[0];
+    return sigma * sigma;  // variance
+}
 
 double Tracker::estimateScaleFromSteps(double vision_disp, int64_t dt_ns,
                                         IMUPreintegrator& imu) {
@@ -485,6 +511,36 @@ VisionOutput Tracker::processFrame(const uint8_t* yuv_data, int width, int heigh
         LOGI("LOW_LIGHT: brightness=%.2f -> dead reckoning mode", frame_brightness);
     }
 
+    // ── 1.b Motion-blur gate (Plan Step 5) ───────────────────────────────────
+    // Compute variance of Laplacian on the centre crop. When the score drops
+    // below BLUR_VAR_THRESH we still propagate IMU + run ZUPT (single-frame
+    // dead reckoning is fine), but skip the EKF visual measurement updates
+    // (geometric verification, SLAM-feature update, MSCKF processLostFeatures,
+    // ORB reloc trigger) so the filter does not consume high-noise residuals.
+    // measureBlur returning -1 means "unusable input" — treat as not-blurry
+    // so we never silently skip on a degenerate buffer.
+    const double blur_var       = measureBlur(gray_buf_);
+    const bool   frame_is_blurry = (blur_var >= 0.0 && blur_var < BLUR_VAR_THRESH);
+    if (frame_is_blurry) {
+        const int prev_streak = blur_skipped_streak_;
+        blur_skipped_streak_++;
+        // Rate-limit: log only on entry to a blur burst (avoids 30 lines/s
+        // during a 1 s head-turn). The exit transition is logged in the
+        // else branch below when a non-trivial streak ends.
+        if (prev_streak == 0) {
+            LOGI("BLUR: enter var=%.1f thresh=%.1f", blur_var, BLUR_VAR_THRESH);
+        }
+    } else {
+        if (blur_skipped_streak_ > 0) {
+            LOGI("BLUR: exit after %d frames", blur_skipped_streak_);
+        }
+        blur_skipped_streak_ = 0;
+    }
+    // Keep the `frame_blurry_`-named local available to existing call sites
+    // below without renaming every use (the trailing-underscore form was a
+    // lint nit; the rename above is the canonical one).
+    const bool frame_blurry_ = frame_is_blurry;
+
     // ── 2. Camera intrinsics + lens corrector ────────────────────────────────
     double fx_use = (fx_ > 0) ? fx_ : 0.7 * width;
     double fy_use = (fy_ > 0) ? fy_ : fx_use;
@@ -607,14 +663,47 @@ VisionOutput Tracker::processFrame(const uint8_t* yuv_data, int width, int heigh
     // ── Statistical Zero-Velocity Detection (ZUPT) ──
     // (Moved below mean_flow calculation)
     bool is_static = false;
-    bool is_pure_rotation = (gyro_norm > GYRO_ROT_ONLY_THRESH);
+    // Plan Step 5: dual-gate pure-rotation detector. The gyro-magnitude gate
+    // is the necessary condition (rotation is what produces high gyro), but
+    // it is not sufficient — a sustained scooter "looking around" still
+    // shows large flow because the rider is also translating, so the
+    // existing single-gate version misclassified those frames as
+    // "pure rotation" and (correctly) suppressed the visual yaw update but
+    // (incorrectly) also suppressed the scale / SLAM updates. We tighten by
+    // requiring the optical-flow direction distribution to also look like
+    // rotation (Rayleigh resultant length R/N below FLOW_RAYLEIGH_REJECT
+    // means flow directions are approximately uniform on the unit circle,
+    // i.e. they are NOT pointing away from a focus-of-expansion). Computed
+    // below after the per-feature flow loop; until then we use the
+    // gyro-only candidate, which is preserved as the conservative default
+    // for code paths that fire BEFORE the Rayleigh stage (none today, but
+    // explicit for future maintenance).
+    bool gyro_pure_rotation_candidate = (gyro_norm > GYRO_ROT_ONLY_THRESH);
+    bool is_pure_rotation = gyro_pure_rotation_candidate;
 
     // ── 5. Optical flow tracking (TrackKLT) ──────────────────────────────────
+    // Plan Step 5: adaptive KLT search-window sizing from gyro magnitude.
+    // Expected per-frame pixel displacement of a stationary point under the
+    // observed angular rate: expected_disp_px = focal * |gyro| * dt. KLT
+    // loses tracks when its window is < ~1.5× the inter-frame displacement;
+    // growing the window to 41 px covers ~3 rad/s on a 30 Hz frame at
+    // f≈525 px (typical phone telephoto-ish narrow FOV). Steady-state walk
+    // (gyro ≈ 0) clamps to 21 px so the cost matches pre-Step-5 builds.
+    const double dt_klt = (imu_delta.dt > 0.0) ? imu_delta.dt : 0.0;
+    const double expected_disp_px = fx_use * gyro_norm * dt_klt;
+    int win_sz = static_cast<int>(2.0 * expected_disp_px + 11.0);
+    win_sz = std::max(21, std::min(41, win_sz));
+    if ((win_sz & 1) == 0) win_sz += 1;  // KLT requires an odd window
+    if (win_sz > 21 && frame_counter_ % 30 == 0) {
+        LOGI("KLT: adaptive win=%d gyro=%.2f rad/s expected_disp=%.1f px",
+             win_sz, gyro_norm, expected_disp_px);
+    }
+
     int64_t t_klt_start = now_us();
     std::vector<uchar> status;
     next_pts_buf_.clear();
     klt_.track(current_prev_gray, gray_buf_, current_prev_pts_buf_,
-               next_pts_buf_, status, imu_delta.deltaR, K);
+               next_pts_buf_, status, imu_delta.deltaR, K, win_sz);
     int64_t t_klt_end = now_us();
     if (frame_counter_ % 30 == 0) {
         LOGI("PERF: section=klt us=%lld n_pts=%zu",
@@ -677,6 +766,57 @@ VisionOutput Tracker::processFrame(const uint8_t* yuv_data, int width, int heigh
     bool motion_blur = (mean_flow > MAX_FLOW_PX);
     bool sufficient_motion = (mean_flow >= MIN_FLOW_PX) && !motion_blur;
     bool has_parallax = (mean_flow >= MIN_PARALLAX_PX) && !motion_blur;
+
+    // ── Plan Step 5: Rayleigh dual-gate for pure rotation ────────────────────
+    // The mean resultant length R/N of the per-feature flow direction unit
+    // vectors. Rotation produces an approximately uniform direction
+    // distribution (R/N → 0); translation produces directions that converge
+    // on the focus-of-expansion (R/N → 1). FLOW_RAYLEIGH_REJECT (=0.3)
+    // gates the rotation classification — only when BOTH gyro magnitude is
+    // high AND flow direction is uniform do we declare pure rotation. If
+    // we can't compute a meaningful R/N (too few flow vectors or all-zero
+    // flow), we fall back to the gyro-only result so this gate can only
+    // ADD restrictions, never loosen the existing detector. Concern: on a
+    // legitimate scooter ride forward where flow IS concentrated toward
+    // the FoE, R/N stays high → the gate keeps `is_pure_rotation` FALSE,
+    // which is the correct behaviour (we want scale / SLAM updates to
+    // proceed during forward motion).
+    // Size invariant: the FB-check + boundary filter earlier in the frame
+    // can shrink next_good_buf_ below prev_good_buf_, so iterating
+    // prev_good_buf_ while indexing next_good_buf_[i] would read OOB. We
+    // require the two buffers to be co-indexed before computing R/N. If
+    // they ever diverge mid-frame (a future refactor), the dual gate
+    // silently falls back to the gyro-only result rather than UB-reading
+    // a stale slot.
+    if (gyro_pure_rotation_candidate
+        && prev_good_buf_.size() >= 10
+        && next_good_buf_.size() == prev_good_buf_.size()) {
+        double sx = 0.0, sy = 0.0;
+        int    n_dirs = 0;
+        for (size_t i = 0; i < prev_good_buf_.size(); ++i) {
+            const double dx = next_good_buf_[i].x - prev_good_buf_[i].x;
+            const double dy = next_good_buf_[i].y - prev_good_buf_[i].y;
+            const double mag = std::sqrt(dx * dx + dy * dy);
+            if (mag < 1e-3) continue;  // sub-pixel noise carries no direction
+            sx += dx / mag;
+            sy += dy / mag;
+            n_dirs++;
+        }
+        if (n_dirs >= 10) {
+            const double R   = std::sqrt(sx * sx + sy * sy);
+            const double r_n = R / static_cast<double>(n_dirs);
+            // Concentrated flow (R/N >= reject threshold) → translation
+            // present → relax the gyro classification back to "not pure
+            // rotation". Uniform flow (R/N < reject threshold) → confirm
+            // pure rotation.
+            is_pure_rotation = (r_n < FLOW_RAYLEIGH_REJECT);
+            if (frame_counter_ % 30 == 0) {
+                LOGI("ROT_GATE: gyro=%.2f R/N=%.2f thresh=%.2f -> pure_rot=%d",
+                     gyro_norm, r_n, FLOW_RAYLEIGH_REJECT,
+                     is_pure_rotation ? 1 : 0);
+            }
+        }
+    }
 
     // ── Phase 6: Time-offset cross-correlation warmup ───────────────────────
     if (!td_warmup_done_ && frame_counter_ <= TD_WARMUP_FRAMES) {
@@ -784,7 +924,16 @@ VisionOutput Tracker::processFrame(const uint8_t* yuv_data, int width, int heigh
     // weak inlier count — frames skipped due to is_static / no-parallax
     // do not penalise the streak (they are legitimately scale-blind).
     bool geo_verification_attempted = false;
-    if (sufficient_motion && has_parallax && !is_static && tracked >= 8) {
+    // Plan Step 5: motion-blur skip — visual measurement updates would
+    // inject high-noise residuals into the EKF, so this entire section
+    // (geometric verification + R_vo fusion + scale observers + MSCKF
+    // block at section 11.1 + SLAM block at section 11.1b) is gated on
+    // !frame_blurry_. propagateIMU + ZUPT have already run above; the
+    // filter still advances on IMU dead reckoning for the blurred frame.
+    // Because geo_verification_attempted stays false, the ORB reloc
+    // trigger streak (section 7.x below) is also naturally suppressed.
+    if (sufficient_motion && has_parallax && !is_static && tracked >= 8
+        && !frame_blurry_) {
         geo_verification_attempted = true;
         // Undistort matched points before geometric estimation
         std::vector<cv::Point2f> prev_ud = prev_good_buf_;
@@ -1349,18 +1498,29 @@ VisionOutput Tracker::processFrame(const uint8_t* yuv_data, int width, int heigh
         // the sliding window has the latest pose and the residual is built
         // against the post-rotation-update state.
         if (ekf_.isFullInitialized() && !feature_ids_.empty()) {
-            auto lost = feature_mgr_.getMSCKFCandidates(feature_ids_, 4);
-            if (!lost.empty()) {
-                int used = msckf_updater_.processLostFeatures(
-                    ekf_, lost, fx_use, fy_use, cx_use, cy_use);
-                if (used > 0) {
-                    LOGI("MSCKF: ran update with %zu lost features, %d used "
-                         "(huber_rejected=%d)",
-                         lost.size(), used,
-                         ekf_.getMSCKFHuberRejectedCount());
-                } else if (lost.size() >= 2) {
-                    LOGI("MSCKF: %zu lost features all rejected (chi²/triang)",
-                         lost.size());
+            // Plan Step 5: skip the MSCKF measurement update on blurred
+            // frames — the lost-feature reprojection residual is dominated
+            // by KLT noise on a soft frame and would inject a bad
+            // correction. The observation history kept by FeatureManager
+            // is unchanged (still appended in section 9.1 above), so a
+            // post-blur frame can still reuse the same lost features once
+            // they're picked up again. The window-prune below MUST still
+            // run unconditionally to keep the sliding-window slot
+            // accounting consistent with the EKF state.
+            if (!frame_blurry_) {
+                auto lost = feature_mgr_.getMSCKFCandidates(feature_ids_, 4);
+                if (!lost.empty()) {
+                    int used = msckf_updater_.processLostFeatures(
+                        ekf_, lost, fx_use, fy_use, cx_use, cy_use);
+                    if (used > 0) {
+                        LOGI("MSCKF: ran update with %zu lost features, %d used "
+                             "(huber_rejected=%d)",
+                             lost.size(), used,
+                             ekf_.getMSCKFHuberRejectedCount());
+                    } else if (lost.size() >= 2) {
+                        LOGI("MSCKF: %zu lost features all rejected (chi²/triang)",
+                             lost.size());
+                    }
                 }
             }
             if (!ekf_.getWindow().empty()) {
@@ -1552,8 +1712,15 @@ VisionOutput Tracker::processFrame(const uint8_t* yuv_data, int width, int heigh
             t_slam_promote_us = now_us() - t_promote_start;
 
             // ── (2) UPDATE ──────────────────────────────────────────────
+            // Plan Step 5: skip the per-SLAM-feature reprojection update on
+            // blurred frames — `cur_obs` would be a soft pixel that
+            // produces a meaningless residual. The SLAM feature stays in
+            // the EKF state with its existing inverse-depth estimate;
+            // PROMOTE / DEMOTE / EXPIRE bookkeeping above and below still
+            // run because they use the stored observation history rather
+            // than the current frame's pixel.
             int64_t t_update_start = now_us();
-            const int n_slam = ekf_.getSlamFeatureCount();
+            const int n_slam = (frame_blurry_) ? 0 : ekf_.getSlamFeatureCount();
             for (int slot = 0; slot < n_slam; slot++) {
                 // Translate slot ↔ feature_id by walking lifecycle map. We
                 // could cache the inverse map, but n_slam ≤ 12 — linear

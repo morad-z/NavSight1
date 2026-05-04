@@ -284,6 +284,40 @@ private:
     static constexpr int MIN_KF_MATCHES = 20;
     static constexpr float KF_MATCH_RADIUS = 15.0f;  // pixels
 
+    // ── Plan Step 5 (ADR-011): adaptive low-light feature replenish ────────
+    //
+    // Brightness gate consumed by replenishSparse. Centre-crop mean of the
+    // gray frame, normalised to [0, 1]. Below the threshold the replenish
+    // path swaps the steady-state (Tracker::MAX_FEATURES = 200,
+    // Tracker::QUALITY_LEVEL = 0.05) targets for the low-light pair below.
+    //
+    // Empirically below ~0.12 (32/255 in 8-bit) phone cameras enter
+    // ISO-pumped territory; corner SNR collapses. In low light, weak
+    // corners are dominated by sensor noise; doubling the quality
+    // threshold rejects them, and lowering the target acknowledges fewer
+    // strong corners are physically available. Net effect: fewer but
+    // more reliable features survive into KLT.
+    static constexpr double BRIGHTNESS_LOW_THRESH      = 0.12;
+    static constexpr int    REPLENISH_TARGET_LOWLIGHT  = 120;   // vs 200
+    static constexpr double REPLENISH_QUALITY_LOWLIGHT = 0.10;  // vs 0.05
+    // Centre-crop fraction along each axis. 0.5 mirrors the "central half"
+    // ROI used by Tracker's blur detector so the brightness probe sees the
+    // same patch — keeps the gate consistent with motion-blur skip frames.
+    static constexpr double BRIGHTNESS_CENTRE_FRAC     = 0.5;
+    // Hysteresis on consecutive-frame transitions: the low-light decision
+    // only flips after this many frames sustain the new state. Prevents
+    // feature-count thrashing across auto-exposure ramps where the mean
+    // brightness oscillates around the 0.12 boundary frame to frame.
+    static constexpr int    BRIGHTNESS_HYSTERESIS_FRAMES = 5;
+
+    // Hysteresis state for the low-light gate, owned per-instance so a
+    // mid-session FeatureManager::reset() (e.g. recalibration) clears them
+    // back to defaults instead of leaking state across the bootstrap.
+    int  low_light_low_streak_     = 0;     // consecutive frames below thresh
+    int  low_light_normal_streak_  = 0;     // consecutive frames at/above
+    bool low_light_state_          = false; // committed state (post-hysteresis)
+    int  low_light_log_counter_    = 0;     // rate-limit LOGI to every 30 hits
+
     // ── Plan Step 4 (ADR-010) ORB descriptor private constants ─────────────
     // (Public ORB extractor params — TARGET_FEATURES / FAST_THRESHOLD /
     //  PREBLUR_SIGMA — are declared in the public section so the Tracker's

@@ -17,7 +17,8 @@ void TrackKLT::track(const cv::Mat& prev_gray, const cv::Mat& curr_gray,
                       const std::vector<cv::Point2f>& prev_pts,
                       std::vector<cv::Point2f>& curr_pts,
                       std::vector<uchar>& status,
-                      const cv::Mat& delta_R, const cv::Mat& K) {
+                      const cv::Mat& delta_R, const cv::Mat& K,
+                      int win_size) {
     if (prev_pts.empty()) {
         curr_pts.clear();
         status.clear();
@@ -27,7 +28,7 @@ void TrackKLT::track(const cv::Mat& prev_gray, const cv::Mat& curr_gray,
     // ── Step 1: Predict point positions using IMU rotation ────────────────────
     std::vector<cv::Point2f> predicted_pts;
     bool has_rotation = (cv::countNonZero(delta_R - cv::Mat::eye(3, 3, CV_64F)) > 0);
-    
+
     if (has_rotation) {
         predictPoints(prev_pts, predicted_pts, delta_R, K);
         curr_pts = predicted_pts;
@@ -35,21 +36,31 @@ void TrackKLT::track(const cv::Mat& prev_gray, const cv::Mat& curr_gray,
         curr_pts = prev_pts; // default guess: stationary
     }
 
+    // Plan Step 5: caller may grow the KLT search window when the IMU predicts
+    // large per-frame pixel displacement (rapid head turn / scooter gyro).
+    // Passing a non-positive win_size opts back to the class default to keep
+    // the steady-state behaviour identical to pre-Step-5 builds.
+    int wsz = (win_size > 0) ? win_size : WINDOW_SIZE;
+    // KLT requires an odd window — round up if the caller passed an even
+    // value (defensive; Tracker already enforces odd, but this keeps the
+    // contract local to TrackKLT).
+    if ((wsz & 1) == 0) wsz += 1;
+
     // ── Step 2: Forward KLT tracking ──────────────────────────────────────────
     std::vector<float> err;
     cv::TermCriteria criteria(cv::TermCriteria::COUNT + cv::TermCriteria::EPS, 30, 0.01);
-    
+
     cv::calcOpticalFlowPyrLK(prev_gray, curr_gray, prev_pts,
-        curr_pts, status, err, cv::Size(WINDOW_SIZE, WINDOW_SIZE), 
+        curr_pts, status, err, cv::Size(wsz, wsz),
         PYRAMID_LEVELS, criteria, cv::OPTFLOW_LK_GET_MIN_EIGENVALS | cv::OPTFLOW_USE_INITIAL_FLOW);
 
     // ── Step 3: Backward KLT check (FB-Consistency) ───────────────────────────
     std::vector<cv::Point2f> back_pts;
     std::vector<uchar> back_status;
     std::vector<float> back_err;
-    
+
     cv::calcOpticalFlowPyrLK(curr_gray, prev_gray, curr_pts,
-        back_pts, back_status, back_err, cv::Size(WINDOW_SIZE, WINDOW_SIZE), 
+        back_pts, back_status, back_err, cv::Size(wsz, wsz),
         PYRAMID_LEVELS, criteria, cv::OPTFLOW_LK_GET_MIN_EIGENVALS);
 
     for (size_t i = 0; i < status.size(); ++i) {

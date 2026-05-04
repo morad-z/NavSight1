@@ -78,6 +78,12 @@ add_executable(navsight_tests
     # impl uses (ORB nfeatures=250, BF NORM_HAMMING + Lowe 0.75, findEssentialMat
     # RANSAC 1.5 px @ focal=525). Self-contained: no FeatureManager dependency.
     test_orb_reloc.cpp
+    # Plan Step 5: adaptive front-end robustness — motion-blur detection,
+    # adaptive KLT window from gyro, dual-gate (Rayleigh + gyro floor)
+    # pure-rotation detector, and low-light feature policy. Self-contained:
+    # exercises the same OpenCV primitives + formulas the Tracker /
+    # FeatureManager impls use, no Tracker / FeatureManager dependency.
+    test_visual_robustness.cpp
 )
 target_link_libraries(navsight_tests navsight_core GTest::gtest_main)
 
