@@ -318,6 +318,7 @@ void Tracker::reset() {
     td_warmup_done_ = false;
     td_warmup_buf_.clear();
     frames_since_keyframe_ = 0;
+    low_inlier_streak_ = 0;
     last_step_speed_ = 0.0;
     last_step_speed_ns_ = 0;
     ekf_.reset();
@@ -461,6 +462,14 @@ VisionOutput Tracker::processFrame(const uint8_t* yuv_data, int width, int heigh
 
     int64_t t0_total = now_us();
 
+    // PERF: log analyzer frame size once per second so we can confirm 640×480.
+    // If ResolutionSelector ever falls back to 1280×960 the per-frame KLT and
+    // cornersSB cost is 4× by pixel area; this line is the single source of
+    // truth for "are we actually at the design resolution?"
+    if (frame_counter_ % 30 == 0) {
+        LOGI("PERF: section=frame_size w=%d h=%d", width, height);
+    }
+
     // ── 1. YUV NV21 → grayscale + adaptive CLAHE ────────────────────────────
     cv::Mat yuv(height + height / 2, width, CV_8UC1, const_cast<uint8_t*>(yuv_data));
     cv::cvtColor(yuv, gray_buf_, cv::COLOR_YUV2GRAY_NV21);
@@ -546,6 +555,12 @@ VisionOutput Tracker::processFrame(const uint8_t* yuv_data, int width, int heigh
             feature_mgr_.storeKeyframe(gray_buf_, prev_pts_, timestamp_ns, 0,
                                       scalar_heading_,
                                       cv::Point3f(0, 0, 0));
+            // Plan Step 4 (ADR-010): mirror the keyframe into the ORB
+            // descriptor ring buffer for relocalization.
+            feature_mgr_.storeKeyframeDescriptors(
+                static_cast<uint64_t>(frame_counter_),
+                static_cast<double>(timestamp_ns),
+                gray_buf_, prev_pts_, feature_ids_);
             LOGI("processFrame: first frame, grid-detected %zu features", prev_pts_.size());
             return out;
         }
@@ -601,6 +616,11 @@ VisionOutput Tracker::processFrame(const uint8_t* yuv_data, int width, int heigh
     klt_.track(current_prev_gray, gray_buf_, current_prev_pts_buf_,
                next_pts_buf_, status, imu_delta.deltaR, K);
     int64_t t_klt_end = now_us();
+    if (frame_counter_ % 30 == 0) {
+        LOGI("PERF: section=klt us=%lld n_pts=%zu",
+             (long long)(t_klt_end - t_klt_start),
+             current_prev_pts_buf_.size());
+    }
 
     // ── 6. Filter valid points + maintain feature ages + IDs ─────────────────
     prev_good_buf_.clear(); next_good_buf_.clear();
@@ -758,7 +778,14 @@ VisionOutput Tracker::processFrame(const uint8_t* yuv_data, int width, int heigh
     }
 
     int64_t t_pose_start = now_us();
+    // Plan Step 4 (ADR-010): track whether the geometric-verification path
+    // actually executed this frame. The relocalization streak counter
+    // advances ONLY on frames where we attempted verification and got a
+    // weak inlier count — frames skipped due to is_static / no-parallax
+    // do not penalise the streak (they are legitimately scale-blind).
+    bool geo_verification_attempted = false;
     if (sufficient_motion && has_parallax && !is_static && tracked >= 8) {
+        geo_verification_attempted = true;
         // Undistort matched points before geometric estimation
         std::vector<cv::Point2f> prev_ud = prev_good_buf_;
         std::vector<cv::Point2f> next_ud = next_good_buf_;
@@ -1039,6 +1066,35 @@ VisionOutput Tracker::processFrame(const uint8_t* yuv_data, int width, int heigh
                 pose_valid = true;
             }
         }
+    }
+
+    // ── 7.x ORB relocalization debounce + trigger (Plan Step 4 / ADR-010) ──
+    // Maintain low_inlier_streak_: increments on attempted-but-degraded
+    // geometric verification, resets on healthy frames or skipped frames.
+    // When the streak hits RELOC_TRIGGER_FRAMES, run ORB descriptor
+    // matching against the recent keyframe ring buffer. On accept, the
+    // helper re-adopts the matched keyframe's feature ids onto current
+    // KLT tracks so SLAM/MSCKF lifecycle continuity is preserved.
+    if (geo_verification_attempted) {
+        if (inlier_count_out < RELOC_LOW_INLIER_BAR) {
+            low_inlier_streak_++;
+        } else {
+            low_inlier_streak_ = 0;
+        }
+        if (low_inlier_streak_ >= RELOC_TRIGGER_FRAMES) {
+            const bool relocked = tryRelocalizeWithORB(gray_buf_, next_good_buf_);
+            if (relocked) {
+                LOGI("RELOC_ORB: re-adopted feature ids after %d-frame degradation",
+                     low_inlier_streak_);
+            }
+            // Reset regardless — the trigger is "diagnose once, then
+            // re-arm". A failing reloc must not pin the trigger high
+            // every subsequent frame (BFMatcher cost), and a successful
+            // reloc has already restored ids.
+            low_inlier_streak_ = 0;
+        }
+    } else {
+        low_inlier_streak_ = 0;
     }
 
     // Always report current scale (even if no new observation this frame)
@@ -1334,7 +1390,36 @@ VisionOutput Tracker::processFrame(const uint8_t* yuv_data, int width, int heigh
         //
         // All of this is gated on isFullInitialized(); the EKF must own
         // the pose (Step 4 of the inertial plan) before SLAM updates land.
+        int64_t t_slam_block_start = now_us();
+        int64_t t_slam_promote_us = 0;
+        int64_t t_slam_update_us  = 0;
+        int64_t t_slam_demote_us  = 0;
+        int64_t t_slam_decrement_us = 0;
+        int     n_slam_updates_ran = 0;
+        int t_slam_prune_us = 0;
+        int n_lifecycle_dropped = 0;
         if (ekf_.isFullInitialized() && !ekf_.getWindow().empty()) {
+            // ── (0) PRUNE LIFECYCLE ─────────────────────────────────────
+            // Step 3b lifecycle entries are created on every observation
+            // by `noteObservation`, but were only being removed when a
+            // SLAM feature got demoted/expired. A KLT track that lives
+            // 10 frames and dies leaves a permanent lifecycle record
+            // (and orphaned active_tracks_ observation history). After
+            // ~17 minutes of normal walking the map grows to thousands
+            // of stale entries, and the three lifecycle scans below
+            // (getPromotableFeatures, getDemoteCandidates,
+            // getLostSlamFeatures) each become a multi-millisecond walk.
+            //
+            // Drop entries that are neither tracked this frame nor
+            // currently promoted as a SLAM feature. The feature_id space
+            // is monotonic (FeatureManager::assignIds) so a dropped KLT
+            // track never re-appears under the same id; the prune is
+            // safe with no risk of losing a still-relevant record.
+            int64_t t_prune_start = now_us();
+            n_lifecycle_dropped = feature_mgr_.pruneStaleLifecycle(
+                feature_ids_, timestamp_ns);
+            t_slam_prune_us = static_cast<int>(now_us() - t_prune_start);
+
             // Push intrinsics into EKFState so SLAM reprojection (pixel
             // space) uses the live calibration, not the test default.
             ekf_.setSlamIntrinsics(fx_use, fy_use, cx_use, cy_use);
@@ -1355,6 +1440,7 @@ VisionOutput Tracker::processFrame(const uint8_t* yuv_data, int width, int heigh
             const int latest_clone_id = ekf_.getLatestCloneId();
 
             // ── (1) PROMOTE ─────────────────────────────────────────────
+            int64_t t_promote_start = now_us();
             auto promotable = feature_mgr_.getPromotableFeatures(
                 /*min_obs=*/12, /*min_kf=*/2, /*max_init_rms_px=*/1.5);
             for (int fid : promotable) {
@@ -1463,7 +1549,10 @@ VisionOutput Tracker::processFrame(const uint8_t* yuv_data, int width, int heigh
                 }
             }
 
+            t_slam_promote_us = now_us() - t_promote_start;
+
             // ── (2) UPDATE ──────────────────────────────────────────────
+            int64_t t_update_start = now_us();
             const int n_slam = ekf_.getSlamFeatureCount();
             for (int slot = 0; slot < n_slam; slot++) {
                 // Translate slot ↔ feature_id by walking lifecycle map. We
@@ -1482,6 +1571,7 @@ VisionOutput Tracker::processFrame(const uint8_t* yuv_data, int width, int heigh
                 if (cur_it == cur_obs.end() || latest_clone_id < 0) continue;
                 std::vector<cv::Point2f> obs1{cur_it->second};
                 std::vector<int> ids1{latest_clone_id};
+                n_slam_updates_ran++;
                 if (ekf_.updateSlamFeature(
                         slot, obs1, ids1,
                         RANSAC_THRESH * RANSAC_THRESH)) {
@@ -1510,7 +1600,10 @@ VisionOutput Tracker::processFrame(const uint8_t* yuv_data, int width, int heigh
                 }
             }
 
+            t_slam_update_us = now_us() - t_update_start;
+
             // ── (3) + (4) DEMOTE + EXPIRE in one pass ──────────────────
+            int64_t t_demote_start = now_us();
             // Snapshot all (fid, slot, reason) tuples from BOTH demote and
             // expire queues, then sort by slot DESCENDING and process
             // highest-first. Removing slot N never shifts the index of any
@@ -1578,6 +1671,9 @@ VisionOutput Tracker::processFrame(const uint8_t* yuv_data, int width, int heigh
             // slots are all < the smallest removed slot OR fall in gaps
             // between, we count for each surviving lifecycle entry how many
             // removed slots were strictly below its current value.
+            t_slam_demote_us = now_us() - t_demote_start;
+
+            int64_t t_decrement_start = now_us();
             if (!removals.empty()) {
                 std::vector<int> removed_slots;
                 removed_slots.reserve(removals.size());
@@ -1597,6 +1693,27 @@ VisionOutput Tracker::processFrame(const uint8_t* yuv_data, int width, int heigh
                     }
                 }
             }
+            t_slam_decrement_us = now_us() - t_decrement_start;
+        }
+        int64_t t_slam_block_us = now_us() - t_slam_block_start;
+        // PERF: log only when the SLAM block did real work, OR every 30 frames
+        // for a baseline. Keeps the log volume sane.
+        if (n_slam_updates_ran > 0 || frame_counter_ % 30 == 0) {
+            LOGI("PERF: section=slam total_us=%lld prune_us=%d promote_us=%lld "
+                 "update_us=%lld demote_us=%lld decrement_us=%lld "
+                 "n_updates=%d n_slam=%d state_dim=%d "
+                 "lifecycle_size=%zu dropped=%d",
+                 (long long)t_slam_block_us,
+                 t_slam_prune_us,
+                 (long long)t_slam_promote_us,
+                 (long long)t_slam_update_us,
+                 (long long)t_slam_demote_us,
+                 (long long)t_slam_decrement_us,
+                 n_slam_updates_ran,
+                 ekf_.getSlamFeatureCount(),
+                 ekf_.getStateDim(),
+                 feature_mgr_.getLifecycleSize(),
+                 n_lifecycle_dropped);
         }
 
         // ── 11.2 Keyframe heading drift correction (Step 2.1, 2.2) ──
@@ -1797,6 +1914,14 @@ VisionOutput Tracker::processFrame(const uint8_t* yuv_data, int width, int heigh
                 static_cast<float>(global_t_.at<double>(2)));
             feature_mgr_.storeKeyframe(gray_buf_, next_good_buf_, timestamp_ns, frame_counter_,
                                        scalar_heading_, kf_pos);
+            // Plan Step 4 (ADR-010): mirror the keyframe into the ORB
+            // descriptor ring buffer for relocalization. Pass the surviving
+            // KLT corners + their FeatureManager ids so the stored ORB
+            // keypoints inherit the same ids by spatial proximity.
+            feature_mgr_.storeKeyframeDescriptors(
+                static_cast<uint64_t>(frame_counter_),
+                static_cast<double>(timestamp_ns),
+                gray_buf_, next_good_buf_, feature_ids_);
             // Plan Step 3b (ADR-009): tag every currently-tracked feature
             // ID as having spanned this keyframe. SLAM promotion needs
             // kf_count ≥ 2; without this tick the gate never opens.
@@ -1897,4 +2022,203 @@ VisionOutput Tracker::processFrame(const uint8_t* yuv_data, int width, int heigh
     frame_out.fx = fx_use; frame_out.fy = fy_use;
     frame_out.cx = cx_use; frame_out.cy = cy_use;
     return out;
+}
+
+// ─────────────────────────────────────────────────────────────────────────────
+// Plan Step 4 (ADR-010): ORB descriptor relocalization
+// ─────────────────────────────────────────────────────────────────────────────
+//
+// Triggered by `low_inlier_streak_ ≥ RELOC_TRIGGER_FRAMES`. Extracts ORB on
+// the current grayscale frame using the same parameters FeatureManager used
+// at keyframe storage time (250 features, FAST 10, σ=1.0 pre-blur), then
+// brute-force matches against each of the most recent RELOC_RECENT_KFS
+// keyframe descriptor records. Each candidate keyframe is scored by its
+// RANSAC inlier count from cv::findEssentialMat at RANSAC_THRESH px. The
+// best-scoring keyframe is accepted iff inliers ≥ RELOC_MIN_INLIERS, and
+// its feature ids are re-attached to the closest current KLT tracks.
+//
+// The path does NOT change Tracker output sources: Madgwick still owns
+// heading and EKFState->global_t_ still owns position. Its only side
+// effect is restoring `feature_ids_` continuity so MSCKF/SLAM lifecycle
+// counters survive a tracking dropout. A future refinement (gated on a
+// clean σ_yaw estimate from this match) could feed the matched keyframe's
+// stored heading through `EKFState::updateGravityAlignedYaw`, but that
+// requires a defensible variance derivation — without one, we let the
+// regular keyframe-yaw path catch up on the next keyframe instead of
+// injecting an ad-hoc correction here.
+bool Tracker::tryRelocalizeWithORB(const cv::Mat& gray,
+                                   const std::vector<cv::Point2f>& current_pts) {
+    if (gray.empty() || gray.type() != CV_8UC1) return false;
+    if (fx_ <= 1e-6 || fy_ <= 1e-6) return false;
+
+    const auto& kf_ring = feature_mgr_.getKeyframeDescriptors();
+    if (kf_ring.empty()) return false;
+
+    // Build ORB extractor with the SAME params as FeatureManager. Lazy-
+    // init on the instance member (not a function-static) so we never
+    // hit the C++11 function-static-init data race under future
+    // multi-threaded callers, and so that future Tracker re-instantiation
+    // doesn't share state with a prior instance.
+    if (!reloc_orb_) {
+        reloc_orb_ = cv::ORB::create(
+            FeatureManager::ORB_TARGET_FEATURES,
+            1.2f, 8, 31, 0, 2, cv::ORB::HARRIS_SCORE, 31,
+            FeatureManager::ORB_FAST_THRESHOLD);
+    }
+
+    cv::Mat blurred;
+    cv::GaussianBlur(gray, blurred, cv::Size(0, 0),
+                     FeatureManager::ORB_PREBLUR_SIGMA);
+
+    std::vector<cv::KeyPoint> cur_kps;
+    cv::Mat cur_desc;
+    reloc_orb_->detectAndCompute(blurred, cv::noArray(), cur_kps, cur_desc);
+    if (cur_kps.empty() || cur_desc.empty()) return false;
+
+    // Camera intrinsic matrix for findEssentialMat. Use the same values the
+    // pose path runs against (set via setIntrinsics).
+    const cv::Mat K = (cv::Mat_<double>(3, 3) <<
+        fx_, 0.0, cx_,
+        0.0, fy_, cy_,
+        0.0, 0.0, 1.0);
+
+    // Walk the last RELOC_RECENT_KFS keyframes. The deque is ordered
+    // oldest-first; rbegin gives newest-first.
+    cv::BFMatcher matcher(cv::NORM_HAMMING, /*crossCheck=*/false);
+
+    int  best_inliers = 0;
+    int  best_kf_idx  = -1;             // index into kf_ring (front-relative)
+    std::vector<cv::DMatch>     best_matches_kept;   // surviving Lowe + RANSAC
+    std::vector<unsigned char>  best_ransac_mask;
+
+    int scanned = 0;
+    for (auto it = kf_ring.rbegin();
+         it != kf_ring.rend() && scanned < RELOC_RECENT_KFS;
+         ++it, ++scanned) {
+
+        const KeyframeDescriptors& kfd = *it;
+        if (kfd.descriptors.empty() || kfd.keypoints.empty()) continue;
+
+        // knnMatch k=2 (Lowe ratio test requires the 2nd-best distance).
+        std::vector<std::vector<cv::DMatch>> knn;
+        matcher.knnMatch(cur_desc, kfd.descriptors, knn, 2);
+
+        std::vector<cv::DMatch>   ratio_matches;
+        std::vector<cv::Point2f>  cur_pts;
+        std::vector<cv::Point2f>  kf_pts;
+        ratio_matches.reserve(knn.size());
+        cur_pts.reserve(knn.size());
+        kf_pts.reserve(knn.size());
+
+        for (const auto& pair : knn) {
+            if (pair.size() < 2) continue;
+            // Lowe 2004 §7.1: best/second_best < ratio → distinctive match.
+            if (pair[0].distance < RELOC_LOWE_RATIO * pair[1].distance) {
+                const auto& m = pair[0];
+                ratio_matches.push_back(m);
+                cur_pts.push_back(cur_kps[m.queryIdx].pt);
+                kf_pts.push_back(kfd.keypoints[m.trainIdx].pt);
+            }
+        }
+
+        // findEssentialMat needs ≥ 5 points; require RELOC_MIN_INLIERS so
+        // even a perfect run could clear the accept bar.
+        if (static_cast<int>(ratio_matches.size()) < RELOC_MIN_INLIERS) continue;
+
+        std::vector<unsigned char> ransac_mask;
+        cv::Mat E = cv::findEssentialMat(kf_pts, cur_pts, K,
+                                         cv::RANSAC, RANSAC_CONF,
+                                         RANSAC_THRESH, ransac_mask);
+        if (E.empty()) continue;
+
+        const int inliers = cv::countNonZero(ransac_mask);
+        if (inliers > best_inliers) {
+            best_inliers      = inliers;
+            best_kf_idx       = static_cast<int>(kf_ring.size())
+                              - 1 - static_cast<int>(it - kf_ring.rbegin());
+            best_matches_kept = std::move(ratio_matches);
+            best_ransac_mask  = std::move(ransac_mask);
+        }
+    }
+
+    if (best_inliers < RELOC_MIN_INLIERS || best_kf_idx < 0) {
+        LOGI("RELOC_ORB: no keyframe accepted (best=%d need=%d, scanned=%d)",
+             best_inliers, RELOC_MIN_INLIERS, scanned);
+        return false;
+    }
+
+    const KeyframeDescriptors& matched_kfd = kf_ring[best_kf_idx];
+
+    // Re-adopt feature ids onto the current KLT tracks. For each surviving
+    // RANSAC inlier, look at the keyframe-side keypoint's stored
+    // feature_id. If it is non-negative AND the current-frame keypoint
+    // lies within RELOC_ID_REATTACH_RADIUS of an entry in `current_pts`,
+    // overwrite that slot's `feature_ids_` entry. This restores
+    // FeatureManager track continuity (MSCKF / SLAM lifecycle keeps the
+    // same id) without minting any new ids.
+    if (feature_ids_.size() != current_pts.size()) {
+        // Size invariant is maintained by the KLT/replenish loop in
+        // section 11; if it ever drifts, abort the re-adopt step rather
+        // than corrupt the parallel arrays. The accept itself still
+        // counts as a successful diagnosis (logs above).
+        LOGI("RELOC_ORB: id/pts size mismatch (%zu vs %zu) — skipping re-adopt",
+             feature_ids_.size(), current_pts.size());
+        return true;
+    }
+
+    // Defensive co-index check before the walk — best_matches_kept and
+    // best_ransac_mask are moved together inside the per-keyframe winner
+    // branch above, so they should always pair, but if a future edit
+    // splits the moves an assert fires loudly instead of silently
+    // mis-indexing the RANSAC mask.
+    assert(best_matches_kept.size() == best_ransac_mask.size());
+
+    const float r2 = RELOC_ID_REATTACH_RADIUS * RELOC_ID_REATTACH_RADIUS;
+    int reattached = 0;
+    int slam_guarded = 0;  // count of overwrites skipped to protect SLAM state
+    for (size_t i = 0; i < best_matches_kept.size(); ++i) {
+        if (!best_ransac_mask[i]) continue;
+        const cv::DMatch& m = best_matches_kept[i];
+        const int kf_fid = matched_kfd.feature_ids[m.trainIdx];
+        if (kf_fid < 0) continue;  // keyframe ORB kp had no KLT corner aligned
+        const cv::Point2f& cur_kp = cur_kps[m.queryIdx].pt;
+
+        // Find nearest current KLT track within radius. O(N) per inlier;
+        // N ≤ MAX_FEATURES (200) so this is bounded.
+        float best_d2 = r2;
+        int   best_slot = -1;
+        for (size_t s = 0; s < current_pts.size(); ++s) {
+            const float dx = cur_kp.x - current_pts[s].x;
+            const float dy = cur_kp.y - current_pts[s].y;
+            const float d2 = dx * dx + dy * dy;
+            if (d2 < best_d2) {
+                best_d2  = d2;
+                best_slot = static_cast<int>(s);
+            }
+        }
+        if (best_slot >= 0 && feature_ids_[best_slot] != kf_fid) {
+            // Guard: never overwrite the id of a slot that currently
+            // holds a SLAM-promoted feature. The SLAM lifecycle in
+            // FeatureManager keys by feature_id; replacing the id under
+            // a live SLAM column orphans the EKF P_ row and the next
+            // markSlamFeatureRMS / getLostSlamFeatures pass would
+            // misroute removeSlamFeature → wrong column dropped from
+            // P_ → ADR-006 5–11 m teleportation regime. Skip silently
+            // and count.
+            const auto* dst_lc = feature_mgr_.getLifecycle(
+                feature_ids_[best_slot]);
+            if (dst_lc && dst_lc->slam_slot >= 0) {
+                slam_guarded++;
+                continue;
+            }
+            feature_ids_[best_slot] = kf_fid;
+            reattached++;
+        }
+    }
+
+    LOGI("RELOC_ORB: kf=%llu inliers=%d/%d reattached=%d slam_guarded=%d",
+         static_cast<unsigned long long>(matched_kfd.keyframe_id),
+         best_inliers, static_cast<int>(best_matches_kept.size()),
+         reattached, slam_guarded);
+    return true;
 }

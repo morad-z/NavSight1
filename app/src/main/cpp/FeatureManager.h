@@ -1,9 +1,12 @@
 #pragma once
 #include <vector>
+#include <deque>
 #include <unordered_map>
 #include <opencv2/core.hpp>
 #include <opencv2/imgproc.hpp>
+#include <opencv2/features2d.hpp>
 #include "UpdaterMSCKF.h"
+#include "KeyframeDescriptors.h"
 
 // Grid-based feature detection, spatial distribution enforcement,
 // and multi-clone feature track management for MSCKF.
@@ -55,6 +58,45 @@ public:
         position_out = keyframes_.back().position;
         return true;
     }
+
+    // ── Plan Step 4 (ADR-010): ORB descriptors at keyframes ────────────────
+    //
+    // Extract ORB on the keyframe's gray image, attach feature_ids by spatial
+    // proximity (≤ 3 px) to the supplied tracked KLT corners, and push the
+    // record into a ring buffer capped at the last KEYFRAME_DESC_RING_SIZE
+    // entries (50). Used by the relocalization path in Tracker::processFrame.
+    //
+    //   kf_id            : monotonic keyframe id (current frame_counter_).
+    //   ts_ns            : keyframe timestamp (ns) — copied verbatim into the
+    //                       record's timestamp_ns (header is double per Agent
+    //                       C's struct contract).
+    //   gray             : keyframe grayscale image (CV_8UC1).
+    //   corner_pts       : KLT corners present at the keyframe (parallel to
+    //                       corner_feature_ids).
+    //   corner_feature_ids : FeatureManager id per corner; -1 if unassigned.
+    void storeKeyframeDescriptors(uint64_t kf_id,
+                                  double ts_ns,
+                                  const cv::Mat& gray,
+                                  const std::vector<cv::Point2f>& corner_pts,
+                                  const std::vector<int>& corner_feature_ids);
+
+    // Read accessor for the relocalization scan in Tracker. The caller walks
+    // the most recent N entries (Plan Step 4 uses the last 5).
+    const std::deque<KeyframeDescriptors>& getKeyframeDescriptors() const {
+        return keyframe_descriptors_;
+    }
+
+    // ── Plan Step 4 (ADR-010) ORB extractor params (PUBLIC) ────────────────
+    // These are intentionally exposed so Tracker's relocalization path can
+    // build a matching cv::ORB extractor without duplicating magic numbers.
+    // Keeping them PUBLIC and constexpr means there is one source of truth
+    // (FeatureManager's storeKeyframeDescriptors used the same values), and
+    // a divergence between extraction and matching params is a compile-time
+    // impossibility rather than a runtime mismatch.
+    static constexpr int    ORB_TARGET_FEATURES = 250;  // density vs CPU
+    static constexpr int    ORB_FAST_THRESHOLD  = 10;   // texture-poor floor
+    static constexpr double ORB_PREBLUR_SIGMA   = 1.0;  // FAST noise reject
+
     void reset();
 
     // ── MSCKF Feature Track Management ──────────────────────────────────────
@@ -175,6 +217,41 @@ public:
     // map and the next removeSlamFeature(stale_slot) silently fails.
     std::vector<int> getAllLifecycleFeatureIds() const;
 
+    // Number of lifecycle records currently held. Used for perf telemetry
+    // so we can verify that the per-frame prune (below) is keeping the
+    // map bounded. O(1).
+    size_t getLifecycleSize() const { return lifecycle_.size(); }
+
+    // Garbage-collect lifecycle records that are no longer useful. An
+    // entry is kept only if (a) its feature_id is in `active_ids` (still
+    // tracked this frame), OR (b) it is currently promoted as a SLAM
+    // feature (slam_slot >= 0). Anything else is a dead lifecycle
+    // record left over from a transient KLT track that never matured —
+    // we observed it once, the track died, and the entry would otherwise
+    // sit in the map forever, padding every getPromotableFeatures /
+    // getDemoteCandidates / getLostSlamFeatures scan with O(N) noise.
+    //
+    // Without this prune, the lifecycle map grows ~200 entries/sec under
+    // a typical KLT churn (200 features × 30 fps × turnover) and the
+    // three per-frame scans turn into a multi-millisecond hot path.
+    // Empirically: 17 minutes runtime → 50–90 ms total in promote+demote
+    // scans alone (logs from the 2026-05-04 profiling pass).
+    //
+    // Recently-observed entries (last_obs_ns within LIFECYCLE_KEEP_NS of
+    // the supplied now_ns) are also kept even when they fell out of
+    // active_ids this frame — KLT routinely misses a feature for 1-2
+    // frames during motion blur and recovers it next frame. Dropping
+    // such an entry would silently reset the SLAM promotion gate (age,
+    // kf_count, observation history) for any feature that ever
+    // flickered, effectively denying SLAM promotion under realistic
+    // motion. Entries whose last_obs_ns is 0 (created but never
+    // observed) are dropped normally — they are stillborn records.
+    //
+    // Returns the number of entries dropped.
+    static constexpr int64_t LIFECYCLE_KEEP_NS = 100'000'000LL;  // 100 ms
+    int pruneStaleLifecycle(const std::vector<int>& active_ids,
+                            int64_t now_ns);
+
     // DEAD CODE: getNextFeatureId — never called
     // int getNextFeatureId() const { return next_feature_id_; }
 
@@ -183,6 +260,14 @@ private:
                     int row, int col, int cell_w, int cell_h) const;
 
     std::vector<Keyframe> keyframes_;
+
+    // Plan Step 4 (ADR-010): ORB descriptor ring buffer for relocalization.
+    // Capped at KEYFRAME_DESC_RING_SIZE; oldest evicted on overflow.
+    // Lazily-built ORB extractor so the cost (cv::ORB::create allocates a
+    // FastFeatureDetector + descriptor extractor) is paid at most once per
+    // FeatureManager lifetime instead of per keyframe.
+    std::deque<KeyframeDescriptors> keyframe_descriptors_;
+    cv::Ptr<cv::ORB>                orb_extractor_;
 
     // MSCKF: per-feature observation history
     int next_feature_id_{0};
@@ -198,4 +283,19 @@ private:
     static constexpr int MAX_KEYFRAMES = 10;
     static constexpr int MIN_KF_MATCHES = 20;
     static constexpr float KF_MATCH_RADIUS = 15.0f;  // pixels
+
+    // ── Plan Step 4 (ADR-010) ORB descriptor private constants ─────────────
+    // (Public ORB extractor params — TARGET_FEATURES / FAST_THRESHOLD /
+    //  PREBLUR_SIGMA — are declared in the public section so the Tracker's
+    //  relocalization path can build a matching cv::ORB without re-stating
+    //  the magic numbers.)
+    //
+    // Spatial-proximity radius for ORB→KLT id inheritance (px). 3 px chosen
+    // because cv::cornerSubPix already tightens KLT corners to ≤ 1 px and
+    // ORB's pyramid keypoint coords drift up to ~2 px at coarser octaves.
+    static constexpr float ORB_KLT_MATCH_RADIUS  = 3.0f;
+    // Ring buffer cap. 50 keyframes × 250 features × 32 bytes (ORB row) ≈
+    // 400 KB descriptor payload + cv::KeyPoint metadata; well under the
+    // 10 MB RAM headroom budgeted in the visual-production plan.
+    static constexpr size_t KEYFRAME_DESC_RING_SIZE = 50;
 };

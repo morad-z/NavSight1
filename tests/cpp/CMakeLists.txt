@@ -73,6 +73,11 @@ add_executable(navsight_tests
     # EKFState::{addSlamFeature, removeSlamFeature, updateSlamFeature,
     # applyMSCKFFeature, getSlamFeatureCovIdx} are now landed.
     test_slam_msckf.cpp
+    # Plan Step 4: ORB descriptors at keyframes + KLT-loss relocalization.
+    # Exercises the OpenCV primitives and parameter tuning the FeatureManager
+    # impl uses (ORB nfeatures=250, BF NORM_HAMMING + Lowe 0.75, findEssentialMat
+    # RANSAC 1.5 px @ focal=525). Self-contained: no FeatureManager dependency.
+    test_orb_reloc.cpp
 )
 target_link_libraries(navsight_tests navsight_core GTest::gtest_main)
 

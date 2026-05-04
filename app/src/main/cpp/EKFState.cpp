@@ -1,6 +1,7 @@
 #include "EKFState.h"
 #include <cmath>
 #include <algorithm>
+#include <chrono>
 #include <opencv2/calib3d.hpp>
 #ifdef __ANDROID__
 #include <android/log.h>
@@ -506,6 +507,8 @@ void EKFState::applyMSCKFUpdate(const cv::Mat& H, const cv::Mat& res,
     if (H.cols != state_dim) return;
     if (H.rows == 0 || res.rows != H.rows) return;
 
+    auto t_amu_start = std::chrono::steady_clock::now();
+
     // ── Plan Step 3a (ADR-008): per-residual Huber kernel ────────────────
     // δ ≈ 2.4477 = √χ²(0.95, 2 dof). For each row i compute the normalised
     // residual m_i = |r_i| / sqrt(S_ii), with
@@ -641,6 +644,21 @@ void EKFState::applyMSCKFUpdate(const cv::Mat& H, const cv::Mat& res,
         msckf_damping_step_++;
     }
 
+    auto t_amu_end = std::chrono::steady_clock::now();
+    long long t_amu_us = std::chrono::duration_cast<std::chrono::microseconds>(
+        t_amu_end - t_amu_start).count();
+    // Gate the per-call PERF line behind a slow-call threshold. With SLAM
+    // active applyMSCKFUpdate fires 2–4× per camera frame; logging every
+    // call at 30 Hz floods logcat (60–120 lines/sec from this function
+    // alone) which itself adds latency on slow log drivers. 500 µs is
+    // well above the steady-state cost (~115 µs measured 2026-05-04 in
+    // the perf-fix pass) so the gate stays silent in normal operation
+    // and only fires when something is actually slow.
+    if (t_amu_us > 500) {
+        LOGI("PERF: section=applyMSCKFUpdate us=%lld H_rows=%d state_dim=%d slam=%d clones=%d",
+             t_amu_us, H.rows, state_dim,
+             (int)slam_features_.size(), (int)window_.size());
+    }
     LOGI("MSCKF update applied: max_correction=%.4f damping=%.2f huber_rejected=%d",
          cv::norm(dx, cv::NORM_INF), damping, msckf_huber_rejected_count_);
 }

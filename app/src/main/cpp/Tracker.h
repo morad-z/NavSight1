@@ -112,6 +112,22 @@ private:
     double estimateScaleFromSteps(double vision_disp, int64_t dt_ns,
                                   IMUPreintegrator& imu);
 
+    // ── Plan Step 4 (ADR-010): ORB descriptor relocalization ──────────────
+    // Runs when low_inlier_streak_ trips RELOC_TRIGGER_FRAMES. Extracts ORB
+    // on the current gray frame, brute-force matches (Hamming + knnMatch
+    // k=2 + Lowe ratio) against the most recent RELOC_RECENT_KFS keyframe
+    // descriptor records, runs cv::findEssentialMat with RANSAC, and
+    // accepts the best-inlier keyframe if ≥ RELOC_MIN_INLIERS survive.
+    // On accept: re-adopts feature ids from the matched keyframe by
+    // attaching them to the nearest current KLT track within
+    // RELOC_ID_REATTACH_RADIUS pixels. Returns true on accept.
+    //
+    // Caller must hold no FeatureManager-related locks for this call (the
+    // method only reads `feature_mgr_.getKeyframeDescriptors()` and writes
+    // back into `feature_ids_`, which is owned by Tracker exclusively).
+    bool tryRelocalizeWithORB(const cv::Mat& gray,
+                              const std::vector<cv::Point2f>& current_pts);
+
     mutable std::mutex mutex_;
     mutable std::mutex pose_mutex_;
 
@@ -236,6 +252,22 @@ private:
     // Keyframe tracking state
     int frames_since_keyframe_{0};
 
+    // ── Plan Step 4 (ADR-010): ORB relocalization debounce ─────────────────
+    // Counts consecutive frames where the geometric-verification inlier
+    // count fell below MIN_INLIERS / 2 (= 4). When it reaches
+    // RELOC_TRIGGER_FRAMES (= 3) we run the ORB descriptor relocalization
+    // path against the recently-stored keyframe descriptor ring buffer.
+    // Reset on any frame where inliers are healthy or the pose path is
+    // skipped entirely (no measurement to evaluate).
+    int low_inlier_streak_{0};
+
+    // ── Plan Step 4 (ADR-010): ORB extractor for the relocalization path
+    // Lazy-instantiated on first call to tryRelocalizeWithORB. Held as
+    // an instance member (not a function-static inside that helper) so
+    // future multi-threaded callers don't trip the C++11 function-
+    // static-init race, and so reset() can clear it cleanly if needed.
+    cv::Ptr<cv::ORB> reloc_orb_;
+
     // Depth-based scale constraint (MiDaS)
     mutable std::mutex depth_mutex_;
     std::vector<float> depth_map_;
@@ -257,9 +289,39 @@ private:
     static constexpr double MIN_FLOW_PX        = 0.4;
     static constexpr double MAX_FLOW_PX        = 150.0;
     static constexpr int    MIN_INLIERS        = 8;
+    // RELOC_LOW_INLIER_BAR floors integer division of MIN_INLIERS / 2.
+    // If MIN_INLIERS is bumped to an odd value the bar silently rounds
+    // down — make the assumption explicit at compile time.
+    static_assert(MIN_INLIERS % 2 == 0,
+                  "RELOC_LOW_INLIER_BAR assumes MIN_INLIERS is even");
     static constexpr double MIN_INLIER_RATIO   = 0.25;
     static constexpr double GYRO_ROT_ONLY_THRESH = 2.0;
     static constexpr double ZUPT_GYRO_THRESH   = 0.04;
     static constexpr int    ACCEL_BIAS_WARMUP  = 150;
     static constexpr double ACCEL_BIAS_ALPHA   = 0.005;
+
+    // ── Plan Step 4 (ADR-010): ORB relocalization tunables ─────────────────
+    // Consecutive low-inlier frames before reloc fires. ~100 ms at 30 Hz —
+    // long enough to debounce a single bad frame from motion blur, short
+    // enough to recover before KLT collapses entirely.
+    static constexpr int    RELOC_TRIGGER_FRAMES   = 3;
+    // Inlier floor that arms the streak counter. MIN_INLIERS is the steady-
+    // state acceptance bar; half of it is "the geometry has degenerated".
+    static constexpr int    RELOC_LOW_INLIER_BAR   = MIN_INLIERS / 2;
+    // Recent-appearance window: only the last N keyframes are scanned per
+    // reloc. Keeps BFMatcher cost bounded; older keyframes have lower
+    // appearance overlap with the present view anyway.
+    static constexpr int    RELOC_RECENT_KFS       = 5;
+    // Lowe's ratio (Lowe 2004 — "Distinctive Image Features from
+    // Scale-Invariant Keypoints", §7.1). Standard 0.75 — slacker than the
+    // 0.7 commonly used for SIFT because ORB's binary distance bins more
+    // coarsely.
+    static constexpr float  RELOC_LOWE_RATIO       = 0.75f;
+    // RANSAC inlier accept threshold. Matches the steady-state mid-band of
+    // the keyframe-yaw correction path (recoverPose ≥ 20 inliers there);
+    // 30 keeps us above noise on dim or repetitive scenes.
+    static constexpr int    RELOC_MIN_INLIERS      = 30;
+    // Radius used when re-attaching restored feature ids to current KLT
+    // tracks. Same 3 px as the ORB↔KLT inheritance step in FeatureManager.
+    static constexpr float  RELOC_ID_REATTACH_RADIUS = 3.0f;
 };

@@ -18,6 +18,7 @@ FeatureManager::FeatureManager() {
 
 void FeatureManager::reset() {
     keyframes_.clear();
+    keyframe_descriptors_.clear();
     active_tracks_.clear();
     lifecycle_.clear();
     next_feature_id_ = 0;
@@ -370,4 +371,132 @@ std::vector<int> FeatureManager::getAllLifecycleFeatureIds() const {
     out.reserve(lifecycle_.size());
     for (const auto& kv : lifecycle_) out.push_back(kv.first);
     return out;
+}
+
+// ──────────────────────────────────────────────────────────────────────────────
+// Plan Step 4 (ADR-010): ORB descriptors at keyframes
+// ──────────────────────────────────────────────────────────────────────────────
+//
+// Lifecycle: Tracker calls storeKeyframeDescriptors every time it stores a
+// keyframe, immediately after the existing storeKeyframe(). The Tracker
+// relocalization path reads getKeyframeDescriptors() when its KLT inlier
+// counter trips the trigger condition (MIN_INLIERS/2 for ≥ 3 consecutive
+// frames). Both paths run inside Tracker::processFrame, which already holds
+// the FeatureManager-protecting mutex_.
+//
+// CPU budget: cv::ORB::create at 250 features on 640×480 lands near
+// 5–8 ms/keyframe on a Snapdragon 695 (per visual-production plan §4
+// timing measurements). At 1 keyframe per ~15 frames, that's well under
+// the 1% CPU envelope target.
+void FeatureManager::storeKeyframeDescriptors(
+        uint64_t kf_id,
+        double ts_ns,
+        const cv::Mat& gray,
+        const std::vector<cv::Point2f>& corner_pts,
+        const std::vector<int>& corner_feature_ids) {
+
+    if (gray.empty()) return;
+    if (gray.type() != CV_8UC1) return;
+
+    // Lazy ORB extractor init. Constructed once and reused across keyframes:
+    // cv::ORB::create() allocates a FastFeatureDetector + a descriptor
+    // pyramid, both of which are non-trivial to build per call. Defaults
+    // mirror cv::ORB::create's signature, with the FAST threshold and
+    // feature cap pulled from the consumer-side constants per the project
+    // rule "constants live next to their consumer".
+    if (orb_extractor_.empty()) {
+        orb_extractor_ = cv::ORB::create(
+            ORB_TARGET_FEATURES,    // nfeatures
+            1.2f,                   // scaleFactor (OpenCV default)
+            8,                      // nlevels (OpenCV default)
+            31,                     // edgeThreshold (OpenCV default)
+            0,                      // firstLevel (OpenCV default)
+            2,                      // WTA_K (OpenCV default)
+            cv::ORB::HARRIS_SCORE,
+            31,                     // patchSize (OpenCV default)
+            ORB_FAST_THRESHOLD);
+    }
+
+    // Gaussian pre-blur σ ≈ 1.0 → ksize=0 lets OpenCV pick the radius from
+    // sigma (≈ 6σ + 1 = 7). Reduces FAST corner noise sensitivity without
+    // smearing fine detail.
+    cv::Mat blurred;
+    cv::GaussianBlur(gray, blurred, cv::Size(0, 0), ORB_PREBLUR_SIGMA);
+
+    KeyframeDescriptors rec;
+    rec.keyframe_id  = kf_id;
+    rec.timestamp_ns = ts_ns;
+    orb_extractor_->detectAndCompute(blurred, cv::noArray(),
+                                     rec.keypoints, rec.descriptors);
+
+    // Inherit FeatureManager ids from the supplied tracked KLT corners by
+    // spatial proximity (≤ ORB_KLT_MATCH_RADIUS). corner_pts /
+    // corner_feature_ids are parallel; if they ever desync we treat all
+    // corners as having no id (-1) to keep the rest of the record valid.
+    rec.feature_ids.assign(rec.keypoints.size(), -1);
+    if (corner_pts.size() == corner_feature_ids.size() && !corner_pts.empty()) {
+        const float r2 = ORB_KLT_MATCH_RADIUS * ORB_KLT_MATCH_RADIUS;
+        for (size_t k = 0; k < rec.keypoints.size(); ++k) {
+            const cv::Point2f& kp = rec.keypoints[k].pt;
+            float best_d2 = r2;
+            int   best_fid = -1;
+            for (size_t c = 0; c < corner_pts.size(); ++c) {
+                const float dx = kp.x - corner_pts[c].x;
+                const float dy = kp.y - corner_pts[c].y;
+                const float d2 = dx * dx + dy * dy;
+                if (d2 < best_d2) {
+                    best_d2  = d2;
+                    best_fid = corner_feature_ids[c];
+                }
+            }
+            rec.feature_ids[k] = best_fid;
+        }
+    }
+
+    keyframe_descriptors_.push_back(std::move(rec));
+    while (keyframe_descriptors_.size() > KEYFRAME_DESC_RING_SIZE) {
+        keyframe_descriptors_.pop_front();
+    }
+}
+
+int FeatureManager::pruneStaleLifecycle(const std::vector<int>& active_ids,
+                                        int64_t now_ns) {
+    if (lifecycle_.empty()) return 0;
+
+    // Hash-set the active IDs once for O(1) membership tests inside the
+    // erase loop. active_ids is typically ≤ 200 — the KLT cap.
+    std::unordered_set<int> active_set;
+    active_set.reserve(active_ids.size() * 2);
+    for (int id : active_ids) {
+        if (id >= 0) active_set.insert(id);
+    }
+
+    int dropped = 0;
+    auto it = lifecycle_.begin();
+    while (it != lifecycle_.end()) {
+        const int fid = it->first;
+        const FeatureLifecycle& lc = it->second;
+        // Keep if (a) still tracked this frame, (b) currently a SLAM
+        // feature in the EKF state, or (c) was observed within the last
+        // LIFECYCLE_KEEP_NS — a one-frame KLT miss during motion blur
+        // is common and the track frequently recovers next frame; the
+        // grace window prevents silent resets of the promotion gate.
+        const bool still_active  = active_set.count(fid) > 0;
+        const bool in_slam       = lc.slam_slot >= 0;
+        const bool recently_seen = lc.last_obs_ns > 0 &&
+                                   (now_ns - lc.last_obs_ns) < LIFECYCLE_KEEP_NS;
+        if (!still_active && !in_slam && !recently_seen) {
+            // Drop the lifecycle record AND any orphaned observation
+            // history in active_tracks_ for the same feature_id. The
+            // observation history is otherwise pruned only when a clone
+            // gets marginalised below it — for a KLT track that died
+            // before the window slid, both grow without bound.
+            active_tracks_.erase(fid);
+            it = lifecycle_.erase(it);
+            dropped++;
+        } else {
+            ++it;
+        }
+    }
+    return dropped;
 }
