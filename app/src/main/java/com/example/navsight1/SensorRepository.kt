@@ -18,17 +18,21 @@ import kotlinx.coroutines.flow.asStateFlow
 import kotlin.math.sqrt
 
 // Plan Step 7 (ADR-013): on-device filename for the ORB DBoW2 vocabulary.
-// SensorRepository.pushLoopClosureVocabularyToNative decompresses the
-// gzipped ORB vocabulary asset on first launch and points native at the
-// extracted file. Original Step 7 code copied a presumed `ORBvoc.bin`
-// asset; we ship `ORBvoc.txt.gz` instead because no clean .bin source
-// was available and DBoW2 supports both formats. See
-// the same name into <filesDir> on first launch and passes the absolute
-// path to native via NativeBridge.nativeLoadLoopClosureVocabulary.
-// The vocabulary asset ships as ORBvoc.txt.gz (gzip of the text-form
-// ORB vocabulary from ORB-SLAM2). DBoW2's loadFromTextFile reads the
-// extracted .txt; we decompress on first launch into <filesDir>.
-const val ORB_VOCAB_ASSET = "ORBvoc.txt.gz"
+// SensorRepository.pushLoopClosureVocabularyToNative copies the ORB
+// vocabulary asset on first launch and points native at the file.
+//
+// We ship ORBvoc.txt.gz in app/src/main/assets/, but the Android
+// Gradle Plugin auto-decompresses .gz assets at packaging time and
+// stores them in the APK as plain text (verified 2026-05-04: APK
+// contains `assets/ORBvoc.txt` at 145 MB, despite the source-tree
+// asset being ORBvoc.txt.gz at 41 MB). The on-disk APK is still
+// zip-deflated so the install size stays reasonable; only the
+// runtime read sees plain text.
+//
+// At runtime we therefore open `ORBvoc.txt` directly from assets and
+// stream it to <filesDir>/ORBvoc.txt. No GZIPInputStream needed.
+// DBoW2's loadFromTextFile reads the result.
+const val ORB_VOCAB_ASSET = "ORBvoc.txt"
 const val ORB_VOCAB_FILE  = "ORBvoc.txt"
 
 class SensorRepository(private val context: Context) : SensorEventListener {
@@ -198,12 +202,13 @@ class SensorRepository(private val context: Context) : SensorEventListener {
         try {
             val outFile = java.io.File(context.filesDir, ORB_VOCAB_FILE)
 
-            // One-time decompress + copy. Asset ships as ORBvoc.txt.gz
-            // (~41 MB compressed); we GZIPInputStream it into the
-            // ~145 MB plain-text ORBvoc.txt that DBoW2 reads. If the
-            // gzip asset is missing entirely we silently skip — loop
-            // closure is an optional accuracy boost, not a hard
-            // requirement for the rest of the VIO pipeline.
+            // One-time copy. AGP auto-decompresses .gz assets at
+            // packaging time, so the APK ships plain ORBvoc.txt — read
+            // it straight through to <filesDir>/ORBvoc.txt. No
+            // decompression layer at runtime. If the asset is missing
+            // entirely we silently skip — loop closure is an optional
+            // accuracy boost, not a hard requirement for the rest of
+            // the VIO pipeline.
             if (!outFile.exists() || outFile.length() == 0L) {
                 val assetExists = try {
                     context.assets.list("")?.contains(ORB_VOCAB_ASSET) == true
@@ -212,14 +217,12 @@ class SensorRepository(private val context: Context) : SensorEventListener {
                     Log.i(TAG, "No assets/$ORB_VOCAB_ASSET — loop closure disabled")
                     return
                 }
-                context.assets.open(ORB_VOCAB_ASSET).use { rawInput ->
-                    java.util.zip.GZIPInputStream(rawInput).use { input ->
-                        java.io.FileOutputStream(outFile).use { output ->
-                            input.copyTo(output)
-                        }
+                context.assets.open(ORB_VOCAB_ASSET).use { input ->
+                    java.io.FileOutputStream(outFile).use { output ->
+                        input.copyTo(output)
                     }
                 }
-                Log.i(TAG, "Decompressed $ORB_VOCAB_ASSET to ${outFile.absolutePath} (${outFile.length()} bytes)")
+                Log.i(TAG, "Copied $ORB_VOCAB_ASSET to ${outFile.absolutePath} (${outFile.length()} bytes)")
             }
 
             val ok = NativeBridge.nativeLoadLoopClosureVocabulary(outFile.absolutePath)

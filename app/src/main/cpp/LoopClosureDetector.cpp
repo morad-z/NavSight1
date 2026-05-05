@@ -36,17 +36,59 @@ namespace {
 
 // ─── Magic-number citations ───────────────────────────────────────────────
 //
-// BOW_SCORE_THRESHOLD
-//   Galvez-Lopez & Tardos, "Bags of Binary Words for Fast Place Recognition
-//   in Image Sequences", IEEE T-RO 2012, §V. The paper recommends ~0.05 as
-//   the absolute alpha threshold below which a query/database pair is
-//   considered too dissimilar to even attempt geometric verification.
-constexpr double kBowScoreThreshold = 0.05;
+// BoW score gating — adaptive minScore (ORB-SLAM2 LoopClosing.cc::DetectLoop)
+//   The previous fixed threshold of 0.05 was a misreading of Galvez-Lopez
+//   & Tardos (T-RO 2012 §V): that paper specifies a threshold on the
+//   *normalized* score η = score(query, candidate) / score(query, prev),
+//   not on the raw L1 score we get back from OrbDatabase::query. With our
+//   250 ORB features per keyframe (vs ORB-SLAM2's ~1000), genuine same-
+//   place revisits produce raw scores in the 0.003-0.012 band — well below
+//   any sensible fixed cutoff. See real-walk evidence in
+//   tests/sims/simulation_data_1777985054704.json (114s twice-around-house
+//   walk: 150 attempts, 0 accepts at threshold 0.05).
+//
+//   ORB-SLAM2 fixes this by computing the minimum BoW score the current
+//   keyframe achieves against its covisibility neighbors and using that
+//   as the per-scene threshold. Quote from raulmur/ORB_SLAM2 LoopClosing.cc:
+//       float minScore = 1;
+//       for (KeyFrame* pKF : vpConnectedKeyFrames) {
+//         float score = mpORBVocabulary->score(CurrentBowVec, pKF->mBowVec);
+//         if (score < minScore) minScore = score;
+//       }
+//       vpCandidateKFs = mpKeyFrameDB->DetectLoopCandidates(currentKF, minScore);
+//
+//   We don't have a covisibility graph yet, so we use the K most recent
+//   keyframes that fall inside the temporal-exclusion window as a temporal
+//   proxy — those are exactly the keyframes the current frame is "still
+//   tracking against" in continuous KLT.
+//
+// kBowScoreFloor
+//   Lower bound on the adaptive threshold. Prevents runaway acceptance in
+//   low-texture stretches where even the temporal neighbors score near
+//   zero against the query — without a floor, an indoor-walls passage
+//   could push minScore to 0.0001 and any DB hit would pass. 0.005 sits
+//   roughly an order of magnitude below the observed same-place range.
+constexpr double kBowScoreFloor   = 0.005;
+//
+// kCovisibilityK
+//   Number of recent keyframes to score against for the adaptive minScore.
+//   At our ~2 Hz keyframe rate, K=10 covers ~5s of recent past — a tight
+//   covisibility proxy that stays comfortably inside the 30 s temporal
+//   exclusion window so the neighbors are themselves excluded from being
+//   loop candidates.
+constexpr size_t kCovisibilityK   = 10;
 
 // PNP_MIN_INLIERS
-//   Step 7 plan, line 723. 30 inliers across keyframes that are 30+ s apart
-//   gives confidence the match isn't a chance descriptor collision.
-constexpr int kPnpMinInliers = 30;
+//   Originally Step 7 plan §line 723 specified 30. That number assumes a
+//   feature-based SLAM where every ORB keypoint owns a 3D MapPoint (so a
+//   keyframe with 1000 ORBs naturally yields hundreds of 2D-3D pairs). Our
+//   hybrid (KLT-tracked + ORB-at-keyframes + ≤12 SLAM features in EKF) only
+//   yields ~5-15 valid pairs even with cross-keyframe ORB triangulation
+//   (Tracker.cpp ~L2245), so 30 was structurally unreachable. ORB-SLAM2's
+//   loop verification in `LoopClosing.cc::ComputeSim3` accepts at 12-20
+//   inliers; we land at 15 as a comfortable middle. Reproj threshold (4 px,
+//   below) is the real false-positive guard.
+constexpr int kPnpMinInliers = 15;
 
 // LOWE_RATIO
 //   Lowe 2004 §7.1. Same value as the Step 4 reloc path.
@@ -97,6 +139,12 @@ struct KeyframeRecord {
     std::vector<cv::Point3f>    pts3d_world;
     cv::Matx33d                 R_world_cam    = cv::Matx33d::eye();
     cv::Vec3d                   t_cam_world    = cv::Vec3d(0, 0, 0);
+    // BoW vector stored alongside the entry so tryDetectLoop can rescore
+    // the query against recent neighbors (adaptive minScore — see comment
+    // block above kBowScoreFloor). DBoW2's OrbDatabase::add takes the BoW
+    // vector internally but does not expose it back, so we compute it on
+    // our side via vocab.transform() before the add() call.
+    DBoW2::BowVector            bow_vec;
 };
 
 }  // namespace
@@ -213,6 +261,18 @@ void LoopClosureDetector::addKeyframe(
              descriptors.rows, keypoints.size());
         return;
     }
+    // QA pass (2026-05-05): the detector's PnP path indexes pts3d_world
+    // by trainIdx (which is bounded by keypoints.size()). If a future
+    // caller passes a mis-sized pts3d_world (older code did exactly this),
+    // every match silently fails the bounds check at the lookup site. Catch
+    // the contract violation at the writer rather than letting it manifest
+    // as "0 PnP pairs" downstream.
+    if (pts3d_world.size() != keypoints.size()) {
+        LOGW("addKeyframe: pts3d_world.size()=%zu != keypoints.size()=%zu — "
+             "refusing (header contract violation)",
+             pts3d_world.size(), keypoints.size());
+        return;
+    }
 
     std::vector<cv::Mat> features = descriptorMatToVec(descriptors);
     if (features.empty()) return;
@@ -229,6 +289,12 @@ void LoopClosureDetector::addKeyframe(
     {
         std::lock_guard<std::mutex> lk(impl_->mutex);
         if (!impl_->db) return;  // ready toggled off behind our back
+        // Compute BoW vector before add() so we can store it alongside the
+        // record. db.add() also computes one internally but does not return
+        // it; rather than dig into DBoW2's internals (or pay for a lookup
+        // by entry id), recomputing once here is the cleanest option and
+        // costs ~50µs per keyframe at 250 features.
+        impl_->vocab.transform(features, rec.bow_vec);
         rec.db_entry_id = impl_->db->add(features);
 
         const size_t idx = impl_->keyframes.size();
@@ -307,6 +373,12 @@ bool LoopClosureDetector::tryDetectLoop(
             return false;
         }
 
+        // Compute query BoW vector once — used both for the db query (via
+        // the same `features`) and for the adaptive minScore against
+        // recent neighbors below.
+        DBoW2::BowVector query_bow;
+        impl_->vocab.transform(features, query_bow);
+
         impl_->db->query(features, results, kBowTopN, max_id);
 
         if (results.empty()) return false;
@@ -315,7 +387,38 @@ bool LoopClosureDetector::tryDetectLoop(
         best_score    = top.Score;
         best_entry_id = top.Id;
 
-        if (best_score < kBowScoreThreshold) {
+        // ── Adaptive minScore (ORB-SLAM2 LoopClosing.cc::DetectLoop) ──
+        // Score the query against the K most recent keyframes that are
+        // themselves *inside* the temporal-exclusion window — those are
+        // our covisibility proxy. Take the minimum: a candidate from the
+        // DB has to look at least as similar to us as our noisiest
+        // recent neighbor does. Floor at kBowScoreFloor to defend against
+        // low-texture stretches where every neighbor scores near zero.
+        double min_score    = 1.0;
+        size_t n_neighbors  = 0;
+        const size_t total_kfs = impl_->keyframes.size();
+        const size_t start_idx = (total_kfs > kCovisibilityK)
+                                 ? total_kfs - kCovisibilityK
+                                 : 0;
+        for (size_t i = start_idx; i < total_kfs; ++i) {
+            const KeyframeRecord& neighbor = impl_->keyframes[i];
+            // Only neighbors NEWER than cutoff_ns count — the rest are
+            // candidate territory, not covisibility territory.
+            if (neighbor.timestamp_ns <= cutoff_ns) continue;
+            const double s = impl_->vocab.score(query_bow, neighbor.bow_vec);
+            if (s < min_score) min_score = s;
+            ++n_neighbors;
+        }
+        if (n_neighbors == 0) {
+            // No recent neighbors yet (early in the walk). Fall back to
+            // the floor so the detector can still accept genuinely strong
+            // matches but not noise.
+            min_score = kBowScoreFloor;
+        } else {
+            min_score = std::max(min_score, kBowScoreFloor);
+        }
+
+        if (best_score < min_score) {
             // Detector owns BOTH rejection counters now (cpp-reviewer 2026-05-04
             // HIGH-1: when Tracker also bumped rejects_low_score on every false
             // return, PnP rejections double-counted because the detector
@@ -324,8 +427,9 @@ bool LoopClosureDetector::tryDetectLoop(
             // owned exclusively here.
             navsight::eventCounters().loop_closure_rejects_low_score.fetch_add(
                 1, std::memory_order_relaxed);
-            LOGD("BoW reject: best_score=%.4f < %.4f (kf %llu)",
-                 best_score, kBowScoreThreshold,
+            LOGD("BoW reject: best_score=%.4f < adaptive_min=%.4f "
+                 "(neighbors=%zu, kf %llu)",
+                 best_score, min_score, n_neighbors,
                  static_cast<unsigned long long>(now_kf_id));
             return false;
         }

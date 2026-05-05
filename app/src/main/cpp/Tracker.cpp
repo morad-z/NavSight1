@@ -2207,19 +2207,6 @@ VisionOutput Tracker::processFrame(const uint8_t* yuv_data, int width, int heigh
             // score + 2D-2D essential matrix path per its contract.
             const int latest_clone_for_kf = ekf_.getLatestCloneId();
             if (loop_closure_.isReady() && latest_clone_for_kf >= 0) {
-                std::vector<cv::Point3f> pts3d_world;
-                pts3d_world.reserve(static_cast<size_t>(ekf_.getSlamFeatureCount()));
-                const int n_slam = ekf_.getSlamFeatureCount();
-                for (int slot = 0; slot < n_slam; ++slot) {
-                    cv::Mat p_w;
-                    if (!ekf_.getSlamFeatureGlobalPosition(slot, p_w)) continue;
-                    if (p_w.empty() || p_w.rows < 3) continue;
-                    pts3d_world.emplace_back(
-                        static_cast<float>(p_w.at<double>(0, 0)),
-                        static_cast<float>(p_w.at<double>(1, 0)),
-                        static_cast<float>(p_w.at<double>(2, 0)));
-                }
-
                 // Pull keypoints + descriptors from the freshly-stored
                 // keyframe descriptor record (so the same ORB output that
                 // FeatureManager built feeds the detector — Step 7 plan
@@ -2237,6 +2224,44 @@ VisionOutput Tracker::processFrame(const uint8_t* yuv_data, int width, int heigh
                 if (kf_pose_ok && !kf_R_mat.empty() && !kf_p_mat.empty() &&
                     !kf_ring.empty()) {
                     const auto& kf_back = kf_ring.back();
+
+                    // ── pts3d_world MUST be aligned to ORB keypoint rows ──
+                    // LoopClosureDetector.h:86 contract:
+                    //   "per-row triangulated 3D world points
+                    //    (cv::Point3f(NaN,NaN,NaN) for rows without depth —
+                    //    those rows skip PnP but stay BoW-active)"
+                    // Earlier this site emplaced raw SLAM features in slot
+                    // order, which left pts3d_world.size() ~30 vs keypoints
+                    // size ~500 → BFMatcher's trainIdx (range [0, N_orb))
+                    // almost always failed `t_idx < pts3d_world.size()` and
+                    // PnP saw < 30 candidate pairs even on real revisits.
+                    //
+                    // Each ORB keypoint already inherits a FeatureManager
+                    // feature_id by spatial proximity (FeatureManager.cpp:559
+                    // — ORB_KLT_MATCH_RADIUS). We map feature_id → SLAM
+                    // slot via EKFState::getSlamFeatureSlot, then read the
+                    // world position. ORB rows without a SLAM-promoted
+                    // feature stay NaN.
+                    constexpr float kNan = std::numeric_limits<float>::quiet_NaN();
+                    std::vector<cv::Point3f> pts3d_world(
+                        kf_back.keypoints.size(), cv::Point3f(kNan, kNan, kNan));
+                    int filled_3d = 0;
+                    for (size_t k = 0; k < kf_back.keypoints.size(); ++k) {
+                        const int fid = (k < kf_back.feature_ids.size())
+                                        ? kf_back.feature_ids[k] : -1;
+                        if (fid < 0) continue;
+                        const int slot = ekf_.getSlamFeatureSlot(fid);
+                        if (slot < 0) continue;
+                        cv::Mat p_w;
+                        if (!ekf_.getSlamFeatureGlobalPosition(slot, p_w)) continue;
+                        if (p_w.empty() || p_w.rows < 3) continue;
+                        pts3d_world[k] = cv::Point3f(
+                            static_cast<float>(p_w.at<double>(0, 0)),
+                            static_cast<float>(p_w.at<double>(1, 0)),
+                            static_cast<float>(p_w.at<double>(2, 0)));
+                        ++filled_3d;
+                    }
+
                     cv::Matx33d R_world_cam(
                         kf_R_mat.at<double>(0, 0), kf_R_mat.at<double>(0, 1), kf_R_mat.at<double>(0, 2),
                         kf_R_mat.at<double>(1, 0), kf_R_mat.at<double>(1, 1), kf_R_mat.at<double>(1, 2),
@@ -2245,6 +2270,190 @@ VisionOutput Tracker::processFrame(const uint8_t* yuv_data, int width, int heigh
                         kf_p_mat.at<double>(0, 0),
                         kf_p_mat.at<double>(1, 0),
                         kf_p_mat.at<double>(2, 0));
+
+                    // Publish this keyframe's world pose into the
+                    // FeatureManager descriptor record so the *next*
+                    // keyframe can triangulate against us.
+                    feature_mgr_.setLatestKeyframePose(R_world_cam, t_cam_world);
+
+                    // ── Triangulate ORB pairs vs the previous keyframe ──
+                    //
+                    // Why this is needed: with MAX_SLAM_FEATURES=12 and
+                    // ORB_KLT_MATCH_RADIUS=3px, only ~0-2 of the 500 ORB
+                    // rows inherit a SLAM-promoted 3D position, so PnP at
+                    // detection time sees ~3-10 pairs per candidate match
+                    // — far below RANSAC's ability to find inliers.
+                    //
+                    // Approach is the same as ORB-SLAM2's
+                    // LocalMapping::CreateNewMapPoints: BFMatch this
+                    // keyframe's ORB descriptors against the previous
+                    // keyframe's, run Lowe ratio (0.75), then triangulate
+                    // matches via cv::triangulatePoints with both
+                    // projection matrices = K * [R_world->cam | -R*t_cam].
+                    //
+                    // Validation: positive depth in BOTH views, depth in
+                    // [0.5, 50] m. We do NOT enforce a reprojection check
+                    // here — that's PnP's job at detection time.
+                    //
+                    // Baseline gate: skip the entire pass if the camera
+                    // moved < 0.1 m between keyframes (pure rotation /
+                    // near-zero baseline → infinite-distance triangulation
+                    // is garbage). The Step 5 rotation gate already drops
+                    // pure-rot keyframes earlier in the pipeline, but a
+                    // user who turns slowly mid-walk could slip through.
+                    int triangulated = 0;
+                    double tri_baseline = 0.0;
+                    int    tri_back_off = 0;
+                    if (kf_ring.size() >= 2 &&
+                        kf_back.keypoints.size() ==
+                            static_cast<size_t>(kf_back.descriptors.rows)) {
+                        // QA fix (BLOCKER-1, 2026-05-05): walk backwards to
+                        // find the most recent neighbor that satisfies the
+                        // pose-published / valid-baseline / valid-descriptor
+                        // gate. Originally we blindly took kf_ring[size-2],
+                        // but if the prior keyframe landed before the
+                        // vocabulary loaded (or before EKF full-init) it has
+                        // has_pose=false and triangulation skipped forever.
+                        // Bound the search at 10 entries so cost stays O(1).
+                        const KeyframeDescriptors* kf_prev_ptr = nullptr;
+                        const size_t max_back =
+                            std::min<size_t>(kf_ring.size(), 10);
+                        for (size_t back_off = 2; back_off <= max_back; ++back_off) {
+                            const auto& cand = kf_ring[kf_ring.size() - back_off];
+                            if (!cand.has_pose) continue;
+                            if (cand.descriptors.empty() ||
+                                cand.descriptors.type() != CV_8U ||
+                                cand.descriptors.cols != 32) continue;
+                            const cv::Vec3d bv =
+                                t_cam_world - cand.t_cam_world;
+                            const double bn =
+                                std::sqrt(bv[0] * bv[0] + bv[1] * bv[1] + bv[2] * bv[2]);
+                            // Reject too-short (degenerate triangulation) and
+                            // too-long (descriptors won't survive viewpoint
+                            // change anyway, so a Lowe-pass is unlikely).
+                            if (bn < 0.1 || bn > 5.0) continue;
+                            kf_prev_ptr = &cand;
+                            tri_baseline = bn;
+                            tri_back_off = static_cast<int>(back_off);
+                            break;
+                        }
+                        if (kf_prev_ptr) {
+                            const KeyframeDescriptors& kf_prev = *kf_prev_ptr;
+                            // Build projection matrices in world frame.
+                            //  P = K * [R_world->cam | t_world->cam]
+                            //  R_world->cam = R_world_cam.t()
+                            //  t_world->cam = -R_world->cam * t_cam_world
+                            auto buildP = [&](const cv::Matx33d& Rwc,
+                                              const cv::Vec3d&   twc) {
+                                const cv::Matx33d R_w2c = Rwc.t();
+                                const cv::Vec3d   t_w2c = -(R_w2c * twc);
+                                cv::Mat Rt = (cv::Mat_<double>(3, 4) <<
+                                    R_w2c(0,0), R_w2c(0,1), R_w2c(0,2), t_w2c[0],
+                                    R_w2c(1,0), R_w2c(1,1), R_w2c(1,2), t_w2c[1],
+                                    R_w2c(2,0), R_w2c(2,1), R_w2c(2,2), t_w2c[2]);
+                                return cv::Mat(K * Rt);
+                            };
+                            const cv::Mat P_now  = buildP(R_world_cam,
+                                                          t_cam_world);
+                            const cv::Mat P_prev = buildP(kf_prev.R_world_cam,
+                                                          kf_prev.t_cam_world);
+
+                            cv::BFMatcher tri_matcher(cv::NORM_HAMMING, false);
+                            std::vector<std::vector<cv::DMatch>> tri_knn;
+                            tri_matcher.knnMatch(kf_back.descriptors,
+                                                 kf_prev.descriptors,
+                                                 tri_knn, 2);
+
+                            const cv::Matx33d R_w2c_now  = R_world_cam.t();
+                            const cv::Vec3d   t_w2c_now  = -(R_w2c_now * t_cam_world);
+                            const cv::Matx33d R_w2c_prev = kf_prev.R_world_cam.t();
+                            const cv::Vec3d   t_w2c_prev =
+                                -(R_w2c_prev * kf_prev.t_cam_world);
+
+                            // Granular instrumentation (walk #4 produced
+                            // triangulated=0 even with healthy baselines —
+                            // need to see WHICH filter is dropping pairs).
+                            int n_knn        = static_cast<int>(tri_knn.size());
+                            int n_lowe       = 0;
+                            int n_bounds     = 0;
+                            int n_avail      = 0;  // not already SLAM-anchored
+                            int n_ok_w       = 0;
+                            int n_depth_now_neg  = 0;
+                            int n_depth_prev_neg = 0;
+                            int n_depth_now_far  = 0;
+                            int n_depth_prev_far = 0;
+                            double avg_depth_now  = 0.0;
+                            for (const auto& pair : tri_knn) {
+                                if (pair.size() < 2) continue;
+                                if (pair[0].distance >= 0.75f * pair[1].distance) continue;
+                                ++n_lowe;
+                                const int q_idx = pair[0].queryIdx;
+                                const int t_idx = pair[0].trainIdx;
+                                if (q_idx < 0 ||
+                                    q_idx >= static_cast<int>(pts3d_world.size())) continue;
+                                if (t_idx < 0 ||
+                                    t_idx >= static_cast<int>(kf_prev.keypoints.size())) continue;
+                                ++n_bounds;
+                                // Don't overwrite SLAM-derived 3D — the
+                                // EKF estimate is more accurate than a
+                                // single-baseline triangulation.
+                                if (std::isfinite(pts3d_world[q_idx].x)) continue;
+                                ++n_avail;
+
+                                const cv::Point2f& p_now  = kf_back.keypoints[q_idx].pt;
+                                const cv::Point2f& p_prev = kf_prev.keypoints[t_idx].pt;
+                                std::vector<cv::Point2f> pts_now  = {p_now};
+                                std::vector<cv::Point2f> pts_prev = {p_prev};
+                                cv::Mat pt4d;
+                                cv::triangulatePoints(P_now, P_prev,
+                                                      pts_now, pts_prev, pt4d);
+                                const double w = pt4d.at<float>(3, 0);
+                                if (std::abs(w) < 1e-6) continue;
+                                ++n_ok_w;
+                                const cv::Vec3d p_world(
+                                    pt4d.at<float>(0, 0) / w,
+                                    pt4d.at<float>(1, 0) / w,
+                                    pt4d.at<float>(2, 0) / w);
+
+                                // Positive-depth check in both views.
+                                const cv::Vec3d p_cam_now  = R_w2c_now  * p_world + t_w2c_now;
+                                const cv::Vec3d p_cam_prev = R_w2c_prev * p_world + t_w2c_prev;
+                                avg_depth_now += p_cam_now[2];
+                                if (p_cam_now[2] < 0.5)  { ++n_depth_now_neg;  continue; }
+                                if (p_cam_now[2] > 50.0) { ++n_depth_now_far;  continue; }
+                                if (p_cam_prev[2] < 0.5) { ++n_depth_prev_neg; continue; }
+                                if (p_cam_prev[2] > 50.0){ ++n_depth_prev_far; continue; }
+
+                                pts3d_world[q_idx] = cv::Point3f(
+                                    static_cast<float>(p_world[0]),
+                                    static_cast<float>(p_world[1]),
+                                    static_cast<float>(p_world[2]));
+                                ++triangulated;
+                            }
+                            if (n_ok_w > 0) avg_depth_now /= n_ok_w;
+                            LOGI("LC_TRI_DBG: knn=%d lowe=%d bounds=%d avail=%d "
+                                 "tri_ok=%d depth_now_neg=%d depth_now_far=%d "
+                                 "depth_prev_neg=%d depth_prev_far=%d "
+                                 "avg_depth_now=%.2fm",
+                                 n_knn, n_lowe, n_bounds, n_avail, n_ok_w,
+                                 n_depth_now_neg, n_depth_now_far,
+                                 n_depth_prev_neg, n_depth_prev_far,
+                                 avg_depth_now);
+                        }
+                    }
+
+                    // QA pass (2026-05-05): log every keyframe (not every
+                    // 30th frame) so walk #4's logcat reveals exactly how
+                    // many 3D points actually got into pts3d_world per
+                    // keyframe. tri_baseline / tri_back_off help diagnose
+                    // why a keyframe got no triangulated pairs (e.g.,
+                    // pure-rotation skipped baseline check, or
+                    // back_off ran out of valid neighbors).
+                    LOGI("LC_KF: kp=%zu filled_3d=%d triangulated=%d "
+                         "tri_baseline=%.2fm tri_back=%d (clone=%d)",
+                         kf_back.keypoints.size(), filled_3d,
+                         triangulated, tri_baseline, tri_back_off,
+                         latest_clone_for_kf);
 
                     loop_closure_.addKeyframe(
                         static_cast<uint64_t>(latest_clone_for_kf),

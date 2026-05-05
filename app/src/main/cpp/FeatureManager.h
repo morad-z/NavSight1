@@ -87,6 +87,21 @@ public:
         return keyframe_descriptors_;
     }
 
+    // Attach a world-frame camera pose to the most recently stored keyframe
+    // descriptor record. Used by Step 7 loop closure (Tracker.cpp) so the
+    // ring buffer can drive ORB-pair triangulation across consecutive
+    // keyframes — see KeyframeDescriptors.h for rationale. Returns true
+    // iff there was a record to update.
+    bool setLatestKeyframePose(const cv::Matx33d& R_world_cam,
+                               const cv::Vec3d&   t_cam_world) {
+        if (keyframe_descriptors_.empty()) return false;
+        auto& back = keyframe_descriptors_.back();
+        back.R_world_cam = R_world_cam;
+        back.t_cam_world = t_cam_world;
+        back.has_pose    = true;
+        return true;
+    }
+
     // ── Plan Step 4 (ADR-010) ORB extractor params (PUBLIC) ────────────────
     // These are intentionally exposed so Tracker's relocalization path can
     // build a matching cv::ORB extractor without duplicating magic numbers.
@@ -94,7 +109,19 @@ public:
     // (FeatureManager's storeKeyframeDescriptors used the same values), and
     // a divergence between extraction and matching params is a compile-time
     // impossibility rather than a runtime mismatch.
-    static constexpr int    ORB_TARGET_FEATURES = 250;  // density vs CPU
+    // 500 features at 640×480 = ~10-16 ms/keyframe on a Snapdragon 695
+    // (2× the prior 250-feature budget; previous comment block in
+    // storeKeyframeDescriptors cited 5-8 ms at 250). At ~2 Hz keyframe
+    // rate that's ~2% CPU — comfortably inside the ~5% visual-pipeline
+    // envelope. The bump is required for Step 7 loop closure: ORB-SLAM2
+    // operates at 1000-2000 features/keyframe and DBoW2 raw L1 scores
+    // scale roughly linearly with feature count, so 250 made even genuine
+    // same-place revisits score ~0.005-0.015 (see Step 7 walk
+    // tests/sims/simulation_data_1777985054704.json) — too low to gate on
+    // confidently. 500 is the smallest bump with a meaningful
+    // discriminability gain (recall ~70% at fixed precision per
+    // Galvez-Lopez T-RO 2012 Fig. 6) without paying full ORB-SLAM2 CPU.
+    static constexpr int    ORB_TARGET_FEATURES = 500;  // density vs CPU
     static constexpr int    ORB_FAST_THRESHOLD  = 10;   // texture-poor floor
     static constexpr double ORB_PREBLUR_SIGMA   = 1.0;  // FAST noise reject
 

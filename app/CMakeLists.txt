@@ -2,9 +2,20 @@ cmake_minimum_required(VERSION 3.22.1)
 
 project("navsight")
 
-# Optimization flags for Production VIO
-set(CMAKE_CXX_FLAGS "${CMAKE_CXX_FLAGS} -O3 -ffast-math -ftree-vectorize")
-set(CMAKE_C_FLAGS "${CMAKE_C_FLAGS} -O3 -ffast-math -ftree-vectorize")
+# Optimization flags for Production VIO.
+#
+# WARNING: -ffast-math implies -ffinite-math-only, which constant-folds
+# `std::isfinite(x)` to `true` for every call site (the compiler is told to
+# assume NaN/Inf never appear). The codebase relies on isfinite checks in 7
+# files (LoopClosureDetector.cpp, ScaleFuser.cpp, ScaleEstimatorVI.cpp,
+# IMUPreintegrator.cpp, native-lib.cpp, Tracker.cpp, VioEngine.cpp) to filter
+# bad triangulations and divergent state. Without -fno-finite-math-only the
+# Step 7 PnP path silently received (0,0,0) "3D points" because its NaN
+# guard never fired (debugged 2026-05-05 from LC_TRI_DBG: avail=0 despite
+# rows being NaN-initialised at fill time). Keep -fno-finite-math-only on
+# both compilers — removing it re-introduces the bug.
+set(CMAKE_CXX_FLAGS "${CMAKE_CXX_FLAGS} -O3 -ffast-math -fno-finite-math-only -ftree-vectorize")
+set(CMAKE_C_FLAGS   "${CMAKE_C_FLAGS}   -O3 -ffast-math -fno-finite-math-only -ftree-vectorize")
 
 # Resolve OpenCV SDK path (with fallback for relative and absolute paths)
 if(DEFINED OpenCV_DIR_OVERRIDE)

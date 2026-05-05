@@ -906,18 +906,25 @@ bool EKFState::updateAbsolutePose(const cv::Mat& target_R_world_imu,
     }
     cv::Mat m_mat = r.t() * S_inv * r;
     const double m2 = m_mat.at<double>(0, 0);
+    // Log residual + state for diagnosis BEFORE the chi² gate, so a
+    // chi²-reject still leaves a trace we can use to figure out whether
+    // the residual itself is wrong (frame mismatch, stale candidate
+    // pose) or the predicted variance S is too tight.
+    LOGI("LC_ABS: r_R=[%.3f %.3f %.3f] r_p=[%.3f %.3f %.3f] "
+         "p_G=[%.3f %.3f %.3f] target_p=[%.3f %.3f %.3f] "
+         "var_R=%.4e var_p=%.4f m2=%.3f thresh=%.1f",
+         r_R.at<double>(0, 0), r_R.at<double>(1, 0), r_R.at<double>(2, 0),
+         r_p.at<double>(0, 0), r_p.at<double>(1, 0), r_p.at<double>(2, 0),
+         p_G_.at<double>(0, 0), p_G_.at<double>(1, 0), p_G_.at<double>(2, 0),
+         target_p_world.at<double>(0, 0), target_p_world.at<double>(1, 0),
+         target_p_world.at<double>(2, 0),
+         sR, sp, m2, kChi2Threshold);
+
     if (m2 > kChi2Threshold) {
-        LOGI("LC_ABS: chi2_reject m=%.3f thresh=%.1f", m2, kChi2Threshold);
         navsight::eventCounters().loop_closure_chi2_rejected.fetch_add(
             1, std::memory_order_relaxed);
         return false;
     }
-
-    LOGI("LC_ABS: r_R=[%.3f %.3f %.3f] r_p=[%.3f %.3f %.3f] "
-         "var_R=%.4e var_p=%.4f m2=%.3f applied",
-         r_R.at<double>(0, 0), r_R.at<double>(1, 0), r_R.at<double>(2, 0),
-         r_p.at<double>(0, 0), r_p.at<double>(1, 0), r_p.at<double>(2, 0),
-         sR, sp, m2);
 
     applyMSCKFUpdate(H, r, R_noise);
     return true;

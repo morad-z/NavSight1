@@ -277,6 +277,17 @@ def analyze(path):
         print(f"  Step 3b SLAM promotions : total={g('slam_promotions_total')}")
         print(f"  Step 3 MSCKF            : updates={g('msckf_update_lines')} "
               f"huber_rej={g('msckf_huber_rejected_sum')}")
+        lc_attempts = g('loop_closure_attempts')
+        lc_accepts  = g('loop_closure_accepts')
+        lc_low      = g('loop_closure_rejects_low_score')
+        lc_pnp      = g('loop_closure_rejects_pnp')
+        lc_chi2     = g('loop_closure_chi2_rejected')
+        lc_kf_db    = g('loop_closure_kf_count_in_db')
+        lc_corr     = g('loop_closure_corrections_applied')
+        print(f"  Step 7 LOOP CLOSURE     : attempts={lc_attempts} accepts={lc_accepts} "
+              f"corrections_applied={lc_corr}")
+        print(f"  Step 7 LC reject reasons: low_score={lc_low} pnp_failed={lc_pnp} "
+              f"chi2_rejected={lc_chi2} (kf_in_db={lc_kf_db})")
         print()
     else:
         print("EVENT SUMMARY: (no event_summary — pre-counter sim)")
