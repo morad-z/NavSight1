@@ -213,7 +213,10 @@ std::vector<cv::Vec2f> makeUniformFlow(int N, uint64_t seed) {
 // the clear frame's variance clears the threshold, the blurred frame
 // fails it, and the blurred is at least 5× lower than clear.
 TEST(VisualRobustness, BlurDetectionFlagsBlurredFrame) {
-    const uint64_t seed = 0xB1U2R3R4U5L6;
+    // [run_tests fix] Original literal `0xB1U2R3R4U5L6` is invalid C++ —
+    // 'U2R3R4U5L6' is not a hex suffix. Replaced with a valid 64-bit hex
+    // constant of equivalent magic-number role.
+    const uint64_t seed = 0xB1B2B3B4B5B6ULL;
 
     cv::Mat clear   = makeNoiseFrame(seed, /*blur_sigma=*/1.0);
     cv::Mat blurred = makeNoiseFrame(seed, /*blur_sigma=*/5.0);

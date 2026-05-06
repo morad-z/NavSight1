@@ -91,8 +91,14 @@ struct EKFWithClones {
     cv::Mat R_GtoC;
 };
 
-EKFWithClones makeEKFWithForwardClones(int n_clones, double baseline_m = 0.05) {
-    EKFWithClones out;
+// [run_tests fix] EKFState contains a std::mutex (ADR-012, EKFState.h:346)
+// so EKFWithClones (which holds an EKFState by value) is also non-copyable
+// and non-movable. Helper now populates a passed-in reference instead of
+// returning by value; call sites use INIT_EKF_FORWARD(ctx, n) to keep
+// the diff minimal.
+void initializeEKFWithForwardClones(EKFWithClones& out,
+                                    int n_clones,
+                                    double baseline_m = 0.05) {
     cv::Mat R_eye = cv::Mat::eye(3, 3, CV_64F);
     out.ekf.initializeFull(R_eye, cv::Point3f(0, 0, 0), cv::Point3f(0, 0, 0));
     out.R_GtoC = R_eye;
@@ -102,8 +108,13 @@ EKFWithClones makeEKFWithForwardClones(int n_clones, double baseline_m = 0.05) {
         out.clone_p_G.push_back(p_G);
         out.clone_ids.push_back(out.ekf.getLatestCloneId());
     }
-    return out;
 }
+#define INIT_EKF_FORWARD_1(name, n)        \
+    EKFWithClones name;                    \
+    initializeEKFWithForwardClones(name, (n))
+#define INIT_EKF_FORWARD_2(name, n, b)     \
+    EKFWithClones name;                    \
+    initializeEKFWithForwardClones(name, (n), (b))
 
 // Sum of covariance diagonal entries on the IMU position block (rows 12..14).
 // Used as a scalar "how confident am I in position" metric. Trend-only.
@@ -143,7 +154,7 @@ CameraPose anchorAt(const cv::Mat& R_GtoC, const cv::Mat& p_G, int state_id) {
 // ── (a) Add / remove grows and shrinks state ─────────────────────────────────
 
 TEST(EKFStateSlamMsckf, AddRemoveSlamFeature_GrowsAndShrinksState) {
-    auto ctx = makeEKFWithForwardClones(/*n_clones=*/3);
+    INIT_EKF_FORWARD_1(ctx, /*n_clones=*/3);
     cv::Mat P0 = ctx.ekf.getCovariance();
     const int dim0 = P0.rows;
     ASSERT_GT(dim0, 0);
@@ -190,7 +201,7 @@ TEST(EKFStateSlamMsckf, AddRemoveSlamFeature_GrowsAndShrinksState) {
 // ── (b) Cap at K=12, replacement after remove ────────────────────────────────
 
 TEST(EKFStateSlamMsckf, SlamFeatureCap_RejectsBeyondK12) {
-    auto ctx = makeEKFWithForwardClones(/*n_clones=*/2);
+    INIT_EKF_FORWARD_1(ctx, /*n_clones=*/2);
     CameraPose anchor =
         anchorAt(ctx.R_GtoC, ctx.clone_p_G[0], ctx.clone_ids[0]);
 
@@ -223,7 +234,7 @@ TEST(EKFStateSlamMsckf, SlamFeatureCap_RejectsBeyondK12) {
 // Must shrink the IMU position covariance (information gain).
 TEST(EKFStateSlamMsckf,
      MSCKFFeature_NullSpaceUpdate_ReducesPositionCovariance) {
-    auto ctx = makeEKFWithForwardClones(/*n_clones=*/4, /*baseline=*/0.10);
+    INIT_EKF_FORWARD_2(ctx, /*n_clones=*/4, /*baseline=*/0.10);
 
     cv::Mat K = makeK();
     cv::Mat X_global = (cv::Mat_<double>(3, 1) << 0.3, -0.1, 5.0);
@@ -271,7 +282,7 @@ TEST(EKFStateSlamMsckf,
 // ── (d) SLAM feature update converges depth ──────────────────────────────────
 
 TEST(EKFStateSlamMsckf, SlamFeatureUpdate_ConvergesDepth) {
-    auto ctx = makeEKFWithForwardClones(/*n_clones=*/5, /*baseline=*/0.20);
+    INIT_EKF_FORWARD_2(ctx, /*n_clones=*/5, /*baseline=*/0.20);
     cv::Mat K = makeK();
 
     // Truth: feature 5 m in front of the anchor clone, slight off-axis.
@@ -349,7 +360,7 @@ TEST(EKFStateSlamMsckf, SlamFeatureUpdate_ConvergesDepth) {
 // ── (e) Huber kernel rejects an outlier observation ──────────────────────────
 
 TEST(EKFStateSlamMsckf, HuberRobustification_RejectsOutlier) {
-    auto ctx = makeEKFWithForwardClones(/*n_clones=*/4, /*baseline=*/0.15);
+    INIT_EKF_FORWARD_2(ctx, /*n_clones=*/4, /*baseline=*/0.15);
     cv::Mat K = makeK();
     cv::Mat X_true = (cv::Mat_<double>(3, 1) << 0.0, 0.0, 6.0);
 

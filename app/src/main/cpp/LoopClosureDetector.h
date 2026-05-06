@@ -87,12 +87,16 @@ public:
     //                      depth — those rows skip PnP but stay BoW-active)
     //   R_world_cam        camera→world rotation at this keyframe
     //   t_cam_world        camera position in world frame
+    //   yaw_rad            camera heading at this keyframe (Tracker::scalar_heading_,
+    //                      measured from north, clockwise). Used by tryDetectLoop
+    //                      to gate same-direction revisits.
     void addKeyframe(uint64_t kf_id, double timestamp_ns,
                      const cv::Mat& descriptors,
                      const std::vector<cv::KeyPoint>& keypoints,
                      const std::vector<cv::Point3f>& pts3d_world,
                      const cv::Matx33d& R_world_cam,
-                     const cv::Vec3d&   t_cam_world);
+                     const cv::Vec3d&   t_cam_world,
+                     double yaw_rad);
 
     // Match payload returned by tryDetectLoop. Identical layout to the
     // one declared in Tracker.h's loop_closure_pending_match_.
@@ -152,12 +156,20 @@ public:
     //                             newer than (now_ns - this) — i.e. the
     //                             recent past; 30 s is the project default
     //                             (see TEMPORAL_EXCLUSION_NS in the .cpp).
+    //   current_yaw_rad           camera heading of the query frame
+    //                             (Tracker::scalar_heading_). Candidates
+    //                             whose stored yaw differs by > π/2 are
+    //                             rejected before PnP — ORB descriptors
+    //                             are not 180°-invariant and produce
+    //                             geometrically inconsistent 3D-2D pairs
+    //                             when the viewpoint is reversed.
     //   out_match                 populated on success.
     bool tryDetectLoop(uint64_t now_kf_id, int64_t now_ns,
                        const cv::Mat& descriptors,
                        const std::vector<cv::KeyPoint>& keypoints,
                        double fx, double fy, double cx, double cy,
                        int64_t temporal_exclusion_ns,
+                       double current_yaw_rad,
                        LoopMatch& out_match);
 
     // Returns the number of keyframes currently in the BoW database.

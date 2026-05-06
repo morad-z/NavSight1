@@ -119,6 +119,10 @@ struct EventCounters {
     std::atomic<long long> loop_closure_accepts{0};
     std::atomic<long long> loop_closure_rejects_low_score{0};
     std::atomic<long long> loop_closure_rejects_pnp{0};
+    // Candidate heading differed from query heading by > 90°: same-session
+    // Step 7 only handles same-direction revisits; opposite-direction
+    // approaches produce geometrically inconsistent 3D-2D pairs for PnP.
+    std::atomic<long long> loop_closure_rejects_heading{0};
     std::atomic<long long> loop_closure_kf_count_in_db{0};
     // Step 7 absolute-pose injection (ADR-013 §"Correction injection —
     // absolute pose path"). Completes accounting from detection to
@@ -163,6 +167,7 @@ struct EventCounters {
         loop_closure_accepts.store(0, std::memory_order_relaxed);
         loop_closure_rejects_low_score.store(0, std::memory_order_relaxed);
         loop_closure_rejects_pnp.store(0, std::memory_order_relaxed);
+        loop_closure_rejects_heading.store(0, std::memory_order_relaxed);
         loop_closure_kf_count_in_db.store(0, std::memory_order_relaxed);
         loop_closure_chi2_rejected.store(0, std::memory_order_relaxed);
         loop_closure_corrections_applied.store(0, std::memory_order_relaxed);
@@ -216,6 +221,7 @@ struct EventCounters {
         const long long v_loop_closure_accepts          = loop_closure_accepts.load(std::memory_order_relaxed);
         const long long v_loop_closure_rejects_low_score= loop_closure_rejects_low_score.load(std::memory_order_relaxed);
         const long long v_loop_closure_rejects_pnp      = loop_closure_rejects_pnp.load(std::memory_order_relaxed);
+        const long long v_loop_closure_rejects_heading  = loop_closure_rejects_heading.load(std::memory_order_relaxed);
         const long long v_loop_closure_kf_count_in_db   = loop_closure_kf_count_in_db.load(std::memory_order_relaxed);
         const long long v_loop_closure_chi2_rejected    = loop_closure_chi2_rejected.load(std::memory_order_relaxed);
         const long long v_loop_closure_corrections_applied = loop_closure_corrections_applied.load(std::memory_order_relaxed);
@@ -252,6 +258,7 @@ struct EventCounters {
         appendKv(out, "loop_closure_accepts",          v_loop_closure_accepts);          out += ',';
         appendKv(out, "loop_closure_rejects_low_score", v_loop_closure_rejects_low_score); out += ',';
         appendKv(out, "loop_closure_rejects_pnp",      v_loop_closure_rejects_pnp);      out += ',';
+        appendKv(out, "loop_closure_rejects_heading",  v_loop_closure_rejects_heading);  out += ',';
         appendKv(out, "loop_closure_kf_count_in_db",   v_loop_closure_kf_count_in_db);   out += ',';
         appendKv(out, "loop_closure_chi2_rejected",    v_loop_closure_chi2_rejected);    out += ',';
         appendKv(out, "loop_closure_corrections_applied", v_loop_closure_corrections_applied);

@@ -327,6 +327,8 @@ void Tracker::reset() {
     feature_ids_.clear();
     heading_initialized_ = false;
     scalar_heading_ = 0.0;
+    total_path_m_ = 0.0;
+    loop_closure_query_yaw_rad_ = 0.0;
     pending_init_heading_set_ = false;
     pending_init_heading_ = 0.0;
     filtered_yaw_rate_ = 0.0;
@@ -1482,6 +1484,7 @@ VisionOutput Tracker::processFrame(const uint8_t* yuv_data, int width, int heigh
             // instead of a sharp turnaround.
             if (speed > 0.1 && gyro_norm < 0.8) {
                 double d = std::min(std::min(speed, 2.0) * dt_s, 1.0 * dt_s);
+                total_path_m_ += d;
                 double dx_step = d * std::sin(heading);   // +X = East
                 double dz_step = d * std::cos(heading);   // +Z = North
 
@@ -2462,7 +2465,8 @@ VisionOutput Tracker::processFrame(const uint8_t* yuv_data, int width, int heigh
                         kf_back.keypoints,
                         pts3d_world,
                         R_world_cam,
-                        t_cam_world);
+                        t_cam_world,
+                        scalar_heading_);
 
                     // Counter (Agent A): kf-count-in-database. Sample once
                     // per addKeyframe call to keep cost bounded.
@@ -2477,7 +2481,8 @@ VisionOutput Tracker::processFrame(const uint8_t* yuv_data, int width, int heigh
                     publishLoopClosureQueryKeyframe(
                         latest_clone_for_kf, timestamp_ns,
                         kf_back.descriptors, kf_back.keypoints,
-                        fx_, fy_, cx_, cy_);
+                        fx_, fy_, cx_, cy_,
+                        scalar_heading_);
                 }
             }
 
@@ -3222,7 +3227,8 @@ void Tracker::publishLoopClosureQueryKeyframe(
         int kf_id, int64_t ts_ns,
         const cv::Mat& descriptors,
         const std::vector<cv::KeyPoint>& keypoints,
-        double fx, double fy, double cx, double cy) {
+        double fx, double fy, double cx, double cy,
+        double yaw_rad) {
     {
         std::lock_guard<std::mutex> lock(loop_closure_query_mutex_);
         // Cheap deep copy: descriptors at most 250×32 bytes ≈ 8 KB,
@@ -3237,6 +3243,7 @@ void Tracker::publishLoopClosureQueryKeyframe(
         loop_closure_query_fy_        = fy;
         loop_closure_query_cx_        = cx;
         loop_closure_query_cy_        = cy;
+        loop_closure_query_yaw_rad_   = yaw_rad;
         loop_closure_query_has_data_  = true;
     }
     // Wake the worker. notify_one is correct — the worker is the only
@@ -3256,6 +3263,7 @@ void Tracker::loopClosureWorkerLoop() {
     int                       q_kf_id = -1;
     int64_t                   q_ts_ns = 0;
     double                    q_fx = 0., q_fy = 0., q_cx = 0., q_cy = 0.;
+    double                    q_yaw_rad = 0.;
 
     while (!loop_closure_should_stop_.load(std::memory_order_acquire)) {
         // Wait either for a fresh keyframe publish or the 1 Hz timeout.
@@ -3282,6 +3290,7 @@ void Tracker::loopClosureWorkerLoop() {
             q_fy        = loop_closure_query_fy_;
             q_cx        = loop_closure_query_cx_;
             q_cy        = loop_closure_query_cy_;
+            q_yaw_rad   = loop_closure_query_yaw_rad_;
             loop_closure_query_has_data_ = false;
         }
 
@@ -3301,6 +3310,7 @@ void Tracker::loopClosureWorkerLoop() {
             q_descriptors, q_keypoints,
             q_fx, q_fy, q_cx, q_cy,
             LOOP_CLOSURE_TEMPORAL_EXCL_NS,
+            q_yaw_rad,
             match);
 
         if (!detected) {
@@ -3448,8 +3458,12 @@ void Tracker::consumeLoopClosureMatchIfReady() {
     // attempt — sigma_axis_sq_R inflated by 1/strength², var_p too.
     const double sigma_axis_sq_R = (LOOP_CLOSURE_BASE_ROT_SIGMA_RAD *
                                      LOOP_CLOSURE_BASE_ROT_SIGMA_RAD) * damping_inv;
-    const double var_p           = (LOOP_CLOSURE_BASE_TRANS_SIGMA_M *
-                                     LOOP_CLOSURE_BASE_TRANS_SIGMA_M) * damping_inv;
+    // Dynamic translation sigma grows with path length to stay above the
+    // actual VIO drift (15 %/100 m from sim_data_1778077139237).
+    // Floor ensures the chi² gate is never tighter than PnP sensor noise.
+    const double sigma_p = std::max(LOOP_CLOSURE_PNP_SIGMA_FLOOR_M,
+                                    LOOP_CLOSURE_DRIFT_RATE * total_path_m_);
+    const double var_p   = (sigma_p * sigma_p) * damping_inv;
 
     const bool ok = ekf_.updateAbsolutePose(target_R_GtoI, target_p_world,
                                              sigma_axis_sq_R, var_p);

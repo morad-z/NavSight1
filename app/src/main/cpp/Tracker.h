@@ -231,6 +231,10 @@ private:
     // user request — Tracker::getHeading() and the JNI layer still read it,
     // and replay_harness::getPose relies on it as the canonical scalar yaw.
     double scalar_heading_{0.0};
+    // Cumulative odometric path length (metres). Incremented in both the
+    // visual update path and the PDR step so the loop-closure dynamic sigma
+    // (LOOP_CLOSURE_DRIFT_RATE * total_path_m_) tracks real walked distance.
+    double total_path_m_{0.0};
     // Pending init heading from setInitialHeading() — applied as a bootstrap
     // seed for ekf_.initializeFull on the first frame.
     double pending_init_heading_{0.0};
@@ -422,6 +426,7 @@ private:
     int64_t                   loop_closure_query_ts_ns_{0};
     double                    loop_closure_query_fx_{0.}, loop_closure_query_fy_{0.};
     double                    loop_closure_query_cx_{0.}, loop_closure_query_cy_{0.};
+    double                    loop_closure_query_yaw_rad_{0.};
 
     // Result handoff. The worker writes the latest accepted LoopMatch under
     // this mutex; the camera thread takes (and clears) it before applying
@@ -450,7 +455,8 @@ private:
                                          const cv::Mat& descriptors,
                                          const std::vector<cv::KeyPoint>& keypoints,
                                          double fx, double fy,
-                                         double cx, double cy);
+                                         double cx, double cy,
+                                         double yaw_rad);
 
     // 1 Hz query worker. Wakes on either loop_closure_cv_ or a timeout,
     // copies the pending query under the query mutex, calls tryDetectLoop,
@@ -479,11 +485,28 @@ private:
     static constexpr double  LOOP_CLOSURE_QUERY_PERIOD_S      = 1.0;
     static constexpr int64_t LOOP_CLOSURE_TEMPORAL_EXCL_NS    = 30LL * 1'000'000'000LL;
     static constexpr int     LOOP_CLOSURE_DAMPING_FRAMES      = 10;
-    // Base 1-σ (m) on the world-frame relative-translation injection. 10 cm
-    // is the same order Step 2's keyframe-yaw fusion floors to: a confident
-    // PnP loop closure should pull the EKF strongly, but not hard enough to
-    // teleport when the world points themselves carry residual scale error.
-    static constexpr double  LOOP_CLOSURE_BASE_TRANS_SIGMA_M  = 0.10;
+    // Dynamic 1-σ (m) for the loop-closure world-position measurement:
+    //   sigma = max(LOOP_CLOSURE_PNP_SIGMA_FLOOR_M,
+    //               LOOP_CLOSURE_DRIFT_RATE * total_path_m_)
+    //
+    // Why dynamic: tight MSCKF updates collapse P_[pp] to ~0, so
+    //   S ≈ R_noise  and  m² ≈ |r_p|² / var_p.
+    // The χ²(0.999,6)=22.5 gate then requires sigma ≥ actual_drift.
+    // VIO drift grows with path length at ~15 %/100 m (measured from
+    // sim_data_1778077139237: 14.6 m drift over ~115 m GPS path).
+    //
+    // LOOP_CLOSURE_PNP_SIGMA_FLOOR_M = 2.0 m
+    //   Lower bound from PnP accuracy: with ≥30 inliers at ~3-5 m
+    //   landmark depth, solvePnPRansac translation error is ~0.5-1.5 m;
+    //   2.0 m is the safe floor that prevents the gate from being tighter
+    //   than the sensor noise floor even on very short paths.
+    //
+    // LOOP_CLOSURE_DRIFT_RATE = 0.032 m drift per metre walked
+    //   Derivation: 15 %/100 m drift rate divided by chi²_sigma_factor
+    //   (√(22.5−0.84) = 4.65) = 0.15/4.65 = 0.032.
+    //   Source: sim_data_1778077139237 + χ²(0.999,6) table.
+    static constexpr double  LOOP_CLOSURE_PNP_SIGMA_FLOOR_M   = 2.0;
+    static constexpr double  LOOP_CLOSURE_DRIFT_RATE           = 0.032;
     // Base 1-σ-axis (rad) on the body-frame relative-rotation injection.
     // 3° is a defensive ceiling for the rotation we get from solvePnPRansac
     // with ≥ 30 inliers; the per-call sigma may be tightened by the detector

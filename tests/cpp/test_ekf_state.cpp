@@ -11,22 +11,23 @@
 
 namespace {
 
-// Initialize a default EKFState with identity rotation, zero biases, one
-// clone at the origin so updateRelativePose has a valid anchor.
-EKFState makeInitializedEKF() {
-    EKFState ekf;
+// [run_tests fix] EKFState now holds a std::mutex (Plan Step 6 / ADR-012,
+// EKFState.h:346) which deletes both copy and move ctors. Helper had to
+// stop returning EKFState by value. Switched to populate-in-place; call
+// sites use the INIT_EKF macro to keep the call-site diff minimal.
+void initializeEKF(EKFState& ekf) {
     cv::Mat R_eye = cv::Mat::eye(3, 3, CV_64F);
     ekf.initializeFull(R_eye, cv::Point3f(0, 0, 0), cv::Point3f(0, 0, 0));
     ekf.addClone(R_eye, cv::Mat::zeros(3, 1, CV_64F), 1'000'000'000LL);
-    return ekf;
 }
+#define INIT_EKF(name) EKFState name; initializeEKF(name)
 
 }  // namespace
 
 // ── getYaw ─────────────────────────────────────────────────────────────────
 
 TEST(EKFStateStep4, GetYaw_IdentityRotation_ReturnsZero) {
-    EKFState ekf = makeInitializedEKF();
+    INIT_EKF(ekf);
     double yaw = ekf.getYaw(0.0, 0.0);
     EXPECT_NEAR(yaw, 0.0, 1e-9);
 }
@@ -52,7 +53,7 @@ TEST(EKFStateStep4, GetYaw_RotateAboutWorldYBy90Deg_ReturnsHalfPi) {
 // ── updateGravityAlignedYaw ────────────────────────────────────────────────
 
 TEST(EKFStateStep4, UpdateYaw_NoOpWhenMeasurementMatches) {
-    EKFState ekf = makeInitializedEKF();
+    INIT_EKF(ekf);
     double yaw0 = ekf.getYaw(0.0, 0.0);
     bool ok = ekf.updateGravityAlignedYaw(yaw0, 0.01, 0.0, 0.0);
     ASSERT_TRUE(ok);
@@ -61,7 +62,7 @@ TEST(EKFStateStep4, UpdateYaw_NoOpWhenMeasurementMatches) {
 }
 
 TEST(EKFStateStep4, UpdateYaw_PullsTowardMeasurement) {
-    EKFState ekf = makeInitializedEKF();
+    INIT_EKF(ekf);
     // Inject a yaw bias by applying a fake update that tries to drag yaw
     // to +0.1 rad with tiny variance. Verify the corrected yaw moved at
     // least halfway toward the measurement.
@@ -82,7 +83,7 @@ TEST(EKFStateStep4, UpdateYaw_FailsWhenStateNotInitialized) {
 // ── updateRelativePose ─────────────────────────────────────────────────────
 
 TEST(EKFStateStep4, UpdateRelativePose_PullsPositionTowardMeasurement) {
-    EKFState ekf = makeInitializedEKF();
+    INIT_EKF(ekf);
     int clone_id = ekf.getLatestCloneId();
     ASSERT_GE(clone_id, 0);
 
@@ -102,7 +103,7 @@ TEST(EKFStateStep4, UpdateRelativePose_PullsPositionTowardMeasurement) {
 }
 
 TEST(EKFStateStep4, UpdateRelativePose_FailsForUnknownClone) {
-    EKFState ekf = makeInitializedEKF();
+    INIT_EKF(ekf);
     cv::Mat t_meas = (cv::Mat_<double>(3, 1) << 0.0, 0.0, 1.0);
     bool ok = ekf.updateRelativePose(t_meas, /*clone_id=*/9999, 0.01);
     EXPECT_FALSE(ok);
@@ -111,7 +112,7 @@ TEST(EKFStateStep4, UpdateRelativePose_FailsForUnknownClone) {
 // ── updatePDRStep ──────────────────────────────────────────────────────────
 
 TEST(EKFStateStep4, UpdatePDRStep_ConstrainsXZ) {
-    EKFState ekf = makeInitializedEKF();
+    INIT_EKF(ekf);
     bool ok = ekf.updatePDRStep(0.7, 0.0, 0.04);  // ~0.7m east step
     ASSERT_TRUE(ok);
     cv::Mat p = ekf.getPosition();

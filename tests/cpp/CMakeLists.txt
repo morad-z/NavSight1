@@ -49,6 +49,9 @@ add_library(navsight_core STATIC
     ${VIO_SRC_DIR}/VioEngine.cpp
     ${VIO_SRC_DIR}/ScaleEstimatorVI.cpp
     ${VIO_SRC_DIR}/ScaleFuser.cpp
+    # Plan Step 6 (ADR-012): local windowed bundle adjustment. test_windowed_ba.cpp
+    # links against WindowedBA::solve, so the TU must be in navsight_core.
+    ${VIO_SRC_DIR}/WindowedBA.cpp
     # Plan Step 7: same-session loop closure (DBoW2). LoopClosureDetector
     # is rewritten on top of the vendored DBoW2 source under
     # third_party/DBoW2/ — Agent A's deliverable. The desktop test build

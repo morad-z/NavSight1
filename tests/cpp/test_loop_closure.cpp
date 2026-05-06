@@ -1,3 +1,7 @@
+// [run_tests fix] cv::Rodrigues lives in opencv2/calib3d.hpp; without
+// this include the test file fails to compile against modern OpenCV
+// modular headers (4.5.x). Pure additive — no existing include displaced.
+#include <opencv2/calib3d.hpp>
 // Step 7 (Visual Production Plan): unit tests for the same-session
 // loop-closure detector.
 //

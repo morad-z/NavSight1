@@ -46,16 +46,15 @@ cv::Mat rotBody(double rx, double ry, double rz) {
     return R;
 }
 
-// Initialize a fully-init EKF with identity attitude, zero biases, plus a
-// single clone at the origin (R_GtoC = I) so updateRelativeRotation has an
-// anchor.
-EKFState makeInitializedEKFWithIdentityClone() {
-    EKFState ekf;
+// [run_tests fix] EKFState carries a std::mutex (ADR-012) so it cannot be
+// copied or moved. Helper now populates a passed-in reference; call sites
+// use INIT_EKF_CLONE(ekf) to keep the diff minimal.
+void initializeEKFWithIdentityClone(EKFState& ekf) {
     cv::Mat R_eye = cv::Mat::eye(3, 3, CV_64F);
     ekf.initializeFull(R_eye, cv::Point3f(0, 0, 0), cv::Point3f(0, 0, 0));
     ekf.addClone(R_eye, cv::Mat::zeros(3, 1, CV_64F), 1'000'000'000LL);
-    return ekf;
 }
+#define INIT_EKF_CLONE(name) EKFState name; initializeEKFWithIdentityClone(name)
 
 }  // namespace
 
@@ -66,7 +65,7 @@ EKFState makeInitializedEKFWithIdentityClone() {
 // covariance, and the shrink factor must match the analytic 1-D Kalman
 // scalar update K = P/(P+R), P_new = (1-K)·P, within 5%.
 TEST(EKFStateRelativeRotation, Synthetic30DegYAxis_ShrinksAttitudeCovariance) {
-    EKFState ekf = makeInitializedEKFWithIdentityClone();
+    INIT_EKF_CLONE(ekf);
     int clone_id = ekf.getLatestCloneId();
     ASSERT_GE(clone_id, 0);
 
@@ -111,20 +110,20 @@ TEST(EKFStateRelativeRotation, ReturnsFalse_WhenStateNotFullyInitialized) {
 }
 
 TEST(EKFStateRelativeRotation, ReturnsFalse_WhenCloneIdMissing) {
-    EKFState ekf = makeInitializedEKFWithIdentityClone();
+    INIT_EKF_CLONE(ekf);
     cv::Mat R = cv::Mat::eye(3, 3, CV_64F);
     EXPECT_FALSE(ekf.updateRelativeRotation(R, 1e-4, /*clone_id=*/9999));
 }
 
 TEST(EKFStateRelativeRotation, ReturnsFalse_WhenRotationEmpty) {
-    EKFState ekf = makeInitializedEKFWithIdentityClone();
+    INIT_EKF_CLONE(ekf);
     int clone_id = ekf.getLatestCloneId();
     cv::Mat R_empty;
     EXPECT_FALSE(ekf.updateRelativeRotation(R_empty, 1e-4, clone_id));
 }
 
 TEST(EKFStateRelativeRotation, ReturnsFalse_WhenRotationWrongShape) {
-    EKFState ekf = makeInitializedEKFWithIdentityClone();
+    INIT_EKF_CLONE(ekf);
     int clone_id = ekf.getLatestCloneId();
     cv::Mat R_wrong = cv::Mat::eye(4, 4, CV_64F);  // not 3x3
     EXPECT_FALSE(ekf.updateRelativeRotation(R_wrong, 1e-4, clone_id));
@@ -136,7 +135,7 @@ TEST(EKFStateRelativeRotation, ReturnsFalse_WhenRotationWrongShape) {
 // ── (c) Multi-axis rotation ──────────────────────────────────────────────
 
 TEST(EKFStateRelativeRotation, MultiAxisRotation_AllAttitudeAxesShrink) {
-    EKFState ekf = makeInitializedEKFWithIdentityClone();
+    INIT_EKF_CLONE(ekf);
     int clone_id = ekf.getLatestCloneId();
     ASSERT_GE(clone_id, 0);
 
@@ -171,7 +170,7 @@ TEST(EKFStateRelativeRotation, MultiAxisRotation_AllAttitudeAxesShrink) {
 // ── (d) No-op rotation: measurement matches prediction ───────────────────
 
 TEST(EKFStateRelativeRotation, IdentityMeasurement_StateUnchanged_CovShrinks) {
-    EKFState ekf = makeInitializedEKFWithIdentityClone();
+    INIT_EKF_CLONE(ekf);
     int clone_id = ekf.getLatestCloneId();
 
     cv::Mat R_before_state = ekf.getRotation();

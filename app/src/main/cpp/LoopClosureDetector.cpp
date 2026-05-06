@@ -139,6 +139,9 @@ struct KeyframeRecord {
     std::vector<cv::Point3f>    pts3d_world;
     cv::Matx33d                 R_world_cam    = cv::Matx33d::eye();
     cv::Vec3d                   t_cam_world    = cv::Vec3d(0, 0, 0);
+    // Camera heading (Tracker::scalar_heading_, radians, north=0 clockwise).
+    // Used by the heading gate in tryDetectLoop.
+    double                      yaw_rad        = 0.0;
     // BoW vector stored alongside the entry so tryDetectLoop can rescore
     // the query against recent neighbors (adaptive minScore — see comment
     // block above kBowScoreFloor). DBoW2's OrbDatabase::add takes the BoW
@@ -245,7 +248,8 @@ void LoopClosureDetector::addKeyframe(
     const std::vector<cv::KeyPoint>& keypoints,
     const std::vector<cv::Point3f>& pts3d_world,
     const cv::Matx33d& R_world_cam,
-    const cv::Vec3d&   t_cam_world)
+    const cv::Vec3d&   t_cam_world,
+    double yaw_rad)
 {
     if (!impl_ || !impl_->ready.load(std::memory_order_acquire)) {
         return;
@@ -285,6 +289,7 @@ void LoopClosureDetector::addKeyframe(
     rec.pts3d_world  = pts3d_world;
     rec.R_world_cam  = R_world_cam;
     rec.t_cam_world  = t_cam_world;
+    rec.yaw_rad      = yaw_rad;
 
     {
         std::lock_guard<std::mutex> lk(impl_->mutex);
@@ -314,6 +319,7 @@ bool LoopClosureDetector::tryDetectLoop(
     const std::vector<cv::KeyPoint>& keypoints,
     double fx, double fy, double cx, double cy,
     int64_t temporal_exclusion_ns,
+    double current_yaw_rad,
     LoopMatch& out_match)
 {
     if (!impl_ || !impl_->ready.load(std::memory_order_acquire)) {
@@ -446,6 +452,27 @@ bool LoopClosureDetector::tryDetectLoop(
     // Lock is released. PnP runs lock-free below.
 
     if (!candidate_valid) return false;
+
+    // Heading gate: reject opposite-direction candidates before the
+    // expensive BFMatcher + PnP step. ORB descriptors are ~30°-invariant
+    // but not 180°-invariant; reversed-viewpoint 3D-2D pairs are
+    // geometrically inconsistent for RANSAC.
+    // Source: sim_data_1778078217065 — 587/638 PnP failures from a
+    // 600 m walk where the user returned via the opposite direction.
+    // π/2 allows ±90° viewpoint variation (forward/sideways) while
+    // blocking the 180° reversal case observed in that sim.
+    {
+        constexpr double kMaxHeadingDiffRad = M_PI / 2.0;
+        double hdiff = std::abs(current_yaw_rad - candidate.yaw_rad);
+        if (hdiff > M_PI) hdiff = 2.0 * M_PI - hdiff;
+        if (hdiff > kMaxHeadingDiffRad) {
+            navsight::eventCounters().loop_closure_rejects_heading.fetch_add(
+                1, std::memory_order_relaxed);
+            LOGD("LC heading reject: now_yaw=%.2f candidate_yaw=%.2f diff=%.2f rad",
+                 current_yaw_rad, candidate.yaw_rad, hdiff);
+            return false;
+        }
+    }
 
     // ── (2) BFMatcher Hamming + Lowe ratio ───────────────────────────────
     std::vector<std::vector<cv::DMatch>> knn;
