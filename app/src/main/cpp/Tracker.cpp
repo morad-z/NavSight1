@@ -67,6 +67,31 @@ void Tracker::setUserScaleCorrection(double correction) {
     user_scale_correction_ = std::max(0.1, std::min(5.0, correction));
 }
 
+// Step 8c (Visual Production Plan): store rolling-shutter row-skew and
+// mirror it into EventCounters so the sim JSON shows the device value.
+// Source: Android Camera2 API — CaptureResult.SENSOR_ROLLING_SHUTTER_SKEW
+// (API level 21+): nanoseconds from first-row to last-row read-out.
+void Tracker::setRollingShutterSkew(int64_t row_skew_ns) {
+    std::lock_guard<std::mutex> lock(mutex_);
+    rolling_shutter_row_skew_ns_ = row_skew_ns;
+    navsight::eventCounters().rolling_shutter_skew_ns.store(
+        static_cast<long long>(row_skew_ns), std::memory_order_relaxed);
+}
+
+// Step 8b: seed the EKF's R_bc from the Android camera sensor-orientation matrix.
+// R_bc_flat is 9 floats in row-major order.  Converted to Matx33d and forwarded
+// to EKFState::setExtrinsicsRotation which logs the angle from identity.
+void Tracker::setExtrinsicsRotation(const float* R_bc_flat) {
+    if (!R_bc_flat) return;
+    cv::Matx33d R_bc(
+        static_cast<double>(R_bc_flat[0]), static_cast<double>(R_bc_flat[1]), static_cast<double>(R_bc_flat[2]),
+        static_cast<double>(R_bc_flat[3]), static_cast<double>(R_bc_flat[4]), static_cast<double>(R_bc_flat[5]),
+        static_cast<double>(R_bc_flat[6]), static_cast<double>(R_bc_flat[7]), static_cast<double>(R_bc_flat[8])
+    );
+    std::lock_guard<std::mutex> lock(mutex_);
+    ekf_.setExtrinsicsRotation(R_bc);
+}
+
 void Tracker::setDepthMap(const float* depth_data, int width, int height) {
     if (!depth_data || width <= 0 || height <= 0) return;
     std::lock_guard<std::mutex> lock(depth_mutex_);
@@ -354,6 +379,7 @@ void Tracker::reset() {
     blur_skipped_streak_ = 0;
     last_step_speed_ = 0.0;
     last_step_speed_ns_ = 0;
+    rolling_shutter_row_skew_ns_ = 0;  // Step 8c: clear stale skew on session reset
     ekf_.reset();
     feature_mgr_.reset();
     // Plan Step 6 (ADR-012): drop any pending BA result so the next session
@@ -1126,11 +1152,20 @@ VisionOutput Tracker::processFrame(const uint8_t* yuv_data, int width, int heigh
                     ekf_.isFullInitialized()) {
                     int prev_clone_id = ekf_.getLatestCloneId();
                     if (prev_clone_id >= 0) {
-                        const cv::Mat R_b2c = (cv::Mat_<double>(3, 3) <<
-                            1.0,  0.0,  0.0,
-                            0.0, -1.0,  0.0,
-                            0.0,  0.0, -1.0);
-                        cv::Mat R_vo_body = R_b2c * R_vo * R_b2c;
+                        // Step 8b: use EKF-maintained R_bc (body→camera) instead
+                        // of the previously hardcoded diag(1,-1,-1). The EKF refines
+                        // R_bc_ online; getExtrinsicsRotation() returns the current
+                        // best estimate. Since R_bc is body→camera (p_cam=R_bc*p_body)
+                        // and is not necessarily self-inverse, the similarity
+                        // transform to re-express R_vo in body frame is:
+                        //   R_vo_body = R_bc^T * R_vo * R_bc
+                        // (R_bc^T = R_bc^{-1} because R_bc is a rotation matrix).
+                        const cv::Matx33d R_bc_mx = ekf_.getExtrinsicsRotation();
+                        cv::Mat R_bc_cv(3, 3, CV_64F);
+                        for (int ri = 0; ri < 3; ri++)
+                            for (int ci = 0; ci < 3; ci++)
+                                R_bc_cv.at<double>(ri, ci) = R_bc_mx(ri, ci);
+                        cv::Mat R_vo_body = R_bc_cv.t() * R_vo * R_bc_cv;
                         double focal = K.at<double>(0, 0);
                         double sigma_axis = (focal > 1e-6)
                             ? (RANSAC_THRESH /
@@ -1530,7 +1565,17 @@ VisionOutput Tracker::processFrame(const uint8_t* yuv_data, int width, int heigh
                     // for SLAM-feature promotion / demotion. Keyframe tag
                     // is set later in the frame (section 11.5) once the
                     // keyframe decision lands.
-                    feature_mgr_.noteObservation(feature_ids_[i], timestamp_ns,
+                    // Step 8c: per-row timestamp for rolling-shutter compensation.
+                    // Camera2 SENSOR_ROLLING_SHUTTER_SKEW is the total read-out
+                    // duration (ns); dividing by image height gives ns-per-row.
+                    // Source: Android Camera2 API reference,
+                    // CaptureResult.SENSOR_ROLLING_SHUTTER_SKEW (API level 21+).
+                    const int64_t row_ts_ns = (rolling_shutter_row_skew_ns_ > 0)
+                        ? (timestamp_ns + static_cast<int64_t>(
+                               next_good_buf_[i].y / static_cast<double>(height)
+                               * static_cast<double>(rolling_shutter_row_skew_ns_)))
+                        : timestamp_ns;
+                    feature_mgr_.noteObservation(feature_ids_[i], row_ts_ns,
                                                  /*is_keyframe=*/false);
                 }
             }
@@ -2063,11 +2108,16 @@ VisionOutput Tracker::processFrame(const uint8_t* yuv_data, int width, int heigh
                                 // toward the wrong direction every keyframe →
                                 // 47 direction flips per 16 s sim, 3.6× path
                                 // inflation.
-                                const cv::Mat R_b2c = (cv::Mat_<double>(3, 3) <<
-                                    1.0,  0.0,  0.0,
-                                    0.0, -1.0,  0.0,
-                                    0.0,  0.0, -1.0);
-                                cv::Mat R_kf_body = R_b2c * R_kf * R_b2c;
+                                // Step 8b: use EKF-maintained R_bc (body→camera).
+                                // R_kf is in camera frame (recoverPose output).
+                                // R_kf_body = R_bc^T * R_kf * R_bc converts it
+                                // to body frame for the gravity-alignment sandwich.
+                                const cv::Matx33d R_bc_mx2 = ekf_.getExtrinsicsRotation();
+                                cv::Mat R_bc_cv2(3, 3, CV_64F);
+                                for (int ri2 = 0; ri2 < 3; ri2++)
+                                    for (int ci2 = 0; ci2 < 3; ci2++)
+                                        R_bc_cv2.at<double>(ri2, ci2) = R_bc_mx2(ri2, ci2);
+                                cv::Mat R_kf_body = R_bc_cv2.t() * R_kf * R_bc_cv2;
 
                                 cv::Mat R_aligned = R_align * R_kf_body * R_align.t();
                                 visual_delta_heading = std::atan2(
@@ -3415,16 +3465,20 @@ void Tracker::consumeLoopClosureMatchIfReady() {
     // world", which is the world pose of the now-camera the loop closure
     // says we should be at.)
     //
-    // Convert camera→world to world→IMU using the symmetric self-inverse
-    // body↔camera extrinsic R_b2c = diag(1, -1, -1) used elsewhere in
-    // Tracker (line ~1127 / ~2063):
+    // Convert camera→world to world→IMU using the EKF-maintained body→camera
+    // extrinsic R_bc (Step 8b). Previously this was hardcoded as diag(1,-1,-1).
     //
-    //   target_R_GtoI = R_b2c * target_R_world_cam.t()
+    // R_bc is body→camera: p_cam = R_bc * p_body.
+    // R_bc^T = R_bc^{-1} is camera→body.
+    //
+    //   target_R_GtoI = R_bc^T * target_R_world_cam.t()
+    //
+    // because target_R_world_cam takes cam→world; its transpose is world→cam;
+    // left-multiplying by R_bc^T (camera→body) gives world→body = world→IMU.
     //
     // Position: handheld phone, body and camera are co-located (lever
-    // arm absorbed into the per-frame R_vo path; Step 8 is where the
-    // proper extrinsic translation lands). So the world-frame IMU
-    // position equals the world-frame camera position.
+    // arm absorbed into the per-frame R_vo path). World-frame IMU position
+    // equals the world-frame camera position.
     // ────────────────────────────────────────────────────────────────────
     const auto& R_wc_match = loop_closure_active_match_.R_world_cam_match;
     const auto& t_cw_match = loop_closure_active_match_.t_cam_world_match;
@@ -3436,14 +3490,10 @@ void Tracker::consumeLoopClosureMatchIfReady() {
     // target world position of now-cam
     const cv::Vec3d   target_t_cam_world = R_wc_match * t_n2m + t_cw_match;
 
-    // R_b2c — same self-inverse extrinsic Tracker uses elsewhere
-    static const cv::Matx33d R_b2c(1.0,  0.0,  0.0,
-                                   0.0, -1.0,  0.0,
-                                   0.0,  0.0, -1.0);
-    // target world→IMU rotation. R_world_cam takes cam→world; transpose
-    // gives world→cam; pre-multiply by R_b2c (body↔camera, self-inverse)
-    // to land in body/IMU frame.
-    const cv::Matx33d target_R_GtoI_mx = R_b2c * target_R_world_cam.t();
+    // Step 8b: use EKF-maintained R_bc (body→camera, refined online).
+    // R_bc^T is the transpose (= inverse for rotation matrices) giving camera→body.
+    const cv::Matx33d R_bc_lc = ekf_.getExtrinsicsRotation();
+    const cv::Matx33d target_R_GtoI_mx = R_bc_lc.t() * target_R_world_cam.t();
 
     cv::Mat target_R_GtoI(3, 3, CV_64F);
     cv::Mat target_p_world(3, 1, CV_64F);

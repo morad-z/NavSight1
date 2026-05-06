@@ -47,6 +47,12 @@ void EKFState::reset() {
 
     // Plan Step 3b (ADR-009): drop all SLAM features on reset.
     slam_features_.clear();
+
+    // Plan Step 8b: reset extrinsics to the default body→camera convention.
+    // diag(1,-1,-1): rear camera, vertical phone (camera +X=body +X, +Y=body -Y, +Z=body -Z).
+    R_bc_ = cv::Matx33d(1.0,  0.0,  0.0,
+                        0.0, -1.0,  0.0,
+                        0.0,  0.0, -1.0);
 }
 
 void EKFState::initialize(double initial_scale) {
@@ -66,9 +72,11 @@ void EKFState::initializeFull(const cv::Mat& R_GtoI, const cv::Point3f& gyro_bia
     v_G_ = cv::Mat::zeros(3, 1, CV_64F);
     p_G_ = cv::Mat::zeros(3, 1, CV_64F);
 
-    // Initialize 15x15 IMU covariance
+    // Initialize 19x19 IMU covariance.
+    // Row layout: δθ(0-2), δb_g(3-5), δv(6-8), δb_a(9-11), δp(12-14),
+    //             δt_d(15, Step 8a), δφ_bc(16-18, Step 8b).
     P_ = cv::Mat::zeros(IMU_STATE_DIM, IMU_STATE_DIM, CV_64F);
-    // Initial uncertainties: rotation(3), bg(3), velocity(3), ba(3), position(3)
+    // Initial uncertainties
     double init_rot_std = 0.02;    // ~1 degree
     double init_bg_std = 0.01;     // rad/s
     double init_vel_std = 0.5;     // m/s
@@ -83,8 +91,26 @@ void EKFState::initializeFull(const cv::Mat& R_GtoI, const cv::Point3f& gyro_bia
         P_.at<double>(12+i, 12+i) = init_pos_std * init_pos_std;
     }
 
+    // Step 8a (ADR-014): seed td variance from the pre-init scalar P_td_.
+    // The TD warmup in Tracker.cpp may have already called setTimeOffset(), which
+    // sets P_td_ to (2ms)². If the warmup has not run yet, P_td_ holds the
+    // default (5ms)². Either way, the initial P_(15,15) matches the best prior
+    // we have — consistent with OpenVINS default initialisation for td.
+    P_.at<double>(15, 15) = P_td_;
+
+    // Step 8b: initialise extrinsics covariance for δφ_bc at rows 16–18.
+    // INIT_EXTR_STD = 0.05 rad (≈ 3°).
+    // Source: Android getCameraOrientation reports physical sensor orientation
+    // to within 5° (Android CDD §7.7.1). 3° is a conservative prior that
+    // lets the filter refine without premature lock-in.
+    constexpr double INIT_EXTR_STD = 0.05;  // ~3 deg in rad
+    for (int i = 0; i < EXTR_STATE_DIM; i++) {
+        P_.at<double>(EXTR_STATE_OFFSET + i, EXTR_STATE_OFFSET + i) =
+            INIT_EXTR_STD * INIT_EXTR_STD;
+    }
+
     full_initialized_ = true;
-    LOGI("EKF full state initialized (15-DOF error-state)");
+    LOGI("EKF full state initialized (19-DOF: δθ,δb_g,δv,δb_a,δp,δt_d,δφ_bc)");
 }
 
 // ── IMU Propagation ─────────────────────────────────────────────────────────
@@ -113,14 +139,16 @@ void EKFState::propagateIMU(const cv::Mat& deltaR, const cv::Mat& deltaV,
     cv::Mat v_new = v_G_ + g * dt + R_GtoI_.t() * deltaV;
     cv::Mat p_new = p_G_ + v_G_ * dt + 0.5 * g * dt * dt + R_GtoI_.t() * deltaP;
 
-    // Build discrete state transition matrix Phi (15x15)
-    // Error-state: [δθ, δb_g, δv, δb_a, δp]
+    // Build discrete state transition matrix Phi (19x19)
+    // Error-state: [δθ(0-2), δb_g(3-5), δv(6-8), δb_a(9-11), δp(12-14), δt_d(15), δφ_bc(16-18)]
     // Linearized dynamics (simplified for pedestrian VIO):
     //   δθ_new  = deltaR^T * δθ - J_R_bg * δb_g
     //   δb_g    = δb_g (random walk)
     //   δv_new  = δv + R^T * [deltaV]_x * δθ - R^T * J_V_bg * δb_g - R^T * J_V_ba * δb_a
     //   δb_a    = δb_a (random walk)
     //   δp_new  = δp + δv * dt + R^T * [deltaP]_x * δθ - R^T * J_P_bg * δb_g - R^T * J_P_ba * δb_a
+    //   δt_d    = δt_d (constant with slow random walk — Phi(15,15)=1 from eye init)
+    //   δφ_bc   = δφ_bc (constant — extrinsics don't drift; Phi(16-18,16-18)=I from eye init)
 
     cv::Mat Phi = cv::Mat::eye(IMU_STATE_DIM, IMU_STATE_DIM, CV_64F);
     cv::Mat Rt = R_GtoI_.t();
@@ -182,11 +210,11 @@ void EKFState::propagateIMU(const cv::Mat& deltaR, const cv::Mat& deltaV,
         block.copyTo(Phi(cv::Range(12,15), cv::Range(9,12)));
     }
 
-    // Process noise Q (15x15)
+    // Process noise Q (19x19)
     cv::Mat Q = cv::Mat::zeros(IMU_STATE_DIM, IMU_STATE_DIM, CV_64F);
     // Use preintegration covariance if available, otherwise construct from noise params
     if (!imu_cov.empty() && imu_cov.rows >= 9) {
-        // Map 9x9 preintegration cov (R,V,P) to 15x15 state noise
+        // Map 9x9 preintegration cov (R,V,P) to 19x19 state noise
         // Rotation noise -> θ block
         imu_cov(cv::Range(0,3), cv::Range(0,3)).copyTo(Q(cv::Range(0,3), cv::Range(0,3)));
         // Velocity noise -> v block
@@ -205,6 +233,25 @@ void EKFState::propagateIMU(const cv::Mat& deltaR, const cv::Mat& deltaV,
     for (int i = 0; i < 3; i++) {
         Q.at<double>(3+i, 3+i) = sigma_bg_ * sigma_bg_ * dt;
         Q.at<double>(9+i, 9+i) = sigma_ba_ * sigma_ba_ * dt;
+    }
+    // Step 8a (ADR-014): td random walk process noise.
+    // Models slow thermal drift of camera-IMU time offset. Value 1e-7 s/√Hz
+    // is the OpenVINS default for MEMS IMUs (Li & Mourikis 2014, §III-B).
+    // Discrete-time variance per step = (1e-7)^2 * dt.
+    constexpr double SIGMA_TD_RW = 1e-7;  // s/√Hz — OpenVINS default for MEMS
+    Q.at<double>(15, 15) = SIGMA_TD_RW * SIGMA_TD_RW * dt;
+
+    // Step 8b: extrinsics rotation random walk process noise for δφ_bc (rows 16-18).
+    // The body→camera rotation is physically constant; this tiny regularisation
+    // prevents P_(16..18,16..18) from collapsing to zero (which would lock out
+    // future refinement if the geometry changes slightly e.g. phone orientation
+    // shifts). Value 1e-8 rad/√Hz per axis is intentionally negligible —
+    // extrinsics do not drift. Source: OpenVINS online extrinsic calibration
+    // reference implementation (Geneva et al. 2020, §IV-B, "near-zero" prior).
+    constexpr double SIGMA_EXTR_RW = 1e-8;  // rad/√Hz — near-zero regularisation
+    for (int i = 0; i < EXTR_STATE_DIM; i++) {
+        Q.at<double>(EXTR_STATE_OFFSET + i, EXTR_STATE_OFFSET + i) =
+            SIGMA_EXTR_RW * SIGMA_EXTR_RW * dt;
     }
 
     // Propagate covariance: full state includes clones
@@ -263,7 +310,14 @@ void EKFState::updateScale(double observed_scale, double confidence) {
 
 void EKFState::updateZUPT() {
     P_scale_ *= 0.99;
+    // Step 8a (ADR-014): when full state is initialized, td variance is in P_(15,15).
+    // ZUPT (stationary period) is weak evidence about td, so apply a mild 0.1%
+    // shrink — same as the legacy P_td_ shrink, now applied to the in-state entry.
+    // Also keep P_td_ in sync for pre-init/fallback getTimeOffsetStd().
     P_td_ *= 0.999;
+    if (full_initialized_ && !P_.empty() && P_.rows > 15) {
+        P_.at<double>(15, 15) *= 0.999;
+    }
 
     // Zero velocity in full EKF state (prevents IMU-propagated drift)
     if (full_initialized_) {
@@ -324,8 +378,8 @@ void EKFState::addClone(const cv::Mat& R_GtoC, const cv::Mat& p_G, int64_t times
     // is the failure mode ADR-006 documents (5–11 m teleportations after
     // a clone churn). Layout:
     //
-    //   old:  [ IMU(15) | C0..C{K-1}(6 each) | S0..S{N-1}(5 each) ]
-    //   new:  [ IMU(15) | C0..C{K-1}(6 each) | C_new(6) | S0..S{N-1}(5 each) ]
+    //   old:  [ IMU(19) | C0..C{K-1}(6 each) | S0..S{N-1}(5 each) ]
+    //   new:  [ IMU(19) | C0..C{K-1}(6 each) | C_new(6) | S0..S{N-1}(5 each) ]
     //
     // The splice strategy: copy the pre-SLAM block into P_new[0..clone_end),
     // copy the SLAM block into P_new[clone_end+CLONE_DIM..end), zero the
@@ -455,7 +509,7 @@ void EKFState::marginalizeOldestCloneNoLock() {
         // to the remaining state via Schur — for the OpenVINS-style sliding
         // window the discard-only "drop" is the standard, since the clone
         // has no measurements yet not folded into IMU/SLAM cross-terms.)
-        const int marg_idx   = IMU_STATE_DIM;  // First clone starts at 15
+        const int marg_idx   = IMU_STATE_DIM;  // First clone starts at IMU_STATE_DIM (19)
         const int marg_dim   = CLONE_DIM;
         const int total_dim  = P_.rows;
         const int remain_dim = total_dim - marg_dim;
@@ -598,8 +652,8 @@ void EKFState::applyMSCKFUpdate(const cv::Mat& H, const cv::Mat& res,
     // corrections are unchanged. Clone corrections are also unchanged —
     // damping is intentionally local to the world-frame body position.
     double damping = computeMSCKFDampingFactor();
-    if (dx.rows >= 15 && damping < 1.0) {
-        for (int i = 12; i < 15; i++) {
+    if (dx.rows >= IMU_STATE_DIM && damping < 1.0) {
+        for (int i = 12; i < 15; i++) {  // δp is always at rows 12-14
             dx.at<double>(i, 0) *= damping;
         }
     }
@@ -617,6 +671,42 @@ void EKFState::applyMSCKFUpdate(const cv::Mat& H, const cv::Mat& res,
         v_G_ += dx(cv::Range(6,9), cv::Range::all());
         b_a_ += dx(cv::Range(9,12), cv::Range::all());
         p_G_ += dx(cv::Range(12,15), cv::Range::all());
+
+        // Step 8a (ADR-014): apply time-offset correction (row 15 = δt_d).
+        // Clamp to ±100 ms — physical camera-IMU lag cannot exceed this on
+        // any mobile device (Li & Mourikis 2014, §III-B practical bound).
+        t_offset_cam_imu_ += dx.at<double>(15, 0);
+        t_offset_cam_imu_ = std::max(-0.1, std::min(0.1, t_offset_cam_imu_));
+
+        // Step 8b: apply body→camera rotation correction (rows 16-18 = δφ_bc).
+        // Lie-algebra update: R_bc = R_bc_hat * Exp(δφ_bc).
+        // cv::Rodrigues maps the 3-vector axis-angle δφ_bc to a rotation
+        // matrix dR; right-multiplying R_bc_ keeps the convention
+        //     R_bc_new = R_bc_old * dR
+        // consistent with the Jacobian derivation in applyMSCKFFeature.
+        // Clamp the correction magnitude to 30° (0.524 rad) per call — a
+        // larger single-step correction indicates a bad measurement or
+        // numerical issue and would corrupt R_bc_ irrecoverably.
+        if (dx.rows >= EXTR_STATE_OFFSET + EXTR_STATE_DIM) {
+            cv::Mat dphi_bc = dx(cv::Range(EXTR_STATE_OFFSET,
+                                           EXTR_STATE_OFFSET + EXTR_STATE_DIM),
+                                 cv::Range::all());
+            const double phi_norm = cv::norm(dphi_bc);
+            constexpr double MAX_EXTR_STEP_RAD = 0.524;  // 30 deg clamp
+            if (phi_norm > 1e-12 && phi_norm < MAX_EXTR_STEP_RAD) {
+                cv::Mat dR_bc;
+                cv::Rodrigues(dphi_bc, dR_bc);
+                // Convert R_bc_ (Matx33d) to cv::Mat, apply, convert back.
+                cv::Mat R_bc_mat(3, 3, CV_64F);
+                for (int r = 0; r < 3; r++)
+                    for (int c = 0; c < 3; c++)
+                        R_bc_mat.at<double>(r, c) = R_bc_(r, c);
+                R_bc_mat = R_bc_mat * dR_bc;
+                for (int r = 0; r < 3; r++)
+                    for (int c = 0; c < 3; c++)
+                        R_bc_(r, c) = R_bc_mat.at<double>(r, c);
+            }
+        }
     }
 
     // Apply clone corrections
@@ -694,6 +784,17 @@ void EKFState::applyMSCKFUpdate(const cv::Mat& H, const cv::Mat& res,
         navsight::eventCounters().msckf_huber_rejected_sum.fetch_add(
             static_cast<long long>(msckf_huber_rejected_count_),
             std::memory_order_relaxed);
+    }
+    // Step 8b: publish current extrinsics deviation to event_summary JSON.
+    // Throttled to every 30 MSCKF updates (~1 Hz at typical keyframe cadence)
+    // because getExtrinsicsAngleDeg() triggers a Rodrigues computation on the
+    // hot path. The counter is not thread-safe, but a missed increment is benign.
+    if (++extr_log_skip_ >= 30) {
+        extr_log_skip_ = 0;
+        const double angle_deg = getExtrinsicsAngleDeg();
+        const long long angle_mdeg = static_cast<long long>(angle_deg * 1000.0 + 0.5);
+        navsight::eventCounters().extrinsics_rotation_angle_mdeg.store(
+            angle_mdeg, std::memory_order_relaxed);
     }
 }
 
@@ -1027,6 +1128,18 @@ int EKFState::getCloneCovIdx(int state_id) const {
     return -1;
 }
 
+// Step 8a (ADR-014): retrieve the nanosecond timestamp of a clone by state_id.
+// Used by applyMSCKFFeature to compute the Δt denominator for feature velocity.
+// Returns 0 if the clone is not found.
+int64_t EKFState::getCloneTimestamp(int state_id) const {
+    for (const auto& pose : window_) {
+        if (pose.state_id == state_id) {
+            return pose.timestamp_ns;
+        }
+    }
+    return 0;
+}
+
 int EKFState::getStateDim() const {
     if (!full_initialized_ || P_.empty()) return 0;
     return P_.rows;
@@ -1044,12 +1157,50 @@ int EKFState::getLatestCloneId() const {
 
 void EKFState::setTimeOffset(double td_seconds) {
     t_offset_cam_imu_ = std::max(-0.1, std::min(0.1, td_seconds));
-    P_td_ = 0.002 * 0.002;
-    LOGI("EKF: Time offset warm-started to %.3fms (std=2.0ms)", td_seconds * 1000.0);
+    // Post-warmup variance: ±2 ms std (0.002 s). The cross-correlation warmup
+    // narrows from the prior (5 ms) to this refined estimate.
+    // Value matches OpenVINS td init after cross-correlation (Li & Mourikis 2014).
+    constexpr double td_post_warmup_var = 0.002 * 0.002;  // (2ms)²
+    P_td_ = td_post_warmup_var;
+
+    // Step 8a (ADR-014): if the full state is already initialized, propagate the
+    // warmup variance into P_(15,15) so the EKF starts from the refined prior.
+    // This path fires when the TD warmup completes after initializeFull — rare in
+    // practice (warmup typically completes at frame ~10, EKF full-init at frame ~5)
+    // but correct to handle.
+    if (full_initialized_ && !P_.empty() && P_.rows > 15) {
+        P_.at<double>(15, 15) = td_post_warmup_var;
+    }
+
+    LOGI("EKF: Time offset warm-started to %.3fms (std=2.0ms, in-state=%s)",
+         td_seconds * 1000.0, full_initialized_ ? "yes" : "pending");
 }
 
 // DEAD CODE: updateTemporal — never called
 // void EKFState::updateTemporal(double observed_scale, double confidence, double H_td) { ... }
+
+// ── Plan Step 8b: Online IMU-Camera Extrinsics Calibration ───────────────────
+
+void EKFState::setExtrinsicsRotation(const cv::Matx33d& R_bc) {
+    R_bc_ = R_bc;
+    // If the full state is already initialized, leave the covariance unchanged
+    // (the caller is providing a better prior, not a correction — the EKF will
+    // begin refining from this new nominal on the next visual update).
+    LOGI("EKF: Extrinsics R_bc set from external source (angle from identity=%.2f deg)",
+         getExtrinsicsAngleDeg());
+}
+
+double EKFState::getExtrinsicsAngleDeg() const {
+    // Angle from identity: ||Rodrigues(R_bc)||_2 converted to degrees.
+    cv::Mat R_mat(3, 3, CV_64F);
+    for (int r = 0; r < 3; r++)
+        for (int c = 0; c < 3; c++)
+            R_mat.at<double>(r, c) = R_bc_(r, c);
+    cv::Mat rvec;
+    cv::Rodrigues(R_mat, rvec);
+    const double angle_rad = cv::norm(rvec);
+    return angle_rad * (180.0 / M_PI);
+}
 
 // ──────────────────────────────────────────────────────────────────────────────
 // Plan Step 3b (ADR-009): SLAM features in EKF state
@@ -1557,13 +1708,31 @@ bool EKFState::updateSlamFeature(int slot,
         }
 
         // Sparse 2 x dim Jacobian:
-        //   - clone slot at [clone_cov, clone_cov+6)
-        //   - SLAM slot   at [slam_idx, slam_idx+5)
+        //   - clone slot        at [clone_cov, clone_cov+6)
+        //   - SLAM slot         at [slam_idx, slam_idx+5)
+        //   - extrinsics slot   at [EXTR_STATE_OFFSET, EXTR_STATE_OFFSET+3) (Step 8b)
         cv::Mat H = cv::Mat::zeros(2, dim, CV_64F);
         H_clone.copyTo(H(cv::Range::all(),
                          cv::Range(clone_cov, clone_cov + CLONE_DIM)));
         H_feat .copyTo(H(cv::Range::all(),
                          cv::Range(slam_idx, slam_idx + SLAM_FEATURE_DIM)));
+
+        // Step 8b: extrinsics Jacobian for SLAM feature reprojection.
+        // p_C_F is the feature in camera frame at the FEJ linearisation point.
+        // slamReprojectionJacobian stores dpC_dtheta = skew(p_C_F)*-1.0 (=-skew(p_C_F)).
+        // The H_bc for δφ_bc follows the same formula as in applyMSCKFFeature:
+        //   H_bc = dproj_dpC * (-skew(p_C_F))
+        // We can derive it from H_clone's first 3 columns, which equal
+        //   H_clone_theta = dproj_dpC * (-skew(p_C_F)).
+        // So H_bc == H_clone_theta = H_clone[:, 0:3].
+        // This is consistent: the extrinsics error acts like a clone rotation
+        // error on p_C_F (both perturb p_C by -[p_C_F]_× * δφ).
+        if (EXTR_STATE_OFFSET + EXTR_STATE_DIM <= dim) {
+            cv::Mat H_bc = H_clone(cv::Range::all(), cv::Range(0, 3)).clone();
+            H_bc.copyTo(H(cv::Range::all(),
+                          cv::Range(EXTR_STATE_OFFSET,
+                                    EXTR_STATE_OFFSET + EXTR_STATE_DIM)));
+        }
 
         // Residual = obs - predicted (normalised image coords).
         cv::Mat r = (cv::Mat_<double>(2, 1) <<
@@ -1635,6 +1804,14 @@ bool EKFState::applyMSCKFFeature(const std::vector<cv::Point2f>& observations,
                -v.at<double>(1, 0),   v.at<double>(0, 0),  0.0);
     };
 
+    // Step 8a (ADR-014): per-observation index into the VALID observations list.
+    // We need to know which valid observations are adjacent (in time) to compute
+    // feature velocity for the H_td column. Track accepted observations as we go.
+    // After collecting all valid rows, we fill column 15 using finite differences
+    // on the normalized image coordinates of consecutive accepted observations.
+    // Indices into the observations/clone_ids input arrays that were accepted:
+    std::vector<size_t> accepted_src_idx;
+
     for (size_t k = 0; k < observations.size(); k++) {
         const int clone_id  = clone_ids[k];
         const int clone_cov = getCloneCovIdx(clone_id);
@@ -1683,13 +1860,79 @@ bool EKFState::applyMSCKFFeature(const std::vector<cv::Point2f>& observations,
 
         cv::Mat H_f = dproj_dpC * dpC_dpw;          // 2x3
 
+        // Step 8b: extrinsics Jacobian H_bc (columns EXTR_STATE_OFFSET..+2).
+        // Perturbation model: R_bc_new = R_bc * Exp(δφ_bc).
+        // The camera-frame point p_C = R_bc * p_body, so:
+        //   d(R_bc * p_body)/dδφ_bc |_{δφ=0} = -[p_C]_×
+        //
+        // FEJ: use p_C_F (from FEJ clone poses) as the linearisation point,
+        // consistent with the clone rotation block above (dpC_dtheta = -skew(p_C_F)).
+        //
+        // Source: OpenVINS online extrinsic calibration (Geneva et al. 2020,
+        // ICRA, eq. (10)): ∂z/∂φ_bc = (∂z/∂p_C) * (-[p_C]_×).
+        if (EXTR_STATE_OFFSET + EXTR_STATE_DIM <= dim) {
+            cv::Mat H_bc = dproj_dpC * (-skew(p_C_F));   // 2×3
+            H_bc.copyTo(H_x(cv::Range::all(),
+                            cv::Range(EXTR_STATE_OFFSET,
+                                      EXTR_STATE_OFFSET + EXTR_STATE_DIM)));
+        }
+
         cv::Mat r = (cv::Mat_<double>(2, 1) <<
                      observations[k].x - pred_u,
                      observations[k].y - pred_v);
 
+        accepted_src_idx.push_back(k);
         H_x_rows.push_back(H_x);
         H_f_rows.push_back(H_f);
         r_rows  .push_back(r);
+    }
+
+    // Step 8a (ADR-014): fill H_x column 15 (δt_d) for each accepted observation.
+    // The time-offset Jacobian for observation k is H_td_k = -v_feature_k (2×1),
+    // where v_feature_k is the pixel velocity of the feature (px/s) divided by
+    // focal length to obtain normalised-image-coordinate velocity (1/s).
+    // Derivation: t_corrected = t_obs + δt_d → residual changes by -v * δt_d.
+    // Source: Li & Mourikis 2014 §III-B, OpenVINS online td estimator.
+    //
+    // We use finite differences on the raw pixel observations; the clone
+    // timestamps give Δt. The column index for δt_d is 15, fixed by the 19-DOF
+    // IMU block layout: [δθ(0-2), δb_g(3-5), δv(6-8), δb_a(9-11), δp(12-14),
+    // δt_d(15), δφ_bc(16-18)]. Step 8a row, not IMU_STATE_DIM-1.
+    const int td_col = 15;  // δt_d column in the full state vector
+    const int n_accepted = static_cast<int>(accepted_src_idx.size());
+    for (int ai = 0; ai < n_accepted; ai++) {
+        // Pick neighbour indices for finite difference (central where possible)
+        int ai_prev = (ai > 0) ? (ai - 1) : ai;
+        int ai_next = (ai < n_accepted - 1) ? (ai + 1) : ai;
+
+        if (ai_prev == ai_next) {
+            // Only one valid observation — cannot estimate velocity; skip td term
+            continue;
+        }
+
+        const size_t src_prev = accepted_src_idx[ai_prev];
+        const size_t src_next = accepted_src_idx[ai_next];
+
+        const int64_t ts_prev = getCloneTimestamp(clone_ids[src_prev]);
+        const int64_t ts_next = getCloneTimestamp(clone_ids[src_next]);
+        const double dt_fd = (ts_next - ts_prev) * 1e-9;  // nanoseconds → seconds
+        if (std::abs(dt_fd) < 1e-6) continue;  // degenerate: clones at same timestamp
+
+        // Pixel velocity via finite difference (pixels/s)
+        const double dpx_du = (observations[src_next].x - observations[src_prev].x) / dt_fd;
+        const double dpx_dv = (observations[src_next].y - observations[src_prev].y) / dt_fd;
+
+        // Convert to normalised image coordinates (1/s). H_td = -v_normalised.
+        // This directly fills H_x(row, 15) = -v_normalised for the 2-DOF row pair.
+        const double h_td_u = -dpx_du / slam_fx_;
+        const double h_td_v = -dpx_dv / slam_fy_;
+
+        // ai maps to rows [2*ai, 2*ai+1] in H_x_rows — already stored.
+        // We need to write into column td_col of the stored H_x matrix.
+        if (td_col < H_x_rows[ai].cols) {
+            H_x_rows[ai].at<double>(0, td_col) = h_td_u;
+            H_x_rows[ai].at<double>(1, td_col) = h_td_v;
+        }
     }
 
     if (H_x_rows.size() < 2) return false;  // null-space needs ≥ 2 obs

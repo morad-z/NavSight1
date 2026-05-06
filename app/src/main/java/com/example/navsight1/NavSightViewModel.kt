@@ -408,6 +408,12 @@ class NavSightViewModel(application: Application) : AndroidViewModel(application
         sensorRepository.processCameraFrame(image)
     }
 
+    // Step 8c: relay rolling-shutter skew from CameraUi Camera2Interop callback
+    // into SensorRepository where the JNI call reads it per frame.
+    fun updateRollingShutterSkew(skewNs: Long) {
+        sensorRepository.updateRollingShutterSkew(skewNs)
+    }
+
     fun requestInitialLocation(granted: Boolean = false) {
         hasLocationPermission = granted
         sensorRepository.requestInitialLocation(granted)

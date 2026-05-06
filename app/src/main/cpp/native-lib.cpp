@@ -300,7 +300,8 @@ Java_com_example_navsight1_NativeBridge_processCameraFrameDirect(
         jint yRowStride,
         jint uvRowStride,
         jint uvPixelStride,
-        jlong timestamp) {
+        jlong timestamp,
+        jlong rollingShutterSkewNs) {
 
     std::shared_ptr<VioEngine> vision;
     {
@@ -312,6 +313,12 @@ Java_com_example_navsight1_NativeBridge_processCameraFrameDirect(
     output.valid = false;
 
     if (vision && width > 0 && height > 0 && yBuffer && uvBuffer) {
+        // Step 8c: push rolling-shutter skew into the Tracker once per frame,
+        // before frame data is consumed. Camera2 API:
+        // CaptureResult.SENSOR_ROLLING_SHUTTER_SKEW (API level 21+).
+        // 0 = global-shutter device or key absent — correction disabled.
+        vision->setRollingShutterSkew(static_cast<int64_t>(rollingShutterSkewNs));
+
         auto* yData = static_cast<uint8_t*>(env->GetDirectBufferAddress(yBuffer));
         auto* uvData = static_cast<uint8_t*>(env->GetDirectBufferAddress(uvBuffer));
 
@@ -812,6 +819,35 @@ Java_com_example_navsight1_NativeBridge_nativeResetEventCounters(
         JNIEnv*, jobject) {
     navsight::eventCounters().reset();
     LOGI("EventCounters reset");
+}
+
+// ── Step 8b: seed body→camera extrinsics rotation ────────────────────────────
+// Called once from Kotlin after camera open, using the rotation matrix derived
+// from CameraCharacteristics.SENSOR_ORIENTATION (degrees) converted by the
+// Kotlin layer into a 3×3 row-major float array.
+// R_bc_flat: 9 floats (float[9]).
+// No-op if VIO is not yet started or the array has the wrong length.
+
+JNIEXPORT void JNICALL
+Java_com_example_navsight1_NativeBridge_nativeSetExtrinsicsRotation(
+        JNIEnv* env, jobject, jfloatArray R_bc_flat) {
+    std::shared_ptr<VioEngine> vision;
+    {
+        std::lock_guard<std::mutex> lock(state_mutex);
+        vision = g_vision;
+    }
+    if (!vision || !R_bc_flat) return;
+    if (env->GetArrayLength(R_bc_flat) != 9) {
+        LOGE("nativeSetExtrinsicsRotation: expected 9-element array, got %d",
+             env->GetArrayLength(R_bc_flat));
+        return;
+    }
+    jfloat* ptr = env->GetFloatArrayElements(R_bc_flat, nullptr);
+    if (ptr) {
+        vision->setExtrinsicsRotation(reinterpret_cast<const float*>(ptr));
+        env->ReleaseFloatArrayElements(R_bc_flat, ptr, JNI_ABORT);
+        LOGI("nativeSetExtrinsicsRotation: R_bc seeded from Kotlin camera metadata");
+    }
 }
 
 // DEAD CODE: setMagnetometerHeading JNI — Kotlin caller commented out in NativeBridge.kt

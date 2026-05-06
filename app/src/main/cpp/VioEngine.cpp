@@ -167,6 +167,16 @@ void VioEngine::setUserScaleCorrection(double correction) {
     tracker_.setUserScaleCorrection(correction);
 }
 
+// Step 8c: forward rolling-shutter skew into the Tracker.
+void VioEngine::setRollingShutterSkew(int64_t row_skew_ns) {
+    tracker_.setRollingShutterSkew(row_skew_ns);
+}
+
+// Step 8b: seed the EKF body→camera rotation from Android camera metadata.
+void VioEngine::setExtrinsicsRotation(const float* R_bc_flat) {
+    tracker_.setExtrinsicsRotation(R_bc_flat);
+}
+
 void VioEngine::setUserHeight(float height_m) {
     imu_.setUserHeight(height_m);
     // DISABLED: mapper_.setCameraHeight — Mapper pipeline disabled

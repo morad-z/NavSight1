@@ -78,6 +78,22 @@ public:
 
     void setInitialHeading(double azimuth_rad);
     void setUserScaleCorrection(double correction);
+
+    // Step 8c (Visual Production Plan) — rolling-shutter per-row time skew.
+    // Source: Android Camera2 API — CaptureResult.SENSOR_ROLLING_SHUTTER_SKEW
+    // (API level 21+) reports the duration from first-row to last-row read-out
+    // in nanoseconds. Zero disables the correction (global-shutter devices, or
+    // devices that do not report the key).  Called once per captured frame from
+    // the JNI layer before processFrame.
+    void setRollingShutterSkew(int64_t row_skew_ns);
+
+    // Step 8b (Visual Production Plan) — seed the EKF's body→camera rotation
+    // R_bc from Android CameraCharacteristics.SENSOR_ORIENTATION.
+    // R_bc_flat: 9 floats, row-major 3×3.  Called once after camera open,
+    // before the first frame.  Safe to call while the VIO engine is running —
+    // guarded by the Tracker's own mutex.
+    void setExtrinsicsRotation(const float* R_bc_flat);
+
     void reset();
 
     // Handle IMU data for initialization
@@ -206,6 +222,10 @@ private:
     cv::Mat global_t_;   // 3x1 CV_64F  — LEGACY mirror / bootstrap seed
 
     double fx_{0.}, fy_{0.}, cx_{0.}, cy_{0.};
+    // Step 8c: row read-out time skew from Camera2 SENSOR_ROLLING_SHUTTER_SKEW.
+    // Units: nanoseconds per image_height rows.  0 = correction disabled.
+    // Reset to 0 in reset() so a new VIO session starts without stale skew.
+    int64_t rolling_shutter_row_skew_ns_{0};
     int scale_obs_count_{0};
     double user_scale_correction_{1.0};
     // Scale bootstrap: collect first N observations and take median

@@ -32,6 +32,9 @@ import androidx.compose.ui.unit.dp
 import androidx.compose.ui.unit.sp
 import androidx.compose.ui.viewinterop.AndroidView
 import androidx.core.content.ContextCompat
+import androidx.camera.camera2.interop.Camera2Interop
+import androidx.camera.camera2.interop.ExperimentalCamera2Interop
+import android.hardware.camera2.CaptureResult
 
 private const val TAG = "NavSight"
 
@@ -62,25 +65,50 @@ fun CameraViewComposable(viewModel: NavSightViewModel) {
                         )
                     )
                     .build()
-                val analysis = ImageAnalysis.Builder()
+                // Step 8c: build ImageAnalysis with Camera2Interop so we can
+                // attach a CaptureCallback and read SENSOR_ROLLING_SHUTTER_SKEW
+                // (Camera2 API, API level 21+) on every captured frame.
+                @OptIn(ExperimentalCamera2Interop::class)
+                val analysisBuilder = ImageAnalysis.Builder()
                     .setResolutionSelector(resSelector)
                     .setBackpressureStrategy(ImageAnalysis.STRATEGY_KEEP_ONLY_LATEST)
                     .setOutputImageFormat(ImageAnalysis.OUTPUT_IMAGE_FORMAT_YUV_420_888)
-                    .build().also { ia ->
-                        ia.setAnalyzer(java.util.concurrent.Executors.newSingleThreadExecutor()) { img ->
-                            try {
-                                if (viewModel.isSensorRepositoryActive()) viewModel.processCameraFrame(img)
-                                else img.close()
-                            } catch (e: java.util.concurrent.RejectedExecutionException) {
-                                try { img.close() } catch (_: Exception) {}
-                            } catch (e: IllegalStateException) {
-                                try { img.close() } catch (_: Exception) {}
-                            } catch (e: Exception) {
-                                Log.w(TAG, "Camera frame dropped: ${e.message}")
-                                try { img.close() } catch (_: Exception) {}
+
+                @OptIn(ExperimentalCamera2Interop::class)
+                Camera2Interop.Extender(analysisBuilder)
+                    .setSessionCaptureCallback(
+                        object : android.hardware.camera2.CameraCaptureSession.CaptureCallback() {
+                            override fun onCaptureCompleted(
+                                session: android.hardware.camera2.CameraCaptureSession,
+                                request: android.hardware.camera2.CaptureRequest,
+                                result: android.hardware.camera2.TotalCaptureResult
+                            ) {
+                                // CaptureResult.SENSOR_ROLLING_SHUTTER_SKEW: nanoseconds
+                                // from first-row to last-row read-out. Null on global-
+                                // shutter devices or when the key is not supported.
+                                val skew = result.get(CaptureResult.SENSOR_ROLLING_SHUTTER_SKEW)
+                                if (skew != null) {
+                                    viewModel.updateRollingShutterSkew(skew)
+                                }
                             }
                         }
+                    )
+
+                val analysis = analysisBuilder.build().also { ia ->
+                    ia.setAnalyzer(java.util.concurrent.Executors.newSingleThreadExecutor()) { img ->
+                        try {
+                            if (viewModel.isSensorRepositoryActive()) viewModel.processCameraFrame(img)
+                            else img.close()
+                        } catch (e: java.util.concurrent.RejectedExecutionException) {
+                            try { img.close() } catch (_: Exception) {}
+                        } catch (e: IllegalStateException) {
+                            try { img.close() } catch (_: Exception) {}
+                        } catch (e: Exception) {
+                            Log.w(TAG, "Camera frame dropped: ${e.message}")
+                            try { img.close() } catch (_: Exception) {}
+                        }
                     }
+                }
                 try {
                     provider.unbindAll()
                     provider.bindToLifecycle(lifecycleOwner, CameraSelector.DEFAULT_BACK_CAMERA, preview, analysis)

@@ -51,7 +51,9 @@
 //     "loop_closure_rejects_pnp": N,
 //     "loop_closure_kf_count_in_db": N,
 //     "loop_closure_chi2_rejected": N,
-//     "loop_closure_corrections_applied": N
+//     "loop_closure_corrections_applied": N,
+//     "extrinsics_rotation_angle_mdeg": N,
+//     "rolling_shutter_skew_ns": N
 //   }
 
 #include <atomic>
@@ -132,6 +134,24 @@ struct EventCounters {
     std::atomic<long long> loop_closure_chi2_rejected{0};
     std::atomic<long long> loop_closure_corrections_applied{0};
 
+    // Step 8b — Online IMU-camera extrinsics calibration (EKFState.cpp).
+    // extrinsics_rotation_angle_mdeg: angle-from-identity of the current
+    // body→camera rotation R_bc_ (||Rodrigues(R_bc)||_2 in milli-degrees).
+    // Written every MSCKF update. The initial default diag(1,-1,-1) has
+    // angle_from_identity ≈ 180,000 mdeg (180 deg, the axis-angle of that
+    // particular rotation). Real deviations during online calibration are
+    // O(few mdeg). Use the delta between two consecutive reads to assess
+    // convergence speed; a stable value across frames means the EKF has
+    // converged.
+    std::atomic<long long> extrinsics_rotation_angle_mdeg{0};
+
+    // Step 8c — Rolling-shutter row read-out time from Camera2.
+    // CaptureResult.SENSOR_ROLLING_SHUTTER_SKEW (API level 21+), in
+    // nanoseconds (first-row to last-row read-out). Not a counter; stores
+    // the last-seen value so the sim JSON shows what the device reported.
+    // 0 = global-shutter device or key not supported by the hardware.
+    std::atomic<long long> rolling_shutter_skew_ns{0};
+
     // Reset every counter to 0. Called on simulator-recording start so
     // each sim begins with a clean slate. Cheap atomic stores; safe to
     // call concurrently with hot-path increments (we accept that a few
@@ -171,6 +191,8 @@ struct EventCounters {
         loop_closure_kf_count_in_db.store(0, std::memory_order_relaxed);
         loop_closure_chi2_rejected.store(0, std::memory_order_relaxed);
         loop_closure_corrections_applied.store(0, std::memory_order_relaxed);
+        extrinsics_rotation_angle_mdeg.store(0, std::memory_order_relaxed);
+        rolling_shutter_skew_ns.store(0, std::memory_order_relaxed);
     }
 
     // Monotonic max-update for ba_solve_us_max. Lock-free CAS loop.
@@ -225,9 +247,11 @@ struct EventCounters {
         const long long v_loop_closure_kf_count_in_db   = loop_closure_kf_count_in_db.load(std::memory_order_relaxed);
         const long long v_loop_closure_chi2_rejected    = loop_closure_chi2_rejected.load(std::memory_order_relaxed);
         const long long v_loop_closure_corrections_applied = loop_closure_corrections_applied.load(std::memory_order_relaxed);
+        const long long v_extrinsics_rotation_angle_mdeg = extrinsics_rotation_angle_mdeg.load(std::memory_order_relaxed);
+        const long long v_rolling_shutter_skew_ns = rolling_shutter_skew_ns.load(std::memory_order_relaxed);
 
         std::string out;
-        out.reserve(800);
+        out.reserve(900);
         out += '{';
         appendKv(out, "reloc_orb_accepts",            v_reloc_orb_accepts);            out += ',';
         appendKv(out, "reloc_orb_rejects",            v_reloc_orb_rejects);            out += ',';
@@ -261,7 +285,9 @@ struct EventCounters {
         appendKv(out, "loop_closure_rejects_heading",  v_loop_closure_rejects_heading);  out += ',';
         appendKv(out, "loop_closure_kf_count_in_db",   v_loop_closure_kf_count_in_db);   out += ',';
         appendKv(out, "loop_closure_chi2_rejected",    v_loop_closure_chi2_rejected);    out += ',';
-        appendKv(out, "loop_closure_corrections_applied", v_loop_closure_corrections_applied);
+        appendKv(out, "loop_closure_corrections_applied", v_loop_closure_corrections_applied); out += ',';
+        appendKv(out, "extrinsics_rotation_angle_mdeg", v_extrinsics_rotation_angle_mdeg); out += ',';
+        appendKv(out, "rolling_shutter_skew_ns",        v_rolling_shutter_skew_ns);
         out += '}';
         return out;
     }

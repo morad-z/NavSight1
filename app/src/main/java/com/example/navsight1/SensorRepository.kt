@@ -61,6 +61,17 @@ class SensorRepository(private val context: Context) : SensorEventListener {
     @Volatile private var vioProcessing = false
     @Volatile private var vioFrameCount = 0
 
+    // Step 8c: rolling-shutter row read-out time from Camera2.
+    // Updated by CameraUi.kt Camera2Interop CaptureCallback on every frame.
+    // Camera2 API: CaptureResult.SENSOR_ROLLING_SHUTTER_SKEW (API level 21+) —
+    // nanoseconds from first-row to last-row read-out. 0 = skew unavailable.
+    @Volatile var rollingShutterSkewNs: Long = 0L
+        private set
+
+    fun updateRollingShutterSkew(skewNs: Long) {
+        rollingShutterSkewNs = skewNs
+    }
+
     // Depth estimation at ~1Hz for scale constraint
     private val depthExecutor = java.util.concurrent.Executors.newSingleThreadExecutor { r ->
         Thread(r, "NavSight-Depth").apply { isDaemon = true }
@@ -125,22 +136,23 @@ class SensorRepository(private val context: Context) : SensorEventListener {
                 sensorManager.registerListener(this, it, SensorManager.SENSOR_DELAY_GAME)
                 Log.d(TAG, "Accelerometer registered")
             } ?: Log.w(TAG, "Accelerometer not available on this device")
-            
+
             magnetometer?.let {
                 sensorManager.registerListener(this, it, SensorManager.SENSOR_DELAY_GAME)
                 Log.d(TAG, "Magnetometer registered")
             } ?: Log.w(TAG, "Magnetometer not available on this device")
-            
+
             gyroscope?.let {
                 sensorManager.registerListener(this, it, SensorManager.SENSOR_DELAY_GAME)
                 Log.d(TAG, "Gyroscope registered")
             } ?: Log.w(TAG, "Gyroscope not available on this device")
-            
+
             if (NativeBridge.isLoaded()) {
                 NativeBridge.startVIO()
                 pushStoredCalibrationToNative()
                 pushCameraIntrinsicsToNative()
                 pushLoopClosureVocabularyToNative()
+                pushExtrinsicsRotationToNative()   // Step 8b
                 startInitStatusPoller()
             } else {
                 Log.e(TAG, "Cannot start VIO: native library not loaded")
@@ -233,6 +245,91 @@ class SensorRepository(private val context: Context) : SensorEventListener {
             }
         } catch (e: Throwable) {
             Log.e(TAG, "Failed to push loop-closure vocabulary: ${e.message}", e)
+        }
+    }
+
+    /**
+     * Step 8b: read the back-camera SENSOR_ORIENTATION from Android
+     * CameraCharacteristics and seed the EKF's R_bc with the corresponding
+     * rotation matrix.
+     *
+     * Android convention: SENSOR_ORIENTATION is the angle (0, 90, 180, 270)
+     * that the camera sensor image must be rotated CW to align with the device's
+     * natural portrait orientation.  For most rear cameras this is 90°.
+     *
+     * Our body frame has +X forward (device top), +Y left, +Z up (screen face).
+     * The default R_bc = diag(1,-1,-1) encodes the camera-to-body flip assumed
+     * when SENSOR_ORIENTATION = 0.  For a 90° rotated sensor we compose an
+     * additional Rz(-90°) on the right (rotating in the camera's own frame):
+     *
+     *   R_bc(θ) = R_bc_default  ×  Rz(−θ)
+     *
+     * where θ = SENSOR_ORIENTATION in radians.  The minus sign comes from the
+     * fact that SENSOR_ORIENTATION is a CW rotation of the image, which
+     * corresponds to a CCW rotation of the coordinate frame.
+     *
+     * If CameraCharacteristics is unavailable the method logs a warning and
+     * returns without calling native — the EKF keeps its compile-time default.
+     */
+    private fun pushExtrinsicsRotationToNative() {
+        try {
+            val cameraManager = context.getSystemService(Context.CAMERA_SERVICE)
+                as android.hardware.camera2.CameraManager
+            val cameraId = cameraManager.cameraIdList.firstOrNull { id ->
+                val chars = cameraManager.getCameraCharacteristics(id)
+                chars.get(android.hardware.camera2.CameraCharacteristics.LENS_FACING) ==
+                    android.hardware.camera2.CameraCharacteristics.LENS_FACING_BACK
+            } ?: run {
+                Log.w(TAG, "pushExtrinsicsRotationToNative: no back camera found — keeping default R_bc")
+                return
+            }
+
+            val chars = cameraManager.getCameraCharacteristics(cameraId)
+            val sensorOrientation = chars.get(
+                android.hardware.camera2.CameraCharacteristics.SENSOR_ORIENTATION
+            ) ?: run {
+                Log.w(TAG, "pushExtrinsicsRotationToNative: SENSOR_ORIENTATION null — keeping default R_bc")
+                return
+            }
+
+            // R_bc_default = diag(1,-1,-1)  (matches the C++ compile-time init)
+            // Rz(-θ) where θ = sensorOrientation degrees (CW sensor rotation → CCW frame rotation)
+            val thetaRad = Math.toRadians(-sensorOrientation.toDouble())
+            val cosT = Math.cos(thetaRad).toFloat()
+            val sinT = Math.sin(thetaRad).toFloat()
+
+            // Rz(-θ), row-major:
+            //  [ cos  -sin  0 ]
+            //  [ sin   cos  0 ]
+            //  [  0     0   1 ]
+            val rz = floatArrayOf(
+                 cosT, -sinT, 0f,
+                 sinT,  cosT, 0f,
+                 0f,    0f,   1f
+            )
+
+            // R_bc_default row-major: [1,0,0, 0,-1,0, 0,0,-1]
+            // R_bc = R_bc_default * Rz(-θ)  (matrix multiply 3×3)
+            val def = floatArrayOf(
+                1f,  0f,  0f,
+                0f, -1f,  0f,
+                0f,  0f, -1f
+            )
+            val R_bc = FloatArray(9)
+            for (row in 0..2) {
+                for (col in 0..2) {
+                    var sum = 0f
+                    for (k in 0..2) {
+                        sum += def[row * 3 + k] * rz[k * 3 + col]
+                    }
+                    R_bc[row * 3 + col] = sum
+                }
+            }
+
+            NativeBridge.nativeSetExtrinsicsRotation(R_bc)
+            Log.i(TAG, "Extrinsics R_bc seeded from SENSOR_ORIENTATION=${sensorOrientation}°")
+        } catch (e: Throwable) {
+            Log.e(TAG, "pushExtrinsicsRotationToNative failed: ${e.message}", e)
         }
     }
 
@@ -555,7 +652,8 @@ class SensorRepository(private val context: Context) : SensorEventListener {
                     yRowStride = yRowStride,
                     uvRowStride = uvRowStride,
                     uvPixelStride = uvPixelStride,
-                    timestamp = timestampNs
+                    timestamp = timestampNs,
+                    rollingShutterSkewNs = rollingShutterSkewNs  // Step 8c
                 )
                 val jniMs = System.currentTimeMillis() - jniStartMs
                 val totalMs = System.currentTimeMillis() - frameStartMs

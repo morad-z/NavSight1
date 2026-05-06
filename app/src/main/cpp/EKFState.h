@@ -30,9 +30,16 @@ struct CameraPose {
 // Extended Kalman Filter for VIO.
 // Full error-state EKF with MSCKF sliding window support.
 //
-// IMU error-state: [δθ(3), δb_g(3), δv(3), δb_a(3), δp(3)] = 15 DOF
+// IMU error-state (19 DOF after Steps 8a + 8b):
+//   rows  0– 2: δθ      — rotation error (rad)
+//   rows  3– 5: δb_g    — gyro bias error (rad/s)
+//   rows  6– 8: δv      — velocity error (m/s)
+//   rows  9–11: δb_a    — accel bias error (m/s²)
+//   rows 12–14: δp      — position error (m)
+//   row  15:    δt_d    — camera-IMU time offset error (s) [Step 8a, ADR-014]
+//   rows 16–18: δφ_bc   — camera-body rotation error (rad) [Step 8b, ADR-015]
 // Each clone adds: [δθ_c(3), δp_c(3)] = 6 DOF
-// Total state dimension: 15 + 6*N_clones
+// Total state dimension: 19 + 6*N_clones + 5*N_slam_features
 class EKFState {
 public:
     EKFState();
@@ -306,9 +313,73 @@ public:
     // void updateTemporal(double observed_scale, double confidence, double H_td);
     void setTimeOffset(double td_seconds);
     double getTimeOffset() const { return t_offset_cam_imu_; }
-    double getTimeOffsetStd() const { return std::sqrt(std::max(0.0, P_td_)); }
+    // Returns the 1-sigma uncertainty of the online td estimate.
+    // When full_initialized_, reads from P_(15,15) which is updated by every
+    // MSCKF correction. Before that, falls back to the pre-init scalar P_td_.
+    double getTimeOffsetStd() const {
+        if (full_initialized_ && !P_.empty() && P_.rows > 15) {
+            return std::sqrt(std::max(0.0, P_.at<double>(15, 15)));
+        }
+        return std::sqrt(std::max(0.0, P_td_));
+    }
 
-    static constexpr int IMU_STATE_DIM = 15;      // δθ, δb_g, δv, δb_a, δp
+    // ── Plan Step 8b: online IMU-camera extrinsics calibration ───────────────
+    //
+    // Set the nominal body→camera rotation. Must be called before or at
+    // initializeFull. The argument is the rotation that transforms body-frame
+    // vectors into camera-frame vectors:  p_cam = R_bc * p_body.
+    //
+    // Call with the result of getCameraOrientation (Android sensor frame to
+    // camera frame) composed with the device mounting geometry. The EKF
+    // will refine this nominal value via the δφ_bc error state during the
+    // visual MSCKF update.
+    //
+    // Thread safety: must be called from the same thread that owns the EKF
+    // (i.e. before processFrame starts) — no mutex is taken.
+    void setExtrinsicsRotation(const cv::Matx33d& R_bc);
+
+    // Read the current best-estimate body→camera rotation. This is the
+    // nominal R_bc_ updated in-place by every MSCKF correction of δφ_bc.
+    // Returns a copy; safe to call from any thread that does not concurrently
+    // call applyMSCKFUpdate (i.e., reads are safe from the camera thread).
+    cv::Matx33d getExtrinsicsRotation() const { return R_bc_; }
+
+    // Returns the angle-from-identity of the current R_bc estimate in degrees.
+    // Used for the event_summary diagnostic field "extrinsics_rotation_delta_deg".
+    // A freshly-initialized system from getCameraOrientation returns ~0°; as
+    // the EKF refines, the delta from the initial nominal should shrink to <1°.
+    double getExtrinsicsAngleDeg() const;
+
+    // Returns the timestamp_ns stored in the clone identified by clone_id.
+    // Returns 0 if the clone is not found (not in current sliding window).
+    int64_t getCloneTimestamp(int clone_id) const;
+
+    // ── Plan Step 8a + Step 8b: IMU error-state dimension ──────────────────
+    //
+    // Step 8a (ADR-016) added δt_d (time delay, 1 DOF) at row 15.
+    // Step 8b (this step) adds δφ_bc (body→camera rotation error, 3 DOF) at
+    // rows 16–18. Full IMU error-state layout after both steps:
+    //
+    //   rows  0– 2  : δθ    — attitude error (rad, body frame)
+    //   rows  3– 5  : δb_g  — gyro bias error (rad/s)
+    //   rows  6– 8  : δv    — velocity error (m/s, global frame)
+    //   rows  9–11  : δb_a  — accel bias error (m/s²)
+    //   rows 12–14  : δp    — position error (m, global frame)
+    //   row  15     : δt_d  — camera-IMU time delay error (s) — Step 8a
+    //   rows 16–18  : δφ_bc — body→camera rotation perturbation (rad, Lie
+    //                         algebra so(3)) — Step 8b
+    //
+    // Step 8b convention: R_bc = R_bc_hat × Exp(δφ_bc)
+    // where R_bc_hat is the nominal body→camera rotation (R_bc_) and Exp is
+    // the matrix exponential on SO(3) (implemented via cv::Rodrigues).
+    // "body→camera" means p_cam = R_bc * p_body.
+    static constexpr int IMU_STATE_DIM    = 19;  // δθ, δb_g, δv, δb_a, δp, δt_d, δφ_bc
+    // Named offsets for the two new DOF blocks (Steps 8a + 8b).
+    // TD_STATE_OFFSET   = 15: row of δt_d (one DOF after the 15-row base IMU state).
+    // EXTR_STATE_OFFSET = 16: first row of δφ_bc (immediately after δt_d).
+    static constexpr int TD_STATE_OFFSET   = 15;
+    static constexpr int EXTR_STATE_OFFSET = 16;
+    static constexpr int EXTR_STATE_DIM    = 3;   // one 3-vector δφ_bc
     static constexpr int CLONE_DIM = 6;            // δθ_c, δp_c
     static constexpr int MAX_CLONES = 11;
 
@@ -330,7 +401,8 @@ private:
     cv::Mat b_a_;       // 3x1 accel bias
     cv::Mat p_G_;       // 3x1 position in global frame
 
-    // Full covariance: (15 + 6*N_clones) x (15 + 6*N_clones)
+    // Full covariance: (19 + 6*N_clones) x (19 + 6*N_clones).
+    // IMU block rows 0..18; clone blocks follow; SLAM block at the end.
     cv::Mat P_;
 
     // MSCKF Sliding Window
@@ -345,9 +417,31 @@ private:
     // mutable because getCloneSnapshot is const and locks for read.
     mutable std::mutex snapshot_mutex_;
 
-    // Online calibration
+    // Online time-offset calibration.
+    // t_offset_cam_imu_ is the mean estimate (seconds). δt_d (row 15 of the
+    // error state) is the CORRECTION — each MSCKF update adds dx[15] to this
+    // mean and P_(15,15) tracks the variance. P_td_ is kept only as the
+    // pre-initializeFull fallback for getTimeOffsetStd() and setTimeOffset().
     double t_offset_cam_imu_{0.010};
-    double P_td_{0.005 * 0.005};
+    double P_td_{0.005 * 0.005};  // pre-init variance fallback (s²)
+
+    // ── Plan Step 8b: body→camera extrinsics (online calibration) ────────────
+    //
+    // R_bc_ is the nominal (best-estimate) body→camera rotation matrix.
+    // Updated in-place by every applyMSCKFUpdate: R_bc_ = R_bc_ * Exp(δφ_bc).
+    //
+    // Default initialisation: diag(1, -1, -1) — the canonical rear-camera /
+    // vertical-phone convention NavSight uses (camera +X = body +X, camera +Y =
+    // body -Y, camera +Z = body -Z). This is the same matrix that was previously
+    // hardcoded at three sites in Tracker.cpp (lines ~1129, ~2066, ~3440).
+    //
+    // Caller sets the real value via setExtrinsicsRotation() before the first
+    // processFrame, using Android's CameraCharacteristics.SENSOR_ORIENTATION
+    // combined with the device mounting geometry. The default keeps the system
+    // functional for devices not providing the rotation at startup.
+    cv::Matx33d R_bc_{1.0,  0.0,  0.0,
+                      0.0, -1.0,  0.0,
+                      0.0,  0.0, -1.0};
 
     bool initialized_{false};
 
@@ -376,6 +470,7 @@ private:
     int msckf_frames_since_call_{0};   // # propagateIMU calls since last MSCKF
     int msckf_damping_step_{0};        // 0..5+; 0=>0.5x, ramps to 1.0 at 5
     int msckf_huber_rejected_count_{0};
+    int extr_log_skip_{0};             // throttle extrinsics angle logging (every 30 updates)
 
     static constexpr int MSCKF_QUIET_PROPAGATION = 5;
     static constexpr int MSCKF_DAMPING_RAMP_FRAMES = 5;

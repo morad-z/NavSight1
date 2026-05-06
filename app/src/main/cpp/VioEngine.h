@@ -41,6 +41,12 @@ public:
     void setMagnetometerHeading(float yaw_rad);
     void setDepthMap(const float* depth_data, int width, int height);
     void setUserScaleCorrection(double correction);
+    // Step 8c: forward rolling-shutter row-skew into the Tracker. See Tracker.h.
+    void setRollingShutterSkew(int64_t row_skew_ns);
+
+    // Step 8b: seed the EKF body→camera rotation from Android camera metadata.
+    // R_bc_flat: 9 floats row-major.  Called once after camera open.
+    void setExtrinsicsRotation(const float* R_bc_flat);
     void setUserHeight(float height_m);
     void reset();
 

@@ -30,12 +30,16 @@ object NativeBridge {
     // external fun processCameraFrame(
     //     frameData: ByteArray, width: Int, height: Int, timestamp: Long
     // ): VioData
-    // Zero-copy: accepts direct ByteBuffer from CameraX ImageProxy
+    // Zero-copy: accepts direct ByteBuffer from CameraX ImageProxy.
+    // rollingShutterSkewNs: Camera2 CaptureResult.SENSOR_ROLLING_SHUTTER_SKEW
+    // (API level 21+) — nanoseconds from first-row to last-row read-out.
+    // Pass 0 if the key is absent (global-shutter device or unavailable).
     external fun processCameraFrameDirect(
         yBuffer: ByteBuffer, uvBuffer: ByteBuffer,
         width: Int, height: Int,
         yRowStride: Int, uvRowStride: Int, uvPixelStride: Int,
-        timestamp: Long
+        timestamp: Long,
+        rollingShutterSkewNs: Long
     ): VioData
     external fun processGyroscope(timestamp: Long, x: Float, y: Float, z: Float)
     external fun processAccelerometer(timestamp: Long, x: Float, y: Float, z: Float)
@@ -90,4 +94,10 @@ object NativeBridge {
     // for the JSON schema.
     external fun nativeGetEventCountersJson(): String
     external fun nativeResetEventCounters()
+
+    // Step 8b (Visual Production Plan): seed the EKF body→camera extrinsics
+    // rotation R_bc from Android CameraCharacteristics.SENSOR_ORIENTATION.
+    // R_bc_flat: 9 floats in row-major order.  Called once after camera open,
+    // before the first frame arrives.  No-op if VIO is not yet started.
+    external fun nativeSetExtrinsicsRotation(R_bc_flat: FloatArray)
 }
