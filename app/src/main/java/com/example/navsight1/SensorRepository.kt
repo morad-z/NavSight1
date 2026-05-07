@@ -401,10 +401,32 @@ class SensorRepository(private val context: Context) : SensorEventListener {
         calibrationPersistedThisRun = true
     }
 
-    /** Step 5: invoked by UI when the user dismisses the timeout dialog. */
+    /** Step 5: invoked by UI when the user dismisses the timeout dialog.
+     *
+     * Bypasses the stationary variance gate entirely by injecting calibration
+     * via loadStoredCalibration — which unconditionally transitions the native
+     * state to WAIT_MOTION. The gate was gating on sensor noise thresholds that
+     * vary widely across devices; when the user explicitly says "it's flat",
+     * we trust them. The EKF refines gyro bias online once walking starts.
+     *
+     * Priority: use persisted calibration from a prior session if available
+     * (best accuracy), otherwise inject identity rotation + zero biases
+     * (VIO starts immediately; EKF converges within seconds of motion).
+     */
     fun clearInitTimeout() {
-        try { NativeBridge.clearInitTimeout() } catch (e: Throwable) {
-            Log.e(TAG, "clearInitTimeout failed: ${e.message}", e)
+        val stored = CalibrationStore.load(context)
+        val rotation  = stored?.rotation  ?: floatArrayOf(1f,0f,0f, 0f,1f,0f, 0f,0f,1f)
+        val gyroBias  = stored?.gyroBias  ?: floatArrayOf(0f, 0f, 0f)
+        val accelBias = stored?.accelBias ?: floatArrayOf(0f, 0f, 0f)
+        try {
+            NativeBridge.loadStoredCalibration(rotation, gyroBias, accelBias)
+            Log.i(TAG, "clearInitTimeout: bypassed gate via loadStoredCalibration " +
+                "(stored=${stored != null})")
+        } catch (e: Throwable) {
+            Log.e(TAG, "clearInitTimeout: loadStoredCalibration failed, falling back", e)
+            try { NativeBridge.clearInitTimeout() } catch (e2: Throwable) {
+                Log.e(TAG, "clearInitTimeout native fallback also failed", e2)
+            }
         }
     }
 

@@ -32,16 +32,23 @@ public:
     };
 
     struct Options {
-        double stationary_seconds;     // Plan: 5.0 s of quiet data
-        double max_accel_var;          // Plan: 0.01 m²/s⁴
-        double max_gyro_mag;           // Plan: 0.02 rad/s
-        double timeout_seconds;        // Plan: 15.0 s before user prompt
+        double stationary_seconds;     // 5.0 s window of quiet data required
+        double max_accel_var;          // 3-axis total accel variance (m²/s⁴).
+                                       // 0.05 ≈ 0.13 m/s² RMS — rejects motion, accepts
+                                       // consumer MEMS noise + mild surface vibrations.
+        double max_gyro_var;           // 3-axis total gyro variance (rad/s)².
+                                       // We check VARIANCE, not mean magnitude, because
+                                       // the mean IS the bias we are measuring and can be
+                                       // anywhere in [0, 0.1] rad/s on different devices.
+                                       // 0.001 (rad/s)² ≈ 0.018 rad/s RMS — accepts still
+                                       // phone regardless of bias magnitude.
+        double timeout_seconds;        // 15.0 s before TIMEOUT_NEEDS_USER fires
         double gravity_mag;
 
         Options() :
             stationary_seconds(5.0),
-            max_accel_var(0.01),
-            max_gyro_mag(0.02),
+            max_accel_var(0.05),
+            max_gyro_var(0.001),
             timeout_seconds(15.0),
             gravity_mag(9.81) {}
     };
@@ -84,6 +91,11 @@ private:
 
     int64_t first_sample_ns_{0};      // Stamp of first sample since reset
     bool    has_first_sample_{false};
+
+    // Set by clearTimeout(): the user explicitly placed the phone flat and
+    // tapped OK, so skip quality variance checks on the next window — just
+    // collect the mean and accept. Cleared immediately after acceptance.
+    bool    force_accept_{false};
 
     cv::Mat R_GtoI_init_;
     cv::Point3f gyro_bias_;

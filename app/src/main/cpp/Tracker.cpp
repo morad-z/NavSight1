@@ -1520,6 +1520,9 @@ VisionOutput Tracker::processFrame(const uint8_t* yuv_data, int width, int heigh
             if (speed > 0.1 && gyro_norm < 0.8) {
                 double d = std::min(std::min(speed, 2.0) * dt_s, 1.0 * dt_s);
                 total_path_m_ += d;
+                navsight::eventCounters().total_path_dm.store(
+                    static_cast<long long>(total_path_m_ * 10.0 + 0.5),
+                    std::memory_order_relaxed);
                 double dx_step = d * std::sin(heading);   // +X = East
                 double dz_step = d * std::cos(heading);   // +Z = North
 

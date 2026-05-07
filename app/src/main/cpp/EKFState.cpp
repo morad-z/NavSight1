@@ -795,6 +795,9 @@ void EKFState::applyMSCKFUpdate(const cv::Mat& H, const cv::Mat& res,
         const long long angle_mdeg = static_cast<long long>(angle_deg * 1000.0 + 0.5);
         navsight::eventCounters().extrinsics_rotation_angle_mdeg.store(
             angle_mdeg, std::memory_order_relaxed);
+        const long long td_us = static_cast<long long>(t_offset_cam_imu_ * 1e6 + 0.5);
+        navsight::eventCounters().cam_imu_time_offset_us.store(
+            td_us, std::memory_order_relaxed);
     }
 }
 

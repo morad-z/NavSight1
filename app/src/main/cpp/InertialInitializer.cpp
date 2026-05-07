@@ -24,6 +24,7 @@ void InertialInitializer::reset() {
     gyro_window_.clear();
     has_first_sample_ = false;
     first_sample_ns_ = 0;
+    force_accept_ = false;
     gyro_bias_ = cv::Point3f(0, 0, 0);
     accel_bias_ = cv::Point3f(0, 0, 0);
     R_GtoI_init_ = cv::Mat::eye(3, 3, CV_64F);
@@ -76,7 +77,10 @@ void InertialInitializer::clearTimeout() {
         gyro_window_.clear();
         has_first_sample_ = false;
         first_sample_ns_ = 0;
-        LOGI("Init timeout cleared by user; restarting stationary gate");
+        // User explicitly confirmed the phone is flat — skip quality checks
+        // on the next 5-second window and accept whatever mean we collect.
+        force_accept_ = true;
+        LOGI("Init timeout cleared by user; force_accept enabled for next window");
     }
 }
 
@@ -168,18 +172,35 @@ bool InertialInitializer::runStationaryCalibration() {
     }
     var_a /= n_a;
 
-    double mean_g_mag = std::sqrt(mean_g.x * mean_g.x
-                                + mean_g.y * mean_g.y
-                                + mean_g.z * mean_g.z);
-
-    if (var_a > options_.max_accel_var) {
-        LOGI("Init gate REJECT: var_a=%.5f > %.5f", var_a, options_.max_accel_var);
-        return false;
+    // Gyro variance — check stability, NOT mean magnitude.
+    // The mean IS the bias we are measuring; it can be 0.05+ rad/s on many
+    // devices. Checking mean magnitude against a small threshold (the old bug)
+    // caused permanent rejection on any phone whose factory gyro bias exceeds
+    // ~0.02 rad/s, which is most consumer handsets.
+    double var_g = 0;
+    for (const auto& g : gyro_window_) {
+        var_g += std::pow(g.x - mean_g.x, 2)
+               + std::pow(g.y - mean_g.y, 2)
+               + std::pow(g.z - mean_g.z, 2);
     }
-    if (mean_g_mag > options_.max_gyro_mag) {
-        LOGI("Init gate REJECT: |mean_g|=%.5f > %.5f rad/s",
-             mean_g_mag, options_.max_gyro_mag);
-        return false;
+    var_g /= n_g;
+
+    if (force_accept_) {
+        // User explicitly said the phone is flat: skip variance thresholds.
+        // Even a noisy bias estimate is better than never starting VIO.
+        // The EKF will refine b_g online within the first few seconds of walking.
+        LOGI("Init gate FORCE-ACCEPT (user-confirmed): var_a=%.5f var_g=%.6f", var_a, var_g);
+        force_accept_ = false;
+    } else {
+        if (var_a > options_.max_accel_var) {
+            LOGI("Init gate REJECT: var_a=%.5f > %.5f", var_a, options_.max_accel_var);
+            return false;
+        }
+        if (var_g > options_.max_gyro_var) {
+            LOGI("Init gate REJECT: var_g=%.6f > %.6f (rad/s)^2",
+                 var_g, options_.max_gyro_var);
+            return false;
+        }
     }
 
     // Gravity alignment: compute roll/pitch from mean_a; yaw stays free
@@ -212,6 +233,12 @@ bool InertialInitializer::runStationaryCalibration() {
     // Stationary alone cannot separate accel bias from gravity; report 0
     // and rely on Madgwick + IMUPreintegrator for online refinement.
     accel_bias_ = cv::Point3f(0, 0, 0);
+    double bias_mag = std::sqrt(mean_g.x * mean_g.x
+                              + mean_g.y * mean_g.y
+                              + mean_g.z * mean_g.z);
+    LOGI("Init gate PASS: var_a=%.5f var_g=%.6f "
+         "gyro_bias=(%.4f,%.4f,%.4f) |bias|=%.4f rad/s samples=%zu",
+         var_a, var_g, mean_g.x, mean_g.y, mean_g.z, bias_mag, accel_window_.size());
     return true;
 }
 

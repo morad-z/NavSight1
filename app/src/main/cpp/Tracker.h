@@ -527,11 +527,15 @@ private:
     //   Source: sim_data_1778077139237 + χ²(0.999,6) table.
     static constexpr double  LOOP_CLOSURE_PNP_SIGMA_FLOOR_M   = 2.0;
     static constexpr double  LOOP_CLOSURE_DRIFT_RATE           = 0.032;
-    // Base 1-σ-axis (rad) on the body-frame relative-rotation injection.
-    // 3° is a defensive ceiling for the rotation we get from solvePnPRansac
-    // with ≥ 30 inliers; the per-call sigma may be tightened by the detector
-    // if it returns one in a future revision.
-    static constexpr double  LOOP_CLOSURE_BASE_ROT_SIGMA_RAD  = 0.05236;  // 3°
+    // 1-σ-axis (rad) on the rotation block of the loop-closure chi² gate.
+    // 3° was far too tight: with m²_rot = |r_R|²/σ²_R the chi²(0.999,6)=22.5
+    // threshold only accepts |r_R| < 14.2°, but typical VIO heading drift over
+    // a 50-100 m loop is 5-20°, so all PnP accepts were rejected.
+    // 20° floor (0.349 rad) allows corrections whenever heading residual
+    // < sqrt(22.5 × 0.349²) ≈ 1.66 rad (limited in practice by the π/2
+    // heading gate upstream). Source: sim_data_1778100250961 — 40 PnP accepts,
+    // 392 chi² rejects, 0 corrections with 3° sigma.
+    static constexpr double  LOOP_CLOSURE_BASE_ROT_SIGMA_RAD  = 0.34907;  // 20°
 
     // Depth-based scale constraint (MiDaS)
     mutable std::mutex depth_mutex_;

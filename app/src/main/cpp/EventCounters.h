@@ -133,6 +133,9 @@ struct EventCounters {
     // updateAbsolutePose injection through the EKF.
     std::atomic<long long> loop_closure_chi2_rejected{0};
     std::atomic<long long> loop_closure_corrections_applied{0};
+    // total_path_m × 10 (integer decimeters) — verifies the dynamic sigma
+    // formula (sigma_p = max(2.0, 0.032 × path_m)) is tracking correctly.
+    std::atomic<long long> total_path_dm{0};
 
     // Step 8b — Online IMU-camera extrinsics calibration (EKFState.cpp).
     // extrinsics_rotation_angle_mdeg: angle-from-identity of the current
@@ -144,6 +147,12 @@ struct EventCounters {
     // convergence speed; a stable value across frames means the EKF has
     // converged.
     std::atomic<long long> extrinsics_rotation_angle_mdeg{0};
+
+    // Step 8a — Online IMU-camera time offset δt_d (EKFState row 15).
+    // Stored as integer microseconds (round-to-nearest). Warmup prior is ~2 ms
+    // (2000 µs); converges toward the true hw offset (typically ±5 ms).
+    // Written in the same throttled block as extrinsics_rotation_angle_mdeg.
+    std::atomic<long long> cam_imu_time_offset_us{0};
 
     // Step 8c — Rolling-shutter row read-out time from Camera2.
     // CaptureResult.SENSOR_ROLLING_SHUTTER_SKEW (API level 21+), in
@@ -191,7 +200,9 @@ struct EventCounters {
         loop_closure_kf_count_in_db.store(0, std::memory_order_relaxed);
         loop_closure_chi2_rejected.store(0, std::memory_order_relaxed);
         loop_closure_corrections_applied.store(0, std::memory_order_relaxed);
+        total_path_dm.store(0, std::memory_order_relaxed);
         extrinsics_rotation_angle_mdeg.store(0, std::memory_order_relaxed);
+        cam_imu_time_offset_us.store(0, std::memory_order_relaxed);
         rolling_shutter_skew_ns.store(0, std::memory_order_relaxed);
     }
 
@@ -247,7 +258,9 @@ struct EventCounters {
         const long long v_loop_closure_kf_count_in_db   = loop_closure_kf_count_in_db.load(std::memory_order_relaxed);
         const long long v_loop_closure_chi2_rejected    = loop_closure_chi2_rejected.load(std::memory_order_relaxed);
         const long long v_loop_closure_corrections_applied = loop_closure_corrections_applied.load(std::memory_order_relaxed);
+        const long long v_total_path_dm               = total_path_dm.load(std::memory_order_relaxed);
         const long long v_extrinsics_rotation_angle_mdeg = extrinsics_rotation_angle_mdeg.load(std::memory_order_relaxed);
+        const long long v_cam_imu_time_offset_us  = cam_imu_time_offset_us.load(std::memory_order_relaxed);
         const long long v_rolling_shutter_skew_ns = rolling_shutter_skew_ns.load(std::memory_order_relaxed);
 
         std::string out;
@@ -286,7 +299,9 @@ struct EventCounters {
         appendKv(out, "loop_closure_kf_count_in_db",   v_loop_closure_kf_count_in_db);   out += ',';
         appendKv(out, "loop_closure_chi2_rejected",    v_loop_closure_chi2_rejected);    out += ',';
         appendKv(out, "loop_closure_corrections_applied", v_loop_closure_corrections_applied); out += ',';
+        appendKv(out, "total_path_dm",                  v_total_path_dm);                  out += ',';
         appendKv(out, "extrinsics_rotation_angle_mdeg", v_extrinsics_rotation_angle_mdeg); out += ',';
+        appendKv(out, "cam_imu_time_offset_us",         v_cam_imu_time_offset_us);         out += ',';
         appendKv(out, "rolling_shutter_skew_ns",        v_rolling_shutter_skew_ns);
         out += '}';
         return out;
