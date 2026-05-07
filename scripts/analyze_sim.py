@@ -220,6 +220,19 @@ def analyze(path, quiet=False):
     lc_kf_db    = g('loop_closure_kf_count_in_db')
     lc_corr     = g('loop_closure_corrections_applied')
 
+    # Step 3 Observer B — MiDaS depth (added 2026-05-07; will be 0 in
+    # pre-counter sims).
+    midas_entries     = g('midas_entries')
+    midas_no_depth    = g('midas_bailout_no_depth')
+    midas_few_pts3d   = g('midas_bailout_few_pts3d')
+    midas_invalid_int = g('midas_bailout_invalid_intrinsics')
+    midas_camera_h    = g('midas_bailout_camera_h')
+    midas_low_g       = g('midas_bailout_low_g')
+    midas_few_floor   = g('midas_bailout_few_floor_matches')
+    midas_extreme     = g('midas_rejected_extreme')
+    midas_fused       = g('midas_fused')
+    midas_skipped     = g('midas_skipped')
+
     # --- Report ---
     if not quiet:
         print("=" * 70)
@@ -319,6 +332,17 @@ def analyze(path, quiet=False):
                   f"corrections_applied={lc_corr}")
             print(f"  Step 7 LC reject reasons: low_score={lc_low} pnp_failed={lc_pnp} "
                   f"chi2_rejected={lc_chi2} (kf_in_db={lc_kf_db})")
+            # Step 3 Observer B — MiDaS counters (added 2026-05-07).
+            # If midas_entries == 0, MiDaS isn't being CALLED — check
+            # Tracker.cpp:1332 callsite or DepthEstimator wiring. If
+            # entries > 0 but midas_fused == 0, one of the bailout
+            # gates is firing every time — read the breakdown below.
+            print(f"  Step 3 MIDAS entries    : {midas_entries}  "
+                  f"fused={midas_fused} skipped={midas_skipped}")
+            print(f"  Step 3 MIDAS bailouts   : no_depth={midas_no_depth} "
+                  f"few_pts3d={midas_few_pts3d} invalid_intr={midas_invalid_int} "
+                  f"camera_h={midas_camera_h} low_g={midas_low_g} "
+                  f"few_floor={midas_few_floor} extreme={midas_extreme}")
             # Step 8 fields — will be 0 in pre-Step-8 sims
             print(f"  Step 8a TD offset       : {td_offset_ms:+.2f} ms  "
                   f"(warmup ~2 ms; converged value = hw pipeline latency)")
@@ -344,6 +368,8 @@ def analyze(path, quiet=False):
         "inl_mean": inl_mean,
         "sc_mean": sc_mean,
         "sc_std": sc_std,
+        "midas_entries": midas_entries,
+        "midas_fused": midas_fused,
     }
 
 

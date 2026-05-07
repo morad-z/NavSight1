@@ -53,7 +53,17 @@
 //     "loop_closure_chi2_rejected": N,
 //     "loop_closure_corrections_applied": N,
 //     "extrinsics_rotation_angle_mdeg": N,
-//     "rolling_shutter_skew_ns": N
+//     "rolling_shutter_skew_ns": N,
+//     "midas_entries": N,
+//     "midas_bailout_no_depth": N,
+//     "midas_bailout_few_pts3d": N,
+//     "midas_bailout_invalid_intrinsics": N,
+//     "midas_bailout_camera_h": N,
+//     "midas_bailout_low_g": N,
+//     "midas_bailout_few_floor_matches": N,
+//     "midas_rejected_extreme": N,
+//     "midas_fused": N,
+//     "midas_skipped": N
 //   }
 
 #include <atomic>
@@ -161,6 +171,33 @@ struct EventCounters {
     // 0 = global-shutter device or key not supported by the hardware.
     std::atomic<long long> rolling_shutter_skew_ns{0};
 
+    // Step 3 Observer B — MiDaS depth scale constraint
+    // (Tracker.cpp applyDepthScaleConstraint). Added 2026-05-07 after
+    // sim 1778147132092 had no way to tell which of the seven bailout
+    // gates was firing — MiDaS feedback was logcat-only, and AI_HANDOFF
+    // had been carrying "MiDaS hasn't fired in any sim — investigate"
+    // since the prior session.
+    //   midas_entries                       every applyDepthScaleConstraint() entry
+    //   midas_bailout_no_depth              depth_map_ empty (DepthEstimator silent)
+    //   midas_bailout_few_pts3d             pts3d.size() < 15 (need 15 triangulated)
+    //   midas_bailout_invalid_intrinsics    fx/fy ≤ 0 (calibration not loaded)
+    //   midas_bailout_camera_h              camera_h ∉ [0.8, 2.2] m (user_height bad)
+    //   midas_bailout_low_g                 |accel| < 5 m/s² (no valid gravity)
+    //   midas_bailout_few_floor_matches     < 8 floor matches (image+geom combined)
+    //   midas_rejected_extreme              target_scale > 3× current (3x safety gate)
+    //   midas_fused                         scale_fuser_.update accepted the obs
+    //   midas_skipped                       scale_fuser_.update skipped the obs
+    std::atomic<long long> midas_entries{0};
+    std::atomic<long long> midas_bailout_no_depth{0};
+    std::atomic<long long> midas_bailout_few_pts3d{0};
+    std::atomic<long long> midas_bailout_invalid_intrinsics{0};
+    std::atomic<long long> midas_bailout_camera_h{0};
+    std::atomic<long long> midas_bailout_low_g{0};
+    std::atomic<long long> midas_bailout_few_floor_matches{0};
+    std::atomic<long long> midas_rejected_extreme{0};
+    std::atomic<long long> midas_fused{0};
+    std::atomic<long long> midas_skipped{0};
+
     // Reset every counter to 0. Called on simulator-recording start so
     // each sim begins with a clean slate. Cheap atomic stores; safe to
     // call concurrently with hot-path increments (we accept that a few
@@ -204,6 +241,16 @@ struct EventCounters {
         extrinsics_rotation_angle_mdeg.store(0, std::memory_order_relaxed);
         cam_imu_time_offset_us.store(0, std::memory_order_relaxed);
         rolling_shutter_skew_ns.store(0, std::memory_order_relaxed);
+        midas_entries.store(0, std::memory_order_relaxed);
+        midas_bailout_no_depth.store(0, std::memory_order_relaxed);
+        midas_bailout_few_pts3d.store(0, std::memory_order_relaxed);
+        midas_bailout_invalid_intrinsics.store(0, std::memory_order_relaxed);
+        midas_bailout_camera_h.store(0, std::memory_order_relaxed);
+        midas_bailout_low_g.store(0, std::memory_order_relaxed);
+        midas_bailout_few_floor_matches.store(0, std::memory_order_relaxed);
+        midas_rejected_extreme.store(0, std::memory_order_relaxed);
+        midas_fused.store(0, std::memory_order_relaxed);
+        midas_skipped.store(0, std::memory_order_relaxed);
     }
 
     // Monotonic max-update for ba_solve_us_max. Lock-free CAS loop.
@@ -262,9 +309,19 @@ struct EventCounters {
         const long long v_extrinsics_rotation_angle_mdeg = extrinsics_rotation_angle_mdeg.load(std::memory_order_relaxed);
         const long long v_cam_imu_time_offset_us  = cam_imu_time_offset_us.load(std::memory_order_relaxed);
         const long long v_rolling_shutter_skew_ns = rolling_shutter_skew_ns.load(std::memory_order_relaxed);
+        const long long v_midas_entries                    = midas_entries.load(std::memory_order_relaxed);
+        const long long v_midas_bailout_no_depth           = midas_bailout_no_depth.load(std::memory_order_relaxed);
+        const long long v_midas_bailout_few_pts3d          = midas_bailout_few_pts3d.load(std::memory_order_relaxed);
+        const long long v_midas_bailout_invalid_intrinsics = midas_bailout_invalid_intrinsics.load(std::memory_order_relaxed);
+        const long long v_midas_bailout_camera_h           = midas_bailout_camera_h.load(std::memory_order_relaxed);
+        const long long v_midas_bailout_low_g              = midas_bailout_low_g.load(std::memory_order_relaxed);
+        const long long v_midas_bailout_few_floor_matches  = midas_bailout_few_floor_matches.load(std::memory_order_relaxed);
+        const long long v_midas_rejected_extreme           = midas_rejected_extreme.load(std::memory_order_relaxed);
+        const long long v_midas_fused                      = midas_fused.load(std::memory_order_relaxed);
+        const long long v_midas_skipped                    = midas_skipped.load(std::memory_order_relaxed);
 
         std::string out;
-        out.reserve(900);
+        out.reserve(1100);
         out += '{';
         appendKv(out, "reloc_orb_accepts",            v_reloc_orb_accepts);            out += ',';
         appendKv(out, "reloc_orb_rejects",            v_reloc_orb_rejects);            out += ',';
@@ -302,7 +359,17 @@ struct EventCounters {
         appendKv(out, "total_path_dm",                  v_total_path_dm);                  out += ',';
         appendKv(out, "extrinsics_rotation_angle_mdeg", v_extrinsics_rotation_angle_mdeg); out += ',';
         appendKv(out, "cam_imu_time_offset_us",         v_cam_imu_time_offset_us);         out += ',';
-        appendKv(out, "rolling_shutter_skew_ns",        v_rolling_shutter_skew_ns);
+        appendKv(out, "rolling_shutter_skew_ns",        v_rolling_shutter_skew_ns);        out += ',';
+        appendKv(out, "midas_entries",                  v_midas_entries);                  out += ',';
+        appendKv(out, "midas_bailout_no_depth",         v_midas_bailout_no_depth);         out += ',';
+        appendKv(out, "midas_bailout_few_pts3d",        v_midas_bailout_few_pts3d);        out += ',';
+        appendKv(out, "midas_bailout_invalid_intrinsics", v_midas_bailout_invalid_intrinsics); out += ',';
+        appendKv(out, "midas_bailout_camera_h",         v_midas_bailout_camera_h);         out += ',';
+        appendKv(out, "midas_bailout_low_g",            v_midas_bailout_low_g);            out += ',';
+        appendKv(out, "midas_bailout_few_floor_matches", v_midas_bailout_few_floor_matches); out += ',';
+        appendKv(out, "midas_rejected_extreme",         v_midas_rejected_extreme);         out += ',';
+        appendKv(out, "midas_fused",                    v_midas_fused);                    out += ',';
+        appendKv(out, "midas_skipped",                  v_midas_skipped);
         out += '}';
         return out;
     }

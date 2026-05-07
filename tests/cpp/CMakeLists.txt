@@ -130,6 +130,9 @@ add_executable(navsight_tests
     # navsight_core), no Tracker / EKFState / FeatureManager
     # dependency.
     test_loop_closure.cpp
+    # Yaw convention regression: pins the sign bug in getYaw / updateGravityAlignedYaw
+    # (R_GtoI_ world→body atan2 sign). Tests are EXPECTED TO FAIL before the fix.
+    test_ekf_yaw_convention.cpp
 )
 target_link_libraries(navsight_tests navsight_core GTest::gtest_main)
 

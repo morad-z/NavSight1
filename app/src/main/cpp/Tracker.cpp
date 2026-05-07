@@ -111,6 +111,9 @@ void Tracker::applyDepthScaleConstraint(
         int img_width, int img_height,
         const IMUPreintegrator& imu) {
 
+    auto& ec_md = navsight::eventCounters();
+    ec_md.midas_entries.fetch_add(1, std::memory_order_relaxed);
+
     LOGI("DEPTH_SCALE: entry pts3d=%zu pts2d=%zu", pts3d.size(), pts2d.size());
 
     std::vector<float> depth_copy;
@@ -118,6 +121,7 @@ void Tracker::applyDepthScaleConstraint(
     {
         std::lock_guard<std::mutex> lock(depth_mutex_);
         if (depth_map_.empty()) {
+            ec_md.midas_bailout_no_depth.fetch_add(1, std::memory_order_relaxed);
             LOGI("DEPTH_SCALE: BAILOUT no depth map");
             return;
         }
@@ -127,10 +131,12 @@ void Tracker::applyDepthScaleConstraint(
     }
 
     if (pts3d.size() < 15 || pts2d.size() != pts3d.size()) {
+        ec_md.midas_bailout_few_pts3d.fetch_add(1, std::memory_order_relaxed);
         LOGI("DEPTH_SCALE: BAILOUT too few pts3d=%zu pts2d=%zu (need 15)", pts3d.size(), pts2d.size());
         return;
     }
     if (fx_ <= 0 || fy_ <= 0) {
+        ec_md.midas_bailout_invalid_intrinsics.fetch_add(1, std::memory_order_relaxed);
         LOGI("DEPTH_SCALE: BAILOUT invalid intrinsics fx=%.1f fy=%.1f", fx_, fy_);
         return;
     }
@@ -139,6 +145,7 @@ void Tracker::applyDepthScaleConstraint(
     float user_h = imu.getUserHeight();
     double camera_h = static_cast<double>(user_h) * 0.85;
     if (camera_h < 0.8 || camera_h > 2.2) {
+        ec_md.midas_bailout_camera_h.fetch_add(1, std::memory_order_relaxed);
         LOGI("DEPTH_SCALE: BAILOUT camera_h=%.2f out of range [0.8, 2.2]", camera_h);
         return;
     }
@@ -147,6 +154,7 @@ void Tracker::applyDepthScaleConstraint(
     float ax = imu.lastAccelX(), ay = imu.lastAccelY(), az = imu.lastAccelZ();
     double g_mag = std::sqrt(ax*ax + ay*ay + az*az);
     if (g_mag < 5.0) {
+        ec_md.midas_bailout_low_g.fetch_add(1, std::memory_order_relaxed);
         LOGI("DEPTH_SCALE: BAILOUT g_mag=%.2f too low (no valid gravity)", g_mag);
         return;
     }
@@ -231,6 +239,7 @@ void Tracker::applyDepthScaleConstraint(
     }
 
     if (scale_ratios.size() < 8) {
+        ec_md.midas_bailout_few_floor_matches.fetch_add(1, std::memory_order_relaxed);
         LOGI("DEPTH_SCALE: BAILOUT only %zu floor matches (need 8) [image=%d geom=%d]",
              scale_ratios.size(), floor_via_image, floor_via_geom);
         return;
@@ -268,6 +277,7 @@ void Tracker::applyDepthScaleConstraint(
 
     // Safety gate: only apply if correction is within 3x of current
     if (target_scale > 3.0 * current || target_scale < current / 3.0) {
+        ec_md.midas_rejected_extreme.fetch_add(1, std::memory_order_relaxed);
         LOGI("DEPTH_SCALE: REJECTED target=%.4f current=%.4f ratio=%.4f (too extreme)",
              target_scale, current, median_ratio);
         return;
@@ -279,6 +289,11 @@ void Tracker::applyDepthScaleConstraint(
     // alpha-blend so that PDR/MiDaS/VI all share one statistically-grounded
     // estimator instead of fighting via independent EMAs.
     bool accepted = scale_fuser_.update(target_scale, median_variance);
+    if (accepted) {
+        ec_md.midas_fused.fetch_add(1, std::memory_order_relaxed);
+    } else {
+        ec_md.midas_skipped.fetch_add(1, std::memory_order_relaxed);
+    }
     {
         std::lock_guard<std::mutex> slock(pose_mutex_);
         last_depth_scale_variance_ = median_variance;

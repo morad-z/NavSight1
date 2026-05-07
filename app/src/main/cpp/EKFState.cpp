@@ -1010,19 +1010,49 @@ bool EKFState::updateAbsolutePose(const cv::Mat& target_R_world_imu,
     }
     cv::Mat m_mat = r.t() * S_inv * r;
     const double m2 = m_mat.at<double>(0, 0);
+
+    // Per-block Mahalanobis diagnostic (added 2026-05-07).
+    // m2_R / m2_p are the 3-DOF marginal Mahalanobis distances over
+    // rotation-only and position-only blocks of S. Each has its own
+    // χ²(0.999, 3) ≈ 16.27 budget. They DON'T sum to m2 because S has
+    // off-diagonal cross terms, but they do reveal which block dominates
+    // a chi²-reject. Cheap (two 3×3 inverses).
+    //
+    // If m2_R alone ≥ 16.27 → rotation residual saturates the budget
+    // (heading-misalignment fingerprint). If m2_p ≥ 16.27 → position
+    // residual saturates (drift-too-far fingerprint). If both are
+    // moderate but m2 > 22.5 → cross-correlation between r_R and r_p
+    // is the culprit (rare; signals R_GtoI vs p_G inconsistency).
+    double m2_R_only = 0.0, m2_p_only = 0.0;
+    {
+        cv::Mat S_R = S(cv::Range(0, 3), cv::Range(0, 3));
+        cv::Mat S_p = S(cv::Range(3, 6), cv::Range(3, 6));
+        cv::Mat S_R_inv, S_p_inv;
+        if (cv::invert(S_R, S_R_inv, cv::DECOMP_CHOLESKY) ||
+            cv::invert(S_R, S_R_inv, cv::DECOMP_SVD)) {
+            cv::Mat m_R = r_R.t() * S_R_inv * r_R;
+            m2_R_only = m_R.at<double>(0, 0);
+        }
+        if (cv::invert(S_p, S_p_inv, cv::DECOMP_CHOLESKY) ||
+            cv::invert(S_p, S_p_inv, cv::DECOMP_SVD)) {
+            cv::Mat m_p = r_p.t() * S_p_inv * r_p;
+            m2_p_only = m_p.at<double>(0, 0);
+        }
+    }
+
     // Log residual + state for diagnosis BEFORE the chi² gate, so a
     // chi²-reject still leaves a trace we can use to figure out whether
     // the residual itself is wrong (frame mismatch, stale candidate
     // pose) or the predicted variance S is too tight.
     LOGI("LC_ABS: r_R=[%.3f %.3f %.3f] r_p=[%.3f %.3f %.3f] "
          "p_G=[%.3f %.3f %.3f] target_p=[%.3f %.3f %.3f] "
-         "var_R=%.4e var_p=%.4f m2=%.3f thresh=%.1f",
+         "var_R=%.4e var_p=%.4f m2=%.3f m2_R=%.3f m2_p=%.3f thresh=%.1f",
          r_R.at<double>(0, 0), r_R.at<double>(1, 0), r_R.at<double>(2, 0),
          r_p.at<double>(0, 0), r_p.at<double>(1, 0), r_p.at<double>(2, 0),
          p_G_.at<double>(0, 0), p_G_.at<double>(1, 0), p_G_.at<double>(2, 0),
          target_p_world.at<double>(0, 0), target_p_world.at<double>(1, 0),
          target_p_world.at<double>(2, 0),
-         sR, sp, m2, kChi2Threshold);
+         sR, sp, m2, m2_R_only, m2_p_only, kChi2Threshold);
 
     if (m2 > kChi2Threshold) {
         navsight::eventCounters().loop_closure_chi2_rejected.fetch_add(
@@ -1046,10 +1076,26 @@ bool EKFState::updateGravityAlignedYaw(double yaw_meas, double var,
     while (res_val >  M_PI) res_val -= 2.0 * M_PI;
     while (res_val < -M_PI) res_val += 2.0 * M_PI;
 
-    // H_yaw: world-Y axis expressed in body frame. For body-frame error
-    // δθ_body, the induced world-yaw change is (R_GtoI_ * e_y_world) · δθ.
+    // H_yaw derivation (NavSight 2026-05-07 sign-fix).
+    //
+    // R_GtoI_ is world→body (EKFState.cpp:860). Body-frame error δθ_body
+    // updates state via R_GtoI_new = Rodrigues(δθ) * R_GtoI_old (line 667
+    // left-multiply convention). The yaw extracted by getYaw (after the
+    // matching sign-fix at line ~1097) is +ψ for body yawed +ψ around world-Y.
+    //
+    // Numerical derivation for state yaw=0 (R_GtoI_=I), perturbation δθ=(0,ε,0):
+    //     R_GtoI_new = Ry(+ε); R_b2w_new = Ry(−ε); body-Z in world = (−sin ε, 0, cos ε)
+    //     yaw_new = atan2(−sin ε, cos ε) ≈ −ε
+    //   ⇒ ∂yaw / ∂δθ_y = −1   ⇒   H_yaw row = e_y_body.transpose() · (−1)
+    //
+    // The body-frame coords of the world-Y axis are R_GtoI_ * e_y_world
+    // (transforming a world vector to body frame). The gradient is the
+    // NEGATIVE of that — fail to negate and the Kalman gain pushes the
+    // filter in the wrong direction (pre-fix bug: filter accumulated 75°
+    // heading drift over 8 min on sim 1778147132092 because every visual
+    // yaw correction pushed away from truth).
     cv::Mat e_y_world = (cv::Mat_<double>(3, 1) << 0.0, 1.0, 0.0);
-    cv::Mat h_body = R_GtoI_ * e_y_world;  // 3x1
+    cv::Mat h_body = -R_GtoI_ * e_y_world;  // 3x1
 
     cv::Mat H = cv::Mat::zeros(1, dim, CV_64F);
     H.at<double>(0, 0) = h_body.at<double>(0);
@@ -1091,10 +1137,15 @@ double EKFState::getYaw(double roll, double pitch) const {
     cv::Mat R_align = Ry * Rx;  // R_phone_to_world
     cv::Mat R_aligned = R_align * R_GtoI_ * R_align.t();
     // Y-up navigation convention (matches IMUPreintegrator::getHeading):
-    // yaw is rotation around world-Y axis, North=0, East=+π/2. Extracted
-    // from the X-Z components of the aligned rotation:
-    //   R_yaw = | cos y, 0, sin y; 0, 1, 0; -sin y, 0, cos y |
-    return std::atan2(R_aligned.at<double>(0, 2),
+    // yaw is rotation around world-Y axis, North=0, East=+π/2.
+    //
+    // Sign fix (2026-05-07, sim 1778147132092 root cause):
+    // R_GtoI_ is world→body. For body yawed +ψ, R_GtoI_ = Ry(−ψ), so
+    // R_aligned[0,2] = −sin ψ and R_aligned[0,0] = cos ψ. The naïve
+    // atan2(R_aligned[0,2], R_aligned[0,0]) returns −ψ (sign-flipped).
+    // Negate the [0,2] component to recover +ψ, the physical Y-up yaw
+    // matching imu.getHeading() and the yaw_meas built in Tracker.cpp.
+    return std::atan2(-R_aligned.at<double>(0, 2),
                       R_aligned.at<double>(0, 0));
 }
 
@@ -1194,11 +1245,24 @@ void EKFState::setExtrinsicsRotation(const cv::Matx33d& R_bc) {
 }
 
 double EKFState::getExtrinsicsAngleDeg() const {
-    // Angle from identity: ||Rodrigues(R_bc)||_2 converted to degrees.
+    // Angle of drift from the *initial* nominal extrinsic R_bc_initial,
+    // not from identity. R_bc_initial = diag(1, -1, -1) (rear camera,
+    // vertical phone — see reset() for derivation) has angle 180° from
+    // identity, so a "from-identity" metric reports a constant 180°
+    // regardless of any actual drift, masking real Step 8b extrinsic
+    // calibration changes (bug spotted in sim 1778147132092).
+    //
+    // The deviation is ||Rodrigues(R_bc_ * R_bc_initial^T)||₂. Since
+    // R_bc_initial = diag(1,-1,-1) is symmetric and self-inverse,
+    // R_bc_initial^T = R_bc_initial, so the product is R_bc_ * R_bc_initial.
+    cv::Matx33d R_bc_initial(1.0,  0.0,  0.0,
+                              0.0, -1.0,  0.0,
+                              0.0,  0.0, -1.0);
+    cv::Matx33d R_drift = R_bc_ * R_bc_initial;
     cv::Mat R_mat(3, 3, CV_64F);
     for (int r = 0; r < 3; r++)
         for (int c = 0; c < 3; c++)
-            R_mat.at<double>(r, c) = R_bc_(r, c);
+            R_mat.at<double>(r, c) = R_drift(r, c);
     cv::Mat rvec;
     cv::Rodrigues(R_mat, rvec);
     const double angle_rad = cv::norm(rvec);
