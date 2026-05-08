@@ -152,6 +152,15 @@ bool VioEngine::loadLoopClosureVocabulary(const std::string& vocab_path) {
 
 void VioEngine::setInitialHeading(double azimuth_rad) {
     tracker_.setInitialHeading(azimuth_rad);
+    // Also seed Madgwick's internal quaternion. Without this, Madgwick
+    // initializes at yaw=0 (North) regardless of the device's actual
+    // compass heading, and the moment Tracker starts refreshing
+    // scalar_heading_ from imu.getHeading() (Tracker.cpp:1422), the
+    // displayed heading flips from azimuth to 0 — a 180° (or any-magnitude)
+    // jump depending on how far from North the device was facing. Bug
+    // surfaced 2026-05-09 on sim 1778258249750 ("at first heading is
+    // correct then it instantly rotates 180 degrees").
+    imu_.setInitialMadgwickYaw(static_cast<float>(azimuth_rad));
 }
 
 void VioEngine::setMagnetometerHeading(float yaw_rad) {
@@ -257,9 +266,14 @@ bool VioEngine::getPose(double& x, double& y, double& z, double& yaw_rad) const 
     if (ekf == nullptr || !ekf->isFullInitialized()) return false;
     cv::Mat p = ekf->getPosition();
     if (p.empty() || p.rows < 3 || p.type() != CV_64F) return false;
-    x = p.at<double>(0, 0);
-    y = p.at<double>(1, 0);
-    z = p.at<double>(2, 0);
+    // Coordinate-frame boundary swap (Z-up internal -> Y-up exposed).
+    // EKF stores p_G_ in Z-up ENU world (X=East, Y=North, Z=Up). Callers
+    // (replay_harness CSV, JNI VioData) historically expect Y-up
+    // (X=East, Y=Up, Z=North). Swap indices 1 and 2 here. See
+    // scripts/test_z_up_conventions.py.
+    x = p.at<double>(0, 0);  // East — same in both
+    y = p.at<double>(2, 0);  // Up — Z-up index 2 -> exposed as Y
+    z = p.at<double>(1, 0);  // North — Z-up index 1 -> exposed as Z
     // Use the cached scalar_heading_ that the runtime pipeline publishes —
     // it is the gravity-aligned EKF yaw refreshed each frame by processFrame.
     yaw_rad = tracker_.getHeading();

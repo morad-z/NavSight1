@@ -133,8 +133,11 @@ void EKFState::propagateIMU(const cv::Mat& deltaR, const cv::Mat& deltaV,
         msckf_damping_step_ = 0;  // cold start on the next MSCKF call
     }
 
-    // Propagate mean state (gravity in global frame: [0, -9.81, 0] for Y-up)
-    cv::Mat g = (cv::Mat_<double>(3,1) << 0.0, -9.81, 0.0);
+    // Propagate mean state. World frame is ENU Z-up (X=East, Y=North, Z=Up),
+    // matching the Madgwick filter (IMUPreintegrator.cpp:677,774) and
+    // Android sensor body frame (body Z is gravity-aligned when phone is
+    // held screen-up). Gravity vector therefore points along world -Z.
+    cv::Mat g = (cv::Mat_<double>(3,1) << 0.0, 0.0, -9.81);
     cv::Mat R_new = R_GtoI_ * deltaR;
     cv::Mat v_new = v_G_ + g * dt + R_GtoI_.t() * deltaV;
     cv::Mat p_new = p_G_ + v_G_ * dt + 0.5 * g * dt * dt + R_GtoI_.t() * deltaP;
@@ -679,34 +682,26 @@ void EKFState::applyMSCKFUpdate(const cv::Mat& H, const cv::Mat& res,
         t_offset_cam_imu_ = std::max(-0.1, std::min(0.1, t_offset_cam_imu_));
 
         // Step 8b: apply body→camera rotation correction (rows 16-18 = δφ_bc).
-        // Lie-algebra update: R_bc = R_bc_hat * Exp(δφ_bc).
-        // cv::Rodrigues maps the 3-vector axis-angle δφ_bc to a rotation
-        // matrix dR; right-multiplying R_bc_ keeps the convention
-        //     R_bc_new = R_bc_old * dR
-        // consistent with the Jacobian derivation in applyMSCKFFeature.
-        // Clamp the correction magnitude to 30° (0.524 rad) per call — a
-        // larger single-step correction indicates a bad measurement or
-        // numerical issue and would corrupt R_bc_ irrecoverably.
-        if (dx.rows >= EXTR_STATE_OFFSET + EXTR_STATE_DIM) {
-            cv::Mat dphi_bc = dx(cv::Range(EXTR_STATE_OFFSET,
-                                           EXTR_STATE_OFFSET + EXTR_STATE_DIM),
-                                 cv::Range::all());
-            const double phi_norm = cv::norm(dphi_bc);
-            constexpr double MAX_EXTR_STEP_RAD = 0.524;  // 30 deg clamp
-            if (phi_norm > 1e-12 && phi_norm < MAX_EXTR_STEP_RAD) {
-                cv::Mat dR_bc;
-                cv::Rodrigues(dphi_bc, dR_bc);
-                // Convert R_bc_ (Matx33d) to cv::Mat, apply, convert back.
-                cv::Mat R_bc_mat(3, 3, CV_64F);
-                for (int r = 0; r < 3; r++)
-                    for (int c = 0; c < 3; c++)
-                        R_bc_mat.at<double>(r, c) = R_bc_(r, c);
-                R_bc_mat = R_bc_mat * dR_bc;
-                for (int r = 0; r < 3; r++)
-                    for (int c = 0; c < 3; c++)
-                        R_bc_(r, c) = R_bc_mat.at<double>(r, c);
-            }
-        }
+        //
+        // Lie-algebra update: R_bc = Exp(δφ_bc) * R_bc_hat   (LEFT-multiply).
+        //
+        // This matches the H_bc Jacobian derivation at applyMSCKFFeature
+        // line 1973: H_bc = dproj_dpC * (-[p_C_F]_×).
+        // Pre-2026-05-09 the update was right-multiply (`R_bc * dR_bc`) while
+        // the Jacobian was the left-mult formula. The mismatch caused the EKF
+        // to push δφ_bc in the wrong direction every measurement update; on
+        // every walk Step 8b extrinsics drift hit 90° within ~30s as R_bc
+        // wandered. Bug source confirmed by Geneva et al. 2020 ICRA
+        // eq. (10) which is the LEFT-mult convention.
+        //
+        // Clamp the correction magnitude to 30° per call to guard against
+        // a single bad measurement irrecoverably corrupting R_bc_.
+        // Step 8b: R_bc update SKIPPED (NavSight 2026-05-09 Step 7 fix).
+        // Clones bake R_bc at storage time, and H_bc is disabled in both
+        // applyMSCKFFeature and slamReprojectionJacobian — so δφ_bc has no
+        // measurement coupling and Kalman gain on those rows is always zero.
+        // Defensive skip prevents process-noise drift from silently moving
+        // R_bc and desynchronising clone storage from live R_bc.
     }
 
     // Apply clone corrections
@@ -1076,26 +1071,36 @@ bool EKFState::updateGravityAlignedYaw(double yaw_meas, double var,
     while (res_val >  M_PI) res_val -= 2.0 * M_PI;
     while (res_val < -M_PI) res_val += 2.0 * M_PI;
 
-    // H_yaw derivation (NavSight 2026-05-07 sign-fix).
+    // H_yaw derivation (NavSight 2026-05-09 left-mult / world-frame δθ).
     //
-    // R_GtoI_ is world→body (EKFState.cpp:860). Body-frame error δθ_body
-    // updates state via R_GtoI_new = Rodrigues(δθ) * R_GtoI_old (line 667
-    // left-multiply convention). The yaw extracted by getYaw (after the
-    // matching sign-fix at line ~1097) is +ψ for body yawed +ψ around world-Y.
+    // World frame: ENU Z-up. yaw is rotation around world Z axis.
+    // R_GtoI_ is world→body. The post-update site at line 670 applies
+    //     R_GtoI_new = Rodrigues(δθ) * R_GtoI_old      (left-multiply)
+    // which means the EKF error state δθ is in WORLD frame (not body
+    // frame). Under this convention, the analytical derivative of yaw
+    // w.r.t. δθ is the same regardless of body orientation:
     //
-    // Numerical derivation for state yaw=0 (R_GtoI_=I), perturbation δθ=(0,ε,0):
-    //     R_GtoI_new = Ry(+ε); R_b2w_new = Ry(−ε); body-Z in world = (−sin ε, 0, cos ε)
-    //     yaw_new = atan2(−sin ε, cos ε) ≈ −ε
-    //   ⇒ ∂yaw / ∂δθ_y = −1   ⇒   H_yaw row = e_y_body.transpose() · (−1)
+    //   For any state R_old, R_new = exp(δθ_world) * R_old. Expanding:
+    //     R_new[i,0] = R_old[i,0] + (skew(δθ) * R_old)[i,0]
+    //   For δθ = (0,0,ε):
+    //     skew((0,0,ε)) * R_old[*,0] = (-ε·R_old[1,0], +ε·R_old[0,0], 0)
+    //     R_new[0,0] = R_old[0,0] - ε·R_old[1,0]
+    //     R_new[1,0] = R_old[1,0] + ε·R_old[0,0]
+    //     yaw_new = atan2(R_new[1,0], R_new[0,0]); ∂yaw/∂ε = +1.
+    //   Symmetric derivations give ∂yaw/∂δθ_x_world = 0 and ∂yaw/∂δθ_y_world = 0.
     //
-    // The body-frame coords of the world-Y axis are R_GtoI_ * e_y_world
-    // (transforming a world vector to body frame). The gradient is the
-    // NEGATIVE of that — fail to negate and the Kalman gain pushes the
-    // filter in the wrong direction (pre-fix bug: filter accumulated 75°
-    // heading drift over 8 min on sim 1778147132092 because every visual
-    // yaw correction pushed away from truth).
-    cv::Mat e_y_world = (cv::Mat_<double>(3, 1) << 0.0, 1.0, 0.0);
-    cv::Mat h_body = -R_GtoI_ * e_y_world;  // 3x1
+    // Therefore h_world = e_z_world = (0, 0, +1), CONSTANT, independent of R.
+    //
+    // Pre-2026-05-09 the formula was `±R_GtoI_ * e_z_world` (body-frame
+    // style). For pure-yaw states the formula coincides with e_z_world
+    // because Z-rotations don't move e_z, so the bug was invisible in flat
+    // poses. For typical walking poses (phone vertical, pitch ≈ −π/2),
+    // R_GtoI * e_z_world = body Y-axis ≠ e_z_world, and the EKF's yaw
+    // correction was distributed over the wrong body axes — driving Step
+    // 7 chi² to reject every loop closure (sim 1778262445638: 100/100
+    // chi² rejects, vyaw drifts away from Madgwick by 50° in 117 s).
+    cv::Mat h_world = (cv::Mat_<double>(3, 1) << 0.0, 0.0, 1.0);
+    cv::Mat& h_body = h_world;  // alias kept to minimise diff churn below
 
     cv::Mat H = cv::Mat::zeros(1, dim, CV_64F);
     H.at<double>(0, 0) = h_body.at<double>(0);
@@ -1109,43 +1114,62 @@ bool EKFState::updateGravityAlignedYaw(double yaw_meas, double var,
     return true;
 }
 
-bool EKFState::updatePDRStep(double dx_world, double dz_world, double var) {
+bool EKFState::updatePDRStep(double dx_world, double dy_world, double var) {
     if (!full_initialized_ || P_.empty()) return false;
     int dim = P_.rows;
 
-    // 2-DOF position constraint on world X and Z (Y handled by gravity).
-    // Treat as direct observation of δp_x and δp_z (state, not delta).
-    // We model the step as observing the absolute world position increment
-    // since the last step, but for simplicity here we apply it as a direct
-    // constraint on δp relative to current state — caller is responsible
-    // for accumulating step displacement into the desired anchor.
-    cv::Mat res = (cv::Mat_<double>(2, 1) << dx_world, dz_world);
+    // 2-DOF position constraint on world X (East) and Y (North); Z (Up)
+    // is gravity-aligned and handled by the IMU propagation. Treat as a
+    // direct observation of δp_x and δp_y (state, not delta). The caller
+    // accumulates step displacement into the desired anchor before this
+    // call. Z-up ENU world (post 2026-05-07 alignment).
+    cv::Mat res = (cv::Mat_<double>(2, 1) << dx_world, dy_world);
 
     cv::Mat H = cv::Mat::zeros(2, dim, CV_64F);
-    H.at<double>(0, 12) = 1.0;  // ∂(dx)/∂δp_x
-    H.at<double>(1, 14) = 1.0;  // ∂(dz)/∂δp_z
+    H.at<double>(0, 12) = 1.0;  // ∂(dx)/∂δp_x  — East
+    H.at<double>(1, 13) = 1.0;  // ∂(dy)/∂δp_y  — North
 
     cv::Mat R_noise = cv::Mat::eye(2, 2, CV_64F) * std::max(var, 1e-6);
     applyMSCKFUpdate(H, res, R_noise);
     return true;
 }
 
+void EKFState::setRotation(const cv::Mat& R_GtoI) {
+    if (R_GtoI.empty() || R_GtoI.rows != 3 || R_GtoI.cols != 3) return;
+    // Replace only R_GtoI_ in-place. Position, velocity, biases, td, R_bc,
+    // covariance and the clone window are deliberately left untouched —
+    // this call is a bootstrap correction for the rotation seed only,
+    // and the EKF has only been propagating for milliseconds when it
+    // fires (between ekf_.initializeFull and Kotlin's UI-thread dispatch
+    // of handleVioInitialized). The clone window typically holds 1
+    // identity-rotated clone at this point; subsequent clones stamp
+    // ekf_.getRotation() so they pick up the corrected R from here.
+    R_GtoI.convertTo(R_GtoI_, CV_64F);
+}
+
 double EKFState::getYaw(double roll, double pitch) const {
     cv::Mat Rx, Ry;
     cv::Rodrigues(cv::Vec3d(roll, 0.0, 0.0), Rx);
     cv::Rodrigues(cv::Vec3d(0.0, pitch, 0.0), Ry);
-    cv::Mat R_align = Ry * Rx;  // R_phone_to_world
+    cv::Mat R_align = Ry * Rx;  // tilt-removal sandwich (Madgwick ZYX)
     cv::Mat R_aligned = R_align * R_GtoI_ * R_align.t();
-    // Y-up navigation convention (matches IMUPreintegrator::getHeading):
-    // yaw is rotation around world-Y axis, North=0, East=+π/2.
+    // Z-up nav convention (matches IMUPreintegrator::getHeading and
+    // Tracker::setInitialHeading): yaw is rotation around world-Z axis,
+    // CW-positive nav heading (North=0, East=+π/2), range [-π, π].
     //
-    // Sign fix (2026-05-07, sim 1778147132092 root cause):
-    // R_GtoI_ is world→body. For body yawed +ψ, R_GtoI_ = Ry(−ψ), so
-    // R_aligned[0,2] = −sin ψ and R_aligned[0,0] = cos ψ. The naïve
-    // atan2(R_aligned[0,2], R_aligned[0,0]) returns −ψ (sign-flipped).
-    // Negate the [0,2] component to recover +ψ, the physical Y-up yaw
-    // matching imu.getHeading() and the yaw_meas built in Tracker.cpp.
-    return std::atan2(-R_aligned.at<double>(0, 2),
+    // World→body matrix R_GtoI_ for body at compass heading +ψ has the
+    // structure built by setInitialHeading at Tracker.cpp:322:
+    //     R_GtoI_ = [[cos ψ, -sin ψ, 0], [sin ψ, cos ψ, 0], [0, 0, 1]]
+    // So R_aligned[1,0] = sin ψ and R_aligned[0,0] = cos ψ, giving:
+    //     atan2(R_aligned[1,0], R_aligned[0,0]) = atan2(sin ψ, cos ψ) = ψ
+    //
+    // The pre-2026-05-07 (c1c15b2) form atan2(-R[0,2], R[0,0]) was Y-up:
+    // it extracted yaw around world-Y, which doesn't match the rest of the
+    // EKF's Z-up world (gravity along -Z, Madgwick filter Z-up). It also
+    // gave degenerate output for the Tracker-init Rz matrix (R[0,2]=0
+    // for any ψ), producing the ~180° heading offset observed on real
+    // walks. Verified via scripts/test_z_up_conventions.py.
+    return std::atan2(R_aligned.at<double>(1, 0),
                       R_aligned.at<double>(0, 0));
 }
 
@@ -1794,12 +1818,9 @@ bool EKFState::updateSlamFeature(int slot,
         // So H_bc == H_clone_theta = H_clone[:, 0:3].
         // This is consistent: the extrinsics error acts like a clone rotation
         // error on p_C_F (both perturb p_C by -[p_C_F]_× * δφ).
-        if (EXTR_STATE_OFFSET + EXTR_STATE_DIM <= dim) {
-            cv::Mat H_bc = H_clone(cv::Range::all(), cv::Range(0, 3)).clone();
-            H_bc.copyTo(H(cv::Range::all(),
-                          cv::Range(EXTR_STATE_OFFSET,
-                                    EXTR_STATE_OFFSET + EXTR_STATE_DIM)));
-        }
+        // Step 8b: SLAM H_bc DISABLED, same rationale as the MSCKF path
+        // (R_bc baked into clone storage at addClone time; no double-counting).
+        // (H is zero-initialized at line 1827; EXTR columns remain 0.)
 
         // Residual = obs - predicted (normalised image coords).
         cv::Mat r = (cv::Mat_<double>(2, 1) <<
@@ -1937,12 +1958,13 @@ bool EKFState::applyMSCKFFeature(const std::vector<cv::Point2f>& observations,
         //
         // Source: OpenVINS online extrinsic calibration (Geneva et al. 2020,
         // ICRA, eq. (10)): ∂z/∂φ_bc = (∂z/∂p_C) * (-[p_C]_×).
-        if (EXTR_STATE_OFFSET + EXTR_STATE_DIM <= dim) {
-            cv::Mat H_bc = dproj_dpC * (-skew(p_C_F));   // 2×3
-            H_bc.copyTo(H_x(cv::Range::all(),
-                            cv::Range(EXTR_STATE_OFFSET,
-                                      EXTR_STATE_OFFSET + EXTR_STATE_DIM)));
-        }
+        // Step 8b: H_bc DISABLED (NavSight 2026-05-09 Step 7 fix).
+        // R_bc is baked into clone storage at addClone time (Tracker.cpp:1622),
+        // so live R_bc no longer factors into projection — treating it as a
+        // free state would double-count it. R_bc stays at the physical
+        // fixed-mount value read from Android SENSOR_ORIENTATION; online
+        // estimation is unnecessary for a fixed-mount phone camera.
+        // (H_x is zero-initialized; the EXTR columns remain 0.)
 
         cv::Mat r = (cv::Mat_<double>(2, 1) <<
                      observations[k].x - pred_u,

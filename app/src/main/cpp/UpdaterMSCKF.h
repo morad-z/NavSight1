@@ -38,10 +38,20 @@ public:
         double chi2_multiplier;
         int min_obs;
         double max_reproj_px;
+        // Per-pixel measurement noise σ in NORMALIZED image coordinates
+        // (residuals in UpdaterMSCKF.cpp:107-108 use obs.pixel_ud.x − u_pred
+        // where pixel_ud is undistorted normalized, and u_pred = X/Z).
+        // For a phone camera with fy ≈ 800 px and target reprojection noise
+        // of ~1.5 px, σ_norm = 1.5 / 800 ≈ 0.002. Pre-2026-05-09 default
+        // was 1.0 (= 800 px equivalent), which made the chi² gate effectively
+        // never reject and made the EKF treat each feature as having ~800 px
+        // measurement noise — drastically underweighting visual updates and
+        // letting noisy features through. Bug surfaced when MSCKF Huber rate
+        // stayed at 1.0+/update on every walk.
         double pixel_noise;
 
         Options() : chi2_multiplier(1.5), min_obs(3),
-                    max_reproj_px(5.0), pixel_noise(1.0) {}
+                    max_reproj_px(5.0), pixel_noise(0.002) {}
     };
 
     UpdaterMSCKF(const Options& options = Options()) : options_(options) {}

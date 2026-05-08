@@ -32,22 +32,22 @@ TEST(EKFStateStep4, GetYaw_IdentityRotation_ReturnsZero) {
     EXPECT_NEAR(yaw, 0.0, 1e-9);
 }
 
-TEST(EKFStateStep4, GetYaw_RotateAboutWorldYBy90Deg_ReturnsHalfPi) {
+TEST(EKFStateStep4, GetYaw_RotateAboutWorldZBy90Deg_ReturnsHalfPi) {
     EKFState ekf;
-    // R rotates body around world-Y by +90°: in body frame, world-Y is
-    // still +Y, so this is a pure yaw rotation.
+    // Z-up world frame (post 2026-05-08 alignment): yaw is rotation around
+    // world Z. R_GtoI is world→body. For body at compass heading +π/2 (East),
+    // setInitialHeading builds:
+    //   R_GtoI = [[cos(π/2), -sin(π/2), 0], [sin(π/2), cos(π/2), 0], [0, 0, 1]]
+    //          = [[0, -1, 0], [1, 0, 0], [0, 0, 1]]
     cv::Mat R_yaw90 = (cv::Mat_<double>(3, 3) <<
-                      std::cos(M_PI/2),  0.0, std::sin(M_PI/2),
-                      0.0,                1.0, 0.0,
-                     -std::sin(M_PI/2),  0.0, std::cos(M_PI/2));
+                      std::cos(M_PI/2), -std::sin(M_PI/2), 0.0,
+                      std::sin(M_PI/2),  std::cos(M_PI/2), 0.0,
+                      0.0,                0.0,             1.0);
     ekf.initializeFull(R_yaw90, cv::Point3f(0, 0, 0), cv::Point3f(0, 0, 0));
     double yaw = ekf.getYaw(0.0, 0.0);
-    // atan2 of (R_aligned[1,0], R_aligned[0,0]) on this matrix gives 0
-    // because the (0,0)/(1,0) entries are (cos90, 0) → atan2(0, 0) is
-    // undefined-but-zero. Our R_GtoI_ stores body-from-global, so the
-    // physical "phone yawed +90°" maps to atan2(-sin, cos) = -π/2 here.
-    // Either ±π/2 is acceptable for this test; we just check magnitude.
-    EXPECT_NEAR(std::abs(yaw), M_PI/2, 1e-6);
+    // getYaw extracts atan2(R[1,0], R[0,0]) = atan2(sin(π/2), cos(π/2)) = π/2.
+    // This matches the input azimuth — the Z-up round-trip is consistent.
+    EXPECT_NEAR(yaw, M_PI/2, 1e-6);
 }
 
 // ── updateGravityAlignedYaw ────────────────────────────────────────────────
@@ -87,7 +87,9 @@ TEST(EKFStateStep4, UpdateRelativePose_PullsPositionTowardMeasurement) {
     int clone_id = ekf.getLatestCloneId();
     ASSERT_GE(clone_id, 0);
 
-    // VIO observes a 1-meter forward translation in world +Z.
+    // VIO observes a 1-meter translation along world +Z. Z-up world: this
+    // is a vertical (Up) translation. The test verifies Kalman pull
+    // direction; world axis interpretation doesn't affect the math.
     cv::Mat t_meas = (cv::Mat_<double>(3, 1) << 0.0, 0.0, 1.0);
     bool ok = ekf.updateRelativePose(t_meas, clone_id, 0.01);
     ASSERT_TRUE(ok);

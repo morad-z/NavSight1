@@ -375,11 +375,23 @@ Java_com_example_navsight1_NativeBridge_processCameraFrameDirect(
     {
         std::lock_guard<std::mutex> lock(state_mutex);
         if (output.valid && !output.R.empty() && !output.t.empty()) {
-            g_x = output.t.at<double>(0);
-            g_y = output.t.at<double>(1);
-            g_z = output.t.at<double>(2);
+            // Coordinate-frame boundary swap (Z-up internal -> Y-up exposed).
+            //
+            // The C++ pipeline runs in Z-up ENU world (X=East, Y=North, Z=Up)
+            // matching the Madgwick filter and Android sensor body frame.
+            // The Kotlin/UI/sim-format layer historically expects Y-up
+            // (X=East, Y=Up, Z=North). Swap output.t[1] (North) and
+            // output.t[2] (Up) here so legacy Kotlin code, sim recordings,
+            // and analyzer scripts continue to work without changes.
+            // See scripts/test_z_up_conventions.py and the 2026-05-07
+            // Z-up surgical fix.
+            g_x = output.t.at<double>(0);   // East — same in both frames
+            g_y = output.t.at<double>(2);   // Up   — Z-up index 2 -> exposed as Y
+            g_z = output.t.at<double>(1);   // North — Z-up index 1 -> exposed as Z
             g_scale = output.estimatedScale;
 
+            // rawT is in OpenCV camera frame (X=right, Y=down, Z=forward),
+            // not world frame, so no axis swap.
             g_raw_x = output.rawT.empty() ? 0.0 : output.rawT.at<double>(0);
             g_raw_y = output.rawT.empty() ? 0.0 : output.rawT.at<double>(1);
             g_raw_z = output.rawT.empty() ? 0.0 : output.rawT.at<double>(2);

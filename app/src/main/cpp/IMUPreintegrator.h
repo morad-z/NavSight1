@@ -154,6 +154,16 @@ public:
     bool  isOrientationInitialized() const { return madgwick_init_.load(); }
     void  resetOrientationFilter();
 
+    // Bootstrap-only: tell Madgwick what compass heading (CW-positive nav,
+    // North=0, East=+π/2) the device is at, so its quaternion doesn't init
+    // at yaw=0. Forces a re-init using the current accel for roll/pitch and
+    // this yaw. Without this call, getHeading() returns 0 until the user
+    // turns or visual yaw correction drags it. Bug discovered 2026-05-09:
+    // a 180° heading flip immediately after init was caused by Madgwick
+    // ignoring the magnetometer-derived setInitialHeading and starting at
+    // yaw=0.
+    void setInitialMadgwickYaw(float azimuth_rad_nav);
+
 private:
     mutable std::mutex mutex_;
     std::vector<GyroSample>  gyro_buf_;
@@ -246,6 +256,11 @@ private:
     double q0_{1.0}, q1_{0.0}, q2_{0.0}, q3_{0.0};
     int64_t madgwick_last_ns_{0};
     std::atomic<bool> madgwick_init_{false};
+    // Pending compass heading (CW-positive nav, radians) supplied by
+    // setInitialMadgwickYaw before tryInitMadgwickLocked fires. Defaults
+    // to 0 (= North) preserving prior behaviour when the bootstrap
+    // never calls setInitialMadgwickYaw.
+    float pending_madgwick_yaw_nav_{0.f};
     // Filter gain — tuned for ~200 Hz IMU. Higher β → faster accel
     // correction (more drift suppression) but more noise bleed-through.
     static constexpr float MADGWICK_BETA = 0.033f;

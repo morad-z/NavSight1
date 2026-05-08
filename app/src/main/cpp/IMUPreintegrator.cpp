@@ -697,15 +697,20 @@ void IMUPreintegrator::tryInitMadgwickLocked() {
     const float amag = std::sqrt(ax * ax + ay * ay + az * az);
     if (amag < 1e-3f) return;
 
-    // Tait-Bryan roll/pitch from gravity in body frame, yaw=0.
-    // World frame: gravity points along +Z_world (down? — here we define
-    // gravity along +Z_world at +9.81, which matches the existing
-    // filtered_gravity_ convention where a phone held flat reads +Z≈9.81).
+    // Tait-Bryan roll/pitch from gravity in body frame.
+    // World frame: gravity points along +Z_world at +9.81, which matches
+    // the existing filtered_gravity_ convention (phone held flat reads
+    // body +Z ≈ 9.81). Z-up world.
     const double roll  = std::atan2(ay, az);
     const double pitch = std::atan2(-static_cast<double>(ax),
                                     std::sqrt(static_cast<double>(ay) * ay +
                                               static_cast<double>(az) * az));
-    const double yaw   = 0.0;
+    // Yaw seed: convert the pending compass heading (CW-positive nav)
+    // into Madgwick's internal math-CCW convention. Madgwick's getHeading
+    // does yaw_nav = -yaw_math, so to get getHeading() = azimuth_nav we
+    // need yaw_math = -azimuth_nav. If no setInitialMadgwickYaw call was
+    // made (pending_madgwick_yaw_nav_ default = 0) yaw stays 0 = North.
+    const double yaw   = -static_cast<double>(pending_madgwick_yaw_nav_);
 
     // ZYX Euler (yaw-pitch-roll) → quaternion (Hamilton).
     const double cr = std::cos(roll * 0.5);
@@ -719,8 +724,27 @@ void IMUPreintegrator::tryInitMadgwickLocked() {
     q2_ = cr * sp * cy + sr * cp * sy;
     q3_ = cr * cp * sy - sr * sp * cy;
     madgwick_init_.store(true);
-    LOGI("Madgwick: initialized roll=%.1f pitch=%.1f yaw=0 (q=[%.3f %.3f %.3f %.3f])",
-         roll * 180.0 / M_PI, pitch * 180.0 / M_PI, q0_, q1_, q2_, q3_);
+    LOGI("Madgwick: initialized roll=%.1f° pitch=%.1f° yaw_nav=%.1f° "
+         "(q=[%.3f %.3f %.3f %.3f])",
+         roll * 180.0 / M_PI, pitch * 180.0 / M_PI,
+         pending_madgwick_yaw_nav_ * 180.0 / M_PI,
+         q0_, q1_, q2_, q3_);
+}
+
+void IMUPreintegrator::setInitialMadgwickYaw(float azimuth_rad_nav) {
+    std::lock_guard<std::mutex> lock(mutex_);
+    pending_madgwick_yaw_nav_ = azimuth_rad_nav;
+    // Force re-initialization so the stored yaw seed is used. tryInitMadgwickLocked
+    // will fire as soon as filtered_gravity_ has settled (which it has well
+    // before setInitialHeading is called from Kotlin, since VIO init is
+    // gated on InertialInitializer being READY which already required the
+    // accel window to settle). Calling tryInitMadgwickLocked here makes
+    // the new yaw take effect immediately if accel is ready.
+    madgwick_init_.store(false);
+    tryInitMadgwickLocked();
+    LOGI("setInitialMadgwickYaw: azimuth_nav=%.1f° (Madgwick %s)",
+         azimuth_rad_nav * 180.0 / M_PI,
+         madgwick_init_.load() ? "re-initialized" : "pending accel");
 }
 
 void IMUPreintegrator::updateMadgwickLocked(int64_t timestamp_ns,

@@ -211,7 +211,17 @@ void Tracker::applyDepthScaleConstraint(
         if (is_floor_by_image) floor_via_image++;
         else                   floor_via_geom++;
 
-        if (pts3d[i].z < 0.3 || pts3d[i].z > 12.0) continue;
+        // Depth bounds are in METERS — but pts3d[i] comes out of
+        // cv::triangulatePoints in VIO baseline-units (line 1118 builds the
+        // P matrix with the unit-norm t_vo from cv::recoverPose, so triangulated
+        // depth is "1 baseline = 1 unit"). Convert to metric using the current
+        // scale snapshot before bounds-checking. Pre-2026-05-09 the bounds were
+        // applied in VIO units which rejected nearly every feature at typical
+        // 1-10 m metric range — MiDaS bailed out with "few_floor" 100 % of the
+        // time. Bug surfaced when MiDaS was instrumented (sims 1778147132092
+        // onward all show midas_fused=0 with 30-50 entries per ~120 s walk).
+        const double pts3d_z_metric = static_cast<double>(pts3d[i].z) * current_scale_snapshot;
+        if (pts3d_z_metric < 0.3 || pts3d_z_metric > 12.0) continue;
 
         // Map 2D point to depth map coordinates
         int dx = static_cast<int>((pts2d[i].x / fw) * dw);
@@ -311,20 +321,39 @@ void Tracker::applyDepthScaleConstraint(
 
 void Tracker::setInitialHeading(double azimuth_rad) {
     std::lock_guard<std::mutex> lock(pose_mutex_);
-    // Step 4: bootstrap-only. After EKF is full-init the EKF owns yaw and
-    // any external mag write would clobber the filter's belief.
+    // Build world→body Z-up matrix for compass-CW azimuth (matches the
+    // convention pinned by scripts/test_z_up_conventions.py).
+    double c = std::cos(azimuth_rad), s = std::sin(azimuth_rad);
+    cv::Mat new_R = (cv::Mat_<double>(3, 3) << c,-s,0, s,c,0, 0,0,1);
+
     if (ekf_.isFullInitialized()) {
-        LOGI("setInitialHeading: ignored (EKF already full-init, az=%.1f deg)",
+        // Post-init bootstrap correction. Kotlin's handleVioInitialized
+        // typically fires AFTER ekf_.initializeFull (the UI-thread dispatch
+        // of `vio.isInitialized` lands one or two frames after the C++
+        // pipeline initializes the EKF with R_GtoI=Identity). Previously
+        // this was a no-op, leaving the EKF's R_GtoI at Identity for the
+        // entire session — loop closure chi² then rejected every PnP
+        // correction as a 180° teleportation, and Step 7 acceptance was
+        // permanently blocked. Apply the heading correction directly to
+        // R_GtoI_ instead. Bug surfaced 2026-05-09 on sim 1778260615221
+        // where vyaw (g_yaw of R_GtoI) stayed near 0 while Madgwick hdg
+        // correctly tracked the user's compass heading.
+        ekf_.setRotation(new_R);
+        global_R_ = new_R;
+        scalar_heading_ = azimuth_rad;
+        LOGI("setInitialHeading: post-init R_GtoI corrected, az=%.1f deg",
              azimuth_rad * 180.0 / M_PI);
         return;
     }
-    double c = std::cos(azimuth_rad), s = std::sin(azimuth_rad);
-    global_R_ = (cv::Mat_<double>(3, 3) << c,-s,0, s,c,0, 0,0,1);
+
+    // Pre-init path: stash the heading and let processFrame's bootstrap
+    // block initialize the EKF with it.
+    global_R_ = new_R;
     pending_init_heading_ = azimuth_rad;
     pending_init_heading_set_ = true;
     scalar_heading_ = azimuth_rad;
     ekf_.initialize(scale_fuser_.scale());
-    LOGI("setInitialHeading: azimuth=%.1f deg (EKF scale initialized)",
+    LOGI("setInitialHeading: pre-init az=%.1f deg (EKF scale initialized)",
          azimuth_rad * 180.0 / M_PI);
 }
 
@@ -532,10 +561,14 @@ bool Tracker::getPositionCovarianceXZ(double out[3]) const {
         return false;
     }
     // EKFState 15-DOF error state layout: [δθ(3), δb_g(3), δv(3), δb_a(3), δp(3)].
-    // Position block is at indices 12..14. Horizontal-plane (x, z) sub-block.
-    out[0] = P.at<double>(12, 12);  // σ_xx (m²)
-    out[1] = P.at<double>(12, 14);  // σ_xz (m²)
-    out[2] = P.at<double>(14, 14);  // σ_zz (m²)
+    // Position block is at indices 12..14. Z-up ENU world: horizontal plane
+    // is X-Y (Z is vertical). Sub-block is (12,12), (12,13), (13,13).
+    // Note: the function name retains the "XZ" suffix for ABI/JNI stability;
+    // the indices below correctly reflect the X-Y horizontal plane post-Z-up
+    // alignment (2026-05-07, see scripts/test_z_up_conventions.py).
+    out[0] = P.at<double>(12, 12);  // σ_xx (m²)  — East variance
+    out[1] = P.at<double>(12, 13);  // σ_xy (m²)  — East/North covariance
+    out[2] = P.at<double>(13, 13);  // σ_yy (m²)  — North variance
     return true;
 }
 
@@ -1460,19 +1493,37 @@ VisionOutput Tracker::processFrame(const uint8_t* yuv_data, int width, int heigh
                 disp = max_disp;
             }
 
+            // Accumulate path length. Pre-2026-05-09 this counter only
+            // incremented in the PDR fallback branch (line ~1575), missing
+            // every visual-VO frame. The result was that
+            // event_summary.total_path_dm reported only ~1/3 of the actual
+            // walked distance (e.g. 41.8 m for a 122 m walk). Step 7's
+            // dynamic translation sigma uses total_path_m_ to grow the
+            // chi² gate as drift accumulates, so under-counting tightened
+            // the gate prematurely and contributed to chi² rejections.
+            total_path_m_ += disp;
+            navsight::eventCounters().total_path_dm.store(
+                static_cast<long long>(total_path_m_ * 10.0 + 0.5),
+                std::memory_order_relaxed);
+
+            // Z-up ENU world frame: X=East, Y=North, Z=Up.
+            // heading is CW-positive nav (North=0, East=+π/2). Project
+            // horizontal step (disp, in metres) onto world (X, Y) axes:
+            //   X (East)  = disp · sin(heading)
+            //   Y (North) = disp · cos(heading)
             double dx_world = disp * std::sin(heading);   // +X = East
-            double dz_world = disp * std::cos(heading);   // +Z = North
-            // dy_world: vertical component. t_vo is in OpenCV camera frame
-            // (Y points DOWN). World Y is UP. Negate the Y component to
-            // bring it into world frame. For flat-ground walking dy ≈ 0;
-            // this matters on stairs / slopes / scooter-on-curb.
-            double dy_world = 0.0;
+            double dy_world = disp * std::cos(heading);   // +Y = North
+            // dz_world: vertical component. t_vo is in OpenCV camera frame
+            // (camera Y points DOWN). World Z is UP. Negate camera-Y to
+            // recover world-Z. For flat-ground walking dz ≈ 0; this matters
+            // on stairs / slopes / scooter-on-curb.
+            double dz_world = 0.0;
             if (!t_vo.empty())
-                dy_world = -appliedScale * t_vo.at<double>(1);
+                dz_world = -appliedScale * t_vo.at<double>(1);
 
             // Tracker-owned position output (see comment at the top of
             // section 9 for why). Also fed to EKF below as a measurement
-            // so EKF state i stays consistent with what the UI displays.
+            // so EKF state stays consistent with what the UI displays.
             global_t_.at<double>(0) += dx_world;
             global_t_.at<double>(1) += dy_world;
             global_t_.at<double>(2) += dz_world;
@@ -1538,15 +1589,16 @@ VisionOutput Tracker::processFrame(const uint8_t* yuv_data, int width, int heigh
                 navsight::eventCounters().total_path_dm.store(
                     static_cast<long long>(total_path_m_ * 10.0 + 0.5),
                     std::memory_order_relaxed);
+                // Z-up ENU world: project step displacement onto X (East), Y (North).
                 double dx_step = d * std::sin(heading);   // +X = East
-                double dz_step = d * std::cos(heading);   // +Z = North
+                double dy_step = d * std::cos(heading);   // +Y = North
 
                 // Tracker-owned position output (visual-degenerate fallback).
                 // Same rationale as the visual path above: EKF position is
                 // unreliable as a display source; Tracker integrates here
                 // and feeds the EKF as a measurement for state consistency.
                 global_t_.at<double>(0) += dx_step;
-                global_t_.at<double>(2) += dz_step;
+                global_t_.at<double>(1) += dy_step;
 
                 // Step 4 Phase C: mirror PDR fallback step into EKFState
                 // with refined per-step variance.
@@ -1555,18 +1607,34 @@ VisionOutput Tracker::processFrame(const uint8_t* yuv_data, int width, int heigh
                 //   dt at 1 Hz  ⇒ d ~30-70cm,    σ ~8-12cm, var ~1-2e-2
                 if (ekf_.isFullInitialized()) {
                     double sigma_step = 0.05 + 0.10 * d;
-                    ekf_.updatePDRStep(dx_step, dz_step, sigma_step * sigma_step);
+                    ekf_.updatePDRStep(dx_step, dy_step, sigma_step * sigma_step);
                 }
             }
         }
 
         // ── 9.1 FEJ & MSCKF: Store Camera Clone ──
-        // Step 4 Phase C: clone the EKF's IMU-state pose, not Tracker's
-        // independently-mutated globals — keeps the sliding window
-        // consistent with the propagated/updated EKF state that subsequent
-        // updateRelativePose calls reference.
-        cv::Mat clone_R = ekf_.isFullInitialized() ? ekf_.getRotation() : global_R_;
-        cv::Mat clone_p = ekf_.isFullInitialized() ? ekf_.getPosition() : global_t_;
+        // Clone the EKF's IMU-state pose, composing R_bc * R_GtoI so that
+        // clones store true world→camera (matching the field name R_GtoC).
+        //
+        // Convention bridge (NavSight 2026-05-09 Step 7 fix): every reader of
+        // clone.R_GtoC — MSCKF projection at EKFState.cpp:1642, SLAM-feature
+        // anchor inverse-depth at EKFState.cpp:1390/1640, loop-closure target
+        // at Tracker.cpp:3549 — uses the formula `p_C = clone_R · (p_world - p_clone)`,
+        // which only produces a camera-frame point if clone_R is world→camera.
+        // Pre-fix the caller passed R_GtoI (world→body), and the EKF's R_bc
+        // estimator drifted to absorb the missing factor (Step 8b drift to
+        // ~90° within 30s on every walk). Composing R_bc here pre-bakes the
+        // extrinsic, so live R_bc no longer factors in projection — H_bc
+        // is disabled and R_bc stays at its physical fixed-mount value
+        // (read from Android SENSOR_ORIENTATION via SensorRepository.kt:285).
+        cv::Mat clone_R_GtoI = ekf_.isFullInitialized() ? ekf_.getRotation() : global_R_;
+        cv::Mat clone_p      = ekf_.isFullInitialized() ? ekf_.getPosition() : global_t_;
+        const cv::Matx33d R_bc_for_clone = ekf_.getExtrinsicsRotation();
+        cv::Mat R_bc_mat(3, 3, CV_64F);
+        for (int rr = 0; rr < 3; ++rr)
+            for (int cc = 0; cc < 3; ++cc)
+                R_bc_mat.at<double>(rr, cc) = R_bc_for_clone(rr, cc);
+        cv::Mat clone_R = R_bc_mat * clone_R_GtoI;  // world→camera
         ekf_.addClone(clone_R, clone_p, timestamp_ns);
         int clone_id = ekf_.getLatestCloneId();
 
@@ -2079,15 +2147,14 @@ VisionOutput Tracker::processFrame(const uint8_t* yuv_data, int width, int heigh
                             // roll/pitch, sandwich R_kf into the gravity-
                             // aligned frame, then extract yaw via atan2 of
                             // the (1,0)/(0,0) components.
+                            // Z-up world: yaw is rotation around world-Z axis.
+                            // visual_delta_heading is extracted as
+                            // atan2(R_aligned[1,0], R_aligned[0,0]) — see
+                            // EKFState::getYaw for the matching convention.
+                            // Both the legacy heading_offset_ blend (deprecated)
+                            // and the EKF updateGravityAlignedYaw call below
+                            // consume this single Z-up delta.
                             double visual_delta_heading = 0.0;
-                            // Step 4 Phase B: also extract Y-up navigation yaw delta
-                            // (atan2(R[0,2], R[0,0])) so it can be fed to
-                            // EKFState::updateGravityAlignedYaw, which uses the same
-                            // convention as imu.getHeading() and EKFState::getYaw().
-                            // The Z-up `visual_delta_heading` above is preserved for
-                            // the legacy heading_offset_ blend so its empirical
-                            // behaviour is unchanged during Phase B.
-                            double visual_delta_heading_y_up = 0.0;
                             double current_roll  = 0.0;
                             double current_pitch = 0.0;
                             bool aligned_ok = false;
@@ -2102,8 +2169,8 @@ VisionOutput Tracker::processFrame(const uint8_t* yuv_data, int width, int heigh
                                 // similarity transform below, this lifts R_kf
                                 // (which recoverPose returns in the OpenCV camera
                                 // frame: X-right, Y-down, Z-forward) into the
-                                // gravity-aligned world frame where Y-up yaw is
-                                // pure rotation about world Y.
+                                // gravity-aligned world frame where the Z-up nav
+                                // yaw is pure rotation about world Z.
                                 cv::Rodrigues(cv::Vec3d(roll, 0.0, 0.0), Rx);
                                 cv::Rodrigues(cv::Vec3d(0.0, pitch, 0.0), Ry);
                                 cv::Mat R_align = Ry * Rx;
@@ -2138,11 +2205,13 @@ VisionOutput Tracker::processFrame(const uint8_t* yuv_data, int width, int heigh
                                 cv::Mat R_kf_body = R_bc_cv2.t() * R_kf * R_bc_cv2;
 
                                 cv::Mat R_aligned = R_align * R_kf_body * R_align.t();
+                                // Z-up extraction: yaw is rotation around world-Z.
+                                // For a pure-yaw R_aligned (which a gravity-aligned
+                                // sandwich produces), atan2(R[1,0], R[0,0]) returns
+                                // the CW-positive nav yaw delta directly. Matches
+                                // EKFState::getYaw and IMUPreintegrator::getHeading.
                                 visual_delta_heading = std::atan2(
                                     R_aligned.at<double>(1, 0),
-                                    R_aligned.at<double>(0, 0));
-                                visual_delta_heading_y_up = std::atan2(
-                                    R_aligned.at<double>(0, 2),
                                     R_aligned.at<double>(0, 0));
                                 aligned_ok = true;
                             } catch (const cv::Exception& e) {
@@ -2188,15 +2257,20 @@ VisionOutput Tracker::processFrame(const uint8_t* yuv_data, int width, int heigh
                             // to catch multi-step accumulation between keyframes
                             if (std::abs(drift) < 20.0 * M_PI / 180.0) {
                                 // Step 4 Phase B: feed visual yaw measurement into
-                                // EKFState as a mirror of the legacy heading_offset_
-                                // blend. yaw_meas is the absolute world yaw the
-                                // visual evidence wants us to be at, in Y-up
-                                // navigation convention (matches EKFState::getYaw
-                                // and imu.getHeading). The Joseph-form Kalman update
-                                // applies its own gain — the legacy 30%-blend below
-                                // remains untouched until Phase C.
+                                // EKFState as the single yaw-correction path.
+                                // The Joseph-form Kalman update applies its own
+                                // gain — the legacy 30%-blend below has been
+                                // removed (see KF_HEADING_CORR log: "EKF-only").
                                 if (aligned_ok && ekf_.isFullInitialized()) {
-                                    double yaw_meas = kf_heading + visual_delta_heading_y_up;
+                                    // Z-up: yaw_meas = absolute world yaw the
+                                    // visual evidence wants the EKF to be at.
+                                    // kf_heading is the cached scalar_heading_
+                                    // at keyframe time (Madgwick CW-positive nav,
+                                    // Z-up). visual_delta_heading is the Z-up
+                                    // nav yaw delta from atan2(R[1,0], R[0,0])
+                                    // above. Sum is the absolute Z-up nav yaw,
+                                    // matching EKFState::getYaw's output.
+                                    double yaw_meas = kf_heading + visual_delta_heading;
                                     while (yaw_meas >  M_PI) yaw_meas -= 2.0 * M_PI;
                                     while (yaw_meas < -M_PI) yaw_meas += 2.0 * M_PI;
                                     // Step 4 Phase C: refined variance.

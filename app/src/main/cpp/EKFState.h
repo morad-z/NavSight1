@@ -257,7 +257,7 @@ public:
 
     // PDR step constraint: world-frame XZ position increment from a step
     // event. var is variance of each component (m²).
-    bool updatePDRStep(double dx_world, double dz_world, double var);
+    bool updatePDRStep(double dx_world, double dy_world, double var);
 
     // Gravity-aligned yaw from the current R_GtoI_, using Madgwick
     // roll/pitch as the alignment frame. Returns yaw in radians
@@ -305,6 +305,17 @@ public:
     // IMU state accessors
     cv::Mat getRotation() const { return R_GtoI_.clone(); }
     cv::Mat getPosition() const { return p_G_.clone(); }
+
+    // Bootstrap-only: replace R_GtoI_ with the magnetometer-derived initial
+    // heading rotation when Kotlin's setInitialHeading lands AFTER ekf_.initializeFull
+    // has already fired (which is the normal case on Android — handleVioInitialized
+    // is dispatched on the UI thread, by which time processFrame has full-init'd
+    // the EKF with R_GtoI=Identity from the InertialInitializer). Without this,
+    // the EKF carries an arbitrary initial-heading state forever and loop
+    // closure / chi² rejects every correction as a 180° teleportation.
+    // Bug surfaced 2026-05-09 on sim 1778260615221 (vyaw stuck near 0 while
+    // Madgwick hdg correctly tracked compass heading).
+    void setRotation(const cv::Mat& R_GtoI);
     // DEAD CODE: getVelocity — never called
     // cv::Mat getVelocity() const { return v_G_.clone(); }
     bool isFullInitialized() const { return full_initialized_; }
@@ -395,7 +406,20 @@ private:
     double P_scale_;
 
     // Full IMU state (mean)
-    cv::Mat R_GtoI_;    // 3x3 rotation Global-to-IMU
+    //
+    // World frame: ENU Z-up (X=East, Y=North, Z=Up), right-handed. Matches
+    // the Madgwick attitude filter (IMUPreintegrator.cpp:677,774) and
+    // Android sensor body frame (body Z is gravity-aligned when phone is
+    // held screen-up flat). gravity = (0, 0, -9.81) m/s².
+    //
+    // R_GtoI_ is world→body: takes a vector expressed in world coordinates
+    // and returns its representation in body (IMU) coordinates. For body
+    // at compass heading ψ (CW-positive nav, North=0, East=+π/2) with
+    // zero roll/pitch, R_GtoI_ has the structure built by
+    // Tracker::setInitialHeading at Tracker.cpp:322:
+    //     R_GtoI_ = [[cos ψ, -sin ψ, 0], [sin ψ, cos ψ, 0], [0, 0, 1]]
+    // and getYaw extracts ψ via atan2(R[1,0], R[0,0]).
+    cv::Mat R_GtoI_;    // 3x3 rotation Global-to-IMU (world->body, Z-up world)
     cv::Mat b_g_;       // 3x1 gyro bias
     cv::Mat v_G_;       // 3x1 velocity in global frame
     cv::Mat b_a_;       // 3x1 accel bias
