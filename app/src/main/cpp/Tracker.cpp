@@ -626,6 +626,12 @@ VisionOutput Tracker::processFrame(const uint8_t* yuv_data, int width, int heigh
     VisionOutput out{};
     frame_out = {};
 
+    // Step 9 (ADR-014): set true when this frame commits a keyframe. Declared
+    // at function scope so the assembly site at the end of processFrame can
+    // surface it on `out` regardless of where the keyframe-storage branch
+    // sat in the per-frame logic.
+    bool stored_keyframe_this_frame = false;
+
     if (!yuv_data || width <= 0 || height <= 0) {
         LOGE("processFrame: invalid args (yuv_data=%p, %dx%d)", yuv_data, width, height);
         return out;
@@ -795,12 +801,129 @@ VisionOutput Tracker::processFrame(const uint8_t* yuv_data, int width, int heigh
     // Shift integration window by estimated latency
     PreintegratedMeasurement imu_delta = imu.integrate(current_prev_ts + td_ns, timestamp_ns + td_ns);
     
-    // Propagate full EKF state with IMU preintegration
+    // 2026-05-09 v18 — single-source-of-truth sync.
+    //
+    // The EKF used to maintain its own internal `p_G_` updated by
+    // `propagateIMU` (pure-IMU integration), which DRIFTED unboundedly
+    // because pedestrian/scooter motion is bias-quadratic in IMU-only
+    // integration. Meanwhile the user-facing trajectory `global_t_` was
+    // computed separately from visual VO + heading + scaled-step and
+    // stayed accurate. The disconnect meant: clones, MSCKF residuals,
+    // loop-closure χ² gates all evaluated against the drifted p_G even
+    // though the user saw a reasonable global_t_ — chi² rejected real
+    // loop closures because `target_p − p_G` had 200+ m residuals while
+    // `target_p − global_t_` was within metres.
+    //
+    // Architecture per Morad's v17→v18 directive: ONE trajectory.
+    // global_t_ IS the position. Sync EKF state to it before the IMU
+    // propagation runs, so propagateIMU integrates from the visually-
+    // grounded base. Any small drift `propagateIMU` adds within a frame
+    // is corrected by the next frame's sync (after global_t_ updates
+    // again from visual VO). Camera leads, IMU assists.
+    //
+    // This eliminates the "two trajectories" problem: there is now no
+    // p_G under the hood that diverges from what the UI shows.
     if (ekf_.isFullInitialized()) {
+        ekf_.setPosition(global_t_);
         ekf_.propagateIMU(imu_delta.deltaR, imu_delta.deltaV, imu_delta.deltaP,
                           imu_delta.dt, imu_delta.cov,
                           imu_delta.J_R_bg, imu_delta.J_V_bg, imu_delta.J_V_ba,
                           imu_delta.J_P_bg, imu_delta.J_P_ba);
+
+        // ── Stage 1: EKF gravity-alignment measurement update ─────────
+        //
+        // The principled fix to R_GtoI drift: feed the accelerometer
+        // back to the EKF as a 2-DOF roll/pitch observation (yaw
+        // unobservable from gravity). Same structure as Madgwick, but
+        // applied as a Kalman measurement update with covariance —
+        // not a state override. This bounds R_GtoI within physics
+        // limits set by σ_accel, instead of trusting Madgwick blindly.
+        //
+        // 2026-05-09 fix #2 — instantaneous accel is too noisy:
+        // walking-induced body sway tilts the per-frame accel vector by
+        // 5-10° per heel-strike. With var_unit ≈ (5.7°)² the EKF's
+        // R_GtoI tracked each tilt, producing visible heading wobble.
+        // Two mitigations now in effect:
+        //   (1) Use imu.getFilteredGravity() — the LP-filtered accel
+        //       vector with α=0.02 effective time constant ~1.6 s
+        //       (IMUPreintegrator.h). Smooths out walking transients
+        //       at the source, same buffer Madgwick uses for its own
+        //       gravity correction.
+        //   (2) Gate on |gyro| being slow. During fast turns the body
+        //       is genuinely rotating; accel-as-gravity assumption
+        //       breaks. Threshold derived from walking-gait baseline:
+        //       typical walking gyro RMS is ≈ 0.4 rad/s on body axes;
+        //       3σ ceiling ≈ 1.2 rad/s. Above that, gravity update is
+        //       suspended until motion calms.
+        constexpr double kAccelNoiseSigma   = 0.1;       // m/s² (white noise floor)
+        constexpr double kGravityMag        = 9.81;      // m/s²
+        constexpr double kGyroGateRadS      = 1.2;       // 3σ above walking-gait RMS
+        // 2026-05-09 fix #3 — Tracker outer gate must match the EKFState
+        // inner gate (g ± 0.8 m/s², derived as 3σ_acc + walking-band in
+        // EKFState::updateGravityAlignment). The previous outer gate was
+        // [0.5g, 1.5g] = [4.9, 14.7] m/s² — 10× wider than the
+        // authoritative inner gate, so it never rejected anything the
+        // inner gate would accept. Looking like a guard but providing
+        // none invites future maintainers to "tune" it without realising
+        // the real filter is elsewhere.
+        constexpr double kAccelMagBand      = 0.8;       // m/s² (matches EKFState inner gate)
+        cv::Point3f g_filt = imu.getFilteredGravity();
+        const double ax = g_filt.x;
+        const double ay = g_filt.y;
+        const double az = g_filt.z;
+        const double a_norm = std::sqrt(ax*ax + ay*ay + az*az);
+        const float gx = imu.lastGyroX();
+        const float gy = imu.lastGyroY();
+        const float gz = imu.lastGyroZ();
+        const double gyro_norm = std::sqrt(static_cast<double>(gx)*gx +
+                                           static_cast<double>(gy)*gy +
+                                           static_cast<double>(gz)*gz);
+        const bool accel_ok = (std::abs(a_norm - kGravityMag) < kAccelMagBand);
+        const bool gyro_ok  = (gyro_norm < kGyroGateRadS);
+        if (accel_ok && gyro_ok) {
+            // Variance scales with |residual| — EKF down-weights samples
+            // taken under residual linear accel even after LP smoothing.
+            // Floor at sensor white-noise σ.
+            const double residual_g = std::abs(a_norm - kGravityMag);
+            const double sigma_acc  = std::max(kAccelNoiseSigma,
+                                               residual_g);
+            const double var_acc    = sigma_acc * sigma_acc;
+
+            // 2026-05-09 v17 — LP-filter rotation lag inflation.
+            //
+            // imu.getFilteredGravity() is an exponential-moving-average
+            // with α = 0.02 (IMUPreintegrator.cpp:131). At Android's
+            // 200 Hz IMU rate (Δt = 5 ms), the 1/e time constant is
+            //   τ_filter = Δt / α = 0.005 / 0.02 = 0.25 s.
+            // Under steady body rotation rate ω, the filtered gravity
+            // vector lags the true body-frame gravity direction by
+            //   θ_lag ≈ τ_filter · ω   (rad)   for ω·τ << 1.
+            // Without this inflation, LC_GA fires during rotation with
+            // z_obs reflecting the OLD gravity direction (before the
+            // rotation started), tries to "correct" R_GtoI toward the
+            // stale observation, and corrupts R_GtoI in the lag direction.
+            // v16 logcat showed r_norm pinned at 1.50 during left-right
+            // rotation (= ~90° error), exactly the failure mode.
+            //
+            // The unit-vector residual variance contribution from
+            // rotation lag is θ_lag² = (τ_filter · ω)². Adding it to
+            // the sensor noise variance gives a Kalman gain that
+            // naturally collapses to zero during fast rotation —
+            // gravity-alignment becomes a no-op when its observation is
+            // unreliable, exactly as it should. Conversely, when the
+            // body slows down (ω → 0), the lag term vanishes and the
+            // update fires at full strength.
+            //
+            // var_total (m²/s⁴, what updateGravityAlignment expects) =
+            //   var_acc  +  (τ_filter · ω · g)²
+            //   ── sensor   ── rotation-lag contribution
+            constexpr double kGravityFilterTau_s = 0.25;   // 1/e settling at 200 Hz, α=0.02
+            const double rot_lag_rad   = kGravityFilterTau_s * gyro_norm;
+            const double var_rot_lag   = (rot_lag_rad * kGravityMag) * (rot_lag_rad * kGravityMag);
+            const double var_total     = var_acc + var_rot_lag;
+            cv::Mat accel_body = (cv::Mat_<double>(3, 1) << ax, ay, az);
+            ekf_.updateGravityAlignment(accel_body, var_total);
+        }
     }
 
     double gyro_norm = 0.0;
@@ -905,6 +1028,19 @@ VisionOutput Tracker::processFrame(const uint8_t* yuv_data, int width, int heigh
     for (const auto& pt : next_good_buf_) {
         tracked_pts_flat.push_back(pt.x);
         tracked_pts_flat.push_back(pt.y);
+    }
+
+    // Phase 2 camera overlay (camera_overlay_phase23_plan.md, Task C):
+    // populate per-feature age (frames survived) parallel to
+    // tracked_pts_flat. feature_ages_ was just rebuilt above to match
+    // next_good_buf_ exactly (line ~999), so size() is guaranteed to
+    // equal next_good_buf_.size() here. Stored on VisionOutput so the
+    // overlay can color-code dots without an extra JNI round trip.
+    std::vector<int> tracked_pts_ages;
+    tracked_pts_ages.reserve(next_good_buf_.size());
+    for (size_t i = 0; i < next_good_buf_.size(); ++i) {
+        const int age = (i < feature_ages_.size()) ? feature_ages_[i] : 0;
+        tracked_pts_ages.push_back(age);
     }
 
     // ── 7. Mean flow + motion gates ──────────────────────────────────────────
@@ -1061,6 +1197,78 @@ VisionOutput Tracker::processFrame(const uint8_t* yuv_data, int width, int heigh
         ekf_.updateZUPT();
         // Refine gyro bias while stationary — prevents heading drift during pauses
         imu.refineGyroBiasDuringZUPT();
+        consecutive_static_frames_++;
+
+        // 2026-05-09 v13 — re-enable stationary specific-force update with
+        // STRICT gating that the v9 attempt lacked. Closes the accel-bias
+        // observability gap that produces the user-visible "drift in a
+        // fixed world direction" symptom (gravity miscancel from residual
+        // b_a integrates into v_G then p_G regardless of phone heading).
+        //
+        // Why the stricter gate works where v9 didn't:
+        //   * v9 fired on EVERY ZUPT trigger → walking heel-strike frames
+        //     (gyro low for ~30 ms, accel briefly stable) sneaked through
+        //     and the residual got absorbed into b_a, runaway to 0.5 m/s².
+        //   * v13 requires SUSTAINED stationarity: ≥15 consecutive ZUPT
+        //     frames (~0.5 s @ 30 Hz) AND a much tighter gyro gate
+        //     (< 0.1 rad/s vs walking-gait RMS 0.4 rad/s). Heel-strikes
+        //     don't stay still for 0.5 s; only an intentional pause does.
+        //
+        // Constants are physics-derived, not magic:
+        //   kSustainedStaticFrames = 15 — covers walking-stride period
+        //     (typical 0.4-0.5 s gait cycle at 2 Hz) so a single foot
+        //     contact never accumulates the count.
+        //   kRotationStillGate = 0.1 rad/s — 4σ below walking-gait RMS
+        //     (0.4 rad/s), corresponds to ~5.7 deg/s phone rotation,
+        //     well below user's intentional pan-around motion.
+        //   sigma_a = 0.1 m/s² — same kAccelNoiseSigma the gravity-
+        //     alignment update uses, matches IMUPreintegrator
+        //     accel_noise_sigma_.
+        constexpr int kSustainedStaticFrames = 15;
+        constexpr double kRotationStillGate  = 0.1;   // rad/s
+        constexpr double kAccelNoiseSigmaZ   = 0.1;   // m/s²
+        if (ekf_.isFullInitialized() &&
+            consecutive_static_frames_ >= kSustainedStaticFrames &&
+            gyro_norm < kRotationStillGate) {
+            cv::Point3f g_zupt = imu.getFilteredGravity();
+            cv::Mat a_zupt = (cv::Mat_<double>(3, 1) <<
+                              g_zupt.x, g_zupt.y, g_zupt.z);
+            ekf_.updateStationaryAccel(a_zupt, kAccelNoiseSigmaZ);
+        }
+    } else {
+        consecutive_static_frames_ = 0;
+        // 2026-05-09 v16 — "no translation" detector based on PDR step speed.
+        //
+        // The previous v13 path gated on `is_pure_rotation` (Rayleigh test
+        // on optical flow direction) but that flag stayed FALSE across the
+        // entire v15 walk (verified by grep: 0 PURE-ROTATION lines in
+        // logcat, every GATES line shows rot=0). The Rayleigh test only
+        // catches rotations where features fan out tangentially — yaw/pan
+        // rotations produce parallel feature motion that LOOKS like
+        // translation to that test, so it never fires for the typical
+        // "user spins phone in hand" case.
+        //
+        // PDR step detector is far more reliable: it measures stride peaks
+        // in body-frame accel and reports speed_mps. Walking gait gives
+        // 0.5-1.5 m/s; in-place rotation/standing gives ~0 because there's
+        // no stride peak. Gating on step_speed_mps < 0.1 catches:
+        //   * Standing still (no movement at all)
+        //   * Rotating phone in place (gyro non-zero, no translation)
+        //   * Looking around / surveying without walking
+        // Walking always produces step_speed >> 0.1 (the existing gate at
+        // Tracker.cpp:1127 uses 0.3 to break is_static during real walks).
+        //
+        // Fire updateZUPT (zeros v_G + shrinks velocity covariance) but
+        // NOT updateStationaryAccel — accel is dynamic during rotation and
+        // the LP-filtered gravity lags too much to support a bias update.
+        // The rotation rate constraint is implicit (gyro feeds R_GtoI via
+        // propagateIMU; bounded by LC_GA gravity-alignment).
+        const double step_speed_mps = imu.getStepInfo().speed_mps;
+        constexpr double kNoTranslationStepGate = 0.1;  // m/s — well below walking-gait floor
+        if (ekf_.isFullInitialized() &&
+            step_speed_mps < kNoTranslationStepGate) {
+            ekf_.updateZUPT();
+        }
     }
 
     // ── 8. Lens undistortion + Essential matrix + pose ───────────────────────
@@ -1637,6 +1845,19 @@ VisionOutput Tracker::processFrame(const uint8_t* yuv_data, int width, int heigh
         cv::Mat clone_R = R_bc_mat * clone_R_GtoI;  // world→camera
         ekf_.addClone(clone_R, clone_p, timestamp_ns);
         int clone_id = ekf_.getLatestCloneId();
+
+        // 2026-05-09 telemetry fix — bridge SLAM features dropped via
+        // EKFState::marginalizeOldestCloneNoLock back into FeatureManager
+        // so the slam_lifetime_count histogram counts EVERY demotion,
+        // not just RMS/chi² rejections. Without this bridge the EKF
+        // erases an entry from slam_features_ but FeatureManager keeps
+        // the lifecycle entry forever (slam_slot stays >= 0 in its map),
+        // so promoted_age - age never gets accumulated and the per-walk
+        // mean SLAM lifetime metric stays NaN.
+        for (int dropped_fid : ekf_.takeLastMarginalizedSlamFeatureIds()) {
+            feature_mgr_.setSlamSlot(dropped_fid, -1);
+            feature_mgr_.dropLifecycle(dropped_fid);
+        }
 
         // Record MSCKF observations: feature pixels in normalized coordinates
         if (clone_id >= 0 && !next_good_buf_.empty()) {
@@ -2313,6 +2534,7 @@ VisionOutput Tracker::processFrame(const uint8_t* yuv_data, int width, int heigh
         // Keyframe storage (with heading + position for drift correction)
         frames_since_keyframe_++;
         if (frames_since_keyframe_ >= 15 || (tracked < MIN_FEATURES / 2 && frames_since_keyframe_ > 3)) {
+            stored_keyframe_this_frame = true;
             cv::Point3f kf_pos(
                 static_cast<float>(global_t_.at<double>(0)),
                 static_cast<float>(global_t_.at<double>(1)),
@@ -2362,6 +2584,12 @@ VisionOutput Tracker::processFrame(const uint8_t* yuv_data, int width, int heigh
                 // 9.1, which keeps this site agnostic to whether Tracker
                 // is mirroring (`global_R_/global_t_`) or whether full-init
                 // has happened.
+                // Stage 2 revert (2026-05-09): restore EKF clone-pose
+                // anchor for keyframe storage. Now that Stage 1 has added
+                // a gravity-alignment measurement update to the EKF, p_G
+                // stays bounded by physics — keyframes can once again be
+                // anchored in the principled EKF state instead of the
+                // working-trajectory patch.
                 cv::Mat kf_R_mat, kf_p_mat;
                 const bool kf_pose_ok = ekf_.getClonePose(
                     latest_clone_for_kf, kf_R_mat, kf_p_mat);
@@ -2617,6 +2845,45 @@ VisionOutput Tracker::processFrame(const uint8_t* yuv_data, int width, int heigh
                         static_cast<long long>(loop_closure_.getKeyframeCount()),
                         std::memory_order_relaxed);
 
+                    // Stage 2 revert: predicted current camera pose now
+                    // comes back from the EKF (post-Stage-1 it's bounded).
+                    // R_world_cam = R_GtoI^T · R_bc^T (cam→world).
+                    cv::Matx33d R_GtoI;
+                    {
+                        cv::Mat R_GtoI_mat = ekf_.getRotation();
+                        for (int r = 0; r < 3; ++r) {
+                            for (int c = 0; c < 3; ++c) {
+                                R_GtoI(r, c) = R_GtoI_mat.at<double>(r, c);
+                            }
+                        }
+                    }
+                    cv::Matx33d R_bc = ekf_.getExtrinsicsRotation();
+                    cv::Matx33d R_world_cam_pred = R_GtoI.t() * R_bc.t();
+                    cv::Vec3d t_cam_world_pred(0., 0., 0.);
+                    {
+                        cv::Mat p_mat = ekf_.getPosition();
+                        t_cam_world_pred[0] = p_mat.at<double>(0);
+                        t_cam_world_pred[1] = p_mat.at<double>(1);
+                        t_cam_world_pred[2] = p_mat.at<double>(2);
+                    }
+                    // Inline the same calc as Tracker::getPositionCovarianceXZ
+                    // (Tracker.cpp:548-573) without taking pose_mutex_ — we're
+                    // already on the camera thread which is the sole EKF
+                    // writer, so no race. P[12,12] / P[13,13] are the X / Y
+                    // (East / North) position-error variances post-Z-up
+                    // alignment.
+                    double sigma_p_xy = 0.0;
+                    if (ekf_.isFullInitialized()) {
+                        cv::Mat P = ekf_.getCovariance();
+                        if (!P.empty() && P.rows >= 15 && P.cols >= 15 && P.type() == CV_64F) {
+                            const double v_xx = P.at<double>(12, 12);
+                            const double v_yy = P.at<double>(13, 13);
+                            sigma_p_xy = std::sqrt(std::max(v_xx, 0.0) + std::max(v_yy, 0.0));
+                        }
+                    }
+                    const double search_radius_m =
+                        std::min(30.0, std::max(2.0, 3.0 * sigma_p_xy));
+
                     // Publish the same descriptors + keypoints to the 1 Hz
                     // worker thread so its next query tick has a fresh
                     // most-recent keyframe to fingerprint.
@@ -2624,7 +2891,12 @@ VisionOutput Tracker::processFrame(const uint8_t* yuv_data, int width, int heigh
                         latest_clone_for_kf, timestamp_ns,
                         kf_back.descriptors, kf_back.keypoints,
                         fx_, fy_, cx_, cy_,
-                        scalar_heading_);
+                        scalar_heading_,
+                        next_good_buf_,           // KLT corners in current frame
+                        R_world_cam_pred,
+                        t_cam_world_pred,
+                        width, height,
+                        search_radius_m);
                 }
             }
 
@@ -2671,18 +2943,22 @@ VisionOutput Tracker::processFrame(const uint8_t* yuv_data, int width, int heigh
     // gravity-aligned and corrected by the keyframe yaw update, so it is
     // strictly better than the gyro-only global_R_ before EKF init.
     //
-    // Position: source from Tracker's global_t_, which is incremented by
-    // the heading×scaled-disp formula in section 9 (visual path) and the
-    // PDR fallback below it. This is the OLD working architecture.
-    // Phase C of the plan delegated position output to the EKF, but the
-    // EKF's IMU-only propagation drifts unboundedly during standstill —
-    // the 2026-05-03 sims showed 0.13 m/s position drift with the phone
-    // genuinely stationary because ZUPT cancels v_G_ but residual
-    // accel-bias × Δt² and Madgwick tilt-bleed accumulate in p_G_ before
-    // ZUPT fires each frame. EKF position is still maintained
-    // (updateRelativePose, updatePDRStep are still called) so its
-    // covariance stays meaningful for UI uncertainty reporting, but
-    // it is not the output source.
+    // Position: 2026-05-09 v17 — REVERTED back to `global_t_`. The v12
+    // experiment of sourcing the user-facing position from EKF `p_G_`
+    // exposed a structural truth: pure IMU integration grows quadratically
+    // with bias errors, while `global_t_` uses a per-step physical model
+    // (stride length × heading) that bounds drift per stride. Even with
+    // the propagation, gravity-alignment, stationary-accel, and MSCKF
+    // sign fixes (v11/v14/v15) the EKF p_G was still flying around when
+    // the user picked up the phone — bias-quadratic-integration before
+    // MSCKF/SLAM features build up.
+    //
+    // Architecture restored: `global_t_` is the user-facing trajectory.
+    // EKF is the correction layer: when loop closure passes χ², the
+    // EKF-computed delta is MIRRORED into global_t_ via the v10 wiring
+    // at consumeLoopClosureMatchIfReady (Tracker.cpp:3837+). Visual
+    // corrections still flow; we just don't trust pure IMU integration
+    // alone for the user-facing position output.
     {
         std::lock_guard<std::mutex> lock(pose_mutex_);
         out.R = ekf_.isFullInitialized() ? ekf_.getRotation() : global_R_.clone();
@@ -2696,6 +2972,7 @@ VisionOutput Tracker::processFrame(const uint8_t* yuv_data, int width, int heigh
     out.estimatedScale = appliedScale;
     out.valid = true;
     out.trackedPoints = std::move(tracked_pts_flat);
+    out.trackedPointAges = std::move(tracked_pts_ages);
     out.meanFlow = mean_flow;
     out.inlierCount = inlier_count_out;
     {
@@ -2707,6 +2984,7 @@ VisionOutput Tracker::processFrame(const uint8_t* yuv_data, int width, int heigh
     }
     out.poseFlags = (is_static ? 1 : 0) | (is_pure_rotation ? 2 : 0)
                   | (pose_valid ? 4 : 0) | (used_fallback ? 8 : 0);
+    out.keyframe_stored = stored_keyframe_this_frame;
 
     // ── 13. Output heading + export frame data for Mapper ────────────────────
     // 2026-05-03 BUG FIX: this block previously overwrote scalar_heading_ and
@@ -3370,7 +3648,12 @@ void Tracker::publishLoopClosureQueryKeyframe(
         const cv::Mat& descriptors,
         const std::vector<cv::KeyPoint>& keypoints,
         double fx, double fy, double cx, double cy,
-        double yaw_rad) {
+        double yaw_rad,
+        const std::vector<cv::Point2f>& klt_corners,
+        const cv::Matx33d& R_world_cam_pred,
+        const cv::Vec3d&   t_cam_world_pred,
+        int img_w, int img_h,
+        double search_radius_m) {
     {
         std::lock_guard<std::mutex> lock(loop_closure_query_mutex_);
         // Cheap deep copy: descriptors at most 250×32 bytes ≈ 8 KB,
@@ -3386,6 +3669,15 @@ void Tracker::publishLoopClosureQueryKeyframe(
         loop_closure_query_cx_        = cx;
         loop_closure_query_cy_        = cy;
         loop_closure_query_yaw_rad_   = yaw_rad;
+        // Step 7.1 — geometric path payload. Empty/zero values disable the
+        // geom fallback for this query (worker checks corners.empty() and
+        // search_radius_m > 0 before attempting).
+        loop_closure_query_klt_corners_     = klt_corners;
+        loop_closure_query_R_world_cam_     = R_world_cam_pred;
+        loop_closure_query_t_cam_world_     = t_cam_world_pred;
+        loop_closure_query_img_w_           = img_w;
+        loop_closure_query_img_h_           = img_h;
+        loop_closure_query_search_radius_m_ = search_radius_m;
         loop_closure_query_has_data_  = true;
     }
     // Wake the worker. notify_one is correct — the worker is the only
@@ -3406,6 +3698,12 @@ void Tracker::loopClosureWorkerLoop() {
     int64_t                   q_ts_ns = 0;
     double                    q_fx = 0., q_fy = 0., q_cx = 0., q_cy = 0.;
     double                    q_yaw_rad = 0.;
+    // Step 7.1 — extras snapshotted alongside the BoW query.
+    std::vector<cv::Point2f>  q_klt_corners;
+    cv::Matx33d               q_R_world_cam = cv::Matx33d::eye();
+    cv::Vec3d                 q_t_cam_world(0., 0., 0.);
+    int                       q_img_w = 0, q_img_h = 0;
+    double                    q_search_radius_m = 0.;
 
     while (!loop_closure_should_stop_.load(std::memory_order_acquire)) {
         // Wait either for a fresh keyframe publish or the 1 Hz timeout.
@@ -3433,6 +3731,13 @@ void Tracker::loopClosureWorkerLoop() {
             q_cx        = loop_closure_query_cx_;
             q_cy        = loop_closure_query_cy_;
             q_yaw_rad   = loop_closure_query_yaw_rad_;
+            // Step 7.1 — geom path extras (additive; OK to be empty/zero).
+            q_klt_corners      = loop_closure_query_klt_corners_;
+            q_R_world_cam      = loop_closure_query_R_world_cam_;
+            q_t_cam_world      = loop_closure_query_t_cam_world_;
+            q_img_w            = loop_closure_query_img_w_;
+            q_img_h            = loop_closure_query_img_h_;
+            q_search_radius_m  = loop_closure_query_search_radius_m_;
             loop_closure_query_has_data_ = false;
         }
 
@@ -3463,6 +3768,44 @@ void Tracker::loopClosureWorkerLoop() {
             // worker bumped rejects_low_score on the false return). attempts
             // and accepts stay here at the worker tick boundary because
             // they are tick-level accounting, not per-rejection-reason.
+
+            // ── Step 7.1 — Geometric loop closure (fallback) ─────────────
+            // Try the direction-invariant path only when BoW didn't fire
+            // on the same query. Same LoopMatch shape, same downstream
+            // injection. Disabled when the publish-side didn't supply the
+            // extras (corners empty or radius zero).
+            if (!q_klt_corners.empty() &&
+                q_search_radius_m > 0.0 &&
+                q_img_w > 0 && q_img_h > 0) {
+                LoopClosureDetector::LoopMatch geom_match;
+                const bool geom_ok = loop_closure_.tryDetectLoopGeometric(
+                    static_cast<uint64_t>(q_kf_id),
+                    q_ts_ns,
+                    q_klt_corners,
+                    q_R_world_cam,
+                    q_t_cam_world,
+                    q_fx, q_fy, q_cx, q_cy,
+                    q_img_w, q_img_h,
+                    q_search_radius_m,
+                    LOOP_CLOSURE_TEMPORAL_EXCL_NS,
+                    geom_match);
+                if (geom_ok) {
+                    // Geometric accepts are bumped inside the detector
+                    // (loop_closure_geom_accepts). Bump the unified
+                    // worker-tick accept counter so loop_closure_accepts
+                    // stays the ground truth for "any path accepted".
+                    ec.loop_closure_accepts.fetch_add(
+                        1, std::memory_order_relaxed);
+                    LOGI("LOOP_CLOSURE: ACCEPT (geom) now_kf=%d match_kf=%llu inl=%d",
+                         q_kf_id,
+                         static_cast<unsigned long long>(geom_match.matched_kf_id),
+                         geom_match.pnp_inliers);
+                    std::lock_guard<std::mutex> rlock(loop_closure_result_mutex_);
+                    loop_closure_pending_match_ = geom_match;
+                    loop_closure_result_pending_ = true;
+                    continue;
+                }
+            }
             continue;
         }
 
@@ -3522,17 +3865,16 @@ void Tracker::consumeLoopClosureMatchIfReady() {
     const int matched_clone_id = static_cast<int>(
         loop_closure_active_match_.matched_kf_id);
 
-    // Step 3 — damping schedule. strength on frame `k` of N (N=10):
-    //     strength_k = 1 - k/N    →  k=0: 1.0,  k=9: 0.1
-    // Inflate the measurement variance by 1/strength² so the EKF gain
-    // shrinks with strength — same pattern as ADR-006 / Step 3a damping.
+    // Stage 2 revert: damping ramp restored to original 10-frame schedule
+    // for the EKF-channel updateAbsolutePose injection. With Stage 1's
+    // gravity-alignment loop in place, p_G stays bounded by sensor
+    // physics, so the chi²(0.999, 6) gate at EKFState.cpp:1000 has a
+    // realistic residual to evaluate again.
     const int    k          = LOOP_CLOSURE_DAMPING_FRAMES -
                               loop_closure_damping_remaining_;  // 0..N-1
     const double strength   = 1.0 - static_cast<double>(k) /
                                     static_cast<double>(LOOP_CLOSURE_DAMPING_FRAMES);
     const double strength_sq = strength * strength;
-    // Floor strength_sq so the divide can never explode (k=N-1 gives
-    // 0.01; the floor of 0.01 keeps var inflation bounded at 100×).
     const double damping_inv = 1.0 / std::max(1e-2, strength_sq);
 
     // ────────────────────────────────────────────────────────────────────
@@ -3596,26 +3938,95 @@ void Tracker::consumeLoopClosureMatchIfReady() {
         target_p_world.at<double>(r, 0) = target_t_cam_world[r];
     }
 
-    // Variance: same damping schedule as the original relative-pose
-    // attempt — sigma_axis_sq_R inflated by 1/strength², var_p too.
-    const double sigma_axis_sq_R = (LOOP_CLOSURE_BASE_ROT_SIGMA_RAD *
-                                     LOOP_CLOSURE_BASE_ROT_SIGMA_RAD) * damping_inv;
-    // Dynamic translation sigma grows with path length to stay above the
-    // actual VIO drift (15 %/100 m from sim_data_1778077139237).
-    // Floor ensures the chi² gate is never tighter than PnP sensor noise.
-    const double sigma_p = std::max(LOOP_CLOSURE_PNP_SIGMA_FLOOR_M,
-                                    LOOP_CLOSURE_DRIFT_RATE * total_path_m_);
-    const double var_p   = (sigma_p * sigma_p) * damping_inv;
+    // 2026-05-09 v19 — principled chi² variance using the EKF's own tracked
+    // covariance + PnP measurement noise.
+    //
+    // Pre-fix recipe: var_p = sigma_p_floor² × damping_inv where damping_inv
+    // ramped 1 → 100 over 10 frames. The ramp inflated variance to LOOSEN
+    // chi² so the gate would eventually accept — but the same inflation made
+    // the Kalman gain K = P / (P + R) collapse to ~0 once R ≫ P. Net effect
+    // (verified in v18 walk loop_house_x2_v18.json): chi² accepts at frames
+    // 8–10 with `ok=1` logged, but actual cumulative correction across the
+    // ramp was 1–2 m for a 15 m residual — not enough to overlay loop-2 on
+    // loop-1. User reported "second loop doesn't match the first."
+    //
+    // The principled formulation (textbook Kalman filter with two correlated
+    // pose estimates):
+    //   r = target_p − p_G            (residual)
+    //   var(r) = var(target_p) + var(p_G)
+    //          = σ_pnp² + σ_p_ekf²
+    // where σ_pnp is the PnP measurement accuracy floor (~2 m with ≥30
+    // inliers at 3–5 m landmarks; cited in Tracker.h:553-557), and
+    // σ_p_ekf is the EKF's tracked horizontal-position uncertainty —
+    // P[12,12] (East variance) + P[13,13] (North variance) post Z-up
+    // alignment. Sum-of-variances is the right additive form because the
+    // two pose estimates are independent measurements of the same physical
+    // location.
+    //
+    // No damping_inv needed because:
+    //   - chi² evaluates the full residual against the natural variance
+    //     budget — accepts/rejects on physical grounds, not artificial
+    //     "easing" timeline.
+    //   - Across the existing 10-frame ramp, residual SHRINKS each frame
+    //     as the Kalman update applies a partial correction; this gives
+    //     a natural exponential decay of the correction without any
+    //     hand-coded damping schedule.
+    //   - K = P_ekf / (P_ekf + σ_pnp²) stays at full physical Kalman gain
+    //     instead of being driven to 0 by inflated R.
+    //
+    // Reading the EKF covariance: P[12,12] is East variance, P[13,13] is
+    // North variance under the Z-up convention. The horizontal position
+    // uncertainty is the trace of the 2×2 horizontal block.
+    double sigma_p_ekf_sq = 0.0;
+    double sigma_R_ekf_sq = 0.0;
+    {
+        cv::Mat P = ekf_.getCovariance();
+        if (!P.empty() && P.rows >= 15 && P.type() == CV_64F) {
+            sigma_p_ekf_sq = std::max(0.0, P.at<double>(12, 12)) +
+                             std::max(0.0, P.at<double>(13, 13));
+            // Rotation tracked uncertainty: sum of attitude diagonal
+            // (rows 0,1,2 of the error-state vector are δθ_x, δθ_y, δθ_z).
+            sigma_R_ekf_sq = std::max(0.0, P.at<double>(0, 0)) +
+                             std::max(0.0, P.at<double>(1, 1)) +
+                             std::max(0.0, P.at<double>(2, 2));
+        }
+    }
+    const double var_p_pnp     = LOOP_CLOSURE_PNP_SIGMA_FLOOR_M *
+                                 LOOP_CLOSURE_PNP_SIGMA_FLOOR_M;     // ≈ 4 m²
+    const double var_R_pnp     = LOOP_CLOSURE_BASE_ROT_SIGMA_RAD *
+                                 LOOP_CLOSURE_BASE_ROT_SIGMA_RAD;    // ≈ 0.122 rad²
+    const double var_p         = var_p_pnp + sigma_p_ekf_sq;
+    const double sigma_axis_sq_R = var_R_pnp + sigma_R_ekf_sq / 3.0;  // per-axis avg
+    (void)damping_inv;  // ramp counter still controls when to STOP; variance no longer scales
 
+    // 2026-05-09 wiring fix: capture EKF p_G BEFORE updateAbsolutePose so we
+    // can mirror the EKF-applied delta into global_t_ on success. Without this
+    // mirror, loop-closure corrections accumulate in p_G_ (the EKF state) but
+    // out.t = global_t_ at Tracker.cpp:2841 — meaning the user-facing trajectory
+    // never sees a correction even when chi² accepts. The user reported exactly
+    // this on v9 (loop_house_x2_v9.json: 18 PnP-accepts, 0 corrections_applied,
+    // second-loop trajectory drifted away from the first because nothing
+    // wrote into global_t_). Capturing the actual Kalman-applied delta keeps
+    // both trajectories in sync without bypassing the chi² gate, and inherits
+    // the 10-frame damping ramp's smoothness automatically (per-ramp-frame
+    // delta is ~ strength × full_correction / 10).
+    cv::Mat p_G_before = ekf_.getPosition().clone();
     const bool ok = ekf_.updateAbsolutePose(target_R_GtoI, target_p_world,
                                              sigma_axis_sq_R, var_p);
     if (ok) {
+        cv::Mat p_G_after = ekf_.getPosition();
+        cv::Mat delta_p   = p_G_after - p_G_before;      // 3×1 world frame
+        {
+            std::lock_guard<std::mutex> lock(pose_mutex_);
+            if (!global_t_.empty() && global_t_.rows == 3 &&
+                global_t_.cols == 1 && global_t_.type() == CV_64F) {
+                global_t_ += delta_p;
+            }
+        }
         navsight::eventCounters().loop_closure_corrections_applied.fetch_add(
             1, std::memory_order_relaxed);
     }
 
-    // Log every step of the ramp at INFO so a real loop closure shows
-    // up in the trace as a coherent 10-line sequence.
     LOGI("LOOP_CLOSURE: damp k=%d/%d strength=%.2f var_p=%.4f var_R=%.4e "
          "target_p=[%.3f %.3f %.3f] match_kf=%d ok=%d (abs-pose channel)",
          k + 1, LOOP_CLOSURE_DAMPING_FRAMES, strength,
@@ -3625,6 +4036,8 @@ void Tracker::consumeLoopClosureMatchIfReady() {
          target_p_world.at<double>(2),
          matched_clone_id,
          ok ? 1 : 0);
+    (void)target_R_world_cam;
+    (void)R_bc_lc;
     if (fresh_match_picked_up) {
         LOGI("LOOP_CLOSURE: fresh match picked up (kf=%d) — beginning "
              "%d-frame damped absolute-pose ramp.",

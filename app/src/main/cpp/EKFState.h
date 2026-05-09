@@ -48,6 +48,60 @@ public:
     void initialize(double initial_scale);
     void updateScale(double observed_scale, double confidence);
     void updateZUPT();
+
+    // 2026-05-09 v18 — single-source-of-truth sync.
+    // Set the EKF's internal position state directly from an external source
+    // (e.g. Tracker's `global_t_`, which is the visual-VO + heading + scaled-step
+    // trajectory the user actually sees on the map). This eliminates the
+    // "EKF p_G drifts under the hood while UI shows global_t_" disconnect that
+    // caused the v9–v16 chi² rejections (loop closure target compared against
+    // a drifted p_G even though the user-visible trajectory was reasonable).
+    //
+    // Does NOT touch covariance — the EKF's uncertainty estimate stays valid
+    // because position-error covariance reflects the current STATE estimate's
+    // uncertainty, and we're updating the state to a value the visual layer
+    // is already confident in. Velocity, biases, rotation are all unchanged.
+    //
+    // Call once per frame (after global_t_ is finalised) so clones, MSCKF
+    // residuals, and loop-closure chi² evaluations all reference the same
+    // trajectory the user sees.
+    void setPosition(const cv::Mat& p_G);
+
+    // Stationary specific-force update (2026-05-09 drift fix).
+    //
+    // Called from Tracker AFTER updateZUPT() confirms the body is
+    // stationary. Closes the accel-bias observability gap that the
+    // existing measurement updates leave open:
+    //
+    //   * MSCKF: observes b_a only via visual residuals. During
+    //     visual-degenerate phases (low texture, motion blur, fast
+    //     turns) b_a drifts unchecked.
+    //   * updateZUPT: zeros v_G and shrinks the velocity block. Does
+    //     NOT observe b_a — so the next propagateIMU step still
+    //     integrates accel-bias residual into v_G.
+    //   * updateGravityAlignment: observes accel direction (yaw
+    //     unobservable). Magnitude information about b_a is discarded
+    //     by the unit-vector normalisation.
+    //
+    // Specific-force model under body-stationary assumption:
+    //   a_imu  =  -R_GtoI · g_world  +  b_a  +  noise
+    //   In Z-up ENU, g_world = (0,0,-9.81) → a_imu = 9.81·R_GtoI[:,2] + b_a
+    //
+    // 3-DOF residual that constrains BOTH δθ (roll/pitch) and δb_a
+    // simultaneously. Yaw stays unobservable (skew of R_GtoI[:,2] has
+    // null direction along R_GtoI[:,2] itself ↔ world-Z by the
+    // left-perturbation Lie identity).
+    //
+    // `accel_body` should be the measurement-window MEAN (e.g.
+    // LP-filtered gravity vector from IMUPreintegrator), not an
+    // instantaneous sample — the ZUPT detector already validated
+    // window stationarity, but the per-sample noise is uncorrelated.
+    // `sigma_a` is the per-axis accel measurement noise σ (m/s²);
+    // pass the same kAccelNoiseSigma used by gravity-alignment.
+    //
+    // Returns false on degenerate input or if the EKF is not
+    // full-initialized.
+    bool updateStationaryAccel(const cv::Mat& accel_body, double sigma_a);
     // DEAD CODE: checkConsistency, getScaleStd — never called
     // double checkConsistency(double camera_disp, double step_disp) const;
     double getScale() const { return scale_; }
@@ -138,6 +192,21 @@ public:
     //     P_keep' = P_keep - P_keep_slam * inv(P_slam_slam) * P_slam_keep
     bool removeSlamFeature(int slot);
 
+    // Plan Step 3b lifecycle bridge (2026-05-09 telemetry fix): inside
+    // marginalizeOldestCloneNoLock the EKF drops SLAM features whose
+    // anchor clone fell off the sliding window. That bypasses the
+    // FeatureManager's setSlamSlot(-1) / dropLifecycle path, leaving the
+    // lifecycle map populated and the slam_lifetime_count histogram at
+    // zero (sim_data_1778329181805 showed 78 promotions, 0 lifetime
+    // events — every demotion went through clone marginalisation, not
+    // RMS / chi² rejection).
+    //
+    // After every addClone() Tracker calls this method to drain the
+    // dropped-feature ids accumulated across the (possibly multiple)
+    // internal marginalisations and forward them to FeatureManager.
+    // Vector is cleared on every addClone() call.
+    std::vector<int> takeLastMarginalizedSlamFeatureIds();
+
     // 2-DOF reprojection update for a single SLAM feature observed across
     // one or more clones. Each (observation, clone_id) pair stacks 2 rows of
     // residual + Jacobian. The Jacobian is sparse: non-zero on the observing
@@ -182,6 +251,14 @@ public:
     // invalid slot.
     bool getSlamFeatureGlobalPosition(int slot, cv::Mat& p_global_out) const;
 
+    // Camera-overlay Phase 3 read accessor: feature_id at the given slot,
+    // or -1 if the slot is out of range. Used by the JNI layer's
+    // getSlamSnapshot to expose stable per-feature identifiers so the
+    // overlay can correlate the same physical point across frames if it
+    // ever wants to (today the overlay only consumes (fid, x, y, z) per
+    // frame and does not track identity itself).
+    int getSlamFeatureId(int slot) const;
+
     // ── Step 4: VIO/PDR/Yaw measurement updates ────────────────────────────
     // These are thin Joseph-form wrappers over applyMSCKFUpdate that build
     // sparse H/res/R for the common VIO measurement types. They make
@@ -203,6 +280,40 @@ public:
     // sandwich used to derive the H jacobian.
     bool updateGravityAlignedYaw(double yaw_meas, double var,
                                  double roll, double pitch);
+
+    // Stage 1 (2026-05-09 root-cause fix) — gravity-alignment measurement.
+    //
+    // Observation: when |a_body| ≈ g (i.e. the IMU is not under significant
+    // linear acceleration), the accelerometer's specific force is the body-
+    // frame projection of world Z-up:
+    //
+    //   accel_body / |accel_body|  ≈  R_GtoI · (0, 0, +1)
+    //
+    // This is a 3D unit-vector observation. Two of its three DOFs are
+    // independent — yaw (rotation about world-Z) cannot change body-Z's
+    // direction, so it stays unobservable from gravity (consistent with
+    // physics; visual yaw and Madgwick mag-init handle yaw separately).
+    //
+    // The EKF previously had no gravity-alignment loop, so its R_GtoI
+    // drifted by 6-10° on a 110 s walk from gyro bias residual integration,
+    // producing the famous -800 m phantom Z drift in p_G via mis-cancelled
+    // gravity in propagateIMU (see scripts/analyze_chi2_rejections.py
+    // against tests/sims/regression/visual/loop_house_x2.json).
+    // This method gives the EKF the same gravity correction Madgwick has,
+    // so R_GtoI stays bounded and p_G no longer diverges.
+    //
+    // Args:
+    //   accel_body : 3×1 raw accelerometer reading (m/s²) in body frame
+    //   var        : per-axis measurement variance (m/s²)² for the residual.
+    //                Caller derives from sensor Allan variance: typical
+    //                Android phones have white-noise σ ≈ 0.1 m/s² so
+    //                var ≈ 0.01 (m/s²)² is a defensible floor; inflate when
+    //                the body is detected to be under linear acceleration.
+    //
+    // Returns true on accept (residual passed gating + Joseph update applied),
+    // false on reject (EKF not init, |accel| outside valid band, or covariance
+    // factorisation failed).
+    bool updateGravityAlignment(const cv::Mat& accel_body, double var);
 
     // Step 2 (visual prod plan): per-frame relative-rotation update from
     // monocular `recoverPose`. R_meas_body is the body-frame rotation
@@ -522,6 +633,12 @@ private:
         int    rms_bad_run{0};
     };
     std::vector<SlamFeature> slam_features_;
+
+    // 2026-05-09 telemetry fix — see takeLastMarginalizedSlamFeatureIds().
+    // Drained by Tracker after every addClone(). Cleared at the head of
+    // addClone() so multiple internal marginalisations within a single
+    // addClone (pruneWindow path) accumulate.
+    std::vector<int> last_marginalized_slam_feature_ids_;
 
     // Cached camera intrinsics for SLAM reprojection (see setSlamIntrinsics).
     // Default 500/500/320/240 matches the test fixture in test_slam_msckf.cpp.

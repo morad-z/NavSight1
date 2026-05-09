@@ -77,6 +77,19 @@ public:
 
     IMUPreintegrator& getIMU() { return imu_; }
 
+    // Camera-overlay Phase 3: const read access to the EKF state so the
+    // JNI layer can expose SLAM feature world positions and the current
+    // camera pose without granting Tracker write access. Returns nullptr
+    // only if Tracker has not yet been initialised — never under normal
+    // running conditions.
+    const EKFState* getEKFState() const { return tracker_.getEKF(); }
+    // Access the Tracker's body→camera extrinsics for projection. Read
+    // through the EKFState to avoid duplicating R_bc state.
+    cv::Matx33d getExtrinsicsRotation() const {
+        const EKFState* ekf = tracker_.getEKF();
+        return ekf ? ekf->getExtrinsicsRotation() : cv::Matx33d::eye();
+    }
+
 private:
     // DISABLED: Mapper pipeline (applyMapperResult was a no-op)
     // void mapperThreadFunc();

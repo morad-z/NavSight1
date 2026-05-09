@@ -50,16 +50,52 @@ class SensorRepository(private val context: Context) : SensorEventListener {
     private val fusedLocationClient = LocationServices.getFusedLocationProviderClient(context)
 
     private val orientationTracker = DeviceOrientationTracker()
-    // MiDaS depth feeds Tracker scale constraint (bypasses Mapper)
-    private val depthEstimator = DepthEstimator(context)
+    // MiDaS depth feeds Tracker scale constraint (bypasses Mapper).
+    //
+    // 2026-05-09 reset-fix: same pattern as vioExecutor — stopSensors()
+    // calls depthEstimator.close() which permanently releases the TFLite
+    // interpreter, GPU delegate, and inferenceDispatcher. With a `val`
+    // field, resetAll() leaves MiDaS dead for the rest of the session:
+    // estimateDepth returns null, setDepthMap never fires, scale drift
+    // goes unconstrained. Make it `var` and recreate from
+    // ensureExecutorsAlive() on the next startSensors().
+    private var depthEstimator: DepthEstimator = newDepthEstimator()
+    @Volatile private var depthEstimatorClosed = false
+
+    private fun newDepthEstimator(): DepthEstimator {
+        depthEstimatorClosed = false
+        return DepthEstimator(context)
+    }
 
     // Dedicated VIO processing thread — decouples camera preview from VIO computation.
     // Frame dropping: if VIO is still busy when the next frame arrives, we skip it.
-    private val vioExecutor = java.util.concurrent.Executors.newSingleThreadExecutor { r ->
-        Thread(r, "NavSight-VIO").apply { isDaemon = true }
-    }
+    //
+    // 2026-05-09 reset-fix: the executor is `var` and re-created by
+    // ensureExecutorsAlive() because stopSensors() shuts them down and
+    // resetAll() (Stage 3) wires through stopSensors → startSensors
+    // expecting the pipeline to come back. Without re-creation the second
+    // start would submit to a dead executor and frames would silently drop.
+    private var vioExecutor: java.util.concurrent.ExecutorService = newVioExecutor()
     @Volatile private var vioProcessing = false
     @Volatile private var vioFrameCount = 0
+
+    private fun newVioExecutor() = java.util.concurrent.Executors.newSingleThreadExecutor { r ->
+        Thread(r, "NavSight-VIO").apply { isDaemon = true }
+    }
+
+    // Main-Looper handler reused for SensorManager.registerListener so
+    // sensor callbacks always dispatch on the main thread regardless of
+    // which thread called startSensors().
+    //
+    // 2026-05-09 reset-fix: resetAll() runs stopSensors → startSensors on
+    // Dispatchers.IO. The 3-arg registerListener overload uses
+    // Looper.myLooper() of the caller, which is null on IO threads. The
+    // spec says fall back to the main Looper, but Samsung OneUI variants
+    // have been observed to silently drop — onSensorChanged is never
+    // delivered, EKF receives no IMU, VIO stays forever at WAIT_MOTION
+    // ("VIO LOST" red banner) until app restart. Passing an explicit
+    // main handler makes registration thread-agnostic.
+    private val mainHandler = android.os.Handler(android.os.Looper.getMainLooper())
 
     // Step 8c: rolling-shutter row read-out time from Camera2.
     // Updated by CameraUi.kt Camera2Interop CaptureCallback on every frame.
@@ -72,12 +108,36 @@ class SensorRepository(private val context: Context) : SensorEventListener {
         rollingShutterSkewNs = skewNs
     }
 
-    // Depth estimation at ~1Hz for scale constraint
-    private val depthExecutor = java.util.concurrent.Executors.newSingleThreadExecutor { r ->
-        Thread(r, "NavSight-Depth").apply { isDaemon = true }
+    // Step 9 / ADR-014 — optional camera-frame recorder for replay-harness
+    // fixtures. Set when the user starts a sim recording from the debug panel,
+    // cleared when the recording stops. Volatile because writes happen from
+    // the VM main thread and reads happen from the camera analyzer thread.
+    @Volatile private var frameRecorder: SimulationFrameRecorder? = null
+    fun setFrameRecorder(recorder: SimulationFrameRecorder?) {
+        frameRecorder = recorder
     }
+
+    // Depth estimation at ~1Hz for scale constraint
+    private var depthExecutor: java.util.concurrent.ExecutorService = newDepthExecutor()
     @Volatile private var depthProcessing = false
     private var lastDepthTimeMs = 0L
+
+    private fun newDepthExecutor() = java.util.concurrent.Executors.newSingleThreadExecutor { r ->
+        Thread(r, "NavSight-Depth").apply { isDaemon = true }
+    }
+
+    /**
+     * Re-create per-frame executors and the depth estimator if
+     * stopSensors() shut them down. Called from startSensors() so the
+     * second start after a resetAll() restores the VIO frame-processing
+     * pipeline AND the MiDaS scale constraint. Idempotent — leaves
+     * still-alive resources untouched.
+     */
+    private fun ensureExecutorsAlive() {
+        if (vioExecutor.isShutdown) vioExecutor = newVioExecutor()
+        if (depthExecutor.isShutdown) depthExecutor = newDepthExecutor()
+        if (depthEstimatorClosed) depthEstimator = newDepthEstimator()
+    }
     private val DEPTH_THROTTLE_MS = 1000L // 1Hz depth — conservative for battery
 
     private val _orientationState = MutableStateFlow(DeviceOrientationTracker.OrientationResult(
@@ -88,6 +148,60 @@ class SensorRepository(private val context: Context) : SensorEventListener {
 
     private val _vioState = MutableStateFlow(VioData())
     val vioState = _vioState.asStateFlow()
+
+    /**
+     * Phase 1 camera-overlay plumbing: the analyzer image dimensions and the
+     * CCW rotation CameraX applies to make the analyzer upright on the
+     * preview surface. Both are needed by `CameraFeatureOverlay` to map
+     * analyzer-space KLT pixel coords onto the Compose Canvas. Updated on
+     * every camera frame in `processCameraFrame`; the flow only emits when
+     * the geometry actually changes (typically once per session). Cleared
+     * back to null in `resetAll` so the overlay hides until the first new
+     * frame after reset re-publishes.
+     */
+    data class CameraFrameGeometry(
+        val analyzerWidth: Int,
+        val analyzerHeight: Int,
+        val rotationDegrees: Int,
+    )
+    private val _cameraFrameGeometry = MutableStateFlow<CameraFrameGeometry?>(null)
+    val cameraFrameGeometry = _cameraFrameGeometry.asStateFlow()
+
+    // ── Camera overlay Phase 2/3/4 plumbing ────────────────────────────────
+    // These flows publish at the FULL native frame rate (~30 Hz) so the
+    // overlay tracks the live preview with no lag. They are SEPARATE from
+    // _vioState (which the ViewModel deliberately throttles to 5 Hz for
+    // heavier consumers like the path history and crash logger). The
+    // overlay collects ONLY this flow, so heavy consumers stay throttled.
+    //
+    // OverlaySnapshot bundles every per-frame piece of overlay state into
+    // a single value class so the ViewModel collects ONE flow and the
+    // Canvas recomposes at most once per native frame even when multiple
+    // fields change together.
+    data class OverlaySnapshot(
+        val trackedPoints: FloatArray,    // [x0,y0, x1,y1, ...] analyzer px
+        val trackedAges: IntArray,        // parallel, frames survived
+        val slamSnapshot: FloatArray,     // [fid,x,y,z, ...] Y-up world
+        val cameraPose: FloatArray,       // 16 floats; empty if EKF not ready
+        val loopClosureCount: Long,       // cumulative
+    ) {
+        // Compose reads-per-frame; equality on identity is enough.
+        override fun equals(other: Any?): Boolean = this === other
+        override fun hashCode(): Int = System.identityHashCode(this)
+    }
+    private val _overlaySnapshot = MutableStateFlow(
+        OverlaySnapshot(floatArrayOf(), intArrayOf(), floatArrayOf(), floatArrayOf(), 0L)
+    )
+    val overlaySnapshot = _overlaySnapshot.asStateFlow()
+
+    // Reusable JNI getter buffers — preallocated so the hot camera path
+    // does not allocate. The agesBuf trims via copyOf when fewer features
+    // are returned. SLAM is bounded by MAX_SLAM_FEATURES = 12 (ADR-009).
+    private val agesBuf = IntArray(512)
+    private val slamBuf = FloatArray(4 * 12)
+    private val cameraPoseBuf = FloatArray(16)
+    private val emptyFloats = FloatArray(0)
+    private val emptyInts = IntArray(0)
 
     private val _startLocation = MutableStateFlow<LatLng?>(null)
     val startLocation = _startLocation.asStateFlow()
@@ -131,19 +245,25 @@ class SensorRepository(private val context: Context) : SensorEventListener {
         if (!repositoryScope.isActive) {
             repositoryScope = CoroutineScope(Dispatchers.Main + SupervisorJob())
         }
+        // 2026-05-09 reset-fix: stopSensors() shuts the per-frame executors
+        // down. Re-create them now or every camera-thread submit will throw
+        // RejectedExecutionException and frames will silently drop —
+        // visible to the user as VIO never advancing past WAIT_MOTION
+        // ("VIO LOST" red banner) after pressing the reset button.
+        ensureExecutorsAlive()
         try {
             accelerometer?.let {
-                sensorManager.registerListener(this, it, SensorManager.SENSOR_DELAY_GAME)
+                sensorManager.registerListener(this, it, SensorManager.SENSOR_DELAY_GAME, mainHandler)
                 Log.d(TAG, "Accelerometer registered")
             } ?: Log.w(TAG, "Accelerometer not available on this device")
 
             magnetometer?.let {
-                sensorManager.registerListener(this, it, SensorManager.SENSOR_DELAY_GAME)
+                sensorManager.registerListener(this, it, SensorManager.SENSOR_DELAY_GAME, mainHandler)
                 Log.d(TAG, "Magnetometer registered")
             } ?: Log.w(TAG, "Magnetometer not available on this device")
 
             gyroscope?.let {
-                sensorManager.registerListener(this, it, SensorManager.SENSOR_DELAY_GAME)
+                sensorManager.registerListener(this, it, SensorManager.SENSOR_DELAY_GAME, mainHandler)
                 Log.d(TAG, "Gyroscope registered")
             } ?: Log.w(TAG, "Gyroscope not available on this device")
 
@@ -557,7 +677,13 @@ class SensorRepository(private val context: Context) : SensorEventListener {
         stopGpsUpdates()
         vioExecutor.shutdown()
         depthExecutor.shutdown()
-        depthEstimator.close()
+        // Guard against double-close if stopSensors fires twice (e.g. a
+        // pause arrives mid-resetAll). Some TFLite native heap sanitizers
+        // crash on a re-close of an already-released interpreter.
+        if (!depthEstimatorClosed) {
+            depthEstimator.close()
+            depthEstimatorClosed = true
+        }
         intrinsicsInitialized = false
         calibratedIntrinsicsLoaded = false
         calibrationPersistedThisRun = false
@@ -618,6 +744,21 @@ class SensorRepository(private val context: Context) : SensorEventListener {
         val w = image.width
         val h = image.height
 
+        // Phase 1 camera-overlay plumbing: publish analyzer geometry so the
+        // Compose overlay can map analyzer-space KLT coords → Canvas pixels.
+        // The MutableStateFlow update only fires downstream collectors when
+        // the value actually changes, so this is a near-no-op after frame 1.
+        run {
+            val rot = image.imageInfo.rotationDegrees
+            val cur = _cameraFrameGeometry.value
+            if (cur == null ||
+                cur.analyzerWidth != w ||
+                cur.analyzerHeight != h ||
+                cur.rotationDegrees != rot) {
+                _cameraFrameGeometry.value = CameraFrameGeometry(w, h, rot)
+            }
+        }
+
         // Initialize intrinsics once
         if (!intrinsicsInitialized) {
             val intrinsics = getCameraIntrinsics(w, h)
@@ -640,6 +781,28 @@ class SensorRepository(private val context: Context) : SensorEventListener {
         val timestampNs = image.imageInfo.timestamp
         val nowMs = System.currentTimeMillis()
 
+        // Step 9 / ADR-014 — submit the Y plane to the frame recorder before
+        // the JNI consumes it. The recorder copies bytes synchronously then
+        // returns; encode runs on its own thread. Filename uses wall-clock
+        // ms × 1e6 so the replay harness can match against the simulator
+        // JSON `ts` field (also wall-clock ms). The few-ms offset between
+        // this capture stamp and the matching SimulationPoint timestamp is
+        // absorbed by the harness's --frame-match-tolerance-ms flag.
+        run {
+            val recorder = frameRecorder
+            if (recorder != null && recorder.isActive()) {
+                yBuffer.rewind()
+                recorder.captureFrame(
+                    yBuffer = yBuffer,
+                    width = w,
+                    height = h,
+                    yRowStride = yRowStride,
+                    timestampNs = nowMs * 1_000_000L,
+                )
+                yBuffer.rewind()  // restore for downstream JNI / depth path
+            }
+        }
+
         // Copy yBytes for depth estimation BEFORE submitting to vioExecutor.
         // This eliminates any ordering dependency between the VIO executor thread
         // (which reads yBuffer via GetDirectBufferAddress) and the camera thread
@@ -660,61 +823,90 @@ class SensorRepository(private val context: Context) : SensorEventListener {
             }
         } else null
 
-        // 1. VIO processing — pass direct buffers to JNI (near zero-copy)
+        // 1. VIO processing — pass direct buffers to JNI (near zero-copy).
+        //
+        // 2026-05-09 reset-fix: vioProcessing is set BEFORE submit so a
+        // second camera frame arriving before the runnable starts gets
+        // dropped at the line ~649 early-out guard. The catch below is
+        // critical: if execute() throws RejectedExecutionException
+        // (e.g. between stopSensors() and ensureExecutorsAlive() during
+        // resetAll), the runnable's `finally` never runs and
+        // vioProcessing would latch `true` forever — every subsequent
+        // frame would be silently dropped at the early-out and VIO
+        // would die for the rest of the session. Resetting the flag in
+        // the catch closes that latch.
         vioProcessing = true
         val frameStartMs = nowMs
-        vioExecutor.execute {
-            try {
-                val jniStartMs = System.currentTimeMillis()
-                val vio = NativeBridge.processCameraFrameDirect(
-                    yBuffer = yBuffer,
-                    uvBuffer = uvBuffer,
-                    width = w,
-                    height = h,
-                    yRowStride = yRowStride,
-                    uvRowStride = uvRowStride,
-                    uvPixelStride = uvPixelStride,
-                    timestamp = timestampNs,
-                    rollingShutterSkewNs = rollingShutterSkewNs  // Step 8c
-                )
-                val jniMs = System.currentTimeMillis() - jniStartMs
-                val totalMs = System.currentTimeMillis() - frameStartMs
-                vioFrameCount++
-                if (vioFrameCount % 30 == 0) {
-                    Log.i(TAG, "VIO_FPS: jni=${jniMs}ms total=${totalMs}ms fc=$vioFrameCount pts=${vio.trackedFeatures}")
+        try {
+            vioExecutor.execute {
+                try {
+                    val jniStartMs = System.currentTimeMillis()
+                    val vio = NativeBridge.processCameraFrameDirect(
+                        yBuffer = yBuffer,
+                        uvBuffer = uvBuffer,
+                        width = w,
+                        height = h,
+                        yRowStride = yRowStride,
+                        uvRowStride = uvRowStride,
+                        uvPixelStride = uvPixelStride,
+                        timestamp = timestampNs,
+                        rollingShutterSkewNs = rollingShutterSkewNs  // Step 8c
+                    )
+                    val jniMs = System.currentTimeMillis() - jniStartMs
+                    val totalMs = System.currentTimeMillis() - frameStartMs
+                    vioFrameCount++
+                    if (vioFrameCount % 30 == 0) {
+                        Log.i(TAG, "VIO_FPS: jni=${jniMs}ms total=${totalMs}ms fc=$vioFrameCount pts=${vio.trackedFeatures}")
+                    }
+                    _vioState.value = vio
+                    publishOverlaySnapshot(vio)
+                    handleVioInitialized(vio)
+                    checkCameraBlocked(vio)
+                } finally {
+                    image.close()  // Release ImageProxy AFTER JNI is done
+                    vioProcessing = false
                 }
-                _vioState.value = vio
-                handleVioInitialized(vio)
-                checkCameraBlocked(vio)
-            } finally {
-                image.close()  // Release ImageProxy AFTER JNI is done
-                vioProcessing = false
             }
+        } catch (e: java.util.concurrent.RejectedExecutionException) {
+            Log.w(TAG, "vioExecutor rejected frame (executor shut down); dropping")
+            image.close()
+            vioProcessing = false
         }
 
-        // Depth estimation at 1Hz — MiDaS feeds Tracker scale constraint
+        // Depth estimation at 1Hz — MiDaS feeds Tracker scale constraint.
+        //
+        // 2026-05-09 reset-fix: same RejectedExecutionException pattern
+        // as the VIO submit above. Without the outer try/catch,
+        // depthProcessing would latch `true` after a shutdown executor
+        // rejected a submit, and depth would never run again for the
+        // rest of the session — silent MiDaS death after any reset.
         if (yBytesForDepth != null) {
             depthProcessing = true
             lastDepthTimeMs = nowMs
-            depthExecutor.execute {
-                try {
-                    val bitmap = android.graphics.Bitmap.createBitmap(w, h, android.graphics.Bitmap.Config.ARGB_8888)
-                    val pixels = IntArray(w * h)
-                    for (i in yBytesForDepth.indices) {
-                        val lum = yBytesForDepth[i].toInt() and 0xFF
-                        pixels[i] = (0xFF shl 24) or (lum shl 16) or (lum shl 8) or lum
+            try {
+                depthExecutor.execute {
+                    try {
+                        val bitmap = android.graphics.Bitmap.createBitmap(w, h, android.graphics.Bitmap.Config.ARGB_8888)
+                        val pixels = IntArray(w * h)
+                        for (i in yBytesForDepth.indices) {
+                            val lum = yBytesForDepth[i].toInt() and 0xFF
+                            pixels[i] = (0xFF shl 24) or (lum shl 16) or (lum shl 8) or lum
+                        }
+                        bitmap.setPixels(pixels, 0, w, 0, 0, w, h)
+                        val depthMap = kotlinx.coroutines.runBlocking { depthEstimator.estimateDepth(bitmap) }
+                        if (depthMap != null) {
+                            NativeBridge.setDepthMap(depthMap, 256, 256)
+                        }
+                        bitmap.recycle()
+                    } catch (e: Exception) {
+                        Log.e(TAG, "Depth processing error: ${e.message}")
+                    } finally {
+                        depthProcessing = false
                     }
-                    bitmap.setPixels(pixels, 0, w, 0, 0, w, h)
-                    val depthMap = kotlinx.coroutines.runBlocking { depthEstimator.estimateDepth(bitmap) }
-                    if (depthMap != null) {
-                        NativeBridge.setDepthMap(depthMap, 256, 256)
-                    }
-                    bitmap.recycle()
-                } catch (e: Exception) {
-                    Log.e(TAG, "Depth processing error: ${e.message}")
-                } finally {
-                    depthProcessing = false
                 }
+            } catch (e: java.util.concurrent.RejectedExecutionException) {
+                Log.w(TAG, "depthExecutor rejected frame (executor shut down); dropping")
+                depthProcessing = false
             }
         }
     }
@@ -810,6 +1002,54 @@ class SensorRepository(private val context: Context) : SensorEventListener {
         }
     }
 
+    /**
+     * Camera overlay Phase 2/3/4: publish a fresh per-frame snapshot to the
+     * overlay flow. Runs on the VIO executor immediately after the native
+     * frame returned. Allocations on the steady-state path are bounded to
+     * one OverlaySnapshot object plus copyOf calls only when each field is
+     * non-empty (the buffers themselves are reused).
+     *
+     * Why a single bundled flow rather than four parallel ones: a single
+     * MutableStateFlow.value set fires one Compose invalidation per
+     * subscriber. Bundling means the Canvas recomposes once per native
+     * frame even when all four fields change. Compare to four flows: four
+     * invalidations per frame, four StateFlow writes, four equality checks.
+     */
+    private fun publishOverlaySnapshot(vio: VioData) {
+        // Phase 2: ages parallel to vio.trackedPoints.
+        val expectedAgeCount = vio.trackedPoints.size / 2
+        val agesArr: IntArray = if (expectedAgeCount <= 0) emptyInts
+        else {
+            val n = NativeBridge.getLastTrackedPointAges(agesBuf)
+            // Trim if VIO published a different count than the JNI getter
+            // returned (the two sources share state_mutex on the writer
+            // side; reads here are sequential so a mismatch would only
+            // happen if the buffer was undersized — agesBuf is sized 512,
+            // well above any plausible KLT count).
+            if (n == expectedAgeCount) agesBuf.copyOf(n) else emptyInts
+        }
+
+        // Phase 3: SLAM positions (Y-up world). Bounded by MAX_SLAM_FEATURES.
+        val slamCount = NativeBridge.getSlamSnapshot(slamBuf)
+        val slamArr: FloatArray = if (slamCount > 0) slamBuf.copyOf(slamCount * 4)
+        else emptyFloats
+
+        // Phase 3: camera pose (Y-up world). Empty when EKF not ready.
+        val poseValid = NativeBridge.getCurrentCameraPose(cameraPoseBuf)
+        val poseArr: FloatArray = if (poseValid) cameraPoseBuf.copyOf() else emptyFloats
+
+        // Phase 4: loop closure correction count.
+        val lcCount = NativeBridge.getLoopClosureCorrectionsApplied()
+
+        _overlaySnapshot.value = OverlaySnapshot(
+            trackedPoints = vio.trackedPoints,   // already a fresh JNI alloc per frame
+            trackedAges = agesArr,
+            slamSnapshot = slamArr,
+            cameraPose = poseArr,
+            loopClosureCount = lcCount,
+        )
+    }
+
     fun resetPath() {
         NativeBridge.resetVIO()
         _vioState.value = VioData()
@@ -819,6 +1059,78 @@ class SensorRepository(private val context: Context) : SensorEventListener {
         consecutiveVioFailures = 0
         _showCameraBlocked.value = false
         accelMagnitudeHistory.clear()
+    }
+
+    /**
+     * Stage 3 (2026-05-09) — full reset that mirrors a fresh app launch.
+     *
+     * Equivalent to: onPause → wipe persistent state → onResume →
+     * requestInitialLocation. Everything that gets seeded from
+     * `startSensors()` on a cold start is re-seeded. After this returns
+     * the system is in the same state as immediately after MainActivity
+     * acquires permissions and runs the first frame.
+     *
+     * Called from the UI's "Rides" reset button. Idempotent.
+     *
+     * @param hasLocationPermission caller-owned permission state (matches
+     *        the ViewModel's flag set in requestInitialLocation()). Passed
+     *        explicitly so the repository doesn't shadow the activity's
+     *        permission tracking.
+     */
+    fun resetAll(hasLocationPermission: Boolean) {
+        // 1. Tear down active subscriptions and any in-flight recorder
+        //    so callbacks during the reset window can't write to stale
+        //    state. Mirrors the lifecycle's onPause path.
+        stopGpsUpdates()
+        setFrameRecorder(null)
+        stopSensors()
+
+        // 2. Wipe Kotlin-side state that crosses session boundaries.
+        _startLocation.value = null
+        _currentLocation.value = null
+        _showCameraBlocked.value = false
+        _initStatus.value = InitStatus.WAIT_STATIONARY
+        wasVioInitialized = false
+        vioInitAzimuth = 0f
+        consecutiveVioFailures = 0
+        accelMagnitudeHistory.clear()
+        intrinsicsInitialized = false
+        calibratedIntrinsicsLoaded = false
+        rollingShutterSkewNs = 0L
+        // Defensive: if a frame slipped between stopSensors's executor
+        // shutdown and ensureExecutorsAlive's recreate, the per-frame
+        // guards may have latched true. Reset here so the first new
+        // camera frame after startSensors() is not dropped at the
+        // early-out gate at the top of processCameraFrame.
+        vioProcessing = false
+        depthProcessing = false
+
+        // 3. Clear native + filter state. resetVIO() flows through to
+        //    VioEngine::reset → Tracker::reset → EKFState::reset, plus
+        //    nativeResetEventCounters() to zero the telemetry block so
+        //    fresh diagnostics start from 0.
+        NativeBridge.resetVIO()
+        runCatching { NativeBridge.nativeResetEventCounters() }
+        orientationTracker.reset()
+        _vioState.value = VioData()
+        // Phase 1 camera-overlay plumbing: drop cached analyzer geometry so
+        // the overlay hides until the first new frame after reset republishes
+        // it. The Composable returns early when this is null.
+        _cameraFrameGeometry.value = null
+        // Phase 2/3/4 overlay plumbing: clear the bundled snapshot so the
+        // overlay's KLT dots, SLAM dots, and any in-flight loop-closure
+        // flash all hide instantly on reset. Republished by the next
+        // native frame after startSensors() completes.
+        _overlaySnapshot.value = OverlaySnapshot(
+            floatArrayOf(), intArrayOf(), floatArrayOf(), floatArrayOf(), 0L
+        )
+
+        // 4. Restart everything in the same order startSensors() does
+        //    at app launch.
+        startSensors()
+        // GPS depends on the permission flag the activity sets; preserve it.
+        startGpsUpdates(hasLocationPermission)
+        requestInitialLocation(hasLocationPermission)
     }
 
     // DEAD CODE: never called — ViewModel calls NativeBridge.setScale() directly

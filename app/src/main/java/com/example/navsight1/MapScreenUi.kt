@@ -91,6 +91,23 @@ fun MainScreen(viewModel: NavSightViewModel, pal: NavPalette, isNight: Boolean, 
             Box(modifier = if (cameraVisible && !calibrationVisible) Modifier.fillMaxSize() else Modifier.size(1.dp).alpha(0f)) {
                 if (!calibrationVisible) {
                     CameraViewComposable(viewModel)
+                    // Phase 1 camera overlay: KLT tracked-feature dots.
+                    // Gated on `cameraVisible` so the always-alive offscreen
+                    // camera (1-dp invisible box) does not pay the per-frame
+                    // recomposition cost. The composable itself early-returns
+                    // when geometry/points aren't available yet.
+                    if (cameraVisible) {
+                        CameraFeatureOverlay(viewModel, pal)
+                        // Phase 3: world-anchored 3D SLAM points (orange
+                        // dots with white ring outline). Reprojected each
+                        // frame from the EKF state, so they stick to
+                        // physical 3D points across pan-and-return motions.
+                        SlamFeatureOverlay(viewModel, pal)
+                        // Phase 4: 1-second flash banner on every accepted
+                        // loop closure correction. Triggers from EventCounters
+                        // increments; reads viewModel.loopClosureFlashUntilMs.
+                        LoopClosureFlash(viewModel)
+                    }
                 }
             }
         }
@@ -260,7 +277,7 @@ fun MainScreen(viewModel: NavSightViewModel, pal: NavPalette, isNight: Boolean, 
                 else { isRecordingGpx = false; scope.launch(Dispatchers.IO) { gpxMessage = saveGpxFile(context, gpxPoints) } }
             },
             onDebugClick    = { debugVisible = !debugVisible },
-            onResetClick    = { viewModel.resetPath() },
+            onResetClick    = { viewModel.resetAll() },
             onStopNavClick  = { viewModel.stopNavigation() },
             onNightToggle   = onToggleNight,
             onToggleExpanded = { bottomSheetExpanded = !bottomSheetExpanded }

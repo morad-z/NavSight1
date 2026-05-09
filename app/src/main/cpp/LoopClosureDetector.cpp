@@ -107,6 +107,31 @@ constexpr int    kPnpMaxIters      = 100;
 // (inverted index walks the same words once) and helps debug.
 constexpr int kBowTopN = 4;
 
+// ─── Step 7.1 — Geometric loop closure (additive) ────────────────────────
+// Spec: docs/VISUAL_PLAN_STEP_7_1_GEOMETRIC_LOOP.md.
+
+// kGeomMinInFrame
+//   Minimum 3D-world points (from a single candidate keyframe) that project
+//   into the predicted current camera with positive depth in [0.5, 50] m
+//   AND fall inside the image bounds. Below this, the spatial overlap
+//   between the candidate keyframe's view and the current view is too thin
+//   to ground a PnP solve. 30 ≈ 2× kPnpMinInliers since not every in-frame
+//   projection will find a real KLT corner inside kGeomMatchRadiusPx.
+constexpr int kGeomMinInFrame = 30;
+
+// kGeomMatchRadiusPx
+//   Image-space radius for nearest-neighbour matching projected-3D-points
+//   to current-frame KLT corners. Tracker MIN_DIST = 10 px is the spacing
+//   between corners by construction; 15 px gives margin for projection
+//   error from EKF orientation drift.
+constexpr double kGeomMatchRadiusPx = 15.0;
+
+// Reuse the same depth gates as the BoW path's two-keyframe triangulation
+// at Tracker.cpp:2567-2570 — points behind the camera or too far for any
+// reasonable pinhole projection are filtered.
+constexpr double kGeomDepthFloorM   = 0.5;
+constexpr double kGeomDepthCeilingM = 50.0;
+
 // Convert a CV_8U Nx32 descriptor matrix to DBoW2's preferred
 // vector<cv::Mat> (one single-row mat per descriptor).
 std::vector<cv::Mat> descriptorMatToVec(const cv::Mat& descriptors) {
@@ -609,4 +634,247 @@ size_t LoopClosureDetector::getKeyframeCount() const {
 bool LoopClosureDetector::isReady() const {
     if (!impl_) return false;
     return impl_->ready.load(std::memory_order_acquire);
+}
+
+// ── Step 7.1 — Geometric loop closure ─────────────────────────────────────
+//
+// Direction-invariant detection that bypasses ORB descriptors. Spec at
+// docs/VISUAL_PLAN_STEP_7_1_GEOMETRIC_LOOP.md. Counters live in
+// EventCounters.h under the loop_closure_geom_* prefix.
+//
+// Note on lifetime: this method does NOT touch impl_->db (the BoW database)
+// at all. It walks impl_->keyframes for spatial filtering only. Safe to call
+// concurrently with addKeyframe / tryDetectLoop because all three take the
+// same impl_->mutex; the geometric path holds the lock just long enough to
+// snapshot candidate KFs, then releases for the slow projection / PnP work.
+bool LoopClosureDetector::tryDetectLoopGeometric(
+    uint64_t now_kf_id, int64_t now_ns,
+    const std::vector<cv::Point2f>& current_klt_corners,
+    const cv::Matx33d& predicted_R_world_cam,
+    const cv::Vec3d&   predicted_t_cam_world,
+    double fx, double fy, double cx, double cy,
+    int img_width, int img_height,
+    double position_search_radius_m,
+    int64_t temporal_exclusion_ns,
+    LoopMatch& out_match) {
+
+    using navsight::eventCounters;
+    eventCounters().loop_closure_geom_attempts.fetch_add(1, std::memory_order_relaxed);
+
+    if (!impl_) return false;
+    if (!impl_->ready.load(std::memory_order_acquire)) return false;
+
+    if (current_klt_corners.empty() || img_width <= 0 || img_height <= 0 ||
+        fx <= 0.0 || fy <= 0.0 ||
+        position_search_radius_m <= 0.0) {
+        eventCounters().loop_closure_geom_rejects_no_position.fetch_add(
+            1, std::memory_order_relaxed);
+        return false;
+    }
+
+    // ── Stage 1: spatial filter under lock ────────────────────────────────
+    // Copy candidate keyframes' (pts3d_world, R, t, kf_id, ts_ns) out so the
+    // slow projection and PnP run lock-free. Same pattern as the BoW path.
+    struct Candidate {
+        uint64_t                  kf_id        = 0;
+        int64_t                   timestamp_ns = 0;
+        std::vector<cv::Point3f>  pts3d_world;
+        cv::Matx33d               R_world_cam  = cv::Matx33d::eye();
+        cv::Vec3d                 t_cam_world  = cv::Vec3d(0, 0, 0);
+    };
+    std::vector<Candidate> candidates;
+    {
+        std::lock_guard<std::mutex> lk(impl_->mutex);
+        const int64_t cutoff_ns = now_ns - temporal_exclusion_ns;
+        for (const auto& kf : impl_->keyframes) {
+            if (kf.kf_id == now_kf_id) continue;
+            if (kf.timestamp_ns > cutoff_ns) continue;  // too recent
+            // Spatial filter: 3D Euclidean distance in world frame. We use
+            // the full 3D distance (not just XY) so a small altitude offset
+            // doesn't hide a genuine revisit; the projection step is the
+            // real visibility test.
+            const cv::Vec3d delta = kf.t_cam_world - predicted_t_cam_world;
+            const double d2 = delta[0]*delta[0] + delta[1]*delta[1] + delta[2]*delta[2];
+            const double r2 = position_search_radius_m * position_search_radius_m;
+            if (d2 > r2) continue;
+            Candidate c;
+            c.kf_id        = kf.kf_id;
+            c.timestamp_ns = kf.timestamp_ns;
+            c.pts3d_world  = kf.pts3d_world;   // copy under lock
+            c.R_world_cam  = kf.R_world_cam;
+            c.t_cam_world  = kf.t_cam_world;
+            candidates.push_back(std::move(c));
+        }
+    }
+
+    if (candidates.empty()) {
+        eventCounters().loop_closure_geom_rejects_no_candidate.fetch_add(
+            1, std::memory_order_relaxed);
+        return false;
+    }
+
+    // ── Stage 2: project each candidate's 3D points into the predicted
+    // current camera; pick the candidate with the most in-frame projections.
+    //
+    // p_cam = R_world_cam_pred^T · (p_world − t_cam_world_pred)
+    //         (camera→world inverted = world→camera)
+    // (u, v) = (fx·p_cam.x/p_cam.z + cx, fy·p_cam.y/p_cam.z + cy)
+    const cv::Matx33d R_cam_world_pred = predicted_R_world_cam.t();
+    const Candidate* best_cand = nullptr;
+    int best_in_frame = 0;
+    // Per-best-candidate output: world point + projected pixel for each
+    // in-frame projection. Reused below by the NN match step.
+    std::vector<cv::Point3f> best_pts3d_world_inframe;
+    std::vector<cv::Point2f> best_proj_inframe;
+    for (const auto& cand : candidates) {
+        if (cand.pts3d_world.empty()) continue;
+        std::vector<cv::Point3f> pts3d_inframe;
+        std::vector<cv::Point2f> proj_inframe;
+        pts3d_inframe.reserve(cand.pts3d_world.size());
+        proj_inframe.reserve(cand.pts3d_world.size());
+        for (const auto& p_world : cand.pts3d_world) {
+            // Skip NaN-marked rows (the BoW path also stores these for
+            // descriptor-only retrieval; they're useless to us here).
+            if (!std::isfinite(p_world.x) ||
+                !std::isfinite(p_world.y) ||
+                !std::isfinite(p_world.z)) continue;
+            const cv::Vec3d w(p_world.x, p_world.y, p_world.z);
+            const cv::Vec3d w_minus_t = w - predicted_t_cam_world;
+            const cv::Vec3d p_cam = R_cam_world_pred * w_minus_t;
+            const double Z = p_cam[2];
+            if (!std::isfinite(Z)) continue;
+            if (Z < kGeomDepthFloorM || Z > kGeomDepthCeilingM) continue;
+            const double u = fx * (p_cam[0] / Z) + cx;
+            const double v = fy * (p_cam[1] / Z) + cy;
+            if (!std::isfinite(u) || !std::isfinite(v)) continue;
+            if (u < 0.0 || u >= img_width || v < 0.0 || v >= img_height) continue;
+            pts3d_inframe.push_back(p_world);
+            proj_inframe.emplace_back(static_cast<float>(u),
+                                      static_cast<float>(v));
+        }
+        if (static_cast<int>(pts3d_inframe.size()) > best_in_frame) {
+            best_in_frame              = static_cast<int>(pts3d_inframe.size());
+            best_cand                  = &cand;
+            best_pts3d_world_inframe   = std::move(pts3d_inframe);
+            best_proj_inframe          = std::move(proj_inframe);
+        }
+    }
+
+    if (best_cand == nullptr || best_in_frame < kGeomMinInFrame) {
+        eventCounters().loop_closure_geom_rejects_few_inframe.fetch_add(
+            1, std::memory_order_relaxed);
+        return false;
+    }
+
+    // ── Stage 3: NN-match projected points to current KLT corners ─────────
+    // Naive O(N·M) is fine here: N (in-frame projections) ≤ keyframe pts3d
+    // size ≈ 100, M (current KLT corners) ≤ MAX_FEATURES=200. ~20K dist
+    // computations per call, sub-millisecond.
+    const double radius2 = kGeomMatchRadiusPx * kGeomMatchRadiusPx;
+    std::vector<cv::Point3f> pnp_pts3d;
+    std::vector<cv::Point2f> pnp_pts2d;
+    pnp_pts3d.reserve(best_in_frame);
+    pnp_pts2d.reserve(best_in_frame);
+    for (size_t i = 0; i < best_proj_inframe.size(); ++i) {
+        const cv::Point2f& proj = best_proj_inframe[i];
+        double best_d2 = radius2;
+        const cv::Point2f* best_corner = nullptr;
+        for (const auto& corner : current_klt_corners) {
+            const float dx = corner.x - proj.x;
+            const float dy = corner.y - proj.y;
+            const double d2 = static_cast<double>(dx)*dx + static_cast<double>(dy)*dy;
+            if (d2 < best_d2) {
+                best_d2     = d2;
+                best_corner = &corner;
+            }
+        }
+        if (best_corner != nullptr) {
+            pnp_pts3d.push_back(best_pts3d_world_inframe[i]);
+            pnp_pts2d.push_back(*best_corner);
+        }
+    }
+
+    if (static_cast<int>(pnp_pts3d.size()) < kPnpMinInliers) {
+        eventCounters().loop_closure_geom_rejects_pnp.fetch_add(
+            1, std::memory_order_relaxed);
+        return false;
+    }
+
+    // ── Stage 4: PnP RANSAC ───────────────────────────────────────────────
+    // Solves for the world→cam transform that best explains the (3D world,
+    // 2D current image) correspondences. Same parameters as the BoW path so
+    // false-positive rates stay comparable. Mat construction mirrors the
+    // BoW path at LoopClosureDetector.cpp:541-546 for type-stability.
+    cv::Mat K = (cv::Mat_<double>(3, 3) <<
+                 fx,  0, cx,
+                  0, fy, cy,
+                  0,  0,  1);
+    cv::Mat dist_zero = cv::Mat::zeros(4, 1, CV_64F);
+
+    cv::Mat rvec, tvec;
+    std::vector<int> inliers_idx;
+    bool pnp_ok = false;
+    try {
+        pnp_ok = cv::solvePnPRansac(
+            pnp_pts3d, pnp_pts2d,
+            K, dist_zero,
+            rvec, tvec,
+            /*useExtrinsicGuess=*/false,
+            kPnpMaxIters,
+            static_cast<float>(kPnpReprojThreshPx),
+            kPnpConfidence,
+            inliers_idx,
+            cv::SOLVEPNP_ITERATIVE);
+    } catch (const cv::Exception&) {
+        pnp_ok = false;
+    }
+
+    if (!pnp_ok || static_cast<int>(inliers_idx.size()) < kPnpMinInliers) {
+        eventCounters().loop_closure_geom_rejects_pnp.fetch_add(
+            1, std::memory_order_relaxed);
+        return false;
+    }
+
+    // ── Stage 5: build LoopMatch identical to the BoW path ────────────────
+    // The PnP solve gave us R_world_now (rvec) and t_now_world (tvec) directly:
+    // these describe the current camera in the world frame inferred from the
+    // correspondences. We then rephrase as the relative now→match transform
+    // so EKFState::updateAbsolutePose can consume the same payload regardless
+    // of which detector fired.
+    cv::Matx33d R_now_world;
+    {
+        cv::Mat R_now_world_mat;
+        cv::Rodrigues(rvec, R_now_world_mat);
+        for (int r = 0; r < 3; ++r) {
+            for (int c = 0; c < 3; ++c) {
+                R_now_world(r, c) = R_now_world_mat.at<double>(r, c);
+            }
+        }
+    }
+    cv::Vec3d t_now_world(tvec.at<double>(0),
+                          tvec.at<double>(1),
+                          tvec.at<double>(2));
+
+    // Match keyframe's stored cam→world pose, derived as in tryDetectLoop:
+    //   R_match_world = R_world_cam_match^T   (world→cam at match)
+    //   t_match_world = -R_match_world · t_cam_world_match (camera-position-flip)
+    const cv::Matx33d R_match_world = best_cand->R_world_cam.t();
+    const cv::Vec3d   t_match_world = -(R_match_world * best_cand->t_cam_world);
+
+    out_match.matched_kf_id     = best_cand->kf_id;
+    out_match.bow_score         = 0.0;  // not produced by this path
+    out_match.pnp_inliers       = static_cast<int>(inliers_idx.size());
+    out_match.R_now_to_match    = R_match_world * R_now_world.t();
+    out_match.t_now_to_match    = t_match_world - out_match.R_now_to_match * t_now_world;
+    out_match.R_world_cam_match = best_cand->R_world_cam;
+    out_match.t_cam_world_match = best_cand->t_cam_world;
+
+    eventCounters().loop_closure_geom_accepts.fetch_add(1, std::memory_order_relaxed);
+    LOGI("LC_GEOM: accept query=%llu match=%llu in_frame=%d nn_pairs=%zu inliers=%zu",
+         (unsigned long long)now_kf_id,
+         (unsigned long long)best_cand->kf_id,
+         best_in_frame,
+         pnp_pts3d.size(),
+         inliers_idx.size());
+    return true;
 }

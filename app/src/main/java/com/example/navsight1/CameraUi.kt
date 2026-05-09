@@ -12,6 +12,7 @@ import androidx.camera.view.PreviewView
 import androidx.compose.animation.*
 import androidx.compose.animation.core.tween
 import androidx.compose.foundation.BorderStroke
+import androidx.compose.foundation.Canvas
 import androidx.compose.foundation.background
 import androidx.compose.foundation.clickable
 import androidx.compose.foundation.layout.*
@@ -24,6 +25,7 @@ import androidx.compose.runtime.*
 import androidx.compose.ui.Alignment
 import androidx.compose.ui.Modifier
 import androidx.compose.ui.draw.clip
+import androidx.compose.ui.geometry.Offset
 import androidx.compose.ui.graphics.Brush
 import androidx.compose.ui.graphics.Color
 import androidx.compose.ui.platform.LocalLifecycleOwner
@@ -262,3 +264,273 @@ private fun CamHudStat(value: String, label: String, color: Color) {
 private fun CamHudDiv() {
     Box(Modifier.width(1.dp).height(26.dp).background(Color(0xFFEEEEEE)))
 }
+
+// ── Phase 1 camera overlay: KLT tracked feature points ─────────────────────
+//
+// `VioData.trackedPoints` is a flat float array `[x0,y0, x1,y1, ...]` in
+// analyzer-native pixel coords (typically 640×480 landscape, sourced from
+// `next_good_buf_` at Tracker.cpp:1026-1031). To draw them on top of the
+// PreviewView we must:
+//
+//   1. Rotate analyzer coords → upright preview coords by
+//      `image.imageInfo.rotationDegrees` (CameraX makes the analyzer image
+//      upright on the preview surface; we replicate the same rotation).
+//   2. Replicate `PreviewView.ScaleType.FILL_CENTER` (declared at
+//      `CameraViewComposable` line 48) — uniform scale by max(sx, sy) so the
+//      smaller dimension fills the view exactly while the larger overflows
+//      symmetrically and is cropped.
+//   3. Draw filled circles in Compose Canvas pixels.
+//
+// The same math lives in `CalibrationScreenUi.kt` for the chessboard
+// overlay; we keep file-local copies (10 lines total) to avoid a refactor
+// for two callers.
+
+// Phase 2 KLT age palette (camera_overlay_phase23_plan.md §C.4).
+// At 30 Hz, 30 frames = 1 s, 90 frames = 3 s.
+private const val OVERLAY_AGE_NEW_FRAMES        = 30        // < 1 s
+private const val OVERLAY_AGE_ESTABLISHED_FRAMES = 90       // 1-3 s
+private val OVERLAY_AGE_NEW_COLOR         = Color(0xD953D34D)   // green @85%
+private val OVERLAY_AGE_ESTABLISHED_COLOR = Color(0xD9FFEB3B)   // yellow @85%
+private val OVERLAY_AGE_MATURE_COLOR      = Color(0xD9EF5350)   // red @85%
+
+// Phase 3 SLAM dot styling.
+private val OVERLAY_SLAM_FILL    = Color(0xD9FF6D00)   // orange @85%
+private val OVERLAY_SLAM_RING    = Color(0xCCFFFFFF)   // white  @80%
+private const val OVERLAY_SLAM_RADIUS_PX = 8f
+private const val OVERLAY_SLAM_RING_RADIUS_PX = 9f
+private const val OVERLAY_SLAM_RING_STROKE_PX = 1.5f
+// Minimum projected depth (m) for a stable dot. Derivation:
+// at fx ~500 px, the focal/depth gain is 500/0.05 = 10 000 px/m.
+// 1° EKF rotation noise ≈ 0.0175 rad pivots a 5 cm-deep point by
+// ~5 cm × tan(1°) = 0.87 mm, projecting to ~17 px on screen. Anything
+// closer than 5 cm flickers visibly; anything farther stays sub-pixel.
+private const val OVERLAY_SLAM_MIN_DEPTH_M = 0.05f
+
+private fun ageToColor(ageFrames: Int): Color = when {
+    ageFrames < OVERLAY_AGE_NEW_FRAMES         -> OVERLAY_AGE_NEW_COLOR
+    ageFrames < OVERLAY_AGE_ESTABLISHED_FRAMES -> OVERLAY_AGE_ESTABLISHED_COLOR
+    else                                        -> OVERLAY_AGE_MATURE_COLOR
+}
+
+@Composable
+fun CameraFeatureOverlay(viewModel: NavSightViewModel, pal: NavPalette) {
+    // Camera overlay Phase 1 LAG FIX (camera_overlay_phase23_plan.md §A):
+    // read from the per-frame `overlaySnapshot` instead of the throttled
+    // `vioState`. The snapshot updates at the full ~30 Hz native frame
+    // rate so dots track the live preview with no perceptible lag.
+    val snap = viewModel.overlaySnapshot
+    val geom = viewModel.cameraFrameGeometry
+    if (geom == null) return
+    val pts = snap.trackedPoints
+    if (pts.isEmpty()) return
+    val ages = snap.trackedAges
+    val n = pts.size / 2
+    // Phase 2 age colouring is enabled iff ages parallel-pair with pts.
+    // Anytime they don't (e.g. the JNI getter race lost a frame) we
+    // fall back to the original teal so dots stay visible.
+    val useAgeColors = ages.size == n
+    val fallbackColor = pal.teal.copy(alpha = 0.85f)
+    val dotRadius = 6f
+
+    Canvas(Modifier.fillMaxSize()) {
+        val (prevW, prevH) = overlayRotatedDims(
+            geom.analyzerWidth, geom.analyzerHeight, geom.rotationDegrees
+        )
+        if (prevW <= 0 || prevH <= 0) return@Canvas
+
+        val viewW = size.width
+        val viewH = size.height
+        val sx = viewW / prevW.toFloat()
+        val sy = viewH / prevH.toFloat()
+        val s = maxOf(sx, sy)                       // FILL_CENTER
+        val ox = (viewW - prevW * s) / 2f
+        val oy = (viewH - prevH * s) / 2f
+
+        for (i in 0 until n) {
+            val ax = pts[2 * i]
+            val ay = pts[2 * i + 1]
+            val r = overlayRotatePoint(
+                ax, ay, geom.analyzerWidth, geom.analyzerHeight, geom.rotationDegrees
+            )
+            val cx = ox + r.x * s
+            val cy = oy + r.y * s
+            val color = if (useAgeColors) ageToColor(ages[i]) else fallbackColor
+            drawCircle(color = color, radius = dotRadius, center = Offset(cx, cy))
+        }
+    }
+}
+
+/**
+ * Camera overlay Phase 3 (camera_overlay_phase23_plan.md §B):
+ * world-anchored 3D SLAM points reprojected through the current camera
+ * pose. Unlike KLT teal/coloured dots — which die when KLT loses the
+ * feature — these dots stay locked to the same physical 3D point in the
+ * scene. Pan away and back: the same orange-with-white-ring dot reappears
+ * at the same spot.
+ *
+ * Math (per feature):
+ *   p_cam = R_world_cam.t() · (p_world - t_world_cam)
+ *   if (p_cam.z <= MIN_DEPTH_M) skip   // behind / too close to camera
+ *   u = fx · p_cam.x / p_cam.z + cx
+ *   v = fy · p_cam.y / p_cam.z + cy
+ *   then apply analyzer→canvas rotation + FILL_CENTER scale-and-crop
+ *
+ * The FILL_CENTER math is identical to [CameraFeatureOverlay] so a SLAM
+ * point at the same scene location as a KLT dot draws at the same canvas
+ * pixel. Verifying that visually is the easiest acceptance test.
+ */
+@Composable
+fun SlamFeatureOverlay(viewModel: NavSightViewModel, pal: NavPalette) {
+    val snap = viewModel.overlaySnapshot
+    val geom = viewModel.cameraFrameGeometry
+    if (geom == null) return
+    val slam = snap.slamSnapshot
+    if (slam.size < 4) return                    // need at least 1 feature
+    val pose = snap.cameraPose
+    if (pose.size < 16) return                   // EKF not yet full-init
+
+    // Decode pose matrix once outside the per-feature loop.
+    // Layout (see native-lib.cpp Java_..._getCurrentCameraPose):
+    //   [0..8]   R_world_cam row-major (camera→world)
+    //   [9..11]  t_world_cam (camera position in Y-up world)
+    //   [12..15] fx, fy, cx, cy
+    val r0 = pose[0]; val r1 = pose[1]; val r2 = pose[2]
+    val r3 = pose[3]; val r4 = pose[4]; val r5 = pose[5]
+    val r6 = pose[6]; val r7 = pose[7]; val r8 = pose[8]
+    val tx = pose[9]; val ty = pose[10]; val tz = pose[11]
+    val fx = pose[12]; val fy = pose[13]
+    val cxIntr = pose[14]; val cyIntr = pose[15]
+
+    Canvas(Modifier.fillMaxSize()) {
+        val (prevW, prevH) = overlayRotatedDims(
+            geom.analyzerWidth, geom.analyzerHeight, geom.rotationDegrees
+        )
+        if (prevW <= 0 || prevH <= 0) return@Canvas
+
+        val viewW = size.width
+        val viewH = size.height
+        val sx = viewW / prevW.toFloat()
+        val sy = viewH / prevH.toFloat()
+        val s = maxOf(sx, sy)                       // FILL_CENTER
+        val ox = (viewW - prevW * s) / 2f
+        val oy = (viewH - prevH * s) / 2f
+
+        val n = slam.size / 4
+        for (i in 0 until n) {
+            // val fid = slam[4 * i]    // feature_id — currently unused in draw
+            val wx = slam[4 * i + 1]
+            val wy = slam[4 * i + 2]
+            val wz = slam[4 * i + 3]
+
+            // p_cam = R_world_cam.t() · (p_world - t_world)
+            // For a row-major R_world_cam, the transpose times a vector
+            // is column-wise: out[r] = sum_c R[c, r] * v[c].
+            val dx = wx - tx
+            val dy = wy - ty
+            val dz = wz - tz
+            val xc = r0 * dx + r3 * dy + r6 * dz
+            val yc = r1 * dx + r4 * dy + r7 * dz
+            val zc = r2 * dx + r5 * dy + r8 * dz
+            if (zc <= OVERLAY_SLAM_MIN_DEPTH_M) continue
+
+            val u = fx * xc / zc + cxIntr
+            val v = fy * yc / zc + cyIntr
+
+            // Apply identical analyzer→canvas transform as KLT overlay.
+            val rot = overlayRotatePoint(
+                u, v, geom.analyzerWidth, geom.analyzerHeight, geom.rotationDegrees
+            )
+            val cx = ox + rot.x * s
+            val cy = oy + rot.y * s
+
+            drawCircle(
+                color = OVERLAY_SLAM_FILL,
+                radius = OVERLAY_SLAM_RADIUS_PX,
+                center = Offset(cx, cy)
+            )
+            drawCircle(
+                color = OVERLAY_SLAM_RING,
+                radius = OVERLAY_SLAM_RING_RADIUS_PX,
+                center = Offset(cx, cy),
+                style = androidx.compose.ui.graphics.drawscope.Stroke(
+                    width = OVERLAY_SLAM_RING_STROKE_PX
+                )
+            )
+        }
+    }
+}
+
+/**
+ * Camera overlay Phase 4 (camera_overlay_phase23_plan.md §D): a one-second
+ * "LOOP CLOSURE" banner that fades in/out whenever the EKF accepts a
+ * loop-closure correction. The flash window is set in the ViewModel by
+ * detecting EventCounters.loop_closure_corrections_applied increments.
+ *
+ * The composable triggers a recomposition loop using `LaunchedEffect` +
+ * `delay()` to drive the alpha decay smoothly even though the
+ * `loopClosureFlashUntilMs` field itself only changes once per increment.
+ */
+@Composable
+fun LoopClosureFlash(viewModel: NavSightViewModel) {
+    val until = viewModel.loopClosureFlashUntilMs
+    if (until == 0L) return
+
+    var nowMs by remember { mutableStateOf(System.currentTimeMillis()) }
+    LaunchedEffect(until) {
+        while (true) {
+            val cur = System.currentTimeMillis()
+            if (cur >= until) {
+                nowMs = cur
+                break
+            }
+            nowMs = cur
+            kotlinx.coroutines.delay(33L)        // ~30 Hz refresh
+        }
+    }
+
+    val remaining = until - nowMs
+    if (remaining <= 0L) return
+    val alpha = (remaining / 1000f).coerceIn(0f, 1f)
+
+    Box(
+        modifier = Modifier.fillMaxSize().statusBarsPadding(),
+        contentAlignment = Alignment.TopCenter
+    ) {
+        Surface(
+            modifier = Modifier.padding(top = 60.dp),
+            color = Color(0xFFFFEB3B).copy(alpha = 0.85f * alpha),
+            shape = RoundedCornerShape(12.dp),
+            shadowElevation = 6.dp
+        ) {
+            Text(
+                "LOOP CLOSURE",
+                modifier = Modifier.padding(horizontal = 18.dp, vertical = 10.dp),
+                color = Color(0xFF1A1A1A).copy(alpha = alpha),
+                fontSize = 18.sp,
+                fontWeight = FontWeight.ExtraBold,
+                letterSpacing = 1.5.sp
+            )
+        }
+    }
+}
+
+/**
+ * Rotate a point from analyzer space (sensor-native landscape) to upright
+ * preview space. `rot` is `ImageProxy.imageInfo.rotationDegrees`. Mirrors the
+ * helper at `CalibrationScreenUi.kt:932`.
+ */
+private fun overlayRotatePoint(x: Float, y: Float, w: Int, h: Int, rot: Int): Offset =
+    when (rot) {
+        90 -> Offset(h - y, x)
+        180 -> Offset(w - x, h - y)
+        270 -> Offset(y, w - x)
+        else -> Offset(x, y)
+    }
+
+/**
+ * Analyzer dimensions rotated to upright preview orientation. For
+ * `rot ∈ {90, 270}` the dims swap (sensor-native landscape → portrait).
+ * Mirrors `CalibrationScreenUi.kt:940`.
+ */
+private fun overlayRotatedDims(w: Int, h: Int, rot: Int): Pair<Int, Int> =
+    if (rot == 90 || rot == 270) Pair(h, w) else Pair(w, h)

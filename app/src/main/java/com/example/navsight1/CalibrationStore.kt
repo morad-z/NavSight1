@@ -18,7 +18,17 @@ object CalibrationStore {
 
     // Bump this whenever the stored schema changes. Old entries with a different
     // version are dropped on read.
-    const val SCHEMA_VERSION = 1
+    //
+    // v2 (2026-05-09): world frame switched from Y-up to Z-up ENU
+    // (project_z_up_fix_2026_05_08). The stored R_GtoI matrix encodes
+    // body-from-world; switching the world convention rotates R_GtoI by
+    // 90° about world-X. Old v1 entries seed R_GtoI with a 50°+ residual
+    // against gravity from the first frame (verified in v9 walk:
+    // simulation_data_1778343884100, LC_GA r_norm starts at 0.86 and
+    // climbs to 1.97 — gravity-alignment can't recover from a seed
+    // that's off by half the unit-vector range). Forcing a re-calibration
+    // is the only correct response.
+    const val SCHEMA_VERSION = 2
 
     private const val PREFS_NAME = "navsight_calibration"
     private const val KEY_VERSION = "version"

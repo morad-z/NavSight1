@@ -1,5 +1,11 @@
 package com.example.navsight1
 
+// LEGACY: original splash composable. The active splash is `SplashScreen(pal, onDone)`
+// in `SplashScreenUi.kt` (white-background, NavPalette-aware), invoked from
+// `MainActivity.NavSightApp` at MainActivity.kt:42. This `(onSplashFinished)`
+// overload has no caller and is kept commented per "comment, don't delete" rule.
+
+/*
 import androidx.compose.animation.core.*
 import androidx.compose.foundation.Image
 import androidx.compose.foundation.background
@@ -22,7 +28,7 @@ import kotlinx.coroutines.delay
 import kotlinx.coroutines.launch
 
 @Composable
-fun SplashScreen(onSplashFinished: () -> Unit) {
+fun SplashScreenLegacy(onSplashFinished: () -> Unit) {
     // --- משתני אנימציה ---
     val logoScale = remember { Animatable(0.1f) }
     val logoAlpha = remember { Animatable(0f) }
@@ -181,3 +187,4 @@ fun SplashScreen(onSplashFinished: () -> Unit) {
         )
     }
 }
+*/

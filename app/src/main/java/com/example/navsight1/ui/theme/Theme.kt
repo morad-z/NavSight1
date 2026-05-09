@@ -1,5 +1,12 @@
 package com.example.navsight1.ui.theme
 
+// LEGACY: Material3 NavSight1Theme from the Android Studio template.
+// Never invoked at runtime — `MainActivity.kt:28` uses
+// `MaterialTheme(colorScheme = darkColorScheme())` directly and threads a
+// custom `NavPalette` (see `NavSightTheme.kt`) through every composable.
+// Kept commented per "comment, don't delete" rule.
+
+/*
 import android.app.Activity
 import android.os.Build
 import androidx.compose.foundation.isSystemInDarkTheme
@@ -22,15 +29,14 @@ private val LightColorScheme = lightColorScheme(
     secondary = PurpleGrey40,
     tertiary = Pink40
 
-    /* Other default colors to override
-    background = Color(0xFFFFFBFE),
-    surface = Color(0xFFFFFBFE),
-    onPrimary = Color.White,
-    onSecondary = Color.White,
-    onTertiary = Color.White,
-    onBackground = Color(0xFF1C1B1F),
-    onSurface = Color(0xFF1C1B1F),
-    */
+    // Other default colors to override
+    // background = Color(0xFFFFFBFE),
+    // surface = Color(0xFFFFFBFE),
+    // onPrimary = Color.White,
+    // onSecondary = Color.White,
+    // onTertiary = Color.White,
+    // onBackground = Color(0xFF1C1B1F),
+    // onSurface = Color(0xFF1C1B1F),
 )
 
 @Composable
@@ -56,3 +62,4 @@ fun NavSight1Theme(
         content = content
     )
 }
+*/

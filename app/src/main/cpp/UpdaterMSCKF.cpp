@@ -87,8 +87,13 @@ void UpdaterMSCKF::getFeatureJacobian(const LostFeature& feat, const EKFState& s
     for (int i = 0; i < M; i++) {
         const auto& obs = feat.observations[i];
         cv::Mat R_CtoG, p_C;
-        // Use FEJ clone pose for Jacobians (observability preservation)
-        state.getCloneFEJ(obs.clone_state_id, R_CtoG, p_C);
+        // Use FEJ clone pose for Jacobians (observability preservation).
+        // If the clone has been evicted between triangulation and Jacobian
+        // construction, leave this row at zeros (contributes nothing to the
+        // null-space projection or χ² gate) instead of running on
+        // uninitialised R_CtoG/p_C. Mirrors the guarded pattern at lines 29
+        // and 62 in triangulate().
+        if (!state.getCloneFEJ(obs.clone_state_id, R_CtoG, p_C)) continue;
 
         cv::Mat R_GtoC = R_CtoG.t();
         cv::Mat p_f_C = R_GtoC * (p_f - p_C);  // Feature in camera frame
@@ -117,17 +122,34 @@ void UpdaterMSCKF::getFeatureJacobian(const LostFeature& feat, const EKFState& s
         cv::Mat H_fi = dz_dpfc * R_GtoC;
         H_fi.copyTo(H_f(cv::Range(2*i, 2*i+2), cv::Range(0, 3)));
 
-        // Jacobian w.r.t. clone pose (rotation and position)
-        // dp_f_C / dθ_C = [p_f_C]_x (skew symmetric of p_f in camera)
-        // dp_f_C / dp_C  = -R_GtoC
+        // Jacobian w.r.t. clone pose (rotation and position).
+        //
+        // 2026-05-09 v15 sign fix — same family of bug as gravity-alignment.
+        // The clone rotation update at EKFState.cpp:760 is left-multiply:
+        //   R_GtoC_new = exp([δθ]×) · R_GtoC_old.
+        // Linearising p_f_C = R_GtoC · (p_f − p_C) under that:
+        //   p_f_C_new ≈ (I + [δθ]×) · p_f_C = p_f_C − [p_f_C]× · δθ
+        //   ∂p_f_C / ∂δθ = −[p_f_C]×
+        //   ∂h / ∂δθ     = dz/dp_f_C · (−[p_f_C]×) = −dz_dpfc · [p_f_C]×
+        // applyMSCKFUpdate is standard Kalman (dx = K·r with H = ∂h/∂x),
+        // so we MUST pass the negated form. Pre-fix code used +dz·[p_f_C]×
+        // which is ∂r/∂δθ (residual derivative) — the wrong sign for K·r.
+        // With the wrong sign, every MSCKF update walked clone rotations in
+        // the OPPOSITE direction of truth → predicted reprojections drifted
+        // → real residuals looked like outliers → Huber mass-rejected the
+        // very 3D-point constraints we need. v14 sim showed this directly:
+        // "27 lost features all rejected (chi²/triang)".
+        // Position Jacobian was already correct: p_f_C_new = R_GtoC·(p_f−(p_C+δp))
+        // gives ∂p_f_C/∂δp = −R_GtoC, so H_pos = dz_dpfc · (−R_GtoC) is
+        // ∂h/∂δp = the right sign. No change needed there.
         cv::Mat skew_pfc = (cv::Mat_<double>(3,3) <<
             0, -Z, Y,
             Z, 0, -X,
             -Y, X, 0);
 
-        // H_theta = dz/dp_f_C * [p_f_C]_x
-        cv::Mat H_theta = dz_dpfc * skew_pfc;
-        // H_pos = dz/dp_f_C * (-R_GtoC)
+        // H_theta = -dz/dp_f_C * [p_f_C]_x   (standard Kalman ∂h/∂x convention)
+        cv::Mat H_theta = -1.0 * dz_dpfc * skew_pfc;
+        // H_pos = dz/dp_f_C * (-R_GtoC)      (already correct)
         cv::Mat H_pos = dz_dpfc * (-R_GtoC);
 
         // Place in H_x at the clone's covariance index
@@ -142,23 +164,22 @@ void UpdaterMSCKF::getFeatureJacobian(const LostFeature& feat, const EKFState& s
 // ── Null-Space Projection ───────────────────────────────────────────────────
 
 void UpdaterMSCKF::nullspaceProject(const cv::Mat& H_f, cv::Mat& H_x, cv::Mat& res) {
-    // QR decomposition of H_f to get left null-space
-    // H_f is (2M x 3). After QR: H_f = Q * R where Q is (2M x 2M)
-    // Left null-space is Q2 = Q[:, 3:] which is (2M x (2M-3))
-    // Projected: H_o = Q2^T * H_x, r_o = Q2^T * res
-
-    if (H_f.rows <= 3) return;  // Need at least 2 observations (4 rows) for 3 DOF feature
-
-    cv::Mat Q, R_qr;
-    // OpenCV's QR via SVD (Householder QR not directly available in OpenCV)
-    // Use thin SVD of H_f^T to get the null-space
-    cv::SVD svd(H_f, cv::SVD::FULL_UV);
-    // svd.u is (2M x 2M), columns 3..2M-1 span null-space of H_f^T
-    // i.e., Q2 = svd.u[:, 3:]
+    // Left null-space projection of H_f via SVD.
+    //
+    // H_f is (2M x 3). SVD: H_f = U · Σ · V^T where U is (2M x 2M).
+    // Columns 0..2 of U span the column space of H_f; columns 3..2M-1 span
+    // the left null-space. Multiplying H_x and res by Q2 = U[:, 3:]^T removes
+    // the 3 feature DOF, leaving (2M-3) measurement rows the EKF can consume.
+    //
+    // Implementation note: the function is named "nullspaceProject" and was
+    // originally intended to use Householder QR — but OpenCV doesn't expose a
+    // direct Householder QR factorisation, so the SVD-based equivalent below
+    // is what actually runs.
 
     int rows = H_f.rows;
-    if (rows <= 3) return;
+    if (rows <= 3) return;  // Need ≥ 2 observations (4 rows) for 3 DOF feature
 
+    cv::SVD svd(H_f, cv::SVD::FULL_UV);
     cv::Mat Q2 = svd.u(cv::Range::all(), cv::Range(3, rows));  // (2M x (2M-3))
 
     // Project

@@ -391,9 +391,28 @@ void FeatureManager::setSlamSlot(int feature_id, int slam_slot) {
     std::lock_guard<std::mutex> lock(snapshot_mutex_);
     auto it = lifecycle_.find(feature_id);
     if (it == lifecycle_.end()) return;
-    it->second.slam_slot = slam_slot;
+    auto& lc = it->second;
+    const int prev_slot = lc.slam_slot;
+    lc.slam_slot = slam_slot;
     if (slam_slot < 0) {
-        it->second.rms_bad_consecutive = 0;
+        lc.rms_bad_consecutive = 0;
+    }
+    // Step 9 (ADR-014) — SLAM lifetime histogram.
+    if (prev_slot < 0 && slam_slot >= 0) {
+        // Promotion: snapshot age so the demotion path can compute Δage.
+        lc.promoted_age = lc.age;
+    } else if (prev_slot >= 0 && slam_slot < 0 && lc.promoted_age >= 0) {
+        // Demotion: contribute lifetime in observations, then clear so a
+        // re-promotion starts fresh accounting.
+        const long long lifetime_obs =
+            static_cast<long long>(lc.age) - static_cast<long long>(lc.promoted_age);
+        if (lifetime_obs > 0) {
+            navsight::eventCounters().slam_lifetime_obs_sum.fetch_add(
+                lifetime_obs, std::memory_order_relaxed);
+            navsight::eventCounters().slam_lifetime_count.fetch_add(
+                1, std::memory_order_relaxed);
+        }
+        lc.promoted_age = -1;
     }
 }
 
@@ -486,7 +505,26 @@ FeatureManager::getObservations(int feature_id) const {
 void FeatureManager::dropLifecycle(int feature_id) {
     // Plan Step 6 (ADR-012): writes lifecycle_ on the camera thread.
     std::lock_guard<std::mutex> lock(snapshot_mutex_);
-    lifecycle_.erase(feature_id);
+    auto it = lifecycle_.find(feature_id);
+    if (it == lifecycle_.end()) return;
+    // Step 9 (ADR-014) — if the feature is dropped while still SLAM-promoted
+    // (e.g. EKF removeSlamFeature path that bypasses an explicit setSlamSlot
+    // demotion), still account its lifetime contribution so the histogram
+    // is monotonic. The promoted_age guard is conservative: zero or negative
+    // deltas (which shouldn't happen but could on a re-entrant edge case)
+    // are skipped.
+    const auto& lc = it->second;
+    if (lc.slam_slot >= 0 && lc.promoted_age >= 0) {
+        const long long lifetime_obs =
+            static_cast<long long>(lc.age) - static_cast<long long>(lc.promoted_age);
+        if (lifetime_obs > 0) {
+            navsight::eventCounters().slam_lifetime_obs_sum.fetch_add(
+                lifetime_obs, std::memory_order_relaxed);
+            navsight::eventCounters().slam_lifetime_count.fetch_add(
+                1, std::memory_order_relaxed);
+        }
+    }
+    lifecycle_.erase(it);
 }
 
 // Returns by VALUE (vector copy under the mutex), so it is safe to call

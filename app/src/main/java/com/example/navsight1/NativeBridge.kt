@@ -100,4 +100,37 @@ object NativeBridge {
     // R_bc_flat: 9 floats in row-major order.  Called once after camera open,
     // before the first frame arrives.  No-op if VIO is not yet started.
     external fun nativeSetExtrinsicsRotation(R_bc_flat: FloatArray)
+
+    // ── Camera overlay Phase 2 / 3 / 4 (see camera_overlay_phase23_plan.md) ──
+
+    // Phase 2: per-feature ages (frames survived) for the most recent VIO
+    // frame. Pairs 1:1 with VioData.trackedPoints (length =
+    // trackedPoints.size / 2). Returns the number of ages written into
+    // `out`. Caller preallocates IntArray(MAX_FEATURES) once and reuses.
+    // At 30 Hz: <30 frames is "new" (≤1 s), 30-89 is "established"
+    // (1-3 s), ≥90 is "mature" (≥3 s) for the overlay color ramp.
+    external fun getLastTrackedPointAges(out: IntArray): Int
+
+    // Phase 3: flat snapshot of currently-active SLAM features.
+    // Layout per feature (4 floats): [feature_id, world_x, world_y, world_z]
+    // in Y-up world frame (X=East, Y=Up, Z=North) — same convention as the
+    // existing Kotlin pose pipeline. Returns the number of features written
+    // (≤ out.size / 4). Caller preallocates FloatArray(48) (4 ×
+    // MAX_SLAM_FEATURES = 12). Returns 0 if EKF has no SLAM features yet.
+    external fun getSlamSnapshot(out: FloatArray): Int
+
+    // Phase 3: current camera pose for SLAM-point reprojection. 16 floats:
+    //   [0..8]   R_world_cam row-major (camera→world rotation, Y-up world)
+    //   [9..11]  t_world_cam (camera position in Y-up world)
+    //   [12..15] fx, fy, cx, cy
+    // Returns true on success, false if the EKF has not yet reached full
+    // initialisation. Caller preallocates FloatArray(16) once and reuses.
+    external fun getCurrentCameraPose(out: FloatArray): Boolean
+
+    // Phase 4: cumulative loop-closure correction count from
+    // EventCounters.loop_closure_corrections_applied. Polled per VIO
+    // frame by the overlay; an increment triggers the 1-second
+    // "LOOP CLOSURE" flash banner. Lock-free atomic read — cheap to
+    // call every frame.
+    external fun getLoopClosureCorrectionsApplied(): Long
 }

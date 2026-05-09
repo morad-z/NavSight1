@@ -73,6 +73,45 @@ class NavSightViewModel(application: Application) : AndroidViewModel(application
     var vioState by mutableStateOf(VioData())
         private set
 
+    /**
+     * Phase 1 camera-overlay plumbing: latest analyzer-frame geometry
+     * (width, height, CCW rotation degrees applied by CameraX). Read by
+     * `CameraFeatureOverlay` to map analyzer-space KLT points onto the
+     * Compose Canvas. Null until the first camera frame lands.
+     */
+    var cameraFrameGeometry by mutableStateOf<SensorRepository.CameraFrameGeometry?>(null)
+        private set
+
+    /**
+     * Camera overlay Phase 2/3/4 state (camera_overlay_phase23_plan.md).
+     * Updated on EVERY native VIO frame (~30 Hz), bypassing the 200 ms
+     * UI throttle in [handleVioUpdate]. Heavy [vioState] consumers
+     * (path history, sigma read, GPS snap, crash logger) stay throttled
+     * for performance; the overlay reads these per-frame fields so KLT
+     * dots track the live preview with no perceptible lag.
+     *
+     * The fix for the user's "Phase-1 dots are laggy" report is exactly
+     * this: lift the overlay's data sources off the throttled vioState
+     * onto a parallel un-throttled flow.
+     */
+    var overlaySnapshot by mutableStateOf(
+        SensorRepository.OverlaySnapshot(
+            floatArrayOf(), intArrayOf(), floatArrayOf(), floatArrayOf(), 0L
+        )
+    )
+        private set
+
+    /**
+     * Loop-closure flash window. The overlay reads this every frame and
+     * if `System.currentTimeMillis() < loopClosureFlashUntilMs` it draws
+     * the "LOOP CLOSURE" banner with alpha decaying linearly to 0 across
+     * the remaining time. Set to one second in the future whenever the
+     * native EventCounters.loop_closure_corrections_applied increments.
+     */
+    var loopClosureFlashUntilMs by mutableStateOf(0L)
+        private set
+    private var lastLoopClosureCount = 0L
+
     var virtualX by mutableStateOf(0.0)
         private set
     var virtualZ by mutableStateOf(0.0)
@@ -147,6 +186,14 @@ class NavSightViewModel(application: Application) : AndroidViewModel(application
     var isRecordingSimulation by mutableStateOf(false)
         private set
     private val simulationDataPoints = mutableListOf<SimulationPoint>()
+
+    // Step 9 / ADR-014 — frame recorder lifecycle. Created in
+    // toggleSimulationRecording when the user starts a sim, drained in
+    // saveSimulationData when they stop. Stats are embedded into the
+    // simulator JSON so the replay-harness fixture can self-describe.
+    private var simFrameRecorder: SimulationFrameRecorder? = null
+    private var simFrameStats: SimulationFrameRecorder.Stats? = null
+    private var simFrameStartTimeMs: Long = 0L
     private var currentGpsLocation: Location? = null
 
     data class SimulationPoint(
@@ -202,6 +249,22 @@ class NavSightViewModel(application: Application) : AndroidViewModel(application
         }
         viewModelScope.launch {
             sensorRepository.vioState.collect { vio -> handleVioUpdate(vio) }
+        }
+        viewModelScope.launch {
+            sensorRepository.cameraFrameGeometry.collect { cameraFrameGeometry = it }
+        }
+        viewModelScope.launch {
+            sensorRepository.overlaySnapshot.collect { snap ->
+                // Camera-overlay Phase 2/3/4: per-frame snapshot, NOT subject
+                // to the 200 ms UI throttle. Detect loop-closure increments
+                // here so the flash banner reacts within one frame of the
+                // native correction.
+                overlaySnapshot = snap
+                if (snap.loopClosureCount > lastLoopClosureCount) {
+                    lastLoopClosureCount = snap.loopClosureCount
+                    loopClosureFlashUntilMs = System.currentTimeMillis() + 1000L
+                }
+            }
         }
         viewModelScope.launch {
             sensorRepository.startLocation.collect { startLocation = it }
@@ -336,15 +399,32 @@ class NavSightViewModel(application: Application) : AndroidViewModel(application
     fun toggleSimulationRecording(getExternalFilesDir: (String?) -> java.io.File?, filesDir: java.io.File) {
         if (!isRecordingSimulation) {
             simulationDataPoints.clear()
+            simFrameStats = null
             // Zero the native EventCounters so this recording's
             // event_summary reflects only what happened during the walk.
             // The native singleton survives process lifetime, so leftover
             // counts from a prior recording would otherwise carry over.
             runCatching { NativeBridge.nativeResetEventCounters() }
             sensorRepository.startGpsUpdates(hasLocationPermission)
+            // Step 9 / ADR-014 — start the camera-frame recorder. Output
+            // directory is named for the same wall-clock millisecond the
+            // simulation_data_<ts>.json file will use, so a fixture pair
+            // is trivially co-located.
+            simFrameStartTimeMs = System.currentTimeMillis()
+            val dir = getExternalFilesDir(null) ?: filesDir
+            val framesDir = java.io.File(dir, "simulation_data_${simFrameStartTimeMs}.frames")
+            val recorder = SimulationFrameRecorder(framesDir)
+            recorder.start()
+            simFrameRecorder = recorder
+            sensorRepository.setFrameRecorder(recorder)
             isRecordingSimulation = true
         } else {
             isRecordingSimulation = false
+            // Detach the recorder from the camera analyzer first so no new
+            // frames are submitted, THEN stop (which drains in-flight encodes).
+            sensorRepository.setFrameRecorder(null)
+            simFrameStats = simFrameRecorder?.stop()
+            simFrameRecorder = null
             sensorRepository.stopGpsUpdates()
             saveSimulationData(getExternalFilesDir, filesDir)
         }
@@ -361,11 +441,26 @@ class NavSightViewModel(application: Application) : AndroidViewModel(application
         val eventSummaryJson: String = runCatching {
             NativeBridge.nativeGetEventCountersJson()
         }.getOrNull()?.takeIf { it.isNotBlank() } ?: "{}"
+        val frameStats = simFrameStats
+        val frameStartMs = simFrameStartTimeMs
         viewModelScope.launch(Dispatchers.IO) {
             val startTime = snapshot.firstOrNull()?.timestamp ?: System.currentTimeMillis()
             val sb = StringBuilder()
             sb.append("{\"startTime\":$startTime,\"event_summary\":")
             sb.append(eventSummaryJson)
+            // Step 9 / ADR-014 — frames_meta block. Present iff a frame
+            // recorder was active and wrote ≥ 1 PNG. The replay harness
+            // ignores unknown keys, so older harnesses that don't read
+            // frames_meta still load this JSON unchanged.
+            if (frameStats != null && frameStats.written > 0) {
+                sb.append(",\"frames_meta\":{")
+                sb.append("\"dir\":\"simulation_data_${frameStartMs}.frames\",")
+                sb.append("\"written\":${frameStats.written},")
+                sb.append("\"dropped\":${frameStats.dropped},")
+                sb.append("\"first_ts_ns\":${frameStats.firstFrameNs},")
+                sb.append("\"last_ts_ns\":${frameStats.lastFrameNs}")
+                sb.append("}")
+            }
             sb.append(",\"points\":[")
             snapshot.forEachIndexed { index, p ->
                 if (index > 0) sb.append(",")
@@ -385,7 +480,13 @@ class NavSightViewModel(application: Application) : AndroidViewModel(application
             sb.append("]}")
             try {
                 val dir = getExternalFilesDir(null) ?: filesDir
-                val file = java.io.File(dir, "simulation_data_${System.currentTimeMillis()}.json")
+                // Use the same wall-clock millisecond the recorder used for
+                // its frames-dir so the JSON and the frames sit beside each
+                // other under matching basenames. Falls back to the now-time
+                // when no recorder was active (Step 9 frames-disabled path).
+                val basenameMs =
+                    if (frameStartMs > 0L) frameStartMs else System.currentTimeMillis()
+                val file = java.io.File(dir, "simulation_data_${basenameMs}.json")
                 file.writeText(sb.toString())
             } catch (e: Exception) {
                 Log.e("SIMULATION", "Failed to save: ${e.message}")
@@ -429,6 +530,72 @@ class NavSightViewModel(application: Application) : AndroidViewModel(application
         totalDistanceM = 0.0
         lastVioForSpeed = null
         lastVioForDist = null
+    }
+
+    /**
+     * Stage 3 (2026-05-09) — full reset that mirrors a fresh app launch.
+     * Wired to the "Rides" button in BottomSheetUi.
+     *
+     * Performs the heavy work on Dispatchers.IO because the call chain
+     * blocks for up to several seconds (NativeBridge.resetVIO() joins
+     * the BA + loop-closure worker threads; SimulationFrameRecorder.stop()
+     * awaits encoder thread termination; sensor unregister is synchronous).
+     * Doing all of that on the UI thread caused an ANR. The UI-visible
+     * pieces (state flags, path history) flip immediately on the main
+     * thread so the dot/path clear instantly; the slow work happens
+     * behind that.
+     */
+    fun resetAll() {
+        // ── Main-thread immediate UI clear ─────────────────────────────
+        // Clear visible state synchronously so the user sees the dot/path
+        // disappear right away. The rest happens off-thread below.
+        _pathHistory.clear()
+        pathHistoryVersion = _pathHistoryVersion.incrementAndGet()
+        virtualX = 0.0
+        virtualZ = 0.0
+        currentSpeedKmh = 0f
+        totalDistanceM = 0.0
+        positionSigmaM = Float.NaN
+        positionCovValid = false
+        lastVioForSpeed = null
+        lastVioForDist = null
+        snappedPosition = null
+        navigationStartMessage = null
+        // Camera overlay Phase 2/3/4: clear the bundled snapshot so KLT
+        // dots / SLAM dots / loop-closure flash all disappear instantly
+        // on reset. SensorRepository will republish on the next frame
+        // after startSensors().
+        overlaySnapshot = SensorRepository.OverlaySnapshot(
+            floatArrayOf(), intArrayOf(), floatArrayOf(), floatArrayOf(), 0L
+        )
+        loopClosureFlashUntilMs = 0L
+        lastLoopClosureCount = 0L
+        runCatching { navigationManager.cancelNavigation() }
+        if (scaleCalibrationSession != null) {
+            scaleCalibrationSession = null
+            scaleCalibrationMessage = "Scale calibration cancelled by reset."
+        }
+        // Mark recording stopped IMMEDIATELY so any in-flight frame
+        // callbacks on the camera thread see isRecordingSimulation=false
+        // and skip captureFrame. The recorder itself is drained off-thread.
+        val recorderToStop = if (isRecordingSimulation) {
+            sensorRepository.setFrameRecorder(null)
+            isRecordingSimulation = false
+            simulationDataPoints.clear()
+            simFrameRecorder.also {
+                simFrameRecorder = null
+                simFrameStats = null
+            }
+        } else null
+
+        // ── Off-thread heavy work ─────────────────────────────────────
+        // stopSensors → resetVIO (joins worker threads) → startSensors
+        // → GPS re-acquire. ~1-3 s on this device; must not block UI.
+        viewModelScope.launch(Dispatchers.IO) {
+            // Drain the recorder's encoder thread off-UI.
+            recorderToStop?.stop()
+            sensorRepository.resetAll(hasLocationPermission)
+        }
     }
 
     fun startNavigation(destination: LatLng) {

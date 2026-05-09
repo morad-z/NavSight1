@@ -223,12 +223,28 @@ bool InertialInitializer::runStationaryCalibration() {
     y_axis.x /= mag; y_axis.y /= mag; y_axis.z /= mag;
     x_axis = y_axis.cross(z_axis);
 
-    cv::Mat R_ItoG = (cv::Mat_<double>(3, 3) <<
+    // 2026-05-09 transpose fix — the matrix below has columns
+    // [x_axis | y_axis | z_axis] where each column is a body-frame unit
+    // vector and z_axis = body-frame measurement of world +Z (gravity).
+    // Under the world-to-body convention (R_GtoI · v_world = v_body) the
+    // columns of R_GtoI ARE the world axes expressed in body frame —
+    // exactly what's constructed here. So this matrix IS R_GtoI; the
+    // previous `.t()` flipped it to its inverse (body-to-world), seeding
+    // the EKF with a transpose-flipped rotation. Renamed `R_ItoG` →
+    // `R_GtoI_built` to match what's actually being computed.
+    //
+    // For flat-on-table calibration the matrix is I, so the bug was
+    // invisible there (I.t() == I) — this is why the codebase has been
+    // functional for the typical "I'm flat" calibration path. Any non-flat
+    // calibration (tilted phone, force-accept on a moving body) seeded
+    // R_GtoI as the inverse of correct, biasing every measurement update
+    // and walking trajectory thereafter.
+    cv::Mat R_GtoI_built = (cv::Mat_<double>(3, 3) <<
         x_axis.x, y_axis.x, z_axis.x,
         x_axis.y, y_axis.y, z_axis.y,
         x_axis.z, y_axis.z, z_axis.z);
 
-    R_GtoI_init_ = R_ItoG.t();
+    R_GtoI_init_ = R_GtoI_built.clone();
     gyro_bias_ = mean_g;
     // Stationary alone cannot separate accel bias from gravity; report 0
     // and rely on Madgwick + IMUPreintegrator for online refinement.

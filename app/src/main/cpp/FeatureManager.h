@@ -173,6 +173,14 @@ public:
         cv::Point3f last_p_global{0.0f, 0.0f, 0.0f};
         bool        has_p_global{false};
         int         anchor_clone_id{-1};
+        // Step 9 (ADR-014): age at the moment the feature was promoted into
+        // an EKF SLAM slot. -1 means "not currently promoted" (either never
+        // promoted, or already demoted and the lifetime contribution
+        // accounted for). On demotion or drop, lifetime = age - promoted_age
+        // is summed into eventCounters().slam_lifetime_obs_sum and the
+        // count atomic is bumped. This is the frame-level histogram the
+        // replay scorer needs to surface mean SLAM-feature lifetime.
+        int         promoted_age{-1};
     };
 
     // Record an observation tick on a feature. Call from Tracker each frame

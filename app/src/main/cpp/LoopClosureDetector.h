@@ -172,6 +172,65 @@ public:
                        double current_yaw_rad,
                        LoopMatch& out_match);
 
+    // ── Step 7.1 — Geometric loop closure (additive to BoW) ────────────────
+    //
+    // Direction-invariant detection that bypasses ORB descriptors entirely.
+    // Spec: docs/VISUAL_PLAN_STEP_7_1_GEOMETRIC_LOOP.md.
+    //
+    // Pipeline:
+    //   1. Spatial filter: keyframes within `position_search_radius_m` of
+    //      `predicted_t_cam_world`, older than `temporal_exclusion_ns`.
+    //   2. For each candidate, project its stored `pts3d_world` into the
+    //      predicted current camera (predicted_R_world_cam, predicted_t_cam_world).
+    //   3. Reject candidates with < kGeomMinInFrame projections in-frame
+    //      with positive depth in [0.5, 50] m.
+    //   4. NN-match each in-frame projection to the closest current KLT
+    //      corner within kGeomMatchRadiusPx px.
+    //   5. solvePnPRansac on the (3D world, 2D current image) pairs; same
+    //      thresholds as the BoW path.
+    //   6. Build LoopMatch identical to the BoW return value so the EKF
+    //      injection path doesn't care which detector fired.
+    //
+    // The heading gate (current_yaw_rad / kMaxHeadingDiffRad in tryDetectLoop)
+    // is intentionally NOT applied here — opposite-direction U-turn revisits
+    // are exactly what this method is designed to catch. The downstream
+    // χ²(0.999, 6) gate at EKFState.cpp:1000 is the safety net for genuinely
+    // wrong matches.
+    //
+    // Thread-safe: takes internal mutex briefly while filtering keyframes,
+    // then releases before the (potentially slow) projection / PnP work.
+    //
+    //   now_kf_id                 caller-assigned id for the query frame
+    //   now_ns                    monotonic-clock timestamp of query frame
+    //   current_klt_corners       KLT-tracked corners in the current frame
+    //                             (image px). Must already be undistorted /
+    //                             match the same intrinsics as `fx,fy,cx,cy`.
+    //   predicted_R_world_cam     EKF's predicted current camera→world
+    //                             rotation. For NavSight: ekf.getRotation()
+    //                             (R_GtoI = world→body) inverted ×
+    //                             R_bc.t() to get cam→world.
+    //   predicted_t_cam_world     EKF's predicted current camera position
+    //                             in world frame. For NavSight handheld:
+    //                             ekf.getPosition() (body=camera).
+    //   fx, fy, cx, cy            pinhole intrinsics in pixels
+    //   img_width, img_height     image dimensions in pixels — defines the
+    //                             in-frame test
+    //   position_search_radius_m  see spec §"Position search radius
+    //                             derivation": typically 3 × σ_p_xy with a
+    //                             [2.0, 30.0] m clamp.
+    //   temporal_exclusion_ns     same as the BoW path (typically 30 s)
+    //   out_match                 populated on success.
+    bool tryDetectLoopGeometric(
+        uint64_t now_kf_id, int64_t now_ns,
+        const std::vector<cv::Point2f>& current_klt_corners,
+        const cv::Matx33d& predicted_R_world_cam,
+        const cv::Vec3d&   predicted_t_cam_world,
+        double fx, double fy, double cx, double cy,
+        int img_width, int img_height,
+        double position_search_radius_m,
+        int64_t temporal_exclusion_ns,
+        LoopMatch& out_match);
+
     // Returns the number of keyframes currently in the BoW database.
     size_t getKeyframeCount() const;
 

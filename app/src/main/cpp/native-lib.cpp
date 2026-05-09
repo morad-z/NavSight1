@@ -45,6 +45,13 @@ static double g_stride_length = 0;
 static int    g_pose_flags = 0;
 static double g_heading = 0;
 
+// Camera overlay Phase 2 (Task C): the latest frame's per-feature ages
+// (in frames survived). Updated atomically with the trackedPoints array
+// inside processCameraFrameDirect under state_mutex. Read by the
+// getLastTrackedPointAges JNI accessor for the overlay's age-coloring.
+// Cleared in resetPoseState() so a fresh VIO session starts empty.
+static std::vector<int> g_tracked_point_ages;
+
 // ── resetPoseState ────────────────────────────────────────────────────────────
 // Must be called with state_mutex held.
 
@@ -56,6 +63,7 @@ static void resetPoseState() {
     g_gx = g_gy = g_gz = 0;
     g_mean_flow = 0; g_inlier_count = 0; g_step_count = 0;
     g_step_freq = 0; g_stride_length = 0; g_pose_flags = 0; g_heading = 0;
+    g_tracked_point_ages.clear();
     // keep g_scale
 }
 
@@ -147,7 +155,17 @@ Java_com_example_navsight1_NativeBridge_stopVIO(JNIEnv*, jobject) {
 }
 
 // DEAD CODE: processCameraFrame (old ByteArray version) — Kotlin caller commented out,
-// superseded by processCameraFrameDirect (zero-copy CameraX ByteBuffer path)
+// superseded by processCameraFrameDirect (zero-copy CameraX ByteBuffer path).
+//
+// 2026-05-09 v19 frame-convention audit warning:
+// THIS DEAD BLOCK IS MISSING THE Z-up → Y-up AXIS SWAP that the live
+// processCameraFrameDirect applies at lines 388-390. If this code is ever
+// re-enabled without ALSO adding the swap (`g_y = output.t[2]; g_z = output.t[1]`),
+// every downstream Kotlin/UI/sim consumer will silently get scrambled
+// trajectories: g_y will receive North (Z-up world Y) instead of Up. All
+// distance/speed math (uses x and z only) will mix North into "altitude" and
+// vice versa. Existing sim fixture files would be corrupted retroactively.
+// DO NOT uncomment without applying the same swap from processCameraFrameDirect.
 /*
 JNIEXPORT jobject JNICALL
 Java_com_example_navsight1_NativeBridge_processCameraFrame(
@@ -205,6 +223,22 @@ Java_com_example_navsight1_NativeBridge_processCameraFrame(
             g_pose_flags = output.poseFlags;
             g_heading = output.heading;
 
+            // 2026-05-09 v19 frame-convention audit annotation:
+            // These Euler-angle formulas decompose R assuming a Y-up camera
+            // rotation matrix, but `output.R` is R_GtoI_ — a Z-up world-to-body
+            // rotation. The g_roll/g_pitch/g_yaw values written here are NOT
+            // correct intrinsic Euler angles for R_GtoI; they're numerical
+            // artifacts of applying the wrong decomposition.
+            //
+            // VioData.roll/pitch/yaw flows only into Kotlin diagnostics
+            // (crash snapshot, debug logging). They are NEVER re-ingested by
+            // C++ and never used in motion / position math. The user-visible
+            // heading on the map comes from g_heading (line above) which is
+            // the EKF's gravity-aligned scalar yaw — that one is correct.
+            //
+            // Do NOT consume VioData.roll/pitch/yaw for any feature beyond
+            // diagnostics without first rewriting this decomposition for the
+            // Z-up world / body convention (see EKFState.h:516).
             const cv::Mat& R = output.R;
             g_pitch = std::asin(-R.at<double>(1, 2));
             if (std::abs(std::cos(g_pitch)) > 1e-6) {
@@ -410,6 +444,22 @@ Java_com_example_navsight1_NativeBridge_processCameraFrameDirect(
             g_pose_flags = output.poseFlags;
             g_heading = output.heading;
 
+            // 2026-05-09 v19 frame-convention audit annotation:
+            // These Euler-angle formulas decompose R assuming a Y-up camera
+            // rotation matrix, but `output.R` is R_GtoI_ — a Z-up world-to-body
+            // rotation. The g_roll/g_pitch/g_yaw values written here are NOT
+            // correct intrinsic Euler angles for R_GtoI; they're numerical
+            // artifacts of applying the wrong decomposition.
+            //
+            // VioData.roll/pitch/yaw flows only into Kotlin diagnostics
+            // (crash snapshot, debug logging). They are NEVER re-ingested by
+            // C++ and never used in motion / position math. The user-visible
+            // heading on the map comes from g_heading (line above) which is
+            // the EKF's gravity-aligned scalar yaw — that one is correct.
+            //
+            // Do NOT consume VioData.roll/pitch/yaw for any feature beyond
+            // diagnostics without first rewriting this decomposition for the
+            // Z-up world / body convention (see EKFState.h:516).
             const cv::Mat& R = output.R;
             g_pitch = std::asin(-R.at<double>(1, 2));
             if (std::abs(std::cos(g_pitch)) > 1e-6) {
@@ -434,6 +484,16 @@ Java_com_example_navsight1_NativeBridge_processCameraFrameDirect(
         env->SetFloatArrayRegion(pointsArray, 0,
                                  static_cast<jsize>(output.trackedPoints.size()),
                                  output.trackedPoints.data());
+    }
+
+    // Phase 2 camera overlay (Task C): publish the per-feature ages
+    // (frames survived) for getLastTrackedPointAges. Done under
+    // state_mutex so the JNI getter sees a coherent snapshot. The
+    // overlay calls getLastTrackedPointAges right after this method
+    // returns on the same camera thread.
+    {
+        std::lock_guard<std::mutex> lock(state_mutex);
+        g_tracked_point_ages = output.trackedPointAges;
     }
 
     double ret_x, ret_y, ret_z, ret_roll, ret_pitch, ret_yaw;
@@ -878,6 +938,180 @@ Java_com_example_navsight1_NativeBridge_setMagnetometerHeading(
     }
 }
 */
+
+// ── Camera overlay Phase 2 / 3 (camera_overlay_phase23_plan.md) ──────────────
+//
+// Four read-only accessors for the live camera overlay. None of them mutate
+// EKF state; they snapshot existing accumulators / EKF state into a flat
+// FloatArray (or jlong) the Kotlin overlay can consume cheaply on the camera
+// thread before publishing to a Compose state field.
+//
+// All return zero / false if the VIO engine has not yet been started or the
+// EKF has not yet reached full initialisation. Callers must check the return
+// value before drawing.
+
+// Phase 2: per-feature ages (frames survived) for the most recent frame.
+// Pairs 1:1 with VioData.trackedPoints (length = trackedPoints.length / 2).
+// Returns the number of ages written into `out` (≤ out.length). Callers
+// preallocate IntArray(MAX_FEATURES) once and reuse.
+JNIEXPORT jint JNICALL
+Java_com_example_navsight1_NativeBridge_getLastTrackedPointAges(
+        JNIEnv* env, jobject, jintArray out) {
+    if (!out) return 0;
+    const jsize cap = env->GetArrayLength(out);
+    if (cap <= 0) return 0;
+    std::vector<int> ages_copy;
+    {
+        std::lock_guard<std::mutex> lock(state_mutex);
+        ages_copy = g_tracked_point_ages;
+    }
+    const jsize n = std::min<jsize>(cap, static_cast<jsize>(ages_copy.size()));
+    if (n > 0) env->SetIntArrayRegion(out, 0, n, ages_copy.data());
+    return static_cast<jint>(n);
+}
+
+// Phase 3: flat snapshot of currently-active SLAM features in the EKF.
+// Layout per feature (4 floats):
+//   [feature_id, world_x, world_y, world_z]
+// Coordinates are exposed in Y-up world frame to match the rest of the
+// Kotlin pipeline (X=East, Y=Up, Z=North) — same swap as in
+// processCameraFrameDirect at line ~414. Returns the number of features
+// written (≤ out.length / 4). The EKF caps SLAM features at
+// MAX_SLAM_FEATURES = 12, so a 48-float buffer is always sufficient.
+// Returns 0 if the EKF has not promoted any SLAM features yet.
+JNIEXPORT jint JNICALL
+Java_com_example_navsight1_NativeBridge_getSlamSnapshot(
+        JNIEnv* env, jobject, jfloatArray out) {
+    if (!out) return 0;
+    const jsize cap = env->GetArrayLength(out) / 4;
+    if (cap <= 0) return 0;
+
+    std::shared_ptr<VioEngine> vision;
+    {
+        std::lock_guard<std::mutex> lock(state_mutex);
+        vision = g_vision;
+    }
+    if (!vision) return 0;
+    const EKFState* ekf = vision->getEKFState();
+    if (!ekf) return 0;
+    const int n = ekf->getSlamFeatureCount();
+    if (n <= 0) return 0;
+
+    const jsize writeCap = std::min<jsize>(cap, static_cast<jsize>(n));
+    std::vector<float> buf(writeCap * 4, 0.0f);
+    int wrote = 0;
+    cv::Mat p_global;
+    for (int i = 0; i < writeCap; ++i) {
+        if (!ekf->getSlamFeatureGlobalPosition(i, p_global)) continue;
+        if (p_global.rows != 3 || p_global.cols != 1) continue;
+        const double zup_x = p_global.at<double>(0);   // East
+        const double zup_y = p_global.at<double>(1);   // North (Z-up index 1)
+        const double zup_z = p_global.at<double>(2);   // Up    (Z-up index 2)
+        buf[wrote * 4 + 0] = static_cast<float>(ekf->getSlamFeatureId(i));
+        buf[wrote * 4 + 1] = static_cast<float>(zup_x);   // East unchanged
+        buf[wrote * 4 + 2] = static_cast<float>(zup_z);   // Up   (Z-up Z → Y-up Y)
+        buf[wrote * 4 + 3] = static_cast<float>(zup_y);   // North(Z-up Y → Y-up Z)
+        ++wrote;
+    }
+    if (wrote > 0) env->SetFloatArrayRegion(out, 0, wrote * 4, buf.data());
+    return static_cast<jint>(wrote);
+}
+
+// Phase 3: current camera pose for SLAM-point reprojection.
+// Layout (16 floats):
+//   [0..8]   R_world_cam row-major (camera→world rotation, Y-up world)
+//   [9..11]  t_world_cam (camera position in Y-up world; ≈ body position —
+//            camera-to-body lever arm assumed negligible at typical 1-10 m
+//            feature depths)
+//   [12..15] fx, fy, cx, cy — same intrinsics the EKF uses for SLAM updates
+// Returns true on success, false if EKF not yet full-initialised.
+//
+// Frame derivation:
+//   R_GtoI                        : world Z-up → body
+//   R_bc                          : body → camera (OpenCV conv: X=right, Y=down, Z=forward)
+//   R_world(Zup)_to_cam = R_bc · R_GtoI
+//   R_cam_to_world(Zup) = transpose(R_world(Zup)_to_cam)
+// Then permute world rows from Z-up (X,Y,Z = E,N,U) to Y-up (X,Y,Z = E,U,N):
+//   row1 ↔ row2 in the 3×3 above so the columns of R_cam_to_world_Yup
+//   represent camera unit-axes expressed in the Y-up world frame.
+JNIEXPORT jboolean JNICALL
+Java_com_example_navsight1_NativeBridge_getCurrentCameraPose(
+        JNIEnv* env, jobject, jfloatArray out) {
+    if (!out) return JNI_FALSE;
+    if (env->GetArrayLength(out) != 16) return JNI_FALSE;
+
+    std::shared_ptr<VioEngine> vision;
+    {
+        std::lock_guard<std::mutex> lock(state_mutex);
+        vision = g_vision;
+    }
+    if (!vision) return JNI_FALSE;
+    const EKFState* ekf = vision->getEKFState();
+    if (!ekf || !ekf->isFullInitialized()) return JNI_FALSE;
+
+    const cv::Mat R_GtoI = ekf->getRotation();   // 3×3 CV_64F, world Z-up → body
+    const cv::Mat p_zup  = ekf->getPosition();   // 3×1 CV_64F, body in world Z-up
+    if (R_GtoI.rows != 3 || R_GtoI.cols != 3 || R_GtoI.type() != CV_64F) {
+        return JNI_FALSE;
+    }
+    if (p_zup.rows != 3 || p_zup.cols != 1 || p_zup.type() != CV_64F) {
+        return JNI_FALSE;
+    }
+    const cv::Matx33d R_bc = ekf->getExtrinsicsRotation();   // body → camera
+
+    // R_world(Zup) → camera   = R_bc · R_GtoI
+    cv::Matx33d R_GtoI_x;
+    for (int r = 0; r < 3; ++r) {
+        for (int c = 0; c < 3; ++c) {
+            R_GtoI_x(r, c) = R_GtoI.at<double>(r, c);
+        }
+    }
+    const cv::Matx33d R_world_to_cam_zup = R_bc * R_GtoI_x;
+    const cv::Matx33d R_cam_to_world_zup = R_world_to_cam_zup.t();
+
+    // Permute world axes Z-up → Y-up by swapping rows 1 and 2.
+    // R_cam_to_world rows correspond to world-frame components of the
+    // camera basis vectors; row 0 = East (unchanged), row 1 = Up
+    // (was row 2 in Z-up), row 2 = North (was row 1 in Z-up).
+    cv::Matx33d R_cam_to_world_yup;
+    for (int c = 0; c < 3; ++c) {
+        R_cam_to_world_yup(0, c) = R_cam_to_world_zup(0, c);   // East
+        R_cam_to_world_yup(1, c) = R_cam_to_world_zup(2, c);   // Up   (Z-up row 2)
+        R_cam_to_world_yup(2, c) = R_cam_to_world_zup(1, c);   // North(Z-up row 1)
+    }
+
+    float buf[16];
+    // [0..8] R row-major
+    for (int r = 0; r < 3; ++r) {
+        for (int c = 0; c < 3; ++c) {
+            buf[r * 3 + c] = static_cast<float>(R_cam_to_world_yup(r, c));
+        }
+    }
+    // [9..11] camera position in Y-up world (using body position as
+    // approximation; lever arm ≪ feature depth)
+    buf[9]  = static_cast<float>(p_zup.at<double>(0));   // East
+    buf[10] = static_cast<float>(p_zup.at<double>(2));   // Up    (Z-up Z)
+    buf[11] = static_cast<float>(p_zup.at<double>(1));   // North (Z-up Y)
+    // [12..15] intrinsics
+    buf[12] = static_cast<float>(ekf->getSlamFx());
+    buf[13] = static_cast<float>(ekf->getSlamFy());
+    buf[14] = static_cast<float>(ekf->getSlamCx());
+    buf[15] = static_cast<float>(ekf->getSlamCy());
+
+    env->SetFloatArrayRegion(out, 0, 16, buf);
+    return JNI_TRUE;
+}
+
+// Phase 4: cumulative loop-closure correction count from EventCounters.
+// Polled per frame by the overlay; an increment triggers the
+// "LOOP CLOSURE" 1-second flash banner. Atomic relaxed read — no mutex.
+JNIEXPORT jlong JNICALL
+Java_com_example_navsight1_NativeBridge_getLoopClosureCorrectionsApplied(
+        JNIEnv*, jobject) {
+    return static_cast<jlong>(
+        navsight::eventCounters().loop_closure_corrections_applied
+            .load(std::memory_order_relaxed));
+}
 
 } // extern "C"
 

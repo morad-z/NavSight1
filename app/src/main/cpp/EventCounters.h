@@ -116,6 +116,18 @@ struct EventCounters {
     // no feature ever passed the SLAM-promotion gate — the BA root cause.
     std::atomic<long long> slam_promotions_total{0};
 
+    // Step 9 / ADR-014 — SLAM feature lifetime histogram (sums + count).
+    // Accumulated by FeatureManager::setSlamSlot when a feature transitions
+    // out of an EKF slot (slam_slot >= 0 -> slam_slot < 0) AND inside
+    // dropLifecycle when a still-promoted feature is reclaimed without an
+    // explicit demotion. Lifetime is measured in observations (the
+    // FeatureLifecycle::age delta between promotion and exit), which is a
+    // close proxy for frames on a steady KLT track. Replay scorer derives
+    // mean lifetime as obs_sum / max(count, 1); the plan asked for p50,
+    // which would need a histogram bucket — folded into a future ADR.
+    std::atomic<long long> slam_lifetime_obs_sum{0};
+    std::atomic<long long> slam_lifetime_count{0};
+
     // Step 3a/3b — MSCKF (EKFState.cpp applyMSCKFUpdate)
     std::atomic<long long> msckf_update_lines{0};
     std::atomic<long long> msckf_huber_rejected_sum{0};
@@ -143,6 +155,24 @@ struct EventCounters {
     // updateAbsolutePose injection through the EKF.
     std::atomic<long long> loop_closure_chi2_rejected{0};
     std::atomic<long long> loop_closure_corrections_applied{0};
+
+    // Step 7.1 — Geometric loop closure (additive to the BoW path; spec
+    // in docs/VISUAL_PLAN_STEP_7_1_GEOMETRIC_LOOP.md). The geometric path
+    // does position-based candidate retrieval + projection of pts3d_world
+    // into the predicted current camera + KLT-corner NN matching + PnP.
+    // Fires only when the BoW path did NOT accept on the same query
+    // (fallback semantics), so:
+    //   loop_closure_corrections_applied
+    //     = (BoW accepts that survived χ²) + (Geom accepts that survived χ²)
+    //   loop_closure_corrections_applied - loop_closure_geom_accepts
+    //     = pre-Step-7.1 BoW-only baseline
+    // Reject reasons are explicit so attribution is clean post-hoc.
+    std::atomic<long long> loop_closure_geom_attempts{0};
+    std::atomic<long long> loop_closure_geom_accepts{0};
+    std::atomic<long long> loop_closure_geom_rejects_no_position{0};
+    std::atomic<long long> loop_closure_geom_rejects_no_candidate{0};
+    std::atomic<long long> loop_closure_geom_rejects_few_inframe{0};
+    std::atomic<long long> loop_closure_geom_rejects_pnp{0};
     // total_path_m × 10 (integer decimeters) — verifies the dynamic sigma
     // formula (sigma_p = max(2.0, 0.032 × path_m)) is tracking correctly.
     std::atomic<long long> total_path_dm{0};
@@ -227,6 +257,8 @@ struct EventCounters {
         ba_skipped_no_intrinsics.store(0, std::memory_order_relaxed);
         ba_skipped_too_few_landmarks.store(0, std::memory_order_relaxed);
         slam_promotions_total.store(0, std::memory_order_relaxed);
+        slam_lifetime_obs_sum.store(0, std::memory_order_relaxed);
+        slam_lifetime_count.store(0, std::memory_order_relaxed);
         msckf_update_lines.store(0, std::memory_order_relaxed);
         msckf_huber_rejected_sum.store(0, std::memory_order_relaxed);
         loop_closure_attempts.store(0, std::memory_order_relaxed);
@@ -237,6 +269,12 @@ struct EventCounters {
         loop_closure_kf_count_in_db.store(0, std::memory_order_relaxed);
         loop_closure_chi2_rejected.store(0, std::memory_order_relaxed);
         loop_closure_corrections_applied.store(0, std::memory_order_relaxed);
+        loop_closure_geom_attempts.store(0, std::memory_order_relaxed);
+        loop_closure_geom_accepts.store(0, std::memory_order_relaxed);
+        loop_closure_geom_rejects_no_position.store(0, std::memory_order_relaxed);
+        loop_closure_geom_rejects_no_candidate.store(0, std::memory_order_relaxed);
+        loop_closure_geom_rejects_few_inframe.store(0, std::memory_order_relaxed);
+        loop_closure_geom_rejects_pnp.store(0, std::memory_order_relaxed);
         total_path_dm.store(0, std::memory_order_relaxed);
         extrinsics_rotation_angle_mdeg.store(0, std::memory_order_relaxed);
         cam_imu_time_offset_us.store(0, std::memory_order_relaxed);
@@ -295,6 +333,8 @@ struct EventCounters {
         const long long v_ba_skipped_no_intrinsics      = ba_skipped_no_intrinsics.load(std::memory_order_relaxed);
         const long long v_ba_skipped_too_few_landmarks  = ba_skipped_too_few_landmarks.load(std::memory_order_relaxed);
         const long long v_slam_promotions_total         = slam_promotions_total.load(std::memory_order_relaxed);
+        const long long v_slam_lifetime_obs_sum         = slam_lifetime_obs_sum.load(std::memory_order_relaxed);
+        const long long v_slam_lifetime_count           = slam_lifetime_count.load(std::memory_order_relaxed);
         const long long v_msckf_update_lines            = msckf_update_lines.load(std::memory_order_relaxed);
         const long long v_msckf_huber_rejected_sum      = msckf_huber_rejected_sum.load(std::memory_order_relaxed);
         const long long v_loop_closure_attempts         = loop_closure_attempts.load(std::memory_order_relaxed);
@@ -305,6 +345,12 @@ struct EventCounters {
         const long long v_loop_closure_kf_count_in_db   = loop_closure_kf_count_in_db.load(std::memory_order_relaxed);
         const long long v_loop_closure_chi2_rejected    = loop_closure_chi2_rejected.load(std::memory_order_relaxed);
         const long long v_loop_closure_corrections_applied = loop_closure_corrections_applied.load(std::memory_order_relaxed);
+        const long long v_loop_closure_geom_attempts                 = loop_closure_geom_attempts.load(std::memory_order_relaxed);
+        const long long v_loop_closure_geom_accepts                  = loop_closure_geom_accepts.load(std::memory_order_relaxed);
+        const long long v_loop_closure_geom_rejects_no_position      = loop_closure_geom_rejects_no_position.load(std::memory_order_relaxed);
+        const long long v_loop_closure_geom_rejects_no_candidate     = loop_closure_geom_rejects_no_candidate.load(std::memory_order_relaxed);
+        const long long v_loop_closure_geom_rejects_few_inframe      = loop_closure_geom_rejects_few_inframe.load(std::memory_order_relaxed);
+        const long long v_loop_closure_geom_rejects_pnp              = loop_closure_geom_rejects_pnp.load(std::memory_order_relaxed);
         const long long v_total_path_dm               = total_path_dm.load(std::memory_order_relaxed);
         const long long v_extrinsics_rotation_angle_mdeg = extrinsics_rotation_angle_mdeg.load(std::memory_order_relaxed);
         const long long v_cam_imu_time_offset_us  = cam_imu_time_offset_us.load(std::memory_order_relaxed);
@@ -346,6 +392,8 @@ struct EventCounters {
         appendKv(out, "ba_skipped_no_intrinsics",     v_ba_skipped_no_intrinsics);     out += ',';
         appendKv(out, "ba_skipped_too_few_landmarks", v_ba_skipped_too_few_landmarks); out += ',';
         appendKv(out, "slam_promotions_total",        v_slam_promotions_total);        out += ',';
+        appendKv(out, "slam_lifetime_obs_sum",         v_slam_lifetime_obs_sum);         out += ',';
+        appendKv(out, "slam_lifetime_count",           v_slam_lifetime_count);           out += ',';
         appendKv(out, "msckf_update_lines",            v_msckf_update_lines);            out += ',';
         appendKv(out, "msckf_huber_rejected_sum",      v_msckf_huber_rejected_sum);      out += ',';
         appendKv(out, "loop_closure_attempts",         v_loop_closure_attempts);         out += ',';
@@ -356,6 +404,12 @@ struct EventCounters {
         appendKv(out, "loop_closure_kf_count_in_db",   v_loop_closure_kf_count_in_db);   out += ',';
         appendKv(out, "loop_closure_chi2_rejected",    v_loop_closure_chi2_rejected);    out += ',';
         appendKv(out, "loop_closure_corrections_applied", v_loop_closure_corrections_applied); out += ',';
+        appendKv(out, "loop_closure_geom_attempts",                 v_loop_closure_geom_attempts);                 out += ',';
+        appendKv(out, "loop_closure_geom_accepts",                  v_loop_closure_geom_accepts);                  out += ',';
+        appendKv(out, "loop_closure_geom_rejects_no_position",      v_loop_closure_geom_rejects_no_position);      out += ',';
+        appendKv(out, "loop_closure_geom_rejects_no_candidate",     v_loop_closure_geom_rejects_no_candidate);     out += ',';
+        appendKv(out, "loop_closure_geom_rejects_few_inframe",      v_loop_closure_geom_rejects_few_inframe);      out += ',';
+        appendKv(out, "loop_closure_geom_rejects_pnp",              v_loop_closure_geom_rejects_pnp);              out += ',';
         appendKv(out, "total_path_dm",                  v_total_path_dm);                  out += ',';
         appendKv(out, "extrinsics_rotation_angle_mdeg", v_extrinsics_rotation_angle_mdeg); out += ',';
         appendKv(out, "cam_imu_time_offset_us",         v_cam_imu_time_offset_us);         out += ',';

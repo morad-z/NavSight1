@@ -7,7 +7,9 @@
     <uses-permission android:name="android.permission.ACCESS_FINE_LOCATION" />
     <uses-permission android:name="android.permission.VIBRATE" />
     <uses-permission android:name="android.permission.WAKE_LOCK" />
-    <uses-permission android:name="android.permission.RECORD_AUDIO" />
+    <!-- LEGACY: RECORD_AUDIO declared but never runtime-requested or used in code.
+         Kept commented per "comment, don't delete" rule; remove for store release. -->
+    <!-- <uses-permission android:name="android.permission.RECORD_AUDIO" /> -->
     <uses-permission android:name="android.permission.HIGH_SAMPLING_RATE_SENSORS" />
 
     <application

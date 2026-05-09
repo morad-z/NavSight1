@@ -47,6 +47,7 @@ void EKFState::reset() {
 
     // Plan Step 3b (ADR-009): drop all SLAM features on reset.
     slam_features_.clear();
+    last_marginalized_slam_feature_ids_.clear();
 
     // Plan Step 8b: reset extrinsics to the default body→camera convention.
     // diag(1,-1,-1): rear camera, vertical phone (camera +X=body +X, +Y=body -Y, +Z=body -Z).
@@ -138,7 +139,26 @@ void EKFState::propagateIMU(const cv::Mat& deltaR, const cv::Mat& deltaV,
     // Android sensor body frame (body Z is gravity-aligned when phone is
     // held screen-up). Gravity vector therefore points along world -Z.
     cv::Mat g = (cv::Mat_<double>(3,1) << 0.0, 0.0, -9.81);
-    cv::Mat R_new = R_GtoI_ * deltaR;
+    // 2026-05-09 propagation fix — `R_new = R_GtoI_ * deltaR` was inconsistent
+    // with both the Phi linearization at line 170 (`δθ_new = deltaR^T · δθ`,
+    // i.e. LEFT perturbation by deltaR^T) and the world-to-body convention
+    // pinned by scripts/test_z_up_conventions.py (`R_GtoI · v_world = v_body`).
+    //
+    // Forster preintegration produces deltaR as the body-to-world relative
+    // rotation Δ over the integration interval (`current_R = current_R *
+    // dR_step` in IMUPreintegrator.cpp:316). Standard navigation:
+    //
+    //   R_W_b(j)  =  R_W_b(i) · ΔR_ij           (Forster)
+    //   R_GtoI(j) = R_W_b(j)^T = ΔR_ij^T · R_W_b(i)^T = ΔR_ij^T · R_GtoI(i)
+    //
+    // The previous formula (R_GtoI · ΔR) is the body-to-world right-perturb
+    // rule — applied to a world-to-body matrix it walks R_GtoI in the wrong
+    // direction. Verified by example with flat→portrait rotation: the old
+    // formula produces the TRANSPOSE of the correct R_GtoI, exactly matching
+    // the v9/v10 trace where LC_GA r_norm grew from ~0 to 1.97 (max=2.0)
+    // over 90 s of walking — i.e. R_GtoI degenerated toward its inverse as
+    // wrong-direction increments accumulated.
+    cv::Mat R_new = deltaR.t() * R_GtoI_;
     cv::Mat v_new = v_G_ + g * dt + R_GtoI_.t() * deltaV;
     cv::Mat p_new = p_G_ + v_G_ * dt + 0.5 * g * dt * dt + R_GtoI_.t() * deltaP;
 
@@ -353,6 +373,11 @@ void EKFState::updateZUPT() {
 // ── Clone Management ────────────────────────────────────────────────────────
 
 void EKFState::addClone(const cv::Mat& R_GtoC, const cv::Mat& p_G, int64_t timestamp_ns) {
+    // 2026-05-09 telemetry fix: clear the per-addClone "dropped SLAM
+    // feature ids" buffer so the caller (Tracker) sees only ids dropped
+    // during THIS addClone's internal marginalisation passes. See
+    // takeLastMarginalizedSlamFeatureIds() for the full rationale.
+    last_marginalized_slam_feature_ids_.clear();
     // Plan Step 6 (ADR-012): hold the snapshot mutex around the whole splice
     // so the BA worker thread cannot observe a torn `window_` mid-augmentation.
     // Internal `marginalizeOldestClone` call below MUST go through the
@@ -564,10 +589,27 @@ void EKFState::marginalizeOldestCloneNoLock() {
     if (dropped_id >= 0) {
         for (int slot = static_cast<int>(slam_features_.size()) - 1; slot >= 0; --slot) {
             if (slam_features_[slot].anchor_clone_id == dropped_id) {
+                // 2026-05-09 telemetry fix: capture the dropped feature_id
+                // BEFORE removeSlamFeature erases the entry. Tracker drains
+                // this list after addClone() and forwards each id to
+                // FeatureManager::setSlamSlot(-1) + dropLifecycle so the
+                // lifetime-histogram demotion path runs.
+                const int dropped_fid = slam_features_[slot].feature_id;
+                if (dropped_fid >= 0) {
+                    last_marginalized_slam_feature_ids_.push_back(dropped_fid);
+                }
                 removeSlamFeature(slot);
             }
         }
     }
+}
+
+std::vector<int> EKFState::takeLastMarginalizedSlamFeatureIds() {
+    // Move-and-clear so the caller owns a unique copy and the next addClone()
+    // starts from an empty buffer. Cheap — typically 0-3 entries per call.
+    std::vector<int> out = std::move(last_marginalized_slam_feature_ids_);
+    last_marginalized_slam_feature_ids_.clear();
+    return out;
 }
 
 // ── MSCKF EKF Update ────────────────────────────────────────────────────────
@@ -1134,6 +1176,189 @@ bool EKFState::updatePDRStep(double dx_world, double dy_world, double var) {
     return true;
 }
 
+bool EKFState::updateGravityAlignment(const cv::Mat& accel_body, double var) {
+    if (!full_initialized_ || P_.empty()) return false;
+    if (accel_body.empty() || accel_body.rows != 3 || accel_body.cols != 1) return false;
+    if (accel_body.type() != CV_64F) return false;
+
+    // ── Validity gate from sensor physics, not magic numbers ──────────
+    //
+    // Reject samples with magnitude far from g — those are under linear
+    // acceleration and the "accel ≈ -gravity" assumption breaks.
+    //
+    // Bounds derived from accelerometer 3σ noise floor:
+    //   σ_acc ≈ 0.1 m/s² (typical Android MEMS; same value used as
+    //                     accel_noise_sigma_ in EKFState ctor and as
+    //                     UpdaterZeroVelocity::sigma_a default)
+    //   3σ_acc ≈ 0.3 m/s²
+    // Walking-induced linear-accel transients add another ~0.5 m/s² on
+    // peaks, so an outer bound of g ± 0.8 m/s² admits walking but rejects
+    // jolts (handheld drop, bus brakes). The EKF sees one accel sample
+    // per frame; missed samples don't compound — we just skip those.
+    constexpr double kGravityMagN = 9.81;          // m/s², standard Earth gravity
+    constexpr double kAccelMagBand = 0.8;          // m/s² (3σ_acc + walking-band)
+    const double a_norm = cv::norm(accel_body);
+    if (a_norm < kGravityMagN - kAccelMagBand ||
+        a_norm > kGravityMagN + kAccelMagBand) {
+        return false;
+    }
+
+    // ── Observation model ─────────────────────────────────────────────
+    //
+    // Specific-force model: when body is approximately stationary or
+    // moving at constant velocity, the accelerometer measures
+    //
+    //   accel_body  =  -g_body  =  -R_GtoI · g_world
+    //
+    // with g_world = (0, 0, -9.81) in Z-up ENU. So accel_body_normalised
+    // points along body's "+up" direction:
+    //
+    //   z_obs  = accel_body / |accel_body|     in body frame  (measurement z)
+    //   z_pred = R_GtoI · (0, 0, +1)           predicted body-frame +up = h(x)
+    //
+    // Residual:
+    //   r = z_obs - z_pred = z - h(x)
+    //
+    // Jacobian. applyMSCKFUpdate is standard Kalman: K = P·H^T·S^{-1},
+    // dx = K·r, state += dx with r = z − h and H = ∂h/∂x. So we MUST
+    // pass H = ∂h/∂x, not ∂r/∂x.
+    //
+    // With left-perturbation R_GtoI_new = exp([δθ]×) · R_GtoI:
+    //   z_pred_new ≈ z_pred + [δθ]× · z_pred = z_pred − [z_pred]× · δθ
+    // so  ∂h / ∂δθ = −[z_pred]×.   (Other state slots: zero.)
+    //
+    // 2026-05-09 v14 sign fix: pre-fix code used H_theta = +[z_pred]×
+    // (which is ∂r/∂δθ). With the wrong sign, every Kalman update
+    // pushed δθ in the OPPOSITE direction — verified in v13 walk
+    // (LC_SA r_norm climbed 1.5 → 8.28, b_a runaway to 0.36 m/s²
+    // even with stationary phone). Same bug existed in updateStationaryAccel.
+    //
+    // Yaw observability: rotation about world-Z leaves body-Z unchanged →
+    // the row in H_θ for δθ_z is zero. The 3D residual has rank-2
+    // observability (roll + pitch); the EKF Kalman update naturally
+    // applies correction only along the observed sub-space.
+    cv::Mat z_obs = accel_body / a_norm;
+    cv::Mat z_pred(3, 1, CV_64F);
+    z_pred.at<double>(0, 0) = R_GtoI_.at<double>(0, 2);
+    z_pred.at<double>(1, 0) = R_GtoI_.at<double>(1, 2);
+    z_pred.at<double>(2, 0) = R_GtoI_.at<double>(2, 2);
+    cv::Mat r = z_obs - z_pred;
+
+    // H_θ = -[z_pred]× (negated skew-symmetric of z_pred).
+    const double zx = z_pred.at<double>(0, 0);
+    const double zy = z_pred.at<double>(1, 0);
+    const double zz = z_pred.at<double>(2, 0);
+    cv::Mat H_theta = (cv::Mat_<double>(3, 3) <<
+            0.0,  zz, -zy,
+            -zz, 0.0,  zx,
+             zy, -zx, 0.0);
+
+    int dim = P_.rows;
+    cv::Mat H = cv::Mat::zeros(3, dim, CV_64F);
+    H_theta.copyTo(H(cv::Range(0, 3), cv::Range(0, 3)));
+
+    // ── Measurement noise ─────────────────────────────────────────────
+    //
+    // Caller supplies var in (m/s²)². Convert to unit-vector variance
+    // by dividing by g²:  σ²_unit = σ²_acc / g²  ≈ 0.01 / 96.24 ≈ 1.04e-4.
+    // Same per-axis variance for all three rows (isotropic noise model).
+    const double var_unit = std::max(1e-8, var / (kGravityMagN * kGravityMagN));
+    cv::Mat R_noise = cv::Mat::eye(3, 3, CV_64F) * var_unit;
+
+    // navsight-vio-specialist Playbook A6: every measurement update
+    // emits a single LOGI line so we can replay the gate behaviour
+    // from logcat without re-instrumenting the build. Format mirrors
+    // the LC_* family used by other updates (gate value, residual norm,
+    // observation variance) — see EventCounters.h for the chi² counters
+    // these lines feed cross-checking against.
+    LOGI("LC_GA: a_norm=%.4f r_norm=%.6f var_unit=%.6e",
+         a_norm, cv::norm(r), var_unit);
+    applyMSCKFUpdate(H, r, R_noise);
+    return true;
+}
+
+bool EKFState::updateStationaryAccel(const cv::Mat& accel_body, double sigma_a) {
+    if (!full_initialized_ || P_.empty()) return false;
+    if (accel_body.empty() || accel_body.rows != 3 || accel_body.cols != 1) return false;
+    if (accel_body.type() != CV_64F) return false;
+    if (P_.rows < IMU_STATE_DIM) return false;  // need full b_a slot at rows 9-11
+
+    // ── Specific-force model under body-stationary assumption ─────────
+    //
+    // Body acceleration ≈ 0 (caller guaranteed by ZUPT detector).
+    // IMU specific-force model:
+    //   a_imu  =  -R_GtoI · g_world  +  b_a  +  noise         (= z = h(x) + n)
+    // In Z-up ENU,  g_world = (0, 0, -9.81)  → -R_GtoI·g_world = 9.81·R_GtoI[:,2]
+    //   h(x)       =  9.81 · R_GtoI[:,2]  +  b_a
+    //   r          =  a_imu_measured  -  h(x)        (3 × 1, m/s²)
+    //
+    // Jacobian H = ∂h/∂x (standard Kalman convention; applyMSCKFUpdate
+    // does dx = K·r with r = z−h and K = P·H^T·S^{-1}):
+    //
+    //   ∂(R_GtoI[:,2]) / ∂δθ  =  -[R_GtoI[:,2]]×          (left perturbation)
+    //   ∂h / ∂δθ              = -9.81 · [R_GtoI[:,2]]×    (3 × 3)
+    //   ∂h / ∂b_a             = +I                         (3 × 3)
+    //
+    // 2026-05-09 v14 sign fix: pre-fix code passed +9.81·[z]× and -I
+    // (which is ∂r/∂x, not ∂h/∂x). With both signs flipped the EKF
+    // pushed δθ AND δb_a in opposing directions on every measurement —
+    // direct cause of the LC_SA divergence in v13 logcat (b_a ran from 0
+    // to (0.08, 0.23, -0.26) within 80 s while residual climbed to 8.28
+    // m/s², physically impossible for a body the ZUPT detector confirmed
+    // stationary).
+    //
+    // Yaw observability: same as updateGravityAlignment — [R_GtoI[:,2]]×
+    // has null direction along R_GtoI[:,2] itself, so yaw is structurally
+    // unobservable from gravity alone (correctly so).
+    //
+    // Noise:  R_noise = σ_a² · I  (isotropic accel measurement noise).
+    constexpr double kGravityMagS = 9.81;
+
+    cv::Mat z_dir(3, 1, CV_64F);
+    z_dir.at<double>(0, 0) = R_GtoI_.at<double>(0, 2);
+    z_dir.at<double>(1, 0) = R_GtoI_.at<double>(1, 2);
+    z_dir.at<double>(2, 0) = R_GtoI_.at<double>(2, 2);
+
+    cv::Mat predicted = kGravityMagS * z_dir + b_a_;
+    cv::Mat r = accel_body - predicted;
+
+    // -[R_GtoI[:,2]]× — negated skew-symmetric of body-frame world-up direction.
+    const double zx = z_dir.at<double>(0, 0);
+    const double zy = z_dir.at<double>(1, 0);
+    const double zz = z_dir.at<double>(2, 0);
+    cv::Mat neg_skew_z = (cv::Mat_<double>(3, 3) <<
+            0.0,  zz, -zy,
+            -zz, 0.0,  zx,
+             zy, -zx, 0.0);
+
+    int dim = P_.rows;
+    cv::Mat H = cv::Mat::zeros(3, dim, CV_64F);
+    cv::Mat H_theta = kGravityMagS * neg_skew_z;
+    H_theta.copyTo(H(cv::Range(0, 3), cv::Range(0, 3)));
+
+    // δb_a slot is rows 9-11 in the IMU state layout
+    // (δθ:0-2, δb_g:3-5, δv:6-8, δb_a:9-11, δp:12-14, δt_d:15, δφ_bc:16-18).
+    cv::Mat H_ba = cv::Mat::eye(3, 3, CV_64F);   // ∂h/∂b_a = +I
+    H_ba.copyTo(H(cv::Range(0, 3), cv::Range(9, 12)));
+
+    const double var_a = std::max(1e-6, sigma_a * sigma_a);
+    cv::Mat R_noise = cv::Mat::eye(3, 3, CV_64F) * var_a;
+
+    // navsight-vio-specialist Playbook A6 — every measurement update
+    // emits one LOGI line so we can replay gate behaviour from logcat.
+    LOGI("LC_SA: a_norm=%.4f r_norm=%.6f b_a=(%.4f,%.4f,%.4f) var_a=%.6e",
+         cv::norm(accel_body), cv::norm(r),
+         b_a_.at<double>(0, 0), b_a_.at<double>(1, 0), b_a_.at<double>(2, 0),
+         var_a);
+    applyMSCKFUpdate(H, r, R_noise);
+    return true;
+}
+
+void EKFState::setPosition(const cv::Mat& p_G) {
+    if (p_G.empty() || p_G.rows != 3 || p_G.cols != 1) return;
+    p_G.convertTo(p_G_, CV_64F);
+}
+
 void EKFState::setRotation(const cv::Mat& R_GtoI) {
     if (R_GtoI.empty() || R_GtoI.rows != 3 || R_GtoI.cols != 3) return;
     // Replace only R_GtoI_ in-place. Position, velocity, biases, td, R_bc,
@@ -1329,6 +1554,11 @@ int EKFState::getSlamFeatureSlot(int feature_id) const {
         }
     }
     return -1;
+}
+
+int EKFState::getSlamFeatureId(int slot) const {
+    if (slot < 0 || slot >= static_cast<int>(slam_features_.size())) return -1;
+    return slam_features_[slot].feature_id;
 }
 
 bool EKFState::getSlamFeatureGlobalPosition(int slot, cv::Mat& p_global_out) const {

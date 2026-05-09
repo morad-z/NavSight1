@@ -16,6 +16,13 @@ struct VisionOutput {
     bool valid;
     std::vector<float> trackedPoints; // [x0,y0, x1,y1, ...]
 
+    // Phase 2 camera overlay: ages (in FRAMES survived) parallel to
+    // trackedPoints. trackedPointAges.size() == trackedPoints.size() / 2.
+    // Empty when not populated; consumers must check size() before use.
+    // At 30 Hz: <30 frames is "new" (≤1 s), 30-89 is "established"
+    // (1-3 s), ≥90 is "mature" (≥3 s).
+    std::vector<int> trackedPointAges;
+
     // Diagnostic fields for simulation recording
     double meanFlow;
     int    inlierCount;
@@ -25,4 +32,8 @@ struct VisionOutput {
     int    poseFlags;        // bit0=static, bit1=pureRot, bit2=poseValid, bit3=fallback
     double heading;
     double td_imu_cam;       // Camera-to-IMU time offset (seconds)
+    bool   keyframe_stored;  // Step 9 (ADR-014): true on the frame a keyframe was
+                             // committed (frames_since_keyframe_ resets to 0).
+                             // Lets the replay scorer compute keyframe-rate metrics
+                             // (keyframe_match_count_p95) without keyframe-side logging.
 };

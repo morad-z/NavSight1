@@ -31,8 +31,9 @@
 // or "DEAD CODE" to find them. Specifically retained:
 //   • global_R_ / global_t_ — Tracker-owned pose (mirror of EKFState).
 //   • scalar_heading_       — yaw mirror published via getHeading()/JNI.
-//   • UpdaterMSCKF member   — never exercised after Step 4; its update site
-//                             at Tracker.cpp:1193 is wrapped in DISABLED.
+//   • UpdaterMSCKF member   — re-enabled per ADR-008 (Step 3a); update site
+//                             is Tracker.cpp:1729-1742 (processLostFeatures).
+//                             Damping ramp + per-row Huber kernel applied.
 //   • Mapper pipeline       — see VioEngine.h banner; was a no-op corrector.
 // New code MUST read pose state from ekf_ accessors, not from these mirrors.
 // ─────────────────────────────────────────────────────────────────────────────
@@ -238,6 +239,14 @@ private:
     std::vector<cv::Point3f> points_3d_current_;
     std::vector<int> feature_ages_;  // Phase 2: track age per feature (frames survived)
     int frame_counter_{0};
+
+    // 2026-05-09 v13: count of consecutive frames where the ZUPT detector
+    // flagged the body stationary. Used to gate the stationary specific-force
+    // measurement update (EKFState::updateStationaryAccel) so it only fires
+    // on SUSTAINED stationarity (e.g. user paused at a corner) — never on
+    // walking heel-strike micro-stationary frames that sneaks past a
+    // single-frame ZUPT trigger. Cleared whenever is_static is false.
+    int consecutive_static_frames_{0};
 
     // Phase 5: Magnetometer heading used ONCE at startup only
     bool heading_initialized_{false};
@@ -447,6 +456,17 @@ private:
     double                    loop_closure_query_fx_{0.}, loop_closure_query_fy_{0.};
     double                    loop_closure_query_cx_{0.}, loop_closure_query_cy_{0.};
     double                    loop_closure_query_yaw_rad_{0.};
+    // Step 7.1 — extra payload for the geometric loop-closure path. Snapshot
+    // alongside the BoW query so both detectors see the SAME query frame.
+    // The geometric path uses these to spatial-filter candidates and project
+    // their pts3d_world into the current camera. See spec at
+    // docs/VISUAL_PLAN_STEP_7_1_GEOMETRIC_LOOP.md.
+    std::vector<cv::Point2f>  loop_closure_query_klt_corners_;
+    cv::Matx33d               loop_closure_query_R_world_cam_{cv::Matx33d::eye()};
+    cv::Vec3d                 loop_closure_query_t_cam_world_{0., 0., 0.};
+    int                       loop_closure_query_img_w_{0};
+    int                       loop_closure_query_img_h_{0};
+    double                    loop_closure_query_search_radius_m_{0.};
 
     // Result handoff. The worker writes the latest accepted LoopMatch under
     // this mutex; the camera thread takes (and clears) it before applying
@@ -476,7 +496,17 @@ private:
                                          const std::vector<cv::KeyPoint>& keypoints,
                                          double fx, double fy,
                                          double cx, double cy,
-                                         double yaw_rad);
+                                         double yaw_rad,
+                                         // Step 7.1 — extras for the geometric
+                                         // loop-closure path (additive). Pass
+                                         // empty vector / identity matrix /
+                                         // zero radius to disable the geom
+                                         // path for a given query.
+                                         const std::vector<cv::Point2f>& klt_corners,
+                                         const cv::Matx33d& R_world_cam_pred,
+                                         const cv::Vec3d&   t_cam_world_pred,
+                                         int img_w, int img_h,
+                                         double search_radius_m);
 
     // 1 Hz query worker. Wakes on either loop_closure_cv_ or a timeout,
     // copies the pending query under the query mutex, calls tryDetectLoop,
@@ -505,6 +535,23 @@ private:
     static constexpr double  LOOP_CLOSURE_QUERY_PERIOD_S      = 1.0;
     static constexpr int64_t LOOP_CLOSURE_TEMPORAL_EXCL_NS    = 30LL * 1'000'000'000LL;
     static constexpr int     LOOP_CLOSURE_DAMPING_FRAMES      = 10;
+    /* LEGACY: Stage 2 v1 (2026-05-09) — direct global_t_ injection ramp.
+       Reverted in Stage 2 v2 once Stage 1 (EKFState::updateGravityAlignment)
+       bounded R_GtoI tilt and the EKF absolute-pose channel
+       (consumeLoopClosureMatchIfReady → updateAbsolutePose) became viable
+       again. The active correction ramp is LOOP_CLOSURE_DAMPING_FRAMES = 10
+       above; nothing in any .cpp references the two constants below.
+       Kept commented per project "comment, don't delete" rule — do NOT
+       re-enable without restoring the global_t_ injection path.
+
+    // Step χ-3 (2026-05-09) — direct global_t_ injection ramp parameters.
+    // sim_data_1778329181805 showed 30 jumps > 0.5 m, max 3.32 m at 10
+    // frames × 1.82 m first-frame strength. Extending the ramp to 30
+    // frames + capping per-frame translation made corrections naturalistic
+    // (comparable to walking-pace motion).
+    static constexpr int     LOOP_CLOSURE_GLOBAL_RAMP_FRAMES  = 30;
+    static constexpr double  LOOP_CLOSURE_GLOBAL_MAX_STEP_M   = 0.20;
+    */
     // Dynamic 1-σ (m) for the loop-closure world-position measurement:
     //   sigma = max(LOOP_CLOSURE_PNP_SIGMA_FLOOR_M,
     //               LOOP_CLOSURE_DRIFT_RATE * total_path_m_)
