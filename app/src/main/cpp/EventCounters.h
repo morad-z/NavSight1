@@ -156,6 +156,26 @@ struct EventCounters {
     std::atomic<long long> loop_closure_chi2_rejected{0};
     std::atomic<long long> loop_closure_corrections_applied{0};
 
+    // Phase 1 Step 2b verification: counts loop closures that succeeded
+    // on a candidate OTHER than results[0] (i.e. the top-1 BoW match
+    // failed PnP but a lower-ranked candidate did match). If this counter
+    // is > 0 across a walk, the multi-candidate retry is doing real work.
+    // If = 0, the top-1 was always sufficient and Step 2b had no effect
+    // on this dataset. Counter increments inside LoopClosureDetector
+    // (Tracker doesn't see the candidate index).
+    std::atomic<long long> loop_closure_lower_rank_accepts{0};
+
+    // Phase 1 Step 2c verification: rolling-window camera frame rate
+    // statistics, persisted to event_summary so we don't depend on
+    // logcat retention to verify the [30, 30] fps lock. Stored in
+    // milli-Hz (×1000) because std::atomic<double> isn't part of C++17.
+    // Updated by Tracker every kCamFpsWindow=30 frames from a Welford-
+    // style running aggregate. Final values written into event_summary
+    // by toJson(). Convert to Hz on read by dividing by 1000.0.
+    std::atomic<long long> cam_fps_mean_milli_hz{0};
+    std::atomic<long long> cam_fps_stdev_milli_hz{0};
+    std::atomic<long long> cam_fps_window_count{0};   // # of fps samples
+
     // Step 7.1 — Geometric loop closure (additive to the BoW path; spec
     // in docs/VISUAL_PLAN_STEP_7_1_GEOMETRIC_LOOP.md). The geometric path
     // does position-based candidate retrieval + projection of pts3d_world
@@ -269,6 +289,10 @@ struct EventCounters {
         loop_closure_kf_count_in_db.store(0, std::memory_order_relaxed);
         loop_closure_chi2_rejected.store(0, std::memory_order_relaxed);
         loop_closure_corrections_applied.store(0, std::memory_order_relaxed);
+        loop_closure_lower_rank_accepts.store(0, std::memory_order_relaxed);
+        cam_fps_mean_milli_hz.store(0, std::memory_order_relaxed);
+        cam_fps_stdev_milli_hz.store(0, std::memory_order_relaxed);
+        cam_fps_window_count.store(0, std::memory_order_relaxed);
         loop_closure_geom_attempts.store(0, std::memory_order_relaxed);
         loop_closure_geom_accepts.store(0, std::memory_order_relaxed);
         loop_closure_geom_rejects_no_position.store(0, std::memory_order_relaxed);
@@ -345,6 +369,10 @@ struct EventCounters {
         const long long v_loop_closure_kf_count_in_db   = loop_closure_kf_count_in_db.load(std::memory_order_relaxed);
         const long long v_loop_closure_chi2_rejected    = loop_closure_chi2_rejected.load(std::memory_order_relaxed);
         const long long v_loop_closure_corrections_applied = loop_closure_corrections_applied.load(std::memory_order_relaxed);
+        const long long v_loop_closure_lower_rank_accepts   = loop_closure_lower_rank_accepts.load(std::memory_order_relaxed);
+        const long long v_cam_fps_mean_milli_hz             = cam_fps_mean_milli_hz.load(std::memory_order_relaxed);
+        const long long v_cam_fps_stdev_milli_hz            = cam_fps_stdev_milli_hz.load(std::memory_order_relaxed);
+        const long long v_cam_fps_window_count              = cam_fps_window_count.load(std::memory_order_relaxed);
         const long long v_loop_closure_geom_attempts                 = loop_closure_geom_attempts.load(std::memory_order_relaxed);
         const long long v_loop_closure_geom_accepts                  = loop_closure_geom_accepts.load(std::memory_order_relaxed);
         const long long v_loop_closure_geom_rejects_no_position      = loop_closure_geom_rejects_no_position.load(std::memory_order_relaxed);
@@ -404,6 +432,10 @@ struct EventCounters {
         appendKv(out, "loop_closure_kf_count_in_db",   v_loop_closure_kf_count_in_db);   out += ',';
         appendKv(out, "loop_closure_chi2_rejected",    v_loop_closure_chi2_rejected);    out += ',';
         appendKv(out, "loop_closure_corrections_applied", v_loop_closure_corrections_applied); out += ',';
+        appendKv(out, "loop_closure_lower_rank_accepts",  v_loop_closure_lower_rank_accepts);  out += ',';
+        appendKv(out, "cam_fps_mean_milli_hz",            v_cam_fps_mean_milli_hz);            out += ',';
+        appendKv(out, "cam_fps_stdev_milli_hz",           v_cam_fps_stdev_milli_hz);           out += ',';
+        appendKv(out, "cam_fps_window_count",             v_cam_fps_window_count);             out += ',';
         appendKv(out, "loop_closure_geom_attempts",                 v_loop_closure_geom_attempts);                 out += ',';
         appendKv(out, "loop_closure_geom_accepts",                  v_loop_closure_geom_accepts);                  out += ',';
         appendKv(out, "loop_closure_geom_rejects_no_position",      v_loop_closure_geom_rejects_no_position);      out += ',';

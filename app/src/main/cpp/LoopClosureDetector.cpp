@@ -66,9 +66,20 @@ namespace {
 //   Lower bound on the adaptive threshold. Prevents runaway acceptance in
 //   low-texture stretches where even the temporal neighbors score near
 //   zero against the query — without a floor, an indoor-walls passage
-//   could push minScore to 0.0001 and any DB hit would pass. 0.005 sits
-//   roughly an order of magnitude below the observed same-place range.
-constexpr double kBowScoreFloor   = 0.005;
+//   could push minScore to 0.0001 and any DB hit would pass.
+//
+//   2026-05-09 v21 retune (Phase 1 Step 2a): 0.005 → 0.002.
+//   Empirical range of genuine same-place revisit BoW scores observed in
+//   simulation_data_1778343884100.json + 1778345984086.json + 1778350846616.json:
+//   0.003 – 0.012. The 0.005 floor sat in the BOTTOM HALF of that range,
+//   rejecting ~50% of real revisits before they could reach BFMatcher+PnP.
+//   0.002 keeps the false-positive guard (well above the 0.0001 noise floor
+//   we set out to block) while admitting the lower-half of the legitimate
+//   same-place range. Subsequent BFMatcher (Lowe ratio) + PnP RANSAC
+//   (kPnpReprojThreshPx = 4 px, kPnpMinInliers = 15) are the real outlier
+//   filters; the BoW floor is just a "is this even worth running PnP on" gate.
+//   Source: Agent 2 dependency audit, docs/study/dependency_audit.md §A1.
+constexpr double kBowScoreFloor   = 0.002;
 //
 // kCovisibilityK
 //   Number of recent keyframes to score against for the adaptive minScore.
@@ -102,9 +113,15 @@ constexpr double kPnpReprojThreshPx = 4.0;
 constexpr double kPnpConfidence    = 0.99;
 constexpr int    kPnpMaxIters      = 100;
 
-// Top-N candidates pulled from BoW. We only attempt geometric verification
-// on the best one (idx 0) — querying a few extras is essentially free
-// (inverted index walks the same words once) and helps debug.
+// Top-N candidates pulled from BoW. 2026-05-09 v21 retune (Phase 1 Step 2b):
+// previously only `results[0]` got geometric verification (BFMatcher + PnP),
+// candidates 1–3 were discarded. The top-1 is not always the right match —
+// a slightly lower-scoring candidate often has better geometric agreement
+// (more 2D-3D inliers from BFMatcher's Hamming search). Query cost is
+// unchanged — DBoW2's inverted-index walk produces all 4 in one pass — and
+// the per-candidate BFMatcher + PnP overhead at 1 Hz worker rate is
+// ~3× negligible. Now we iterate all 4, returning on the first PnP-passing
+// match. Source: Agent 2 dependency audit, docs/study/dependency_audit.md §D.
 constexpr int kBowTopN = 4;
 
 // ─── Step 7.1 — Geometric loop closure (additive) ────────────────────────
@@ -367,14 +384,13 @@ bool LoopClosureDetector::tryDetectLoop(
     // delegates that to us — Tracker.cpp ~L3103).
 
     // ── (1) BoW query under the lock ─────────────────────────────────────
-    DBoW2::QueryResults results;
-
-    // Snapshot of the candidate's stored data, taken under the lock and
-    // then used outside the lock for the (slow) PnP step.
-    KeyframeRecord candidate;
-    bool candidate_valid = false;
-    double         best_score = 0.0;
-    DBoW2::EntryId best_entry_id = 0;
+    //
+    // 2026-05-09 v21 (Phase 1 Step 2b): collect ALL candidates whose BoW
+    // score clears the adaptive minScore floor — not just results[0].
+    // Each candidate stores its own score + a snapshot of its
+    // KeyframeRecord (taken under the lock; the slow PnP runs lock-free).
+    // The first candidate that survives heading + BFMatcher + PnP wins.
+    std::vector<std::pair<double, KeyframeRecord>> candidates_to_try;
 
     {
         std::lock_guard<std::mutex> lk(impl_->mutex);
@@ -410,13 +426,10 @@ bool LoopClosureDetector::tryDetectLoop(
         DBoW2::BowVector query_bow;
         impl_->vocab.transform(features, query_bow);
 
+        DBoW2::QueryResults results;
         impl_->db->query(features, results, kBowTopN, max_id);
 
         if (results.empty()) return false;
-        // results[0] is highest-score by DBoW2 contract.
-        const DBoW2::Result& top = results[0];
-        best_score    = top.Score;
-        best_entry_id = top.Id;
 
         // ── Adaptive minScore (ORB-SLAM2 LoopClosing.cc::DetectLoop) ──
         // Score the query against the K most recent keyframes that are
@@ -449,179 +462,224 @@ bool LoopClosureDetector::tryDetectLoop(
             min_score = std::max(min_score, kBowScoreFloor);
         }
 
-        if (best_score < min_score) {
-            // Detector owns BOTH rejection counters now (cpp-reviewer 2026-05-04
-            // HIGH-1: when Tracker also bumped rejects_low_score on every false
-            // return, PnP rejections double-counted because the detector
-            // already bumped rejects_pnp before returning false). Worker's
-            // accept/attempt counters stay; rejection-reason counters are
-            // owned exclusively here.
+        // results[0] is highest-score by DBoW2 contract. If even the BEST
+        // candidate doesn't clear min_score, no point trying lower-ranked
+        // ones (sorted desc) — count as low-score reject and bail.
+        // Detector owns BOTH rejection counters (cpp-reviewer 2026-05-04
+        // HIGH-1: Tracker double-counted before this consolidation).
+        if (results[0].Score < min_score) {
             navsight::eventCounters().loop_closure_rejects_low_score.fetch_add(
                 1, std::memory_order_relaxed);
             LOGD("BoW reject: best_score=%.4f < adaptive_min=%.4f "
                  "(neighbors=%zu, kf %llu)",
-                 best_score, min_score, n_neighbors,
+                 results[0].Score, min_score, n_neighbors,
                  static_cast<unsigned long long>(now_kf_id));
             return false;
         }
 
-        auto it = impl_->entry_to_index.find(best_entry_id);
-        if (it == impl_->entry_to_index.end()) {
-            // Should never happen — entry_to_index is updated alongside
-            // every db.add(). Defensive guard only.
-            return false;
-        }
-        candidate       = impl_->keyframes[it->second];
-        candidate_valid = true;
-    }
-    // Lock is released. PnP runs lock-free below.
-
-    if (!candidate_valid) return false;
-
-    // Heading gate: reject opposite-direction candidates before the
-    // expensive BFMatcher + PnP step. ORB descriptors are ~30°-invariant
-    // but not 180°-invariant; reversed-viewpoint 3D-2D pairs are
-    // geometrically inconsistent for RANSAC.
-    // Source: sim_data_1778078217065 — 587/638 PnP failures from a
-    // 600 m walk where the user returned via the opposite direction.
-    // π/2 allows ±90° viewpoint variation (forward/sideways) while
-    // blocking the 180° reversal case observed in that sim.
-    {
-        constexpr double kMaxHeadingDiffRad = M_PI / 2.0;
-        double hdiff = std::abs(current_yaw_rad - candidate.yaw_rad);
-        if (hdiff > M_PI) hdiff = 2.0 * M_PI - hdiff;
-        if (hdiff > kMaxHeadingDiffRad) {
-            navsight::eventCounters().loop_closure_rejects_heading.fetch_add(
-                1, std::memory_order_relaxed);
-            LOGD("LC heading reject: now_yaw=%.2f candidate_yaw=%.2f diff=%.2f rad",
-                 current_yaw_rad, candidate.yaw_rad, hdiff);
-            return false;
+        // Collect every candidate whose Score >= min_score. Results are
+        // sorted by Score desc per DBoW2 contract — break on first below
+        // threshold. entry_to_index lookups are defensive; they should
+        // always succeed because the index is updated atomically with
+        // every db.add().
+        candidates_to_try.reserve(results.size());
+        for (const auto& r : results) {
+            if (r.Score < min_score) break;
+            auto it = impl_->entry_to_index.find(r.Id);
+            if (it == impl_->entry_to_index.end()) continue;
+            candidates_to_try.emplace_back(r.Score,
+                                           impl_->keyframes[it->second]);
         }
     }
+    // Lock is released. Heading + BFMatcher + PnP run lock-free below.
 
-    // ── (2) BFMatcher Hamming + Lowe ratio ───────────────────────────────
-    std::vector<std::vector<cv::DMatch>> knn;
-    impl_->matcher->knnMatch(descriptors, candidate.descriptors, knn, 2);
+    if (candidates_to_try.empty()) return false;
 
-    std::vector<cv::Point2f> pts2d;
-    std::vector<cv::Point3f> pts3d;
-    pts2d.reserve(knn.size());
-    pts3d.reserve(knn.size());
-
-    for (const auto& pair : knn) {
-        if (pair.size() < 2) continue;
-        if (pair[0].distance >= kLoweRatio * pair[1].distance) continue;
-
-        const int q_idx = pair[0].queryIdx;
-        const int t_idx = pair[0].trainIdx;
-        if (q_idx < 0 || q_idx >= static_cast<int>(keypoints.size())) continue;
-        if (t_idx < 0 ||
-            t_idx >= static_cast<int>(candidate.pts3d_world.size())) continue;
-
-        const cv::Point3f& p3 = candidate.pts3d_world[t_idx];
-        // Skip rows whose 3D point isn't valid — Tracker uses NaN to mark
-        // keypoints that never got triangulated.
-        if (!std::isfinite(p3.x) || !std::isfinite(p3.y) ||
-            !std::isfinite(p3.z)) continue;
-
-        pts2d.push_back(keypoints[q_idx].pt);
-        pts3d.push_back(p3);
-    }
-
-    if (static_cast<int>(pts2d.size()) < kPnpMinInliers) {
-        navsight::eventCounters().loop_closure_rejects_pnp.fetch_add(
-            1, std::memory_order_relaxed);
-        LOGD("PnP reject: only %zu 2D-3D pairs (need %d) for kf %llu vs %llu",
-             pts2d.size(), kPnpMinInliers,
-             static_cast<unsigned long long>(now_kf_id),
-             static_cast<unsigned long long>(candidate.kf_id));
-        return false;
-    }
-
-    // ── (3) solvePnPRansac ───────────────────────────────────────────────
+    // ── (2) Per-candidate verification (heading + BFMatcher + PnP) ──────
+    //
+    // Try each candidate in DBoW2 score order; return on the first one
+    // that survives all three gates. Per-candidate failures (heading
+    // mismatch, too few 2D-3D pairs, PnP RANSAC failure) only bump the
+    // rejection counters for the FIRST candidate (idx 0), so the counters
+    // stay 1:1 with `loop_closure_attempts` instead of multiplying by N.
+    // The rationale: each tryDetectLoop call is one query against the DB;
+    // multiple candidate attempts within that query are an internal
+    // implementation detail of the geometric verification, not separate
+    // attempts.
     cv::Mat K = (cv::Mat_<double>(3, 3) <<
                  fx,  0, cx,
                   0, fy, cy,
                   0,  0,  1);
     cv::Mat dist = cv::Mat::zeros(4, 1, CV_64F);  // already undistorted upstream
-    cv::Mat rvec, tvec;
-    std::vector<int> inliers;
 
-    bool pnp_ok = false;
-    try {
-        pnp_ok = cv::solvePnPRansac(
-            pts3d, pts2d, K, dist, rvec, tvec,
-            /*useExtrinsicGuess=*/false,
-            kPnpMaxIters,
-            static_cast<float>(kPnpReprojThreshPx),
-            kPnpConfidence,
-            inliers,
-            cv::SOLVEPNP_ITERATIVE);
-    } catch (const cv::Exception& e) {
-        LOGW("solvePnPRansac threw: %s", e.what());
-        navsight::eventCounters().loop_closure_rejects_pnp.fetch_add(
-            1, std::memory_order_relaxed);
-        return false;
-    }
+    for (size_t ci = 0; ci < candidates_to_try.size(); ++ci) {
+        const double cand_score          = candidates_to_try[ci].first;
+        const KeyframeRecord& candidate  = candidates_to_try[ci].second;
+        const bool count_rejects         = (ci == 0);
 
-    if (!pnp_ok || static_cast<int>(inliers.size()) < kPnpMinInliers) {
-        navsight::eventCounters().loop_closure_rejects_pnp.fetch_add(
-            1, std::memory_order_relaxed);
-        LOGD("PnP reject: ok=%d inliers=%zu (need %d) for kf %llu vs %llu",
-             pnp_ok ? 1 : 0, inliers.size(), kPnpMinInliers,
+        // Heading gate: reject opposite-direction candidates before the
+        // expensive BFMatcher + PnP step. ORB descriptors are ~30°
+        // -invariant but not 180°-invariant; reversed-viewpoint 3D-2D
+        // pairs are geometrically inconsistent for RANSAC.
+        // Source: sim_data_1778078217065 — 587/638 PnP failures from a
+        // 600 m walk where the user returned via the opposite direction.
+        // π/2 allows ±90° viewpoint variation (forward/sideways) while
+        // blocking the 180° reversal case observed in that sim.
+        {
+            constexpr double kMaxHeadingDiffRad = M_PI / 2.0;
+            double hdiff = std::abs(current_yaw_rad - candidate.yaw_rad);
+            if (hdiff > M_PI) hdiff = 2.0 * M_PI - hdiff;
+            if (hdiff > kMaxHeadingDiffRad) {
+                if (count_rejects) {
+                    navsight::eventCounters().loop_closure_rejects_heading.fetch_add(
+                        1, std::memory_order_relaxed);
+                }
+                LOGD("LC heading reject: now_yaw=%.2f candidate_yaw=%.2f "
+                     "diff=%.2f rad (cand_idx=%zu)",
+                     current_yaw_rad, candidate.yaw_rad, hdiff, ci);
+                continue;
+            }
+        }
+
+        // BFMatcher Hamming + Lowe ratio
+        std::vector<std::vector<cv::DMatch>> knn;
+        impl_->matcher->knnMatch(descriptors, candidate.descriptors, knn, 2);
+
+        std::vector<cv::Point2f> pts2d;
+        std::vector<cv::Point3f> pts3d;
+        pts2d.reserve(knn.size());
+        pts3d.reserve(knn.size());
+
+        for (const auto& pair : knn) {
+            if (pair.size() < 2) continue;
+            if (pair[0].distance >= kLoweRatio * pair[1].distance) continue;
+
+            const int q_idx = pair[0].queryIdx;
+            const int t_idx = pair[0].trainIdx;
+            if (q_idx < 0 || q_idx >= static_cast<int>(keypoints.size())) continue;
+            if (t_idx < 0 ||
+                t_idx >= static_cast<int>(candidate.pts3d_world.size())) continue;
+
+            const cv::Point3f& p3 = candidate.pts3d_world[t_idx];
+            // Skip rows whose 3D point isn't valid — Tracker uses NaN to mark
+            // keypoints that never got triangulated.
+            if (!std::isfinite(p3.x) || !std::isfinite(p3.y) ||
+                !std::isfinite(p3.z)) continue;
+
+            pts2d.push_back(keypoints[q_idx].pt);
+            pts3d.push_back(p3);
+        }
+
+        if (static_cast<int>(pts2d.size()) < kPnpMinInliers) {
+            if (count_rejects) {
+                navsight::eventCounters().loop_closure_rejects_pnp.fetch_add(
+                    1, std::memory_order_relaxed);
+            }
+            LOGD("PnP reject: only %zu 2D-3D pairs (need %d) for kf %llu vs %llu (cand_idx=%zu)",
+                 pts2d.size(), kPnpMinInliers,
+                 static_cast<unsigned long long>(now_kf_id),
+                 static_cast<unsigned long long>(candidate.kf_id), ci);
+            continue;
+        }
+
+        // solvePnPRansac
+        cv::Mat rvec, tvec;
+        std::vector<int> inliers;
+        bool pnp_ok = false;
+        try {
+            pnp_ok = cv::solvePnPRansac(
+                pts3d, pts2d, K, dist, rvec, tvec,
+                /*useExtrinsicGuess=*/false,
+                kPnpMaxIters,
+                static_cast<float>(kPnpReprojThreshPx),
+                kPnpConfidence,
+                inliers,
+                cv::SOLVEPNP_ITERATIVE);
+        } catch (const cv::Exception& e) {
+            LOGW("solvePnPRansac threw: %s (cand_idx=%zu)", e.what(), ci);
+            if (count_rejects) {
+                navsight::eventCounters().loop_closure_rejects_pnp.fetch_add(
+                    1, std::memory_order_relaxed);
+            }
+            continue;
+        }
+
+        if (!pnp_ok || static_cast<int>(inliers.size()) < kPnpMinInliers) {
+            if (count_rejects) {
+                navsight::eventCounters().loop_closure_rejects_pnp.fetch_add(
+                    1, std::memory_order_relaxed);
+            }
+            LOGD("PnP reject: ok=%d inliers=%zu (need %d) for kf %llu vs %llu (cand_idx=%zu)",
+                 pnp_ok ? 1 : 0, inliers.size(), kPnpMinInliers,
+                 static_cast<unsigned long long>(now_kf_id),
+                 static_cast<unsigned long long>(candidate.kf_id), ci);
+            continue;
+        }
+
+        // ── (3) Build the LoopMatch payload ──────────────────────────────
+        // PnP returns rvec/tvec mapping a 3D point in the *match camera's
+        // world frame* (which == our world frame: same session) into the
+        // current camera. So we have:
+        //     X_now = R_now_world * X_world + t_now_world
+        // Where:
+        //     R_now_world = Rodrigues(rvec)
+        //     t_now_world = tvec
+        // For the LoopMatch caller we want the cam-now → cam-match relative.
+        // Let R_match_world / t_match_world be the candidate's stored pose
+        // (we have R_world_cam_match — its transpose). Then:
+        //     R_now_to_match = R_match_world * R_now_world^T
+        //     t_now_to_match = t_match_world - R_now_to_match * t_now_world
+        cv::Mat R_now_world_cv;
+        cv::Rodrigues(rvec, R_now_world_cv);
+        cv::Matx33d R_now_world(R_now_world_cv);
+
+        // R_match_world = R_world_cam_match^T (R_world_cam takes cam→world,
+        // its transpose takes world→cam_match).
+        const cv::Matx33d R_match_world = candidate.R_world_cam.t();
+        // The candidate's t_cam_world is the camera *position in world* — to
+        // get the world→cam_match translation we need:
+        //     t_match_world = -R_match_world * t_cam_world_match
+        const cv::Vec3d t_match_world = -(R_match_world * candidate.t_cam_world);
+
+        const cv::Matx33d R_now_to_match = R_match_world * R_now_world.t();
+        const cv::Vec3d   t_now_world(tvec.at<double>(0),
+                                      tvec.at<double>(1),
+                                      tvec.at<double>(2));
+        const cv::Vec3d   t_now_to_match =
+            t_match_world - R_now_to_match * t_now_world;
+
+        out_match.matched_kf_id    = candidate.kf_id;
+        out_match.bow_score        = cand_score;
+        out_match.pnp_inliers      = static_cast<int>(inliers.size());
+        out_match.R_now_to_match   = R_now_to_match;
+        out_match.t_now_to_match   = t_now_to_match;
+        out_match.R_world_cam_match = candidate.R_world_cam;
+        out_match.t_cam_world_match = candidate.t_cam_world;
+
+        // Phase 1 Step 2b verification: count when a non-top-1 candidate
+        // is the one that succeeded. If this counter stays at 0 across
+        // many walks, the multi-candidate retry isn't earning its keep
+        // (top-1 was always sufficient). If it grows, Step 2b is doing
+        // real work — quantifies the BoW-score-isn't-a-perfect-ranking
+        // observation from Agent 2's audit.
+        if (ci > 0) {
+            navsight::eventCounters().loop_closure_lower_rank_accepts.fetch_add(
+                1, std::memory_order_relaxed);
+        }
+
+        LOGI("LOOP CLOSURE accepted: now_kf=%llu match_kf=%llu "
+             "score=%.4f inliers=%d (cand_idx=%zu of %zu)",
              static_cast<unsigned long long>(now_kf_id),
-             static_cast<unsigned long long>(candidate.kf_id));
-        return false;
+             static_cast<unsigned long long>(candidate.kf_id),
+             cand_score, static_cast<int>(inliers.size()),
+             ci, candidates_to_try.size());
+        return true;
     }
 
-    // ── (4) Build the LoopMatch payload ──────────────────────────────────
-    // PnP returns rvec/tvec mapping a 3D point in the *match camera's
-    // world frame* (which == our world frame: same session) into the
-    // current camera. So we have:
-    //     X_now = R_now_world * X_world + t_now_world
-    // Where:
-    //     R_now_world = Rodrigues(rvec)
-    //     t_now_world = tvec
-    // For the LoopMatch caller we want the cam-now → cam-match relative.
-    // Let R_match_world / t_match_world be the candidate's stored pose
-    // (we have R_world_cam_match — its transpose). Then:
-    //     R_now_to_match = R_match_world * R_now_world^T
-    //     t_now_to_match = t_match_world - R_now_to_match * t_now_world
-    cv::Mat R_now_world_cv;
-    cv::Rodrigues(rvec, R_now_world_cv);
-    cv::Matx33d R_now_world(R_now_world_cv);
-
-    // R_match_world = R_world_cam_match^T (R_world_cam takes cam→world,
-    // its transpose takes world→cam_match).
-    const cv::Matx33d R_match_world = candidate.R_world_cam.t();
-    // The candidate's t_cam_world is the camera *position in world* — to
-    // get the world→cam_match translation we need:
-    //     t_match_world = -R_match_world * t_cam_world_match
-    const cv::Vec3d t_match_world = -(R_match_world * candidate.t_cam_world);
-
-    const cv::Matx33d R_now_to_match = R_match_world * R_now_world.t();
-    const cv::Vec3d   t_now_world(tvec.at<double>(0),
-                                  tvec.at<double>(1),
-                                  tvec.at<double>(2));
-    const cv::Vec3d   t_now_to_match =
-        t_match_world - R_now_to_match * t_now_world;
-
-    out_match.matched_kf_id    = candidate.kf_id;
-    out_match.bow_score        = best_score;
-    out_match.pnp_inliers      = static_cast<int>(inliers.size());
-    out_match.R_now_to_match   = R_now_to_match;
-    out_match.t_now_to_match   = t_now_to_match;
-    out_match.R_world_cam_match = candidate.R_world_cam;
-    out_match.t_cam_world_match = candidate.t_cam_world;
-
-    // Tracker bumps loop_closure_accepts itself on the true return — see
-    // note above.
-
-    LOGI("LOOP CLOSURE accepted: now_kf=%llu match_kf=%llu score=%.4f inliers=%d",
-         static_cast<unsigned long long>(now_kf_id),
-         static_cast<unsigned long long>(candidate.kf_id),
-         best_score, static_cast<int>(inliers.size()));
-    return true;
+    // All candidates failed. The first candidate's specific reject reason
+    // was already counted above; we don't double-count by adding a generic
+    // "all-candidates-failed" counter.
+    return false;
 }
 
 // ─── Trivial accessors ───────────────────────────────────────────────────

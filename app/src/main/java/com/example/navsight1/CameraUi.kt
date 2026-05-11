@@ -78,6 +78,20 @@ fun CameraViewComposable(viewModel: NavSightViewModel) {
 
                 @OptIn(ExperimentalCamera2Interop::class)
                 Camera2Interop.Extender(analysisBuilder)
+                    // 2026-05-09 v21 (Phase 1 Step 2c): lock the camera AE
+                    // algorithm to a stable [30, 30] fps range. Without this
+                    // CameraX defaults to a variable rate (commonly [15, 30]
+                    // or [10, 60] depending on lighting) which complicates
+                    // rolling-shutter row-time interpolation (Step 8c) and
+                    // makes the IMU preintegrator's per-frame Δt more
+                    // variable than the 1/fps it expects. 30 fps = the
+                    // analysis target rate; locking both ends prevents
+                    // the AE algorithm from dropping it under low light.
+                    // Source: Agent 2 dependency audit, docs/study/dependency_audit.md §A7.
+                    .setCaptureRequestOption(
+                        android.hardware.camera2.CaptureRequest.CONTROL_AE_TARGET_FPS_RANGE,
+                        android.util.Range(30, 30)
+                    )
                     .setSessionCaptureCallback(
                         object : android.hardware.camera2.CameraCaptureSession.CaptureCallback() {
                             override fun onCaptureCompleted(

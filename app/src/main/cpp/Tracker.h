@@ -240,6 +240,49 @@ private:
     std::vector<int> feature_ages_;  // Phase 2: track age per feature (frames survived)
     int frame_counter_{0};
 
+    // Phase 1 Step 2c verification: rolling-window frame-interval tracking.
+    // Used to log CAM_FPS so we can confirm the Camera2Interop fps lock
+    // ([30, 30] AE_TARGET_FPS_RANGE) is actually taking effect on device.
+    // Per-frame Δt accumulates here; once `kCamFpsWindow` frames have been
+    // sampled we emit a log line and reset. ~1 line/sec at 30 fps.
+    int64_t prev_camera_frame_ts_ns_{0};
+    double  cam_dt_sum_ms_{0.0};
+    int     cam_dt_count_{0};
+    static constexpr int kCamFpsWindow = 30;
+
+    // Session-wide running statistics over per-window fps measurements.
+    // Welford's online algorithm — single pass, numerically stable, no
+    // per-frame accumulator drift, no division until query. Values are
+    // pushed to EventCounters' atomic milli-Hz fields after each window
+    // closes so the sim JSON's event_summary reflects the latest mean+stdev
+    // without needing logcat retention.
+    int     cam_fps_running_count_{0};
+    double  cam_fps_running_mean_hz_{0.0};
+    double  cam_fps_running_m2_{0.0};   // sum of squared deviations
+
+    // Phase 1 Step 3: drift-since-last-loop-closure tracker for the
+    // chi² variance budget in `consumeLoopClosureMatchIfReady`.
+    //
+    // Problem this solves: v18's `setPosition(global_t_)` sync per frame
+    // overrides EKF p_G but does NOT touch P_pp, so MSCKF visual updates
+    // collapse the EKF horizontal-position covariance to ~3 cm even
+    // though `global_t_` has accumulated 5–15 m of real drift since the
+    // last loop closure. The chi² gate then rejects almost everything
+    // (m² hovers at the threshold instead of either accepting cleanly
+    // or rejecting genuine outliers).
+    //
+    // Fix: track the integrated path length since the last accepted
+    // loop closure. The variance budget for chi² becomes
+    //
+    //     σ²_p_total = σ²_p_pnp + max(σ²_p_ekf, σ²_p_drift)
+    //
+    // where σ²_p_drift = (LOOP_CLOSURE_DRIFT_RATE × path_since_last_lc_m_)².
+    // This grows monotonically with walking distance and resets to 0 on
+    // every accepted loop closure (`ok=1` in consumeLoopClosureMatchIfReady).
+    // Incremented after every per-frame update to `global_t_`. Touched
+    // only on the camera thread (the same thread that owns global_t_).
+    double path_since_last_lc_m_{0.0};
+
     // 2026-05-09 v13: count of consecutive frames where the ZUPT detector
     // flagged the body stationary. Used to gate the stationary specific-force
     // measurement update (EKFState::updateStationaryAccel) so it only fires

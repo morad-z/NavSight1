@@ -202,20 +202,176 @@ Output: updated pose_i for all i. Apply Δpose_i to global_t_ along the path bet
 
 ---
 
-## Step 6 — Deferred (Tier 2 + 3)
+## Step 6 — Persistent landmark map (3–5 days, the second architectural piece)
 
-**After Steps 0–5 land and validate:**
+**Scope:** Today every triangulated 3D point lives in exactly one place — either the EKF's `slam_features_` (active, currently observed) or the per-keyframe `pts3d_world` array inside `LoopClosureDetector::KeyframeRecord` (dormant, only touched at loop-closure detection). Drift accumulates between loop closures because the dormant points aren't projected back into current frames and matched.
 
-- **Bad keyframe filter** — when adding to DBoW2 database, sanity-check world position vs neighbors. Prevents the km-range `target_p` corruption observed in v18.
-- **MiDaS validation** — Agent 2 found the unit bug was already fixed today. Watch `midas_fused` counter; if still 0, investigate denominator gate or specular-surface response.
-- **MSCKF Huber rate** — ~80% reject/dampen rate. Investigate triangulation chi² gate and feature lifetime.
-- **MountMode framework (scooter mode):**
-  - PDR off (camera+IMU speed instead of step counting)
-  - `MAX_SLAM_FEATURES` 12 → 25–30 (Agent 1 recommendation)
-  - `MAX_CLONES` 11 → 15 (Agent 1 recommendation)
-  - Mount-specific thresholds (vibration, blur, gyro rotation gate)
-- **OpenCV 4.5.3 → 4.9.x** for NEON KLT improvements (medium dependency bump)
-- **Direction-flip U-turn loop closures** — Agent 2 confirmed FUNDAMENTALLY hard with current architecture (BoW π/2 heading gate + 3D point depth filter). Mitigation: design routes such that revisits occur from approximately the same viewing angle. Future: SuperPoint or LoFTR for rotation-invariant descriptors (large dependency add, scope for v2).
+**ORB-SLAM3 pattern: "Tracking the local map".** A single deduplicated `LandmarkMap` of all triangulated 3D points across the session, queried every frame for "which landmarks should be visible right now", projected into the current camera, matched against current ORB features, fed to the EKF as MSCKF-style measurement updates. Every landmark match is a small drift correction — drift is bounded continuously, not just at loop closures.
+
+### Why this is the drift fix you actually want
+
+- **Pose-graph (Step 5)** corrects drift retroactively at a loop closure event. Useful but only fires when a full revisit happens.
+- **Persistent landmark map (Step 6)** corrects drift PROACTIVELY at every frame where any past landmark is currently in view. Walk down a corridor, look at familiar wall corners, every match is a position constraint.
+
+**For the 100 m walk-and-back scenario:** with persistent landmarks, the orange dots seen on the doorway during the outbound walk stay registered in the map. When you come back 100 m later and look at the same doorway, those landmarks (still in the map) get matched against current ORB features → pose constrained immediately, before any DBoW loop closure even has a chance to fire.
+
+### How DBoW2 fits with this — clarification
+
+DBoW2 today already stores per-keyframe 3D points, but they're inert until the moment of a revisit. The persistent map is the **promotion of those dormant points to first-class citizens** — they get projected, matched, and used every frame, not just when DBoW says "hey, I think you're back here".
+
+DBoW2 stays unchanged — it remains the LARGE-SCALE revisit detector (works at any distance, even when local-map tracking has dropped all candidates because we've walked too far). Persistent landmark map is the SMALL-SCALE continuous corrector.
+
+### Architecture
+
+```
+LandmarkMap class
+  std::vector<Landmark> landmarks_   // all triangulated points across session
+                                     // deduplicated across keyframes
+  cv::flann::KDTreeIndex spatial_idx // for "landmarks near pose" queries
+
+struct Landmark {
+  int id;                            // stable across session
+  cv::Vec3d p_world;                 // triangulated world position
+  cv::Mat reference_descriptor;      // 32-byte ORB descriptor (median across observations)
+  std::vector<int> observed_in_kfs;  // keyframes where this landmark was seen
+  int64_t last_seen_ts_ns;
+  int times_observed;                // for outlier rejection
+};
+
+Per-frame pipeline addition:
+  1. Get current pose estimate from EKF
+  2. Query landmarks within search_radius (e.g. 30 m sphere)
+  3. Project each into current camera; reject behind-camera or out-of-frame
+  4. Match projected landmarks against current frame's ORB features (descriptor + pixel proximity)
+  5. Build 2D-3D correspondences from matches
+  6. Feed to EKF as MSCKF-style measurement update (each match = 2-DOF reprojection residual)
+
+Camera overlay tie-in:
+  - SlamFeatureOverlay reads from LandmarkMap (not just slam_features_)
+  - Orange dots persist forever; gray-out dots not currently observable
+  - Walk past a doorway → dot stays in 3D space, just no longer visible
+  - Walk back → dot re-enters frame, re-matches, re-anchored
+```
+
+### Implementation
+
+1. **New file `app/src/main/cpp/LandmarkMap.cpp/h`** (~400 lines):
+   - `addOrMergeLandmark(p_world, descriptor, kf_id)` — dedup by 3D distance + descriptor similarity
+   - `getLandmarksInBoundingBox(p_center, radius)` — KD-tree query
+   - `projectIntoCamera(p_world, pose, K)` → pixel coord or null if behind camera
+   - `matchAgainstFrame(projected_landmarks, current_orb_features)` → 2D-3D correspondences
+   - JSON serialise/deserialise (for diagnostic dumps)
+
+2. **Wire-up in `Tracker.cpp`:**
+   - On every keyframe storage: `landmark_map_.addOrMergeLandmark(...)` for each triangulated point
+   - On every camera frame: query map → project → match against current ORB → build measurement → call EKF MSCKF-update path
+   - On every accepted loop closure: dedupe landmarks across the matched keyframes (multi-view constraints from same physical point)
+
+3. **Wire-up in `LoopClosureDetector.cpp`:**
+   - Replace the per-keyframe `pts3d_world` storage with reference-by-id into `LandmarkMap`
+   - PnP at revisit time: same code, just pulls 3D points from the map by id
+
+4. **Wire-up in camera overlay:**
+   - `SlamFeatureOverlay` reads from `getLandmarkSnapshot()` (new JNI) instead of `getSlamSnapshot()`
+   - Returns ALL landmarks within 30 m, with a flag for "currently observed" (orange) vs "dormant" (gray-out)
+
+**No magic numbers:**
+- Search radius = 30 m derived from typical KLT max depth × 3
+- Descriptor similarity threshold = Hamming distance ≤ 50 / 256 (ORB standard)
+- 3D dedup distance = 0.5 m (smaller than typical inter-feature spacing in indoor scenes)
+- All cited inline with sim-data references where possible
+
+**Files:**
+- `app/src/main/cpp/LandmarkMap.cpp` (new)
+- `app/src/main/cpp/LandmarkMap.h` (new)
+- `app/CMakeLists.txt` — add new file
+- `Tracker.cpp` — keyframe storage, per-frame query/match/update
+- `LoopClosureDetector.cpp` — refactor `pts3d_world` to `landmark_ids`
+- `LoopClosureDetector.h` — `KeyframeRecord` struct change
+- `native-lib.cpp` — `getLandmarkSnapshot` JNI replacing/supplementing `getSlamSnapshot`
+- `CameraUi.kt` — `SlamFeatureOverlay` reads landmarks not slam features
+
+**Expected outcome:**
+- Drift between loop closures drops from ~30 %/loop to <5 %/loop (matches ORB-SLAM3 numbers)
+- 100 m walk-and-back: orange dots SAW from outbound walk re-appear on return
+- Loop closure (Step 5 pose-graph) becomes the rare large-scale corrector; everyday drift handled by the local map
+- The single biggest accuracy unlock for sustained tracking
+
+**Validation:**
+- Two-loop walk: second loop overlays first within 0.5 m (combined with Step 5)
+- 100 m straight + back walk: orange dots appear on return at same screen positions as outbound (visual confirmation)
+- `landmark_map.json` diagnostic dump shows ~500-2000 landmarks per 100 m of walking
+- Per-frame `landmark_matches_used` counter > 5 most frames (proves the map is contributing)
+
+---
+
+## Step 7 — Phase 1 validation & handoff to Phase 2
+
+**Scope:** After Steps 0–6 land, run a structured validation pass to declare "Phase 1: accurate-VIO foundations complete" and hand off to Phase 2 (productization).
+
+### 7.1 Validation walks
+
+Three structured walks recorded under controlled conditions:
+
+1. **Single-loop test** (~50 m, 1 loop, return to start)
+   - Target: end position within 1 m of origin
+   - `loop_closure_corrections_applied` ≥ 5
+   - `slam_lifetime_obs_mean` ≥ 100 frames (proves Step 4 re-anchoring works)
+   - Camera overlay: orange dots stay pinned, green→yellow→red age progression visible
+
+2. **Two-loop overlay test** (~100 m, 2 loops same path)
+   - Target: loop 2 trajectory overlays loop 1 within 0.5 m
+   - Pose-graph (Step 5) optimization fires on revisit
+   - Visual confirmation: trajectory polylines visually overlap
+
+3. **Out-and-back test** (~100 m straight, U-turn, return)
+   - Target: outbound and return segments overlay within 1 m at the start
+   - Persistent landmark map (Step 6) re-projects outbound dots on return (visual confirmation)
+   - Note: BoW direction-flip is known-hard; persistent map carries the load here
+
+### 7.2 Metrics dashboard
+
+Pull metrics from `replay_scorer.py` for each walk:
+- `loop_closure_corrections_applied`
+- `loop_closure_gap_m` (drop substantially vs v19 baseline)
+- `slam_promotions_total`
+- `slam_lifetime_obs_mean`
+- `landmark_matches_used_per_frame_mean` (new metric from Step 6)
+- `pose_graph_optimizations_run` (new counter from Step 5)
+- `msckf_huber_rejected_sum` (should drop further)
+
+### 7.3 Documentation update
+
+- Update `docs/KNOWN_ISSUES.md` — close out P0 #1, #2, #3 entries
+- Update `docs/ARCHITECTURE.md` — reflect single-trajectory architecture, persistent landmark map, pose-graph back-end
+- Mark `docs/study/post_v19_sprint_plan.md` (this file) as **completed**
+- Open `docs/study/phase2_productization_plan.md` (Phase 2)
+
+### 7.4 Phase 1 success criteria
+
+✅ Two-loop overlay error < 1 m
+✅ 100 m walk-and-back trajectory closure < 1.5 m
+✅ Camera overlay: orange dots persist while observed, no flashing
+✅ No regressions vs v9-v15 baselines on any counter
+✅ All 6 architectural pieces (single-trajectory, sign fixes, re-anchoring, pose graph, persistent map, camera overlay) shipped and verified
+
+### 7.5 Handoff trigger
+
+When all 7.4 criteria pass: commit + tag as `phase1-complete`, push to morad branch, merge to master. Open the Phase 2 plan as the next sprint entry point.
+
+**Phase 2 plan location:** `docs/study/phase2_productization_plan.md` (created alongside this step).
+
+Phase 2 covers:
+- Scooter MountMode framework (PDR off, MountMode-tuned thresholds)
+- Velocity from landmark map (the scooter speed source)
+- Bad keyframe filter
+- MiDaS final validation
+- MSCKF Huber rate tuning
+- Map persistence across sessions (save/load LandmarkMap)
+- OpenCV 4.5.3 → 4.9.x upgrade
+- Direction-flip loop closures (SuperPoint/LoFTR exploration)
+- Performance optimization
+- Testing infrastructure expansion
 
 ---
 
@@ -240,8 +396,9 @@ This avoids the "10 fixes piled up, can't tell which broke what" trap from the v
 | 2 | 🟡 Queued (after Step 1) |
 | 3 | 🟡 Queued |
 | 4 | 🟡 Queued |
-| 5 | 🟡 Queued (the big one — pose-graph) |
-| 6 | ⏸ Deferred until 0–5 validated |
+| 5 | 🟡 Queued (pose-graph — retroactive drift correction at loop closure) |
+| 6 | 🟡 Queued (persistent landmark map — proactive drift correction every frame) |
+| 7 | 🟡 Validation + handoff to Phase 2 (after 0–6 done) |
 
 ---
 

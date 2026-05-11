@@ -397,6 +397,7 @@ void Tracker::reset() {
     heading_initialized_ = false;
     scalar_heading_ = 0.0;
     total_path_m_ = 0.0;
+    path_since_last_lc_m_ = 0.0;  // Phase 1 Step 3 — reset drift estimate
     loop_closure_query_yaw_rad_ = 0.0;
     pending_init_heading_set_ = false;
     pending_init_heading_ = 0.0;
@@ -782,6 +783,65 @@ VisionOutput Tracker::processFrame(const uint8_t* yuv_data, int width, int heigh
     }
 
     frame_counter_++;
+
+    // Phase 1 Step 2c verification: log measured camera frame rate so we
+    // can confirm the [30, 30] AE_TARGET_FPS_RANGE Camera2Interop lock
+    // (CameraUi.kt) is actually in effect. Without this, we have no
+    // way to know if the AE algorithm honored the request — different
+    // devices/lighting can silently fall back to [15, 30] or [10, 60].
+    // Emit one CAM_FPS line per ~kCamFpsWindow frames.
+    if (prev_camera_frame_ts_ns_ != 0) {
+        const double dt_ms = (timestamp_ns - prev_camera_frame_ts_ns_) * 1e-6;
+        // Sanity-bound dt to reject impossible spikes (e.g. first frame
+        // after a long pause); a > 1 s gap means the camera was stopped,
+        // not "we measured an actual 1 Hz frame rate".
+        if (dt_ms > 0.0 && dt_ms < 1000.0) {
+            cam_dt_sum_ms_ += dt_ms;
+            ++cam_dt_count_;
+        }
+        if (cam_dt_count_ >= kCamFpsWindow) {
+            const double avg_dt_ms = cam_dt_sum_ms_ /
+                                     static_cast<double>(cam_dt_count_);
+            const double fps = (avg_dt_ms > 0.0) ? (1000.0 / avg_dt_ms) : 0.0;
+            LOGI("CAM_FPS: avg_dt=%.2fms fps=%.2f (window=%d frames)",
+                 avg_dt_ms, fps, cam_dt_count_);
+
+            // Phase 1 Step 2c verification: persist mean+stdev to
+            // event_summary so we can verify the [30, 30] AE_TARGET_FPS
+            // lock from the sim JSON without needing logcat retention.
+            // Welford's online algorithm — numerically stable, single pass.
+            ++cam_fps_running_count_;
+            const double delta = fps - cam_fps_running_mean_hz_;
+            cam_fps_running_mean_hz_ += delta /
+                                        static_cast<double>(cam_fps_running_count_);
+            const double delta2 = fps - cam_fps_running_mean_hz_;
+            cam_fps_running_m2_ += delta * delta2;
+
+            const double variance =
+                (cam_fps_running_count_ > 1)
+                ? cam_fps_running_m2_ /
+                  static_cast<double>(cam_fps_running_count_ - 1)
+                : 0.0;
+            const double stdev = std::sqrt(std::max(0.0, variance));
+
+            // Push to EventCounters as milli-Hz (atomic<long long>;
+            // C++17 lacks atomic<double>). Truncate, not round, to keep
+            // the read trivially convertible: hz = milli_hz / 1000.0.
+            navsight::eventCounters().cam_fps_mean_milli_hz.store(
+                static_cast<long long>(cam_fps_running_mean_hz_ * 1000.0),
+                std::memory_order_relaxed);
+            navsight::eventCounters().cam_fps_stdev_milli_hz.store(
+                static_cast<long long>(stdev * 1000.0),
+                std::memory_order_relaxed);
+            navsight::eventCounters().cam_fps_window_count.store(
+                cam_fps_running_count_,
+                std::memory_order_relaxed);
+
+            cam_dt_sum_ms_ = 0.0;
+            cam_dt_count_  = 0;
+        }
+    }
+    prev_camera_frame_ts_ns_ = timestamp_ns;
 
     // Step 3 Fusion: time-update the scale fuser once per frame so its
     // variance grows when no observer fires (allowing future observers to
@@ -1736,6 +1796,14 @@ VisionOutput Tracker::processFrame(const uint8_t* yuv_data, int width, int heigh
             global_t_.at<double>(1) += dy_world;
             global_t_.at<double>(2) += dz_world;
 
+            // Phase 1 Step 3: integrate the per-frame world-frame
+            // displacement magnitude into path_since_last_lc_m_ — used by
+            // consumeLoopClosureMatchIfReady to derive σ²_p_drift for the
+            // chi² variance budget. Reset to 0 on accepted loop closure.
+            path_since_last_lc_m_ += std::sqrt(dx_world * dx_world +
+                                               dy_world * dy_world +
+                                               dz_world * dz_world);
+
             // Step 4 Phase C: mirror VO relative-pose update into EKFState
             // with refined variance. updateRelativePose constrains
             // (p_current - p_prev_clone) toward the visual delta. Latest clone
@@ -1807,6 +1875,12 @@ VisionOutput Tracker::processFrame(const uint8_t* yuv_data, int width, int heigh
                 // and feeds the EKF as a measurement for state consistency.
                 global_t_.at<double>(0) += dx_step;
                 global_t_.at<double>(1) += dy_step;
+
+                // Phase 1 Step 3: PDR step magnitude is exactly `d`
+                // (computed at line above as a clamped per-frame distance).
+                // Z is left unchanged in this fallback path, so the step
+                // magnitude is the full path increment.
+                path_since_last_lc_m_ += d;
 
                 // Step 4 Phase C: mirror PDR fallback step into EKFState
                 // with refined per-step variance.
@@ -3991,11 +4065,37 @@ void Tracker::consumeLoopClosureMatchIfReady() {
                              std::max(0.0, P.at<double>(2, 2));
         }
     }
+    // Phase 1 Step 3: drift-based position uncertainty.
+    //
+    // The v19 sum-of-variances `var_p = var_pnp + sigma_p_ekf_sq` decays
+    // to ≈ var_pnp because v18's `setPosition(global_t_)` per frame
+    // overrides p_G but doesn't touch P_pp; MSCKF visual updates then
+    // continuously collapse P_pp. Verified in v19 walk
+    // (loop_house_x2_v19.json): EKF P[12,12]+P[13,13] ≈ 0.0009 m² while
+    // global_t_ had 5–15 m of accumulated drift; chi² m² hovered 23-24
+    // (threshold 22.5) and only 6/213 attempts produced corrections.
+    //
+    // Replace with sum-of-variances using the LARGER of (a) EKF tracked
+    // covariance and (b) integrated drift since last loop closure:
+    //
+    //     σ²_p_drift = (LOOP_CLOSURE_DRIFT_RATE × path_since_last_lc_m_)²
+    //     σ²_p_total = σ²_p_pnp + max(σ²_p_ekf, σ²_p_drift)
+    //
+    // LOOP_CLOSURE_DRIFT_RATE = 0.032 m/m (Tracker.h:564), already in
+    // tree, derived from sim_data drift measurement. path_since_last_lc_m_
+    // is reset to 0 on every accepted loop closure (see ok-block below).
+    // The max() picks the LARGER uncertainty source — covers both:
+    //   * "EKF is genuinely uncertain" (after long visual-degenerate phase)
+    //   * "EKF is overconfident due to recent MSCKF collapse"
+    const double sigma_p_drift     = LOOP_CLOSURE_DRIFT_RATE * path_since_last_lc_m_;
+    const double sigma_p_drift_sq  = sigma_p_drift * sigma_p_drift;
+    const double sigma_p_used_sq   = std::max(sigma_p_ekf_sq, sigma_p_drift_sq);
+
     const double var_p_pnp     = LOOP_CLOSURE_PNP_SIGMA_FLOOR_M *
                                  LOOP_CLOSURE_PNP_SIGMA_FLOOR_M;     // ≈ 4 m²
     const double var_R_pnp     = LOOP_CLOSURE_BASE_ROT_SIGMA_RAD *
                                  LOOP_CLOSURE_BASE_ROT_SIGMA_RAD;    // ≈ 0.122 rad²
-    const double var_p         = var_p_pnp + sigma_p_ekf_sq;
+    const double var_p         = var_p_pnp + sigma_p_used_sq;
     const double sigma_axis_sq_R = var_R_pnp + sigma_R_ekf_sq / 3.0;  // per-axis avg
     (void)damping_inv;  // ramp counter still controls when to STOP; variance no longer scales
 
@@ -4025,12 +4125,26 @@ void Tracker::consumeLoopClosureMatchIfReady() {
         }
         navsight::eventCounters().loop_closure_corrections_applied.fetch_add(
             1, std::memory_order_relaxed);
+
+        // Phase 1 Step 3: reset the drift estimate on accepted correction.
+        // The next chi² evaluation starts with σ²_p_drift = 0 and grows
+        // again as the user walks. Reset only on the FIRST frame of a
+        // damping ramp (k == 0) so partial corrections inside the same
+        // ramp don't reset prematurely — at frame k=0 we just transitioned
+        // from "drifted" to "corrected" for this revisit, frames k=1..9
+        // are smoothing tail.
+        if (k == 0) {
+            path_since_last_lc_m_ = 0.0;
+        }
     }
 
-    LOGI("LOOP_CLOSURE: damp k=%d/%d strength=%.2f var_p=%.4f var_R=%.4e "
+    LOGI("LOOP_CLOSURE: damp k=%d/%d strength=%.2f var_p=%.4f "
+         "(pnp=%.4f drift_path=%.2fm drift²=%.4f ekf²=%.4f) var_R=%.4e "
          "target_p=[%.3f %.3f %.3f] match_kf=%d ok=%d (abs-pose channel)",
          k + 1, LOOP_CLOSURE_DAMPING_FRAMES, strength,
-         var_p, sigma_axis_sq_R,
+         var_p,
+         var_p_pnp, path_since_last_lc_m_, sigma_p_drift_sq, sigma_p_ekf_sq,
+         sigma_axis_sq_R,
          target_p_world.at<double>(0),
          target_p_world.at<double>(1),
          target_p_world.at<double>(2),
