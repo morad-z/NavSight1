@@ -63,7 +63,11 @@
 //     "midas_bailout_few_floor_matches": N,
 //     "midas_rejected_extreme": N,
 //     "midas_fused": N,
-//     "midas_skipped": N
+//     "midas_skipped": N,
+//     "midas_affine_fit_singular": N,
+//     "midas_affine_fit_low_inliers": N,
+//     "midas_affine_fit_inlier_ratio_milli": N,   // gauge: latest inlier ratio × 1000
+//     "midas_affine_fit_shift_milli": N           // gauge: latest fit shift t × 1000
 //   }
 
 #include <atomic>
@@ -128,9 +132,77 @@ struct EventCounters {
     std::atomic<long long> slam_lifetime_obs_sum{0};
     std::atomic<long long> slam_lifetime_count{0};
 
+    // Phase 1 Step 4 (post_v19_sprint_plan.md) — SLAM feature re-anchoring.
+    // Before this fix, marginalizeOldestCloneNoLock would call removeSlamFeature
+    // on every SLAM feature anchored at the dropping clone — i.e. ALL of them
+    // within ~2 s at MAX_CLONES=11/5Hz keyframes. The "flashing dots" bug.
+    //   slam_reanchor_total          — successful re-anchors (the win)
+    //   slam_reanchor_failed_no_clone — no surviving clone after pop (window<2)
+    //   slam_reanchor_failed_geometry — new Zc <= 0.01 (degenerate, point behind)
+    // Healthy walk: total / (total + failures) > 0.5 ; slam_lifetime_obs_sum
+    // grows because features now survive clone churn.
+    std::atomic<long long> slam_reanchor_total{0};
+    std::atomic<long long> slam_reanchor_failed_no_clone{0};
+    std::atomic<long long> slam_reanchor_failed_geometry{0};
+
     // Step 3a/3b — MSCKF (EKFState.cpp applyMSCKFUpdate)
     std::atomic<long long> msckf_update_lines{0};
     std::atomic<long long> msckf_huber_rejected_sum{0};
+
+    // ── Silent-failure observability — 2026-05-16 audit (docs/review_2026_05_16/silent_failures.md)
+    // Each counter converts a previously-invisible failure path into a JSON event_summary signal.
+
+    // EKFState.cpp applyMSCKFUpdate: both Cholesky AND SVD inversion fail on S —
+    // catches numerical instability (NaN/Inf in S) silently dropping the full MSCKF update.
+    std::atomic<long long> applyMSCKFUpdate_inversion_failed{0};
+
+    // WindowedBA.cpp: landmark Hessian det < 1e-30 (singular) —
+    // catches BA Schur computation continuing with garbage-quality pseudo-inverse.
+    std::atomic<long long> ba_singular_landmarks{0};
+
+    // EKFState.cpp propagateIMU: early-return without propagating —
+    // catches timestamp wraparound / JNI unit mismatch / uninitialized state silently freezing EKF.
+    std::atomic<long long> propagate_skipped{0};
+    std::atomic<long long> propagate_skipped_not_init{0};       // full_initialized_ false
+    std::atomic<long long> propagate_skipped_dt_nonpositive{0}; // dt <= 0
+    std::atomic<long long> propagate_skipped_p_empty{0};        // P_.empty()
+
+    // UpdaterMSCKF.cpp: per-feature chi² gate reject —
+    // catches high rejection rates distinguishing "no features" from "all chi²-rejected".
+    std::atomic<long long> msckf_chi2_rejected{0};
+
+    // UpdaterMSCKF.cpp: per-feature Cholesky inversion fails —
+    // catches NaN/Inf in feature covariance as first symptom of numerical divergence.
+    std::atomic<long long> msckf_inversion_failed{0};
+
+    // EKFState.cpp propagateIMU: velocity clamped at 5 m/s —
+    // catches preintegration bugs driving velocity to physically impossible values (50+ m/s).
+    std::atomic<long long> velocity_clamped{0};
+
+    // EKFState.cpp updateScale: chi² gate reject —
+    // catches MiDaS depth scale observations being silently discarded.
+    std::atomic<long long> scale_chi2_rejected{0};
+
+    // EKFState.cpp applyMSCKFUpdate: camera-IMU time offset clamped to ±100 ms —
+    // catches persistent bias saturation of the physical bound.
+    std::atomic<long long> time_offset_clamped{0};
+
+    // UpdaterMSCKF.cpp: getCloneFEJ returns false (clone evicted before Jacobian build) —
+    // catches stale clone refs leaving zero Jacobian rows and corrupting chi² gates.
+    std::atomic<long long> fej_clone_miss{0};
+
+    // Tracker.cpp: updateGravityAlignment returned false —
+    // catches gravity-alignment rejections (EKF not init, accel band, factorisation fail).
+    std::atomic<long long> gravity_alignment_rejected{0};
+
+    // Tracker.cpp: updateRelativeRotation returned false —
+    // catches relative-rotation rejections (clone missing, EKF not init, malformed R).
+    std::atomic<long long> relative_rotation_rejected{0};
+
+    // LoopClosureDetector.cpp: heading/PnP rejects across ALL candidates (not just ci==0) —
+    // catches the majority of rejection events that were invisible when ci>0 was excluded.
+    std::atomic<long long> loop_closure_rejects_heading_total{0};
+    std::atomic<long long> loop_closure_rejects_pnp_total{0};
 
     // Step 7 — Loop closure (LoopClosureDetector.cpp, ADR-013)
     //   loop_closure_attempts             every tryDetectLoop() entry
@@ -165,6 +237,26 @@ struct EventCounters {
     // (Tracker doesn't see the candidate index).
     std::atomic<long long> loop_closure_lower_rank_accepts{0};
 
+    // Phase 6.4c — Loop-closure spatial pre-filter (LandmarkMap-driven).
+    //
+    // Before each BoW query, the LC worker asks LandmarkMap for the union
+    // of observed_in_kfs across landmarks within kLcSpatialSearchRadiusM
+    // of the EKF-predicted camera position, then hands those keyframe ids
+    // to tryDetectLoopWithCandidates as a filter on DBoW2's score list.
+    //
+    //   loop_closure_spatial_candidates_total
+    //     SUM of `n_candidates` across every LC worker tick (NOT a count
+    //     of ticks). Divide by loop_closure_attempts for the mean
+    //     candidate-set size per query — useful for tuning the radius.
+    //
+    //   loop_closure_spatial_fallback_total
+    //     Number of LC worker ticks where the LandmarkMap returned an
+    //     empty candidate set and the detector fell back to the full
+    //     keyframe DB. Expected to be high at the start of a walk
+    //     (LandmarkMap is empty) and approach zero once the map populates.
+    std::atomic<long long> loop_closure_spatial_candidates_total{0};
+    std::atomic<long long> loop_closure_spatial_fallback_total{0};
+
     // Phase 1 Step 2c verification: rolling-window camera frame rate
     // statistics, persisted to event_summary so we don't depend on
     // logcat retention to verify the [30, 30] fps lock. Stored in
@@ -193,9 +285,47 @@ struct EventCounters {
     std::atomic<long long> loop_closure_geom_rejects_no_candidate{0};
     std::atomic<long long> loop_closure_geom_rejects_few_inframe{0};
     std::atomic<long long> loop_closure_geom_rejects_pnp{0};
+    // 2026-05-13 Phase 1 Step 7.1 fix: per-correspondence ORB-descriptor
+    // verification (Hamming ≤ kGeomDescriptorMaxDistance). Increments once
+    // per in-frame projection that found a spatial neighbour in the 15 px
+    // gate but failed the descriptor distance check. Fires per-pair, so
+    // typical values are >> loop_closure_geom_rejects_few_inframe (each
+    // candidate has ~50-150 in-frame projections, each is a vote).
+    std::atomic<long long> loop_closure_geom_rejects_descriptor{0};
     // total_path_m × 10 (integer decimeters) — verifies the dynamic sigma
     // formula (sigma_p = max(2.0, 0.032 × path_m)) is tracking correctly.
     std::atomic<long long> total_path_dm{0};
+
+    // Phase 1 Step 5 (post_v19_sprint_plan.md) — Pose-graph back-end.
+    // Retroactive drift correction at loop closure: 4-DOF (x, y, z, yaw)
+    // Gauss-Newton optimization over keyframes between K_match and K_now.
+    //
+    // Counters here exist because the team has been bitten by "the metric
+    // looks right but the user-visible behaviour is broken" (see
+    // feedback_no_metric_celebration). Each pose-graph invocation publishes
+    // pre/post residual norms and applied correction magnitudes so the
+    // sim JSON proves the optimizer is actually doing work, AND the
+    // back-write is reaching the keyframe DB + global_t_.
+    //
+    //   pose_graph_optimize_calls         every optimize() entry
+    //   pose_graph_iters_used_sum         total Gauss-Newton iterations
+    //   pose_graph_residual_norm_pre_mm   sum of pre-optimize ||r|| × 1000
+    //   pose_graph_residual_norm_post_mm  sum of post-optimize ||r|| × 1000
+    //                                     (ratio post/pre < 0.1 = healthy)
+    //   pose_graph_max_correction_mm      max Δposition applied (×1000, mm)
+    //   pose_graph_max_correction_mrad    max Δyaw applied (×1000, mrad)
+    //   pose_graph_rejected_singular      Cholesky+SVD both failed (counter)
+    //   pose_graph_loop_edges_added       total addLoopEdge() calls
+    //   pose_graph_apply_calls            successful back-write events
+    std::atomic<long long> pose_graph_optimize_calls{0};
+    std::atomic<long long> pose_graph_iters_used_sum{0};
+    std::atomic<long long> pose_graph_residual_norm_pre_mm{0};
+    std::atomic<long long> pose_graph_residual_norm_post_mm{0};
+    std::atomic<long long> pose_graph_max_correction_mm{0};
+    std::atomic<long long> pose_graph_max_correction_mrad{0};
+    std::atomic<long long> pose_graph_rejected_singular{0};
+    std::atomic<long long> pose_graph_loop_edges_added{0};
+    std::atomic<long long> pose_graph_apply_calls{0};
 
     // Step 8b — Online IMU-camera extrinsics calibration (EKFState.cpp).
     // extrinsics_rotation_angle_mdeg: angle-from-identity of the current
@@ -207,6 +337,18 @@ struct EventCounters {
     // convergence speed; a stable value across frames means the EKF has
     // converged.
     std::atomic<long long> extrinsics_rotation_angle_mdeg{0};
+
+    // PHASE_A_8B_REENABLE_2026_05_19 REVERTED — counter retained for future
+    // re-attempts. R_bc safety-cap rejection count (currently never fires
+    // because R_bc update is disabled at the apply site).
+    std::atomic<long long> rbc_runaway_total{0};
+
+    // PHASE_B_6_4_REENABLE_2026_05_19 — safety counter for landmark obs
+    // updates. Increments when applyLandmarkObservations would move EKF
+    // position by > 1.0m in a single call (precedent: v28 4× runaway).
+    // If this climbs > 5 during a normal walk, Phase 6.4 is regressing
+    // toward the v28 failure mode; revert by grepping the marker.
+    std::atomic<long long> landmark_obs_runaway_total{0};
 
     // Step 8a — Online IMU-camera time offset δt_d (EKFState row 15).
     // Stored as integer microseconds (round-to-nearest). Warmup prior is ~2 ms
@@ -221,6 +363,167 @@ struct EventCounters {
     // 0 = global-shutter device or key not supported by the hardware.
     std::atomic<long long> rolling_shutter_skew_ns{0};
 
+    // 2026-05-16 audit Fix C — EKF init deferred because Madgwick is not ready.
+    // Incremented each camera frame where the first-frame EKF init block fires
+    // but getRotationGtoI() returns empty (Madgwick hasn't settled yet). If this
+    // is > 0 in a walk's event_summary it means the bootstrap race window was
+    // open and the init was correctly deferred rather than falling back to the
+    // old pure-Rz path. Zero on healthy cold-start (Madgwick ready before first
+    // camera frame via the SensorRepository seedMadgwickYaw early-seed path).
+    std::atomic<long long> ekf_init_deferred_madgwick_not_ready{0};
+
+    // 2026-05-16 — ZRUP (Zero-Rotation-Rate Update) fired. Dual of ZUPT:
+    // observes mean(gyro_window) = b_g_ when is_stationary detects stationarity.
+    // Without this, EKF b_g_ was frozen during stationary periods (no parallax
+    // → no MSCKF update) and gyro integration drifted at the bias rate.
+    // User-visible symptom before fix: heading slowly rotating + SLAM dots
+    // sliding top-right when phone is held still.
+    std::atomic<long long> zrup_fired_total{0};
+
+    // 2026-05-16 — Tracker.cpp:1039 EKF→IMU gyro-bias feedback loop fix.
+    // Incremented each time the corrective additive loop fires: EKF's b_g_
+    // residual is absorbed into IMU's gyro_bias_, then EKF's b_g_ is reset
+    // to zero. See EKFState::setGyroBias for the full cause/change rationale.
+    // A healthy walk should show this counter > 0 with the absorbed magnitude
+    // converging (each absorption shrinks the residual the next one captures).
+    std::atomic<long long> ekf_bg_absorbed_total{0};
+
+    // 2026-05-16 — Keyframe-cadence EKF→IMU gyro-bias push (Agent A finding).
+    // Restored after Tier 1 verified setPosition is back. The push at every
+    // frame (swarm pattern) oscillates and broke v25-v31; at zero frequency
+    // (post-Option-B revert) EKF and IMU bias estimates drift apart, MSCKF
+    // chi² rejects 89% of features, SLAM features only promote when stationary.
+    // The middle ground: push once per ~6 camera frames (~5 Hz at 30 Hz capture),
+    // matching v22's keyframe-cadence feedback. Counter > 0 confirms wire-up;
+    // rate ≈ 5/sec confirms throttling.
+    std::atomic<long long> gyro_bias_pushed_total{0};
+
+    // 2026-05-16 — visual yaw correction skipped because motion is pure-rotation
+    // or translation-degenerate. v33 stationary-rotate walk showed EKF R_GtoI
+    // yaw drifting +0.73°/sec while Madgwick drifted -0.55°/sec — the +1.28°/sec
+    // divergence came from updateGravityAlignedYaw being fed monocular yaw
+    // measurements that are geometrically degenerate under pure rotation. Gating
+    // this update channel matches updateRelativeRotation's existing gate
+    // (Tracker.cpp:1741) — both visual rotation channels now share the same
+    // motion-characteristics guard. Counter > 0 confirms the gate is firing.
+    std::atomic<long long> visual_yaw_gated_pure_rotation_total{0};
+
+    // 2026-05-16 — MSCKF processLostFeatures gated on is_static.
+    // Per the EKF-update audit (agent finding Q3): processLostFeatures was
+    // the root cause of EKF p_G drifting ~40cm during 9.7s stationary in v35.
+    // KLT subpixel noise produces small visual residuals → MSCKF applies
+    // ~1mm δp corrections × 56 calls/sec → accumulated linear drift.
+    // Counter > 0 confirms the gate fires; rate matches msckf_update_lines
+    // drop during stationary periods.
+    std::atomic<long long> msckf_gated_static_total{0};
+
+    // 2026-05-16 — SLAM updater (Step 5) gated on is_static. Same rationale
+    // as msckf_gated_static_total: SLAM reprojection residuals against
+    // stationary features carry no signal, only KLT noise.
+    std::atomic<long long> slam_update_gated_static_total{0};
+
+    // 2026-05-16 Phase 1 Step 6 — visual-only LandmarkMap counters.
+    //   landmarks_added_total       new landmarks created (no dedup hit) per keyframe.
+    //   landmarks_merged_total      existing landmark merged (within kDedup3DDistanceM
+    //                               AND Hamming ≤ kDescriptorMaxHamming). High ratio
+    //                               of merged/added indicates good revisit behavior.
+    //   landmarks_culled_total      removed by cullStaleLandmarks (times_observed
+    //                               < kMinObservationsAfterGrace after grace period).
+    //   landmarks_skipped_invalid   addOrMergeLandmark refused input (non-finite
+    //                               p_world, empty/wrong-shape descriptor). Should
+    //                               stay near 0 in a healthy walk.
+    //   landmark_map_size           Last observed map.size() at keyframe-storage tick.
+    //                               Snapshot value (not a running sum); diff between
+    //                               consecutive simulations indicates map growth rate.
+    // Phase 6.2 wire site: Tracker.cpp at the keyframe storage block right after
+    // the triangulation pass that fills pts3d_world.
+    std::atomic<long long> landmarks_added_total{0};
+    std::atomic<long long> landmarks_merged_total{0};
+    std::atomic<long long> landmarks_culled_total{0};
+    std::atomic<long long> landmarks_skipped_invalid{0};
+    std::atomic<long long> landmark_map_size{0};
+
+    // 2026-05-19 — Orange-dot anchor-relative render telemetry.
+    // Each render frame, getLandmarkSnapshot iterates up to 500 landmarks. For
+    // each, if the landmark's host_clone_id is still in EKFState::window_,
+    // render via the anchor-relative path
+    //     p_world_render = R_host_GtoC_LIVE.t() * p_anchor_cam + p_host_G_LIVE
+    // → orange dot tracks the actual image feature regardless of EKF drift
+    // between landmark-add time and render time (same mechanism live SLAM
+    // features use). Otherwise fall back to the stored frozen p_world.
+    // Both counters increment per-landmark-render so the ratio in the post-
+    // walk event_summary tells us what fraction of orange dots benefited
+    // from the anchor path versus drifted via the world-fixed fallback.
+    std::atomic<long long> landmarks_rendered_anchor_total{0};
+    std::atomic<long long> landmarks_rendered_world_fixed_total{0};
+
+    // 2026-05-19 Fix #4 — Local BA refinement of LandmarkMap entries.
+    //   landmarks_in_ba_solve_sum   Σ landmark observations fed into BA across
+    //                               all solves in the walk. Diff to
+    //                               ba_solves_total tells average landmarks/solve.
+    //   landmarks_refined_total     Σ landmarks whose p_world was written
+    //                               back via setLandmarkPosition after an
+    //                               accepted BA solve. If 0 across a long
+    //                               walk, BA is either never running or
+    //                               never accepting — see ba_solves_accepted.
+    //   landmark_obs_in_ba_history_min  Minimum observation-history-length
+    //                               seen for a BA-input landmark (≥ 2 by
+    //                               construction, but useful to confirm we
+    //                               don't have a stuck-at-2 pattern that
+    //                               would indicate the ring buffer's not
+    //                               accumulating across keyframes).
+    std::atomic<long long> landmarks_in_ba_solve_sum{0};
+    std::atomic<long long> landmarks_refined_total{0};
+    std::atomic<long long> landmark_obs_in_ba_history_min{0};
+
+    // 2026-05-16 Phase 1 Step 6.4 — Tracker → EKF landmark-observation wire-up.
+    //   landmarks_observed_total    Σ nearby_ids.size() per keyframe (all landmarks
+    //                               returned by getLandmarksInRadius before any
+    //                               descriptor / pixel matching). If this is large
+    //                               but landmarks_matched_total is ~0, the
+    //                               descriptor + 15 px gates are too strict — or
+    //                               the predicted camera pose is wildly off.
+    //   landmarks_matched_total     Σ obs_vec.size() per keyframe — successful
+    //                               (projection + KNN + Lowe-0.75 + Hamming ≤ 50)
+    //                               matches that are handed to the EKF. Diff to
+    //                               landmarks_observed_total quantifies the cost
+    //                               of the matching stage.
+    // The downstream landmarks_msckf_* counters (accepted / rejected_*) are
+    // declared by Phase 6.3 alongside EKFState::applyLandmarkObservations.
+    std::atomic<long long> landmarks_observed_total{0};
+    std::atomic<long long> landmarks_matched_total{0};
+
+    // 2026-05-16 Phase 1 Step 6.3 — fixed-landmark MSCKF measurement update.
+    //
+    // Counters incremented by Tracker.cpp (Phase 6.4 wire site) from the
+    // LandmarkUpdateResult returned by EKFState::applyLandmarkObservations.
+    // EKFState itself is pure — it does NOT touch these atomics. Bucketing
+    // here lets us track update quality across the entire walk:
+    //   landmarks_msckf_accepted_total        observations folded into the EKF
+    //                                         update batch (chi² + Huber survived).
+    //   landmarks_msckf_rejected_chi2_total   per-obs χ²(0.95, 2-DOF) gate
+    //                                         rejects + singular S inversions.
+    //   landmarks_msckf_rejected_huber_total  per-obs Huber hard-reject
+    //                                         (pixel residual ≥ 5·δ).
+    //   landmarks_msckf_rejected_depth_total  camera-frame depth outside
+    //                                         [kLandmarkDepthMinM, kLandmarkDepthMaxM].
+    //   landmarks_msckf_rejected_image_total  predicted pixel outside the
+    //                                         image rectangle.
+    // Healthy walk: accepted >> sum(rejected_*); chi²+huber dominate over
+    // depth+image (depth/image catch data-association bugs upstream).
+    std::atomic<long long> landmarks_msckf_accepted_total{0};
+    std::atomic<long long> landmarks_msckf_rejected_chi2_total{0};
+    std::atomic<long long> landmarks_msckf_rejected_huber_total{0};
+    std::atomic<long long> landmarks_msckf_rejected_depth_total{0};
+    std::atomic<long long> landmarks_msckf_rejected_image_total{0};
+
+    // 2026-05-16: single-snapshot consistency fix (per ekf-inv-dot-investigation agent)
+    // Incremented each time native-lib.cpp refreshes the cached OverlaySnapshot
+    // from EKFState::snapshotForOverlay. If this counter is > 0 in event_summary
+    // the new consolidated-snapshot render path is live; rate ≈ Kotlin overlay
+    // tick rate (one refresh per overlay frame after cache TTL expiry).
+    std::atomic<long long> overlay_snapshots_taken_total{0};
+
     // Step 3 Observer B — MiDaS depth scale constraint
     // (Tracker.cpp applyDepthScaleConstraint). Added 2026-05-07 after
     // sim 1778147132092 had no way to tell which of the seven bailout
@@ -231,12 +534,16 @@ struct EventCounters {
     //   midas_bailout_no_depth              depth_map_ empty (DepthEstimator silent)
     //   midas_bailout_few_pts3d             pts3d.size() < 15 (need 15 triangulated)
     //   midas_bailout_invalid_intrinsics    fx/fy ≤ 0 (calibration not loaded)
-    //   midas_bailout_camera_h              camera_h ∉ [0.8, 2.2] m (user_height bad)
-    //   midas_bailout_low_g                 |accel| < 5 m/s² (no valid gravity)
-    //   midas_bailout_few_floor_matches     < 8 floor matches (image+geom combined)
+    //   midas_bailout_camera_h              [LEGACY] camera_h ∉ [0.8, 2.2] m — never fires post Step 4.2.1
+    //   midas_bailout_low_g                 [LEGACY] |accel| < 5 m/s² — never fires post Step 4.2.1
+    //   midas_bailout_few_floor_matches     post Step 4.2.1: < 8 valid ratios after affine fit
     //   midas_rejected_extreme              target_scale > 3× current (3x safety gate)
     //   midas_fused                         scale_fuser_.update accepted the obs
     //   midas_skipped                       scale_fuser_.update skipped the obs
+    //   midas_affine_fit_singular           Step 4.2.1: det ≤ 0 or N < 8 — fit aborted
+    //   midas_affine_fit_low_inliers        Step 4.2.1: residual-inlier ratio < 50 %
+    //   midas_affine_fit_inlier_ratio_milli Step 4.2.1 GAUGE: latest inlier ratio × 1000
+    //   midas_affine_fit_shift_milli        Step 4.2.1 GAUGE: latest fit shift t × 1000
     std::atomic<long long> midas_entries{0};
     std::atomic<long long> midas_bailout_no_depth{0};
     std::atomic<long long> midas_bailout_few_pts3d{0};
@@ -247,6 +554,22 @@ struct EventCounters {
     std::atomic<long long> midas_rejected_extreme{0};
     std::atomic<long long> midas_fused{0};
     std::atomic<long long> midas_skipped{0};
+    // Phase 2 Step 4.2.1 — VI-Depth affine-fit diagnostics (Tracker.cpp).
+    std::atomic<long long> midas_affine_fit_singular{0};
+    std::atomic<long long> midas_affine_fit_low_inliers{0};
+    std::atomic<long long> midas_affine_fit_inlier_ratio_milli{0};
+    std::atomic<long long> midas_affine_fit_shift_milli{0};
+
+    // 2026-05-17 — translation gated because motion is rotation-only.
+    // Catches "user sitting in chair rotating phone" that defeats is_static
+    // (gyro != 0) and is_pure_rotation (Rayleigh threshold too strict).
+    std::atomic<long long> global_t_gated_rotation_dominated_total{0};
+
+    // 2026-05-17 — revert path: per-frame heading-projection runs after
+    // the rotation_dominated / static gate passes. High count + low
+    // total_path_dm → visual yaw stuck (heading noise dominates) ;
+    // high count + plausible total_path_dm → working as v22 did.
+    std::atomic<long long> translation_heading_projection_total{0};
 
     // Reset every counter to 0. Called on simulator-recording start so
     // each sim begins with a clean slate. Cheap atomic stores; safe to
@@ -279,8 +602,27 @@ struct EventCounters {
         slam_promotions_total.store(0, std::memory_order_relaxed);
         slam_lifetime_obs_sum.store(0, std::memory_order_relaxed);
         slam_lifetime_count.store(0, std::memory_order_relaxed);
+        slam_reanchor_total.store(0, std::memory_order_relaxed);
+        slam_reanchor_failed_no_clone.store(0, std::memory_order_relaxed);
+        slam_reanchor_failed_geometry.store(0, std::memory_order_relaxed);
         msckf_update_lines.store(0, std::memory_order_relaxed);
         msckf_huber_rejected_sum.store(0, std::memory_order_relaxed);
+        applyMSCKFUpdate_inversion_failed.store(0, std::memory_order_relaxed);
+        ba_singular_landmarks.store(0, std::memory_order_relaxed);
+        propagate_skipped.store(0, std::memory_order_relaxed);
+        propagate_skipped_not_init.store(0, std::memory_order_relaxed);
+        propagate_skipped_dt_nonpositive.store(0, std::memory_order_relaxed);
+        propagate_skipped_p_empty.store(0, std::memory_order_relaxed);
+        msckf_chi2_rejected.store(0, std::memory_order_relaxed);
+        msckf_inversion_failed.store(0, std::memory_order_relaxed);
+        velocity_clamped.store(0, std::memory_order_relaxed);
+        scale_chi2_rejected.store(0, std::memory_order_relaxed);
+        time_offset_clamped.store(0, std::memory_order_relaxed);
+        fej_clone_miss.store(0, std::memory_order_relaxed);
+        gravity_alignment_rejected.store(0, std::memory_order_relaxed);
+        relative_rotation_rejected.store(0, std::memory_order_relaxed);
+        loop_closure_rejects_heading_total.store(0, std::memory_order_relaxed);
+        loop_closure_rejects_pnp_total.store(0, std::memory_order_relaxed);
         loop_closure_attempts.store(0, std::memory_order_relaxed);
         loop_closure_accepts.store(0, std::memory_order_relaxed);
         loop_closure_rejects_low_score.store(0, std::memory_order_relaxed);
@@ -290,6 +632,8 @@ struct EventCounters {
         loop_closure_chi2_rejected.store(0, std::memory_order_relaxed);
         loop_closure_corrections_applied.store(0, std::memory_order_relaxed);
         loop_closure_lower_rank_accepts.store(0, std::memory_order_relaxed);
+        loop_closure_spatial_candidates_total.store(0, std::memory_order_relaxed);
+        loop_closure_spatial_fallback_total.store(0, std::memory_order_relaxed);
         cam_fps_mean_milli_hz.store(0, std::memory_order_relaxed);
         cam_fps_stdev_milli_hz.store(0, std::memory_order_relaxed);
         cam_fps_window_count.store(0, std::memory_order_relaxed);
@@ -299,10 +643,49 @@ struct EventCounters {
         loop_closure_geom_rejects_no_candidate.store(0, std::memory_order_relaxed);
         loop_closure_geom_rejects_few_inframe.store(0, std::memory_order_relaxed);
         loop_closure_geom_rejects_pnp.store(0, std::memory_order_relaxed);
+        loop_closure_geom_rejects_descriptor.store(0, std::memory_order_relaxed);
         total_path_dm.store(0, std::memory_order_relaxed);
+        pose_graph_optimize_calls.store(0, std::memory_order_relaxed);
+        pose_graph_iters_used_sum.store(0, std::memory_order_relaxed);
+        pose_graph_residual_norm_pre_mm.store(0, std::memory_order_relaxed);
+        pose_graph_residual_norm_post_mm.store(0, std::memory_order_relaxed);
+        pose_graph_max_correction_mm.store(0, std::memory_order_relaxed);
+        pose_graph_max_correction_mrad.store(0, std::memory_order_relaxed);
+        pose_graph_rejected_singular.store(0, std::memory_order_relaxed);
+        pose_graph_loop_edges_added.store(0, std::memory_order_relaxed);
+        pose_graph_apply_calls.store(0, std::memory_order_relaxed);
         extrinsics_rotation_angle_mdeg.store(0, std::memory_order_relaxed);
+        // PHASE_A_8B_REENABLE_2026_05_19
+        rbc_runaway_total.store(0, std::memory_order_relaxed);
+        // PHASE_B_6_4_REENABLE_2026_05_19
+        landmark_obs_runaway_total.store(0, std::memory_order_relaxed);
         cam_imu_time_offset_us.store(0, std::memory_order_relaxed);
         rolling_shutter_skew_ns.store(0, std::memory_order_relaxed);
+        ekf_init_deferred_madgwick_not_ready.store(0, std::memory_order_relaxed);
+        zrup_fired_total.store(0, std::memory_order_relaxed);
+        ekf_bg_absorbed_total.store(0, std::memory_order_relaxed);
+        gyro_bias_pushed_total.store(0, std::memory_order_relaxed);
+        visual_yaw_gated_pure_rotation_total.store(0, std::memory_order_relaxed);
+        msckf_gated_static_total.store(0, std::memory_order_relaxed);
+        slam_update_gated_static_total.store(0, std::memory_order_relaxed);
+        landmarks_added_total.store(0, std::memory_order_relaxed);
+        landmarks_merged_total.store(0, std::memory_order_relaxed);
+        landmarks_culled_total.store(0, std::memory_order_relaxed);
+        landmarks_skipped_invalid.store(0, std::memory_order_relaxed);
+        landmark_map_size.store(0, std::memory_order_relaxed);
+        landmarks_rendered_anchor_total.store(0, std::memory_order_relaxed);
+        landmarks_rendered_world_fixed_total.store(0, std::memory_order_relaxed);
+        landmarks_in_ba_solve_sum.store(0, std::memory_order_relaxed);
+        landmarks_refined_total.store(0, std::memory_order_relaxed);
+        landmark_obs_in_ba_history_min.store(0, std::memory_order_relaxed);
+        landmarks_observed_total.store(0, std::memory_order_relaxed);
+        landmarks_matched_total.store(0, std::memory_order_relaxed);
+        landmarks_msckf_accepted_total.store(0, std::memory_order_relaxed);
+        landmarks_msckf_rejected_chi2_total.store(0, std::memory_order_relaxed);
+        landmarks_msckf_rejected_huber_total.store(0, std::memory_order_relaxed);
+        landmarks_msckf_rejected_depth_total.store(0, std::memory_order_relaxed);
+        landmarks_msckf_rejected_image_total.store(0, std::memory_order_relaxed);
+        overlay_snapshots_taken_total.store(0, std::memory_order_relaxed);  // 2026-05-16 single-snapshot consistency fix
         midas_entries.store(0, std::memory_order_relaxed);
         midas_bailout_no_depth.store(0, std::memory_order_relaxed);
         midas_bailout_few_pts3d.store(0, std::memory_order_relaxed);
@@ -313,6 +696,12 @@ struct EventCounters {
         midas_rejected_extreme.store(0, std::memory_order_relaxed);
         midas_fused.store(0, std::memory_order_relaxed);
         midas_skipped.store(0, std::memory_order_relaxed);
+        midas_affine_fit_singular.store(0, std::memory_order_relaxed);
+        midas_affine_fit_low_inliers.store(0, std::memory_order_relaxed);
+        midas_affine_fit_inlier_ratio_milli.store(0, std::memory_order_relaxed);
+        midas_affine_fit_shift_milli.store(0, std::memory_order_relaxed);
+        global_t_gated_rotation_dominated_total.store(0, std::memory_order_relaxed);
+        translation_heading_projection_total.store(0, std::memory_order_relaxed);
     }
 
     // Monotonic max-update for ba_solve_us_max. Lock-free CAS loop.
@@ -359,8 +748,27 @@ struct EventCounters {
         const long long v_slam_promotions_total         = slam_promotions_total.load(std::memory_order_relaxed);
         const long long v_slam_lifetime_obs_sum         = slam_lifetime_obs_sum.load(std::memory_order_relaxed);
         const long long v_slam_lifetime_count           = slam_lifetime_count.load(std::memory_order_relaxed);
+        const long long v_slam_reanchor_total           = slam_reanchor_total.load(std::memory_order_relaxed);
+        const long long v_slam_reanchor_failed_no_clone = slam_reanchor_failed_no_clone.load(std::memory_order_relaxed);
+        const long long v_slam_reanchor_failed_geometry = slam_reanchor_failed_geometry.load(std::memory_order_relaxed);
         const long long v_msckf_update_lines            = msckf_update_lines.load(std::memory_order_relaxed);
         const long long v_msckf_huber_rejected_sum      = msckf_huber_rejected_sum.load(std::memory_order_relaxed);
+        const long long v_applyMSCKFUpdate_inversion_failed = applyMSCKFUpdate_inversion_failed.load(std::memory_order_relaxed);
+        const long long v_ba_singular_landmarks          = ba_singular_landmarks.load(std::memory_order_relaxed);
+        const long long v_propagate_skipped              = propagate_skipped.load(std::memory_order_relaxed);
+        const long long v_propagate_skipped_not_init     = propagate_skipped_not_init.load(std::memory_order_relaxed);
+        const long long v_propagate_skipped_dt_nonpositive = propagate_skipped_dt_nonpositive.load(std::memory_order_relaxed);
+        const long long v_propagate_skipped_p_empty      = propagate_skipped_p_empty.load(std::memory_order_relaxed);
+        const long long v_msckf_chi2_rejected            = msckf_chi2_rejected.load(std::memory_order_relaxed);
+        const long long v_msckf_inversion_failed         = msckf_inversion_failed.load(std::memory_order_relaxed);
+        const long long v_velocity_clamped               = velocity_clamped.load(std::memory_order_relaxed);
+        const long long v_scale_chi2_rejected            = scale_chi2_rejected.load(std::memory_order_relaxed);
+        const long long v_time_offset_clamped            = time_offset_clamped.load(std::memory_order_relaxed);
+        const long long v_fej_clone_miss                 = fej_clone_miss.load(std::memory_order_relaxed);
+        const long long v_gravity_alignment_rejected     = gravity_alignment_rejected.load(std::memory_order_relaxed);
+        const long long v_relative_rotation_rejected     = relative_rotation_rejected.load(std::memory_order_relaxed);
+        const long long v_loop_closure_rejects_heading_total = loop_closure_rejects_heading_total.load(std::memory_order_relaxed);
+        const long long v_loop_closure_rejects_pnp_total = loop_closure_rejects_pnp_total.load(std::memory_order_relaxed);
         const long long v_loop_closure_attempts         = loop_closure_attempts.load(std::memory_order_relaxed);
         const long long v_loop_closure_accepts          = loop_closure_accepts.load(std::memory_order_relaxed);
         const long long v_loop_closure_rejects_low_score= loop_closure_rejects_low_score.load(std::memory_order_relaxed);
@@ -370,6 +778,8 @@ struct EventCounters {
         const long long v_loop_closure_chi2_rejected    = loop_closure_chi2_rejected.load(std::memory_order_relaxed);
         const long long v_loop_closure_corrections_applied = loop_closure_corrections_applied.load(std::memory_order_relaxed);
         const long long v_loop_closure_lower_rank_accepts   = loop_closure_lower_rank_accepts.load(std::memory_order_relaxed);
+        const long long v_loop_closure_spatial_candidates_total = loop_closure_spatial_candidates_total.load(std::memory_order_relaxed);
+        const long long v_loop_closure_spatial_fallback_total   = loop_closure_spatial_fallback_total.load(std::memory_order_relaxed);
         const long long v_cam_fps_mean_milli_hz             = cam_fps_mean_milli_hz.load(std::memory_order_relaxed);
         const long long v_cam_fps_stdev_milli_hz            = cam_fps_stdev_milli_hz.load(std::memory_order_relaxed);
         const long long v_cam_fps_window_count              = cam_fps_window_count.load(std::memory_order_relaxed);
@@ -379,23 +789,69 @@ struct EventCounters {
         const long long v_loop_closure_geom_rejects_no_candidate     = loop_closure_geom_rejects_no_candidate.load(std::memory_order_relaxed);
         const long long v_loop_closure_geom_rejects_few_inframe      = loop_closure_geom_rejects_few_inframe.load(std::memory_order_relaxed);
         const long long v_loop_closure_geom_rejects_pnp              = loop_closure_geom_rejects_pnp.load(std::memory_order_relaxed);
+        const long long v_loop_closure_geom_rejects_descriptor       = loop_closure_geom_rejects_descriptor.load(std::memory_order_relaxed);
         const long long v_total_path_dm               = total_path_dm.load(std::memory_order_relaxed);
+        const long long v_pose_graph_optimize_calls          = pose_graph_optimize_calls.load(std::memory_order_relaxed);
+        const long long v_pose_graph_iters_used_sum          = pose_graph_iters_used_sum.load(std::memory_order_relaxed);
+        const long long v_pose_graph_residual_norm_pre_mm    = pose_graph_residual_norm_pre_mm.load(std::memory_order_relaxed);
+        const long long v_pose_graph_residual_norm_post_mm   = pose_graph_residual_norm_post_mm.load(std::memory_order_relaxed);
+        const long long v_pose_graph_max_correction_mm       = pose_graph_max_correction_mm.load(std::memory_order_relaxed);
+        const long long v_pose_graph_max_correction_mrad     = pose_graph_max_correction_mrad.load(std::memory_order_relaxed);
+        const long long v_pose_graph_rejected_singular       = pose_graph_rejected_singular.load(std::memory_order_relaxed);
+        const long long v_pose_graph_loop_edges_added        = pose_graph_loop_edges_added.load(std::memory_order_relaxed);
+        const long long v_pose_graph_apply_calls             = pose_graph_apply_calls.load(std::memory_order_relaxed);
         const long long v_extrinsics_rotation_angle_mdeg = extrinsics_rotation_angle_mdeg.load(std::memory_order_relaxed);
+        // PHASE_A_8B_REENABLE_2026_05_19
+        const long long v_rbc_runaway_total = rbc_runaway_total.load(std::memory_order_relaxed);
+        // PHASE_B_6_4_REENABLE_2026_05_19
+        const long long v_landmark_obs_runaway_total = landmark_obs_runaway_total.load(std::memory_order_relaxed);
         const long long v_cam_imu_time_offset_us  = cam_imu_time_offset_us.load(std::memory_order_relaxed);
         const long long v_rolling_shutter_skew_ns = rolling_shutter_skew_ns.load(std::memory_order_relaxed);
-        const long long v_midas_entries                    = midas_entries.load(std::memory_order_relaxed);
-        const long long v_midas_bailout_no_depth           = midas_bailout_no_depth.load(std::memory_order_relaxed);
-        const long long v_midas_bailout_few_pts3d          = midas_bailout_few_pts3d.load(std::memory_order_relaxed);
-        const long long v_midas_bailout_invalid_intrinsics = midas_bailout_invalid_intrinsics.load(std::memory_order_relaxed);
-        const long long v_midas_bailout_camera_h           = midas_bailout_camera_h.load(std::memory_order_relaxed);
-        const long long v_midas_bailout_low_g              = midas_bailout_low_g.load(std::memory_order_relaxed);
-        const long long v_midas_bailout_few_floor_matches  = midas_bailout_few_floor_matches.load(std::memory_order_relaxed);
-        const long long v_midas_rejected_extreme           = midas_rejected_extreme.load(std::memory_order_relaxed);
-        const long long v_midas_fused                      = midas_fused.load(std::memory_order_relaxed);
-        const long long v_midas_skipped                    = midas_skipped.load(std::memory_order_relaxed);
+        const long long v_ekf_init_deferred_madgwick_not_ready = ekf_init_deferred_madgwick_not_ready.load(std::memory_order_relaxed);
+        const long long v_zrup_fired_total = zrup_fired_total.load(std::memory_order_relaxed);
+        const long long v_ekf_bg_absorbed_total = ekf_bg_absorbed_total.load(std::memory_order_relaxed);
+        const long long v_gyro_bias_pushed_total = gyro_bias_pushed_total.load(std::memory_order_relaxed);
+        const long long v_visual_yaw_gated_pure_rotation_total = visual_yaw_gated_pure_rotation_total.load(std::memory_order_relaxed);
+        const long long v_msckf_gated_static_total = msckf_gated_static_total.load(std::memory_order_relaxed);
+        const long long v_slam_update_gated_static_total = slam_update_gated_static_total.load(std::memory_order_relaxed);
+        const long long v_landmarks_added_total     = landmarks_added_total.load(std::memory_order_relaxed);
+        const long long v_landmarks_merged_total    = landmarks_merged_total.load(std::memory_order_relaxed);
+        const long long v_landmarks_culled_total    = landmarks_culled_total.load(std::memory_order_relaxed);
+        const long long v_landmarks_skipped_invalid = landmarks_skipped_invalid.load(std::memory_order_relaxed);
+        const long long v_landmark_map_size         = landmark_map_size.load(std::memory_order_relaxed);
+        const long long v_landmarks_rendered_anchor_total      = landmarks_rendered_anchor_total.load(std::memory_order_relaxed);
+        const long long v_landmarks_rendered_world_fixed_total = landmarks_rendered_world_fixed_total.load(std::memory_order_relaxed);
+        const long long v_landmarks_in_ba_solve_sum      = landmarks_in_ba_solve_sum.load(std::memory_order_relaxed);
+        const long long v_landmarks_refined_total        = landmarks_refined_total.load(std::memory_order_relaxed);
+        const long long v_landmark_obs_in_ba_history_min = landmark_obs_in_ba_history_min.load(std::memory_order_relaxed);
+        const long long v_landmarks_observed_total  = landmarks_observed_total.load(std::memory_order_relaxed);
+        const long long v_landmarks_matched_total   = landmarks_matched_total.load(std::memory_order_relaxed);
+        const long long v_landmarks_msckf_accepted_total       = landmarks_msckf_accepted_total.load(std::memory_order_relaxed);
+        const long long v_landmarks_msckf_rejected_chi2_total  = landmarks_msckf_rejected_chi2_total.load(std::memory_order_relaxed);
+        const long long v_landmarks_msckf_rejected_huber_total = landmarks_msckf_rejected_huber_total.load(std::memory_order_relaxed);
+        const long long v_landmarks_msckf_rejected_depth_total = landmarks_msckf_rejected_depth_total.load(std::memory_order_relaxed);
+        const long long v_landmarks_msckf_rejected_image_total = landmarks_msckf_rejected_image_total.load(std::memory_order_relaxed);
+        // 2026-05-16 single-snapshot consistency fix (per ekf-inv-dot-investigation agent)
+        const long long v_overlay_snapshots_taken_total        = overlay_snapshots_taken_total.load(std::memory_order_relaxed);
+        const long long v_midas_entries                       = midas_entries.load(std::memory_order_relaxed);
+        const long long v_midas_bailout_no_depth              = midas_bailout_no_depth.load(std::memory_order_relaxed);
+        const long long v_midas_bailout_few_pts3d             = midas_bailout_few_pts3d.load(std::memory_order_relaxed);
+        const long long v_midas_bailout_invalid_intrinsics    = midas_bailout_invalid_intrinsics.load(std::memory_order_relaxed);
+        const long long v_midas_bailout_camera_h              = midas_bailout_camera_h.load(std::memory_order_relaxed);
+        const long long v_midas_bailout_low_g                 = midas_bailout_low_g.load(std::memory_order_relaxed);
+        const long long v_midas_bailout_few_floor_matches     = midas_bailout_few_floor_matches.load(std::memory_order_relaxed);
+        const long long v_midas_rejected_extreme              = midas_rejected_extreme.load(std::memory_order_relaxed);
+        const long long v_midas_fused                         = midas_fused.load(std::memory_order_relaxed);
+        const long long v_midas_skipped                       = midas_skipped.load(std::memory_order_relaxed);
+        const long long v_midas_affine_fit_singular           = midas_affine_fit_singular.load(std::memory_order_relaxed);
+        const long long v_midas_affine_fit_low_inliers        = midas_affine_fit_low_inliers.load(std::memory_order_relaxed);
+        const long long v_midas_affine_fit_inlier_ratio_milli = midas_affine_fit_inlier_ratio_milli.load(std::memory_order_relaxed);
+        const long long v_midas_affine_fit_shift_milli        = midas_affine_fit_shift_milli.load(std::memory_order_relaxed);
+        const long long v_global_t_gated_rotation_dominated_total = global_t_gated_rotation_dominated_total.load(std::memory_order_relaxed);
+        const long long v_translation_heading_projection_total = translation_heading_projection_total.load(std::memory_order_relaxed);
 
         std::string out;
-        out.reserve(1100);
+        out.reserve(2200);  // expanded for 18 new silent-failure counters (2026-05-16)
         out += '{';
         appendKv(out, "reloc_orb_accepts",            v_reloc_orb_accepts);            out += ',';
         appendKv(out, "reloc_orb_rejects",            v_reloc_orb_rejects);            out += ',';
@@ -422,8 +878,27 @@ struct EventCounters {
         appendKv(out, "slam_promotions_total",        v_slam_promotions_total);        out += ',';
         appendKv(out, "slam_lifetime_obs_sum",         v_slam_lifetime_obs_sum);         out += ',';
         appendKv(out, "slam_lifetime_count",           v_slam_lifetime_count);           out += ',';
+        appendKv(out, "slam_reanchor_total",           v_slam_reanchor_total);           out += ',';
+        appendKv(out, "slam_reanchor_failed_no_clone", v_slam_reanchor_failed_no_clone); out += ',';
+        appendKv(out, "slam_reanchor_failed_geometry", v_slam_reanchor_failed_geometry); out += ',';
         appendKv(out, "msckf_update_lines",            v_msckf_update_lines);            out += ',';
         appendKv(out, "msckf_huber_rejected_sum",      v_msckf_huber_rejected_sum);      out += ',';
+        appendKv(out, "applyMSCKFUpdate_inversion_failed", v_applyMSCKFUpdate_inversion_failed); out += ',';
+        appendKv(out, "ba_singular_landmarks",          v_ba_singular_landmarks);          out += ',';
+        appendKv(out, "propagate_skipped",              v_propagate_skipped);              out += ',';
+        appendKv(out, "propagate_skipped_not_init",     v_propagate_skipped_not_init);     out += ',';
+        appendKv(out, "propagate_skipped_dt_nonpositive", v_propagate_skipped_dt_nonpositive); out += ',';
+        appendKv(out, "propagate_skipped_p_empty",      v_propagate_skipped_p_empty);      out += ',';
+        appendKv(out, "msckf_chi2_rejected",            v_msckf_chi2_rejected);            out += ',';
+        appendKv(out, "msckf_inversion_failed",         v_msckf_inversion_failed);         out += ',';
+        appendKv(out, "velocity_clamped",               v_velocity_clamped);               out += ',';
+        appendKv(out, "scale_chi2_rejected",            v_scale_chi2_rejected);            out += ',';
+        appendKv(out, "time_offset_clamped",            v_time_offset_clamped);            out += ',';
+        appendKv(out, "fej_clone_miss",                 v_fej_clone_miss);                 out += ',';
+        appendKv(out, "gravity_alignment_rejected",     v_gravity_alignment_rejected);     out += ',';
+        appendKv(out, "relative_rotation_rejected",     v_relative_rotation_rejected);     out += ',';
+        appendKv(out, "loop_closure_rejects_heading_total", v_loop_closure_rejects_heading_total); out += ',';
+        appendKv(out, "loop_closure_rejects_pnp_total", v_loop_closure_rejects_pnp_total); out += ',';
         appendKv(out, "loop_closure_attempts",         v_loop_closure_attempts);         out += ',';
         appendKv(out, "loop_closure_accepts",          v_loop_closure_accepts);          out += ',';
         appendKv(out, "loop_closure_rejects_low_score", v_loop_closure_rejects_low_score); out += ',';
@@ -433,6 +908,8 @@ struct EventCounters {
         appendKv(out, "loop_closure_chi2_rejected",    v_loop_closure_chi2_rejected);    out += ',';
         appendKv(out, "loop_closure_corrections_applied", v_loop_closure_corrections_applied); out += ',';
         appendKv(out, "loop_closure_lower_rank_accepts",  v_loop_closure_lower_rank_accepts);  out += ',';
+        appendKv(out, "loop_closure_spatial_candidates_total", v_loop_closure_spatial_candidates_total); out += ',';
+        appendKv(out, "loop_closure_spatial_fallback_total",   v_loop_closure_spatial_fallback_total);   out += ',';
         appendKv(out, "cam_fps_mean_milli_hz",            v_cam_fps_mean_milli_hz);            out += ',';
         appendKv(out, "cam_fps_stdev_milli_hz",           v_cam_fps_stdev_milli_hz);           out += ',';
         appendKv(out, "cam_fps_window_count",             v_cam_fps_window_count);             out += ',';
@@ -442,20 +919,66 @@ struct EventCounters {
         appendKv(out, "loop_closure_geom_rejects_no_candidate",     v_loop_closure_geom_rejects_no_candidate);     out += ',';
         appendKv(out, "loop_closure_geom_rejects_few_inframe",      v_loop_closure_geom_rejects_few_inframe);      out += ',';
         appendKv(out, "loop_closure_geom_rejects_pnp",              v_loop_closure_geom_rejects_pnp);              out += ',';
+        appendKv(out, "loop_closure_geom_rejects_descriptor",       v_loop_closure_geom_rejects_descriptor);       out += ',';
         appendKv(out, "total_path_dm",                  v_total_path_dm);                  out += ',';
+        appendKv(out, "pose_graph_optimize_calls",        v_pose_graph_optimize_calls);        out += ',';
+        appendKv(out, "pose_graph_iters_used_sum",        v_pose_graph_iters_used_sum);        out += ',';
+        appendKv(out, "pose_graph_residual_norm_pre_mm",  v_pose_graph_residual_norm_pre_mm);  out += ',';
+        appendKv(out, "pose_graph_residual_norm_post_mm", v_pose_graph_residual_norm_post_mm); out += ',';
+        appendKv(out, "pose_graph_max_correction_mm",     v_pose_graph_max_correction_mm);     out += ',';
+        appendKv(out, "pose_graph_max_correction_mrad",   v_pose_graph_max_correction_mrad);   out += ',';
+        appendKv(out, "pose_graph_rejected_singular",     v_pose_graph_rejected_singular);     out += ',';
+        appendKv(out, "pose_graph_loop_edges_added",      v_pose_graph_loop_edges_added);      out += ',';
+        appendKv(out, "pose_graph_apply_calls",           v_pose_graph_apply_calls);           out += ',';
         appendKv(out, "extrinsics_rotation_angle_mdeg", v_extrinsics_rotation_angle_mdeg); out += ',';
+        // PHASE_A_8B_REENABLE_2026_05_19
+        appendKv(out, "rbc_runaway_total",              v_rbc_runaway_total);              out += ',';
+        // PHASE_B_6_4_REENABLE_2026_05_19
+        appendKv(out, "landmark_obs_runaway_total",     v_landmark_obs_runaway_total);     out += ',';
         appendKv(out, "cam_imu_time_offset_us",         v_cam_imu_time_offset_us);         out += ',';
         appendKv(out, "rolling_shutter_skew_ns",        v_rolling_shutter_skew_ns);        out += ',';
-        appendKv(out, "midas_entries",                  v_midas_entries);                  out += ',';
-        appendKv(out, "midas_bailout_no_depth",         v_midas_bailout_no_depth);         out += ',';
-        appendKv(out, "midas_bailout_few_pts3d",        v_midas_bailout_few_pts3d);        out += ',';
-        appendKv(out, "midas_bailout_invalid_intrinsics", v_midas_bailout_invalid_intrinsics); out += ',';
-        appendKv(out, "midas_bailout_camera_h",         v_midas_bailout_camera_h);         out += ',';
-        appendKv(out, "midas_bailout_low_g",            v_midas_bailout_low_g);            out += ',';
-        appendKv(out, "midas_bailout_few_floor_matches", v_midas_bailout_few_floor_matches); out += ',';
-        appendKv(out, "midas_rejected_extreme",         v_midas_rejected_extreme);         out += ',';
-        appendKv(out, "midas_fused",                    v_midas_fused);                    out += ',';
-        appendKv(out, "midas_skipped",                  v_midas_skipped);
+        appendKv(out, "ekf_init_deferred_madgwick_not_ready", v_ekf_init_deferred_madgwick_not_ready); out += ',';
+        appendKv(out, "zrup_fired_total", v_zrup_fired_total); out += ',';
+        appendKv(out, "ekf_bg_absorbed_total", v_ekf_bg_absorbed_total); out += ',';
+        appendKv(out, "gyro_bias_pushed_total", v_gyro_bias_pushed_total); out += ',';
+        appendKv(out, "visual_yaw_gated_pure_rotation_total", v_visual_yaw_gated_pure_rotation_total); out += ',';
+        appendKv(out, "msckf_gated_static_total", v_msckf_gated_static_total); out += ',';
+        appendKv(out, "slam_update_gated_static_total", v_slam_update_gated_static_total); out += ',';
+        appendKv(out, "landmarks_added_total",     v_landmarks_added_total);     out += ',';
+        appendKv(out, "landmarks_merged_total",    v_landmarks_merged_total);    out += ',';
+        appendKv(out, "landmarks_culled_total",    v_landmarks_culled_total);    out += ',';
+        appendKv(out, "landmarks_skipped_invalid", v_landmarks_skipped_invalid); out += ',';
+        appendKv(out, "landmark_map_size",         v_landmark_map_size);         out += ',';
+        appendKv(out, "landmarks_rendered_anchor_total",      v_landmarks_rendered_anchor_total);      out += ',';
+        appendKv(out, "landmarks_rendered_world_fixed_total", v_landmarks_rendered_world_fixed_total); out += ',';
+        appendKv(out, "landmarks_in_ba_solve_sum",      v_landmarks_in_ba_solve_sum);      out += ',';
+        appendKv(out, "landmarks_refined_total",        v_landmarks_refined_total);        out += ',';
+        appendKv(out, "landmark_obs_in_ba_history_min", v_landmark_obs_in_ba_history_min); out += ',';
+        appendKv(out, "landmarks_observed_total",  v_landmarks_observed_total);  out += ',';
+        appendKv(out, "landmarks_matched_total",   v_landmarks_matched_total);   out += ',';
+        appendKv(out, "landmarks_msckf_accepted_total",       v_landmarks_msckf_accepted_total);       out += ',';
+        appendKv(out, "landmarks_msckf_rejected_chi2_total",  v_landmarks_msckf_rejected_chi2_total);  out += ',';
+        appendKv(out, "landmarks_msckf_rejected_huber_total", v_landmarks_msckf_rejected_huber_total); out += ',';
+        appendKv(out, "landmarks_msckf_rejected_depth_total", v_landmarks_msckf_rejected_depth_total); out += ',';
+        appendKv(out, "landmarks_msckf_rejected_image_total", v_landmarks_msckf_rejected_image_total); out += ',';
+        // 2026-05-16 single-snapshot consistency fix (per ekf-inv-dot-investigation agent)
+        appendKv(out, "overlay_snapshots_taken_total",        v_overlay_snapshots_taken_total);        out += ',';
+        appendKv(out, "midas_entries",                       v_midas_entries);                       out += ',';
+        appendKv(out, "midas_bailout_no_depth",              v_midas_bailout_no_depth);              out += ',';
+        appendKv(out, "midas_bailout_few_pts3d",             v_midas_bailout_few_pts3d);             out += ',';
+        appendKv(out, "midas_bailout_invalid_intrinsics",    v_midas_bailout_invalid_intrinsics);    out += ',';
+        appendKv(out, "midas_bailout_camera_h",              v_midas_bailout_camera_h);              out += ',';
+        appendKv(out, "midas_bailout_low_g",                 v_midas_bailout_low_g);                 out += ',';
+        appendKv(out, "midas_bailout_few_floor_matches",     v_midas_bailout_few_floor_matches);     out += ',';
+        appendKv(out, "midas_rejected_extreme",              v_midas_rejected_extreme);              out += ',';
+        appendKv(out, "midas_fused",                         v_midas_fused);                         out += ',';
+        appendKv(out, "midas_skipped",                       v_midas_skipped);                       out += ',';
+        appendKv(out, "midas_affine_fit_singular",           v_midas_affine_fit_singular);           out += ',';
+        appendKv(out, "midas_affine_fit_low_inliers",        v_midas_affine_fit_low_inliers);        out += ',';
+        appendKv(out, "midas_affine_fit_inlier_ratio_milli", v_midas_affine_fit_inlier_ratio_milli); out += ',';
+        appendKv(out, "midas_affine_fit_shift_milli",        v_midas_affine_fit_shift_milli);        out += ',';
+        appendKv(out, "global_t_gated_rotation_dominated_total", v_global_t_gated_rotation_dominated_total); out += ',';
+        appendKv(out, "translation_heading_projection_total",    v_translation_heading_projection_total);
         out += '}';
         return out;
     }

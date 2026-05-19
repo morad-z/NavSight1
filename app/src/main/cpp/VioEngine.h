@@ -4,6 +4,7 @@
 #include "VioTypes.h"
 #include "IMUPreintegrator.h"
 #include "Tracker.h"
+#include "ViewerServer.h"
 // DISABLED: Mapper pipeline — applyMapperResult was a no-op (corrections caused teleportation).
 // Mapper, LoopClosureDetector, PoseGraph all run but output is discarded. Disabled to save CPU/battery.
 // #include "Mapper.h"
@@ -38,6 +39,14 @@ public:
     bool loadLoopClosureVocabulary(const std::string& vocab_path);
 
     void setInitialHeading(double azimuth_rad);
+    // 2026-05-13 heading-startup fix: seed Madgwick's yaw IMMEDIATELY from
+    // the compass, without waiting for VIO init. Only touches the IMU
+    // integrator; no Tracker/EKF side effects. The full setInitialHeading
+    // path stays for EKF rotation seeding. Calling this before
+    // setInitialHeading is safe (Madgwick re-initializes on every yaw seed
+    // call). Calling it AGAIN after GPS arrives is also safe — it re-runs
+    // tryInitMadgwickLocked with the declination-corrected azimuth.
+    void seedMadgwickYaw(double yaw_rad);
     void setMagnetometerHeading(float yaw_rad);
     void setDepthMap(const float* depth_data, int width, int height);
     void setUserScaleCorrection(double correction);
@@ -83,6 +92,9 @@ public:
     // only if Tracker has not yet been initialised — never under normal
     // running conditions.
     const EKFState* getEKFState() const { return tracker_.getEKF(); }
+    // v23.11: expose the Tracker for native-lib SLAM debug snapshot access.
+    Tracker* getTracker() { return &tracker_; }
+    const Tracker* getTracker() const { return &tracker_; }
     // Access the Tracker's body→camera extrinsics for projection. Read
     // through the EKFState to avoid duplicating R_bc state.
     cv::Matx33d getExtrinsicsRotation() const {
@@ -97,6 +109,12 @@ private:
 
     IMUPreintegrator imu_;
     Tracker tracker_;
+
+    // 2026-05-17 — PC live viewer. HTTP server bound to 0.0.0.0:8765 on
+    // VioEngine construction. PC on same WiFi opens http://<phone-ip>:8765/
+    // to view a 3D scene of the current LandmarkMap + EKF pose + trajectory.
+    // Read-only relative to the VIO state.
+    navsight::ViewerServer viewer_server_;
 
     // DISABLED: Mapper + background thread — output was discarded via no-op applyMapperResult
     // Mapper mapper_;

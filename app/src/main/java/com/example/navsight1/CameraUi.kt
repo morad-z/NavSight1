@@ -43,6 +43,23 @@ private const val TAG = "NavSight"
 @Composable
 fun CameraViewComposable(viewModel: NavSightViewModel) {
     val lifecycleOwner = LocalLifecycleOwner.current
+    // Audit Finding 13 (2026-05-16): Executors.newSingleThreadExecutor() created
+    // inline in the AndroidView factory was never shut down. The thread is
+    // non-daemon and keeps a reference to the captured lambda (including viewModel),
+    // blocking GC after the composable is removed.
+    // Fix: remember the executor so it survives recomposition, and use
+    // DisposableEffect to shut it down when the composable leaves composition.
+    val analyzerExecutor = remember {
+        java.util.concurrent.Executors.newSingleThreadExecutor { r ->
+            Thread(r, "NavSight-CameraAnalyzer").apply { isDaemon = true }
+        }
+    }
+    DisposableEffect(Unit) {
+        onDispose {
+            Log.d(TAG, "CameraViewComposable: shutting down analyzerExecutor (Finding 13 fix)")
+            analyzerExecutor.shutdown()
+        }
+    }
     AndroidView(
         factory = { ctx ->
             val pv = PreviewView(ctx).apply {
@@ -111,7 +128,7 @@ fun CameraViewComposable(viewModel: NavSightViewModel) {
                     )
 
                 val analysis = analysisBuilder.build().also { ia ->
-                    ia.setAnalyzer(java.util.concurrent.Executors.newSingleThreadExecutor()) { img ->
+                    ia.setAnalyzer(analyzerExecutor) { img ->
                         try {
                             if (viewModel.isSensorRepositoryActive()) viewModel.processCameraFrame(img)
                             else img.close()
@@ -320,6 +337,33 @@ private const val OVERLAY_SLAM_RING_STROKE_PX = 1.5f
 // closer than 5 cm flickers visibly; anything farther stays sub-pixel.
 private const val OVERLAY_SLAM_MIN_DEPTH_M = 0.05f
 
+// ── Phase 1 Step 6 (post_v19_sprint_plan.md §205-298): LandmarkMap overlay ───
+// Static landmark dots rendered BEHIND the live SLAM dots. Two colour states:
+//   * observed_this_frame == 1 → bright orange filled circle (recently matched)
+//   * observed_this_frame == 0 → dim gray   filled circle (in DB, not in view)
+// Spec: orange (255,160,0) @ alpha 0.95 with 5 px radius for observed;
+// gray (128,128,128) @ alpha 0.50 with 4 px radius for dormant. These are the
+// fixed Phase 6.5 colours — they intentionally differ from the live SLAM
+// orange (OVERLAY_SLAM_FILL above, ~FF6D00 darker) so the user can distinguish
+// "persistent map point" (this overlay) from "EKF SLAM feature" (the layer
+// drawn on top of us).
+private val OVERLAY_LANDMARK_OBSERVED_COLOR = Color(0xF2FFA000)  // RGB 255,160,0 @95%
+private val OVERLAY_LANDMARK_DORMANT_COLOR  = Color(0x80808080)  // RGB 128,128,128 @50%
+private const val OVERLAY_LANDMARK_OBSERVED_RADIUS_PX = 5f
+private const val OVERLAY_LANDMARK_DORMANT_RADIUS_PX  = 4f
+// Stride of the JNI float array returned by NativeBridge.getLandmarkSnapshot.
+// See native-lib.cpp Java_..._getLandmarkSnapshot for the layout:
+//   [0]=id, [1]=x_yup, [2]=y_yup, [3]=z_yup, [4]=observed_this_frame,
+//   [5]=obs_u, [6]=obs_v.
+// 2026-05-19 Fix #3 (orange-dot anchor): added obs_u/obs_v so observed
+// landmarks render AT the actual KLT-matched image pixel instead of
+// projecting through a possibly-drifted EKF camera pose. obs_u = obs_v = 0
+// when the landmark was not observed this frame OR the Tracker pixel
+// lookup raced; the projection path remains the fallback in that case.
+private const val OVERLAY_LANDMARK_STRIDE = 7
+// Minimum depth (m) — match OVERLAY_SLAM_MIN_DEPTH_M so the two layers
+// disappear together as features pass behind the camera.
+
 private fun ageToColor(ageFrames: Int): Color = when {
     ageFrames < OVERLAY_AGE_NEW_FRAMES         -> OVERLAY_AGE_NEW_COLOR
     ageFrames < OVERLAY_AGE_ESTABLISHED_FRAMES -> OVERLAY_AGE_ESTABLISHED_COLOR
@@ -372,6 +416,180 @@ fun CameraFeatureOverlay(viewModel: NavSightViewModel, pal: NavPalette) {
             drawCircle(color = color, radius = dotRadius, center = Offset(cx, cy))
         }
     }
+}
+
+/**
+ * Camera overlay Phase 6.5 (post_v19_sprint_plan.md §205-298): persistent
+ * 3D LandmarkMap overlay. Renders the visual-only Landmark database
+ * (populated each keyframe by `Tracker::addOrMergeLandmark`, persisted
+ * across loop closures via `LandmarkMap::applyKeyframePoseCorrection`).
+ *
+ * Two colour states per landmark:
+ *   * observed_this_frame == 1.0 → bright orange filled circle (the EKF
+ *     just matched this landmark in the most recent keyframe — confirming
+ *     the map at this physical location).
+ *   * observed_this_frame == 0.0 → dim gray filled circle (in the DB but
+ *     not seen this frame — the map remembers it from earlier passes).
+ *
+ * Draw order (MapScreenUi): LandmarkOverlay → SlamFeatureOverlay so the
+ * live EKF features render ABOVE the static landmark layer. This is the
+ * design contract — flipping the order makes orange landmarks occlude the
+ * live SLAM-orange dots and breaks the "live > static" hierarchy.
+ *
+ * Projection math: identical to [SlamFeatureOverlay] (snapshot.cameraPose
+ * carries R_world_cam + t_world_cam + intrinsics in Y-up world). The JNI
+ * returns landmark world coords in the SAME Y-up frame as SlamSnapshot —
+ * verified at the JNI boundary via the `JNI_LM_BOUNDARY:` log line on the
+ * first frame.
+ */
+@Composable
+fun LandmarkOverlay(viewModel: NavSightViewModel, pal: NavPalette) {
+    // Gate on the camera-pose snapshot (16 floats) — same gate
+    // [SlamFeatureOverlay] uses. When the EKF is not yet full-initialised
+    // the pose array is empty and we have no way to project the
+    // world-anchored landmarks onto the camera plane. This also implicitly
+    // requires VIO to be initialised, mirroring how
+    // `SensorRepository.wasVioInitialized` gates the rest of the overlay.
+    val snap = viewModel.overlaySnapshot
+    val geom = viewModel.cameraFrameGeometry
+    if (geom == null) return
+    val pose = snap.cameraPose
+    if (pose.size < 16) return
+
+    // Pull a fresh landmark snapshot from JNI. The buffer size scales with
+    // map population (capped at 500 landmarks × 5 floats = 2500 entries in
+    // the JNI getter — see native-lib.cpp::getLandmarkSnapshot). The Kotlin-
+    // side allocation is unavoidable given the JNI contract returns a new
+    // FloatArray each call; the 500-cap keeps it bounded.
+    val landmarks = NativeBridge.getLandmarkSnapshot()
+
+    // Diagnostic: when the snapshot is empty for too long after VIO init we
+    // expect the user to want to see why. Throttle to ≤ 1 line/sec to keep
+    // logcat readable.
+    val throttle = remember { LandmarkOverlayThrottle() }
+    if (landmarks.isEmpty()) {
+        val now = System.currentTimeMillis()
+        if (now - throttle.lastWarnMs >= 1000L) {
+            throttle.lastWarnMs = now
+            Log.w(TAG, "LM_OVERLAY: snapshot empty (camera_pose_valid=${pose.size >= 16})")
+        }
+        return
+    }
+    val n = landmarks.size / OVERLAY_LANDMARK_STRIDE
+    if (n <= 0) return
+
+    // Decode the pose matrix once outside the per-feature loop — identical
+    // to [SlamFeatureOverlay]. Layout (native-lib.cpp getCurrentCameraPose):
+    //   [0..8]   R_world_cam row-major (camera→world)
+    //   [9..11]  t_world_cam (camera position in Y-up world)
+    //   [12..15] fx, fy, cx, cy
+    val r0 = pose[0]; val r1 = pose[1]; val r2 = pose[2]
+    val r3 = pose[3]; val r4 = pose[4]; val r5 = pose[5]
+    val r6 = pose[6]; val r7 = pose[7]; val r8 = pose[8]
+    val tx = pose[9]; val ty = pose[10]; val tz = pose[11]
+    val fx = pose[12]; val fy = pose[13]
+    val cxIntr = pose[14]; val cyIntr = pose[15]
+
+    Canvas(Modifier.fillMaxSize()) {
+        val (prevW, prevH) = overlayRotatedDims(
+            geom.analyzerWidth, geom.analyzerHeight, geom.rotationDegrees
+        )
+        if (prevW <= 0 || prevH <= 0) return@Canvas
+
+        val viewW = size.width
+        val viewH = size.height
+        val sx = viewW / prevW.toFloat()
+        val sy = viewH / prevH.toFloat()
+        // FILL_CENTER scale — identical pipeline as the SLAM overlay so a
+        // landmark at the same scene location as an EKF SLAM feature draws
+        // at the same canvas pixel.
+        val s = maxOf(sx, sy)
+        val ox = (viewW - prevW * s) / 2f
+        val oy = (viewH - prevH * s) / 2f
+
+        for (i in 0 until n) {
+            // Stride 7: [id, wx, wy, wz, observed_flag, obs_u, obs_v]
+            // val id = landmarks[OVERLAY_LANDMARK_STRIDE * i]    // unused in draw
+            val wx = landmarks[OVERLAY_LANDMARK_STRIDE * i + 1]
+            val wy = landmarks[OVERLAY_LANDMARK_STRIDE * i + 2]
+            val wz = landmarks[OVERLAY_LANDMARK_STRIDE * i + 3]
+            val observed = landmarks[OVERLAY_LANDMARK_STRIDE * i + 4] > 0.5f
+            val obsU = landmarks[OVERLAY_LANDMARK_STRIDE * i + 5]
+            val obsV = landmarks[OVERLAY_LANDMARK_STRIDE * i + 6]
+
+            // 2026-05-19 Fix #3 — observed-dot direct-pixel render.
+            //
+            // If the landmark was matched against a current-frame KLT
+            // keypoint, `obsU/obsV` IS that keypoint's pixel — the actual
+            // image-feature location THIS frame. Drawing there anchors the
+            // dot by construction (the dot IS the image feature). The
+            // projection chain (R_world_cam, t, fx/fy/cx/cy) is skipped
+            // entirely because projection through a drifted EKF camera
+            // pose produces the wrong screen position; we already know the
+            // right pixel from the matcher.
+            //
+            // (obsU == 0 && obsV == 0) is the JNI sentinel for "no pixel
+            // available" (race between Tracker's last-observed snapshot
+            // and our lookup, OR the lookup function returned false).
+            // Treat as unobserved and fall through to projection.
+            val haveObsPixel =
+                observed && (obsU != 0f || obsV != 0f)
+
+            val u: Float
+            val v: Float
+            if (haveObsPixel) {
+                u = obsU
+                v = obsV
+            } else {
+                // Fall-back: project p_world through current camera pose.
+                // p_cam = R_world_cam.t() · (p_world - t_world)
+                // Row-major R_world_cam transpose-times-vector:
+                //   out[r] = sum_c R[c, r] * v[c]
+                val dx = wx - tx
+                val dy = wy - ty
+                val dz = wz - tz
+                val xc = r0 * dx + r3 * dy + r6 * dz
+                val yc = r1 * dx + r4 * dy + r7 * dz
+                val zc = r2 * dx + r5 * dy + r8 * dz
+                if (zc <= OVERLAY_SLAM_MIN_DEPTH_M) continue
+                u = fx * xc / zc + cxIntr
+                v = fy * yc / zc + cyIntr
+            }
+
+            // Apply identical analyzer→canvas transform as KLT / SLAM overlays.
+            val rot = overlayRotatePoint(
+                u, v, geom.analyzerWidth, geom.analyzerHeight, geom.rotationDegrees
+            )
+            val cx = ox + rot.x * s
+            val cy = oy + rot.y * s
+
+            // Cull obviously off-screen draws. Compose's drawCircle will
+            // happily clip, but skipping early avoids per-pixel raster cost
+            // when the map carries hundreds of landmarks behind the camera.
+            if (cx < -16f || cx > viewW + 16f || cy < -16f || cy > viewH + 16f) continue
+
+            if (observed) {
+                drawCircle(
+                    color = OVERLAY_LANDMARK_OBSERVED_COLOR,
+                    radius = OVERLAY_LANDMARK_OBSERVED_RADIUS_PX,
+                    center = Offset(cx, cy)
+                )
+            } else {
+                drawCircle(
+                    color = OVERLAY_LANDMARK_DORMANT_COLOR,
+                    radius = OVERLAY_LANDMARK_DORMANT_RADIUS_PX,
+                    center = Offset(cx, cy)
+                )
+            }
+        }
+    }
+}
+
+// Per-Composable throttle holder for the "snapshot empty" warning. Kept as
+// a plain class (not a data class) so identity-equality lets the
+// `remember {}` survive across recompositions without unintentional resets.
+private class LandmarkOverlayThrottle {
+    var lastWarnMs: Long = 0L
 }
 
 /**
@@ -429,12 +647,16 @@ fun SlamFeatureOverlay(viewModel: NavSightViewModel, pal: NavPalette) {
         val ox = (viewW - prevW * s) / 2f
         val oy = (viewH - prevH * s) / 2f
 
-        val n = slam.size / 4
+        // v23.11: stride 7 (fid, wx, wy, wz, obs_u, obs_v, has_obs).
+        val n = slam.size / 7
         for (i in 0 until n) {
-            // val fid = slam[4 * i]    // feature_id — currently unused in draw
-            val wx = slam[4 * i + 1]
-            val wy = slam[4 * i + 2]
-            val wz = slam[4 * i + 3]
+            // val fid = slam[7 * i]    // feature_id — currently unused in draw
+            val wx = slam[7 * i + 1]
+            val wy = slam[7 * i + 2]
+            val wz = slam[7 * i + 3]
+            val obsU = slam[7 * i + 4]
+            val obsV = slam[7 * i + 5]
+            val hasObs = slam[7 * i + 6] > 0.5f
 
             // p_cam = R_world_cam.t() · (p_world - t_world)
             // For a row-major R_world_cam, the transpose times a vector
@@ -451,21 +673,80 @@ fun SlamFeatureOverlay(viewModel: NavSightViewModel, pal: NavPalette) {
             val v = fy * yc / zc + cyIntr
 
             // Apply identical analyzer→canvas transform as KLT overlay.
-            val rot = overlayRotatePoint(
+            val rotPred = overlayRotatePoint(
                 u, v, geom.analyzerWidth, geom.analyzerHeight, geom.rotationDegrees
             )
-            val cx = ox + rot.x * s
-            val cy = oy + rot.y * s
+            val cPredX = ox + rotPred.x * s
+            val cPredY = oy + rotPred.y * s
 
+            // v23.11 DIAGNOSTIC overlay: draw the obs (where KLT thinks the
+            // feature actually is) as a small cyan crosshair, plus a red line
+            // from obs to the EKF projection. Line length = the EKF's
+            // disagreement in screen pixels. Short red line / cyan crosshair
+            // ON the orange dot = healthy SLAM. Long red line / cyan offset
+            // from orange = EKF projection is drifting from reality.
+            // 2026-05-19 Fix #6 — pull cObsX/cObsY out of the if-block so
+            // the dot-render below can reference them. Defaults to the
+            // pred position when there's no obs (KLT lost the track).
+            var cObsX = cPredX
+            var cObsY = cPredY
+            if (hasObs) {
+                val rotObs = overlayRotatePoint(
+                    obsU, obsV, geom.analyzerWidth, geom.analyzerHeight,
+                    geom.rotationDegrees
+                )
+                cObsX = ox + rotObs.x * s
+                cObsY = oy + rotObs.y * s
+                // Red residual line (pred → obs).
+                drawLine(
+                    color = androidx.compose.ui.graphics.Color(0xFFFF3030),
+                    start = Offset(cPredX, cPredY),
+                    end = Offset(cObsX, cObsY),
+                    strokeWidth = 2f
+                )
+                // Cyan crosshair at the obs (KLT) position.
+                val crossLen = 8f
+                drawLine(
+                    color = androidx.compose.ui.graphics.Color(0xFF00E5FF),
+                    start = Offset(cObsX - crossLen, cObsY),
+                    end = Offset(cObsX + crossLen, cObsY),
+                    strokeWidth = 2f
+                )
+                drawLine(
+                    color = androidx.compose.ui.graphics.Color(0xFF00E5FF),
+                    start = Offset(cObsX, cObsY - crossLen),
+                    end = Offset(cObsX, cObsY + crossLen),
+                    strokeWidth = 2f
+                )
+            }
+
+            // 2026-05-19 Fix #6 — render the SLAM dot AT the observation
+            // pixel (where KLT is currently tracking the feature in this
+            // frame) rather than at the EKF projection. The projection
+            // through (R_world_cam, p_G) reflects the EKF's belief, which
+            // only refreshes via UpdaterSLAM at keyframe rate (~2 Hz). KLT
+            // tracks the feature in real time at 30 Hz, so drawing at the
+            // KLT pixel makes the dot anchor to the actual image feature
+            // every frame instead of "jumping" each keyframe when the EKF
+            // snaps to the live KLT obs. The red residual line (above)
+            // still shows EKF projection drift as a diagnostic — short
+            // line = healthy, long line = EKF state drifting between
+            // keyframes (separate concern).
+            //
+            // hasObs=false (KLT lost the feature this frame) falls back
+            // to the projection draw — there's no current observation,
+            // so the EKF prediction is the best we have.
+            val drawX = if (hasObs) cObsX else cPredX
+            val drawY = if (hasObs) cObsY else cPredY
             drawCircle(
                 color = OVERLAY_SLAM_FILL,
                 radius = OVERLAY_SLAM_RADIUS_PX,
-                center = Offset(cx, cy)
+                center = Offset(drawX, drawY)
             )
             drawCircle(
                 color = OVERLAY_SLAM_RING,
                 radius = OVERLAY_SLAM_RING_RADIUS_PX,
-                center = Offset(cx, cy),
+                center = Offset(drawX, drawY),
                 style = androidx.compose.ui.graphics.drawscope.Stroke(
                     width = OVERLAY_SLAM_RING_STROKE_PX
                 )

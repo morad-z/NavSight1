@@ -75,11 +75,21 @@ public:
     //   corner_pts       : KLT corners present at the keyframe (parallel to
     //                       corner_feature_ids).
     //   corner_feature_ids : FeatureManager id per corner; -1 if unassigned.
+    // 2026-05-19 — `lens` is OPTIONAL. When provided AND calibrated with
+    // distortion coefficients, populates `keypoints_ud` (parallel array
+    // in KeyframeDescriptors) with undistorted versions of the ORB
+    // keypoint positions. Math-side consumers (LandmarkMap triangulation,
+    // MSCKF observations, local-map descriptor match, LC PnP) read
+    // `keypoints_ud[i].pt` so they're consistent with the linear pinhole
+    // projection matrix. Display paths continue to read raw `keypoints`.
+    // Pass nullptr to skip — `keypoints_ud` defaults to a copy of
+    // `keypoints` so consumers never have to check has_undistortion.
     void storeKeyframeDescriptors(uint64_t kf_id,
                                   double ts_ns,
                                   const cv::Mat& gray,
                                   const std::vector<cv::Point2f>& corner_pts,
-                                  const std::vector<int>& corner_feature_ids);
+                                  const std::vector<int>& corner_feature_ids,
+                                  const class LensCorrector* lens = nullptr);
 
     // Read accessor for the relocalization scan in Tracker. The caller walks
     // the most recent N entries (Plan Step 4 uses the last 5).
@@ -168,6 +178,13 @@ public:
         int     rms_bad_consecutive{0};  // # consecutive frames with rms > 3 px
         double  last_rms_px{0.0};
         int64_t last_obs_ns{0};
+        // v23.11 (2026-05-11): last observed pixel position (undistorted, in
+        // image-pixel coords). Set by markSlamFeatureRMS during the SLAM
+        // update path so the visual debug overlay can draw a residual line
+        // between obs and the EKF projection.
+        float   last_obs_u{0.0f};
+        float   last_obs_v{0.0f};
+        bool    has_last_obs{false};
         // Last triangulated 3-D point (world frame). Updated when the
         // promotion gate fires; used to seed `EKFState::addSlamFeature`.
         cv::Point3f last_p_global{0.0f, 0.0f, 0.0f};
@@ -212,12 +229,36 @@ public:
     //   - last reprojection RMS ≤ max_init_rms_px (1.5 px)
     //   - has a triangulated p_global
     //   - is not already promoted
-    std::vector<int> getPromotableFeatures(int min_obs = 12,
+    // 2026-05-12: window_clone_ids is the list of clone state IDs currently
+    // in the EKF sliding window. A feature can only be promoted if it has
+    // at least 2 active_tracks_ entries whose clone_state_id is in this set
+    // — i.e., the triangulation loop in Tracker::tryPromote will have ≥2
+    // live in-window observations to work with. The old version gated only
+    // on lc.age (raw frame count), which let through features whose 8
+    // observations had all been marginalised out of the window → silent
+    // rejection at the obs->size() < 2 check downstream.
+    std::vector<int> getPromotableFeatures(const std::vector<int>& window_clone_ids,
+                                            int min_obs = 12,
                                             int min_kf = 2,
                                             double max_init_rms_px = 1.5) const;
 
     // Increment / reset the rms_bad_consecutive counter. > 3 px => bad.
-    void markSlamFeatureRMS(int feature_id, double rms_px);
+    // v23.11: now also stores the last observed pixel position (undistorted)
+    // so the visual debug overlay can draw obs vs predicted reprojection.
+    void markSlamFeatureRMS(int feature_id, double rms_px,
+                            float obs_u = 0.0f, float obs_v = 0.0f,
+                            bool has_obs = false);
+
+    // v23.11: read the last observed pixel for a SLAM-promoted feature.
+    // Returns true if the feature exists and has had a markSlamFeatureRMS
+    // call with valid obs uv this session.
+    bool getSlamFeatureLastObs(int feature_id, float& u, float& v) const;
+
+    // v23.12: stash the latest KLT obs pixel for a feature regardless of
+    // whether the SLAM update fires. The visual debug overlay needs this
+    // so the cyan crosshair tracks the current KLT obs, not the last obs
+    // from when the parallax-gated SLAM update last passed.
+    void noteSlamLastObs(int feature_id, float u, float v);
 
     // SLAM-promoted features that have failed reprojection RMS ≥ 3 frames
     // in a row. Returned IDs should be removed from EKFState.

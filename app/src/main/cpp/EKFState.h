@@ -49,6 +49,14 @@ public:
     void updateScale(double observed_scale, double confidence);
     void updateZUPT();
 
+    // Zero-Rotation-Rate Update — dual of ZUPT. When stationary, the gyro
+    // reading IS the bias by definition. Observes mean(gyro_window) - b_g_ = 0
+    // as a standard Kalman measurement with H = -I on rows 3:6 (b_g_ block).
+    // Returns true on success, false if EKF not full-initialized or invalid
+    // window size. See EKFState.cpp for the full Cause/Change/Falsifier block.
+    bool updateZRUP(double mean_gx, double mean_gy, double mean_gz,
+                    double sigma_gyro_per_sample, int N_samples);
+
     // 2026-05-09 v18 — single-source-of-truth sync.
     // Set the EKF's internal position state directly from an external source
     // (e.g. Tracker's `global_t_`, which is the visual-VO + heading + scaled-step
@@ -101,7 +109,7 @@ public:
     //
     // Returns false on degenerate input or if the EKF is not
     // full-initialized.
-    bool updateStationaryAccel(const cv::Mat& accel_body, double sigma_a);
+    [[nodiscard]] bool updateStationaryAccel(const cv::Mat& accel_body, double sigma_a);
     // DEAD CODE: checkConsistency, getScaleStd — never called
     // double checkConsistency(double camera_disp, double step_disp) const;
     double getScale() const { return scale_; }
@@ -124,11 +132,20 @@ public:
 
     // Clone management
     void addClone(const cv::Mat& R_GtoC, const cv::Mat& p_G, int64_t timestamp_ns);
-    void pruneWindow(size_t max_poses = 11);
+    // Phase 1 Step 4b: default kept in sync with MAX_CLONES (11 → 15). Can't
+    // reference the constant directly because MAX_CLONES is declared lower in
+    // this class body; the value here mirrors the declaration at line ~506.
+    void pruneWindow(size_t max_poses = 15);
     void marginalizeOldestClone();
 
     // MSCKF update: apply stacked null-space-projected measurement
-    void applyMSCKFUpdate(const cv::Mat& H, const cv::Mat& res, const cv::Mat& R_noise);
+    // v23.14 (2026-05-12): added apply_huber=true default. Set false for
+    // hard-physical-constraint updates (gravity-alignment, etc.) where the
+    // Huber kernel structurally fights against real attitude residuals that
+    // ARE the correction signal, not outliers. Defaulting to true preserves
+    // all existing MSCKF/SLAM-update callsites unchanged.
+    void applyMSCKFUpdate(const cv::Mat& H, const cv::Mat& res,
+                          const cv::Mat& R_noise, bool apply_huber = true);
 
     // ── Plan Step 3b (ADR-009): SLAM features in EKF state ────────────────────
     //
@@ -270,7 +287,7 @@ public:
     // metric). H places +I on δp_current and -I on δp at clone_id, so the
     // measurement constrains the position delta between the two clones.
     // Returns true on success, false if clone not found / state not init.
-    bool updateRelativePose(const cv::Mat& t_world_metric,
+    [[nodiscard]] bool updateRelativePose(const cv::Mat& t_world_metric,
                             int clone_id,
                             double var_t);
 
@@ -278,7 +295,7 @@ public:
     // (navigation conv: CW-positive, North=0), var in rad². roll/pitch
     // come from the Madgwick filter and define the gravity-alignment
     // sandwich used to derive the H jacobian.
-    bool updateGravityAlignedYaw(double yaw_meas, double var,
+    [[nodiscard]] bool updateGravityAlignedYaw(double yaw_meas, double var,
                                  double roll, double pitch);
 
     // Stage 1 (2026-05-09 root-cause fix) — gravity-alignment measurement.
@@ -313,7 +330,7 @@ public:
     // Returns true on accept (residual passed gating + Joseph update applied),
     // false on reject (EKF not init, |accel| outside valid band, or covariance
     // factorisation failed).
-    bool updateGravityAlignment(const cv::Mat& accel_body, double var);
+    [[nodiscard]] bool updateGravityAlignment(const cv::Mat& accel_body, double var);
 
     // Step 2 (visual prod plan): per-frame relative-rotation update from
     // monocular `recoverPose`. R_meas_body is the body-frame rotation
@@ -329,7 +346,7 @@ public:
     // clone_id selects which clone in the sliding window the relative
     // rotation is measured against. Returns false if the clone is not
     // found, the EKF is not fully initialized, or R_meas_body is malformed.
-    bool updateRelativeRotation(const cv::Mat& R_meas_body,
+    [[nodiscard]] bool updateRelativeRotation(const cv::Mat& R_meas_body,
                                 double sigma_axis_sq,
                                 int clone_id);
 
@@ -361,19 +378,109 @@ public:
     // gate trips (residual > a generous outer threshold — protects
     // against wildly wrong loop matches before damping has a chance
     // to fade them in).
-    bool updateAbsolutePose(const cv::Mat& target_R_world_imu,
+    [[nodiscard]] bool updateAbsolutePose(const cv::Mat& target_R_world_imu,
                             const cv::Mat& target_p_world,
                             double sigma_axis_sq_R,
                             double var_p);
 
     // PDR step constraint: world-frame XZ position increment from a step
     // event. var is variance of each component (m²).
-    bool updatePDRStep(double dx_world, double dy_world, double var);
+    [[nodiscard]] bool updatePDRStep(double dx_world, double dy_world, double var);
+
+    // ── Phase 1 Step 6.3 (post_v19_sprint_plan.md, 2026-05-16) ────────────────
+    //
+    // Pose-only Kalman measurement update against fixed 3D landmarks
+    // (ORB-SLAM3 "Tracking" pattern, Campos et al. 2021, §III.B): the camera
+    // pose is updated while map points are held fixed (no Jacobian column for
+    // them). Used by Tracker.cpp (Phase 6.4) to fold persistent LandmarkMap
+    // observations into the EKF so revisits anchor pose drift back to the
+    // historical map.
+    //
+    // Each LandmarkObservation pairs a world-frame landmark position with
+    // the pixel where the current camera observed it. The caller is
+    // responsible for the data-association step (descriptor match,
+    // projection-radius gate) and for picking `sigma_px` from the
+    // landmark's reprojection-noise estimate. `landmark_id` is opaque to
+    // the EKF — it appears only in rejection log lines so the caller can
+    // grep its trajectory.
+    //
+    // Returned counters are PER-CALL (not cumulative). The caller (Tracker)
+    // is responsible for forwarding into EventCounters; this keeps EKFState
+    // pure and lets the Tracker decide how to bucket counters across sites.
+    struct LandmarkObservation {
+        int          landmark_id;   // for logging only — caller-controlled id
+        cv::Vec3d    p_world;       // FIXED landmark position (Z-up world frame)
+        cv::Point2f  pixel_meas;    // observed pixel in current camera image
+        double       sigma_px;      // per-obs measurement noise (caller picks)
+    };
+
+    struct LandmarkUpdateResult {
+        int    accepted               = 0;
+        int    rejected_chi2          = 0;
+        int    rejected_huber         = 0;
+        int    rejected_depth         = 0;
+        int    rejected_outside_image = 0;
+        double chi2_total             = 0.0;
+    };
+
+    // Apply a batch of fixed-landmark observations as a 2N-row pose-only
+    // measurement update. Builds H_stack with non-zero columns only at
+    // rows 0..2 (δθ) and 12..14 (δp_G); the rest of the error state is
+    // updated via the standard Joseph-form correlation in applyMSCKFUpdate.
+    //
+    // Gates (in order, per-observation):
+    //   1. depth gate         — kLandmarkDepthMinM ≤ p_C.z ≤ kLandmarkDepthMaxM
+    //   2. in-image gate      — predicted pixel inside [0,W) × [0,H)
+    //   3. per-obs χ² gate    — m² ≤ kLandmarkChi2Gate95 (χ²(0.95, 2-DOF))
+    //   4. per-obs Huber      — pixel residual ≥ 5·kLandmarkHuberPx is a
+    //                            hard reject; in (δ, 5·δ) the row is
+    //                            de-weighted to (δ / r_px).
+    //
+    // Returns the per-call rejection breakdown. Caller-side flow:
+    //
+    //     auto r = ekf.applyLandmarkObservations(obs, R_bc, fx, fy, cx, cy, W, H);
+    //     counters.landmarks_msckf_accepted_total.fetch_add(r.accepted, ...);
+    //     counters.landmarks_msckf_rejected_chi2_total.fetch_add(r.rejected_chi2, ...);
+    //     ...
+    //
+    // Returns an all-zero LandmarkUpdateResult on (a) EKF not full-init,
+    // (b) malformed inputs, (c) empty `obs` vector — no exception.
+    [[nodiscard]] LandmarkUpdateResult applyLandmarkObservations(
+        const std::vector<LandmarkObservation>& obs,
+        const cv::Matx33d& R_bc,
+        double fx, double fy,
+        double cx, double cy,
+        int img_width, int img_height);
 
     // Gravity-aligned yaw from the current R_GtoI_, using Madgwick
     // roll/pitch as the alignment frame. Returns yaw in radians
     // (navigation conv: CW-positive, North=0).
     double getYaw(double roll, double pitch) const;
+
+    // 2026-05-16 audit Fix B — canonical single-source heading accessor.
+    //
+    // Returns nav-CW yaw (rad) from R_GtoI_ using the same gravity-alignment
+    // sandwich as getYaw(roll, pitch), but derives roll and pitch internally
+    // from the gravity column of R_GtoI_ (column 2, world-Z direction in body
+    // frame) via standard tilt-angle decomposition, so the caller is NOT
+    // required to supply Madgwick angles. This eliminates the 4-formula
+    // duplication flagged in architecture audit Finding 2.1.
+    //
+    // Convention (Z-up ENU, nav-CW):
+    //   North:  R_GtoI has body-x ≈ world-x  →  atan2(R[1,0], R[0,0]) ≈ 0
+    //   East:   body-x ≈ world-y              →  atan2(R[1,0], R[0,0]) ≈ +π/2
+    //   South:  body-x ≈ -world-x             →  atan2(R[1,0], R[0,0]) ≈ ±π
+    //   West:   body-x ≈ -world-y             →  atan2(R[1,0], R[0,0]) ≈ -π/2
+    //
+    // Unit-test-style expected outputs for vertical-phone walking (phone held
+    // portrait, screen toward stomach, camera facing forward):
+    //   Walking North (body-x ≈ world-x, R[1,0]≈0, R[0,0]≈1):   result ≈  0.0 rad
+    //   Walking East  (body-x ≈ world-y, R[1,0]≈1, R[0,0]≈0):   result ≈ +π/2 rad
+    //   Walking South (body-x ≈ -world-x, R[1,0]≈0, R[0,0]≈-1): result ≈ ±π rad
+    //   Walking West  (body-x ≈ -world-y, R[1,0]≈-1, R[0,0]≈0): result ≈ -π/2 rad
+    //
+    // Returns 0.0 if the EKF is not full-initialized or R_GtoI_ is empty.
+    double getWorldHeadingRad() const;
 
     // Clone accessors (used by UpdaterMSCKF)
     bool getClonePose(int state_id, cv::Mat& R_GtoC, cv::Mat& p_G) const;
@@ -410,12 +517,113 @@ public:
     };
     std::vector<CloneSnapshot> getCloneSnapshot(int max_clones = 5) const;
 
+    // 2026-05-16: single-snapshot consistency fix (per ekf-inv-dot-investigation agent)
+    //
+    // Cause: the JNI overlay render path (native-lib.cpp getCurrentCameraPose +
+    //   getSlamSnapshot) calls multiple EKF accessors (getRotation, getPosition,
+    //   getExtrinsicsRotation, plus per-feature getSlamFeatureGlobalPosition which
+    //   internally calls getClonePose). Each call is unsynchronised against the
+    //   camera thread; between two JNI hops the camera thread can run a full
+    //   processFrame cycle (~16-33 ms), mutating R_GtoI_/p_G_/window_/slam_features_.
+    //   Result: the camera pose used to project SLAM dots is from a different
+    //   EKF state-version than the feature world positions → sub-cm pose drift
+    //   produces 1-2 px visible sliding even when phone is stationary.
+    //
+    // Change: this method takes snapshot_mutex_ once (same mutex protecting
+    //   window_ + slam_features_ + P_ splicing in addClone / marginalizeOldestClone)
+    //   and reads R_GtoI, p_G, R_bc, intrinsics, AND every SLAM feature's world
+    //   position INSIDE the same critical section. Caller (native-lib.cpp) gets
+    //   one coherent EKF state-version per overlay tick.
+    //
+    // Falsifier: post-fix walk — hold phone still for 5+ s; orange dots should
+    //   be pixel-perfect anchored to image features. Visible sliding ⇒ root
+    //   cause is elsewhere (raw sensor noise, Madgwick wobble, or inverse-depth
+    //   state noise) and this fix is insufficient.
+    //
+    // Falsifier log site: native-lib.cpp logs once per second the snapshot
+    //   yaw + p_G + slam_features.size() so post-hoc analysis can verify the
+    //   new path runs and the snapshot is internally consistent.
+    struct OverlaySnapshot {
+        bool         full_initialized = false;                              // false → caller should bail
+        cv::Matx33d  R_GtoI{1.0, 0.0, 0.0,  0.0,  1.0, 0.0,  0.0,  0.0,  1.0};  // world Z-up → body (identity default)
+        cv::Vec3d    p_G{0.0, 0.0, 0.0};                                    // body in world Z-up (m)
+        cv::Matx33d  R_bc{1.0, 0.0, 0.0,  0.0, -1.0, 0.0,  0.0,  0.0, -1.0};    // body → camera (matches R_bc_ default)
+        double       slam_fx = 500.0;
+        double       slam_fy = 500.0;
+        double       slam_cx = 320.0;
+        double       slam_cy = 240.0;
+        struct SlamFeatureEntry {
+            int       feature_id = -1;
+            cv::Vec3d p_world{0.0, 0.0, 0.0};                               // Z-up world frame (m)
+        };
+        std::vector<SlamFeatureEntry> slam_features;
+
+        // 2026-05-19 — Orange-dot anchor-relative render support.
+        //
+        // Cause: getLandmarkSnapshot (native-lib.cpp) wants to render each
+        // landmark anchored to its host clone's CURRENT live pose so the
+        // projection compensates for EKF drift since add time. It needs a
+        // (clone_id → R_GtoC, p_G) lookup table populated from the SAME
+        // snapshot tick as R_GtoI / p_G / slam_features so the overlay
+        // pose, live SLAM dots, and orange dots are all derived from one
+        // consistent EKF state-version.
+        //
+        // Window size is bounded by EKFState::MAX_CLONES (~15), so the copy
+        // cost is trivial. Use the same-tick `snapshot_mutex_` critical
+        // section that already walks window_ for slam_features above.
+        struct CloneEntry {
+            int         state_id = -1;
+            cv::Matx33d R_GtoC{1.0, 0.0, 0.0,  0.0, 1.0, 0.0,  0.0, 0.0, 1.0};  // world→camera
+            cv::Vec3d   p_G{0.0, 0.0, 0.0};                                      // camera position in world (Z-up)
+        };
+        std::vector<CloneEntry> clones;
+    };
+    OverlaySnapshot snapshotForOverlay() const;
+
     // DEAD CODE: getFEJ — only used by disabled MSCKF updater
     // void getFEJ(int state_id, cv::Mat& R_fej, cv::Mat& p_fej) const;
 
     // IMU state accessors
     cv::Mat getRotation() const { return R_GtoI_.clone(); }
     cv::Mat getPosition() const { return p_G_.clone(); }
+    // 2026-05-12: expose the EKF-estimated gyro bias so Tracker can close the
+    // feedback loop to IMUPreintegrator::gyro_bias_. Without this sync, every
+    // MSCKF visual update writes a bias correction into b_g_ that is never
+    // applied to the integrator, so subsequent imu_delta.deltaR continues
+    // integrating with stale bias → R_GtoI accumulates rotation error.
+    cv::Mat getGyroBias() const { return b_g_.clone(); }
+
+    // 2026-05-16 — Reset b_g_ mean to a specified value WITHOUT modifying the
+    // covariance P_.
+    //
+    // Cause this exists: the original feedback loop at Tracker.cpp:1039-1045
+    // (added 2026-05-12 by the architecture-review swarm) overwrites the
+    // IMUPreintegrator's gyro_bias_ with the EKF's b_g_ every frame. b_g_
+    // tracks the RESIDUAL bias on top of what the IMU already subtracts —
+    // typically ~0.02 rad/s when the calibrated IMU bias is ~0.18 rad/s. The
+    // overwrite collapses IMU's calibrated bias to the small residual,
+    // leaving ~0.16 rad/s of unsubtracted gyro entering preintegration.
+    // R_GtoI then rotates phantomly around body-Y at ~9°/s, mis-rotating
+    // R^T·deltaV to a constant wrong world direction; position propagates
+    // there regardless of actual heading.
+    //
+    // Correct loop (this method enables): the caller READS b_g_, ADDS it to
+    // the IMU's gyro_bias_ (absorbing the EKF residual into the IMU's full
+    // bias estimate), then calls setGyroBias(0,0,0) here. The residual is
+    // now zero from the EKF's perspective; the FULL bias lives in the IMU
+    // side. Subsequent preintegration sees correctly-corrected gyro.
+    //
+    // Covariance P_ is intentionally NOT modified. The uncertainty about the
+    // bias hasn't changed — we just transferred where the estimate is held.
+    // The next MSCKF update that touches b_g_ will accumulate fresh residual.
+    // External synchronization required (caller holds Tracker::pose_mutex_ —
+    // same convention as updateZRUP / applyMSCKFUpdate).
+    void setGyroBias(double bgx, double bgy, double bgz) {
+        if (b_g_.empty()) return;
+        b_g_.at<double>(0, 0) = bgx;
+        b_g_.at<double>(1, 0) = bgy;
+        b_g_.at<double>(2, 0) = bgz;
+    }
 
     // Bootstrap-only: replace R_GtoI_ with the magnetometer-derived initial
     // heading rotation when Kotlin's setInitialHeading lands AFTER ekf_.initializeFull
@@ -427,8 +635,8 @@ public:
     // Bug surfaced 2026-05-09 on sim 1778260615221 (vyaw stuck near 0 while
     // Madgwick hdg correctly tracked compass heading).
     void setRotation(const cv::Mat& R_GtoI);
-    // DEAD CODE: getVelocity — never called
-    // cv::Mat getVelocity() const { return v_G_.clone(); }
+    // 2026-05-16 re-enabled — used by UpdaterMSCKF velocity-divergence diagnostic.
+    cv::Mat getVelocity() const { return v_G_.clone(); }
     bool isFullInitialized() const { return full_initialized_; }
 
     // DEAD CODE: updateTemporal — never called
@@ -503,122 +711,17 @@ public:
     static constexpr int EXTR_STATE_OFFSET = 16;
     static constexpr int EXTR_STATE_DIM    = 3;   // one 3-vector δφ_bc
     static constexpr int CLONE_DIM = 6;            // δθ_c, δp_c
-    static constexpr int MAX_CLONES = 11;
+    // Phase 1 Step 4b (post_v19_sprint_plan.md): bumped from 11 -> 15 to give
+    // SLAM features ~3 s anchor-clone lifetime instead of ~2 s at 5 Hz KF rate.
+    // Stacks with Fix 4a (reanchorSlamFeature) for cumulative benefit. Also
+    // aligned with Agent 1's scooter-mode architectural recommendation.
+    static constexpr int MAX_CLONES = 15;
 
     // Plan Step 3a (ADR-008): how many residuals were hard-rejected by the
     // Huber kernel on the last applyMSCKFUpdate call. Surfaced for logcat
     // visibility so we can see MSCKF outlier behaviour at runtime.
     int getMSCKFHuberRejectedCount() const { return msckf_huber_rejected_count_; }
 
-private:
-    // Legacy scale estimation state
-    double scale_;
-    double scale_fej_{-1.0};
-    double P_scale_;
-
-    // Full IMU state (mean)
-    //
-    // World frame: ENU Z-up (X=East, Y=North, Z=Up), right-handed. Matches
-    // the Madgwick attitude filter (IMUPreintegrator.cpp:677,774) and
-    // Android sensor body frame (body Z is gravity-aligned when phone is
-    // held screen-up flat). gravity = (0, 0, -9.81) m/s².
-    //
-    // R_GtoI_ is world→body: takes a vector expressed in world coordinates
-    // and returns its representation in body (IMU) coordinates. For body
-    // at compass heading ψ (CW-positive nav, North=0, East=+π/2) with
-    // zero roll/pitch, R_GtoI_ has the structure built by
-    // Tracker::setInitialHeading at Tracker.cpp:322:
-    //     R_GtoI_ = [[cos ψ, -sin ψ, 0], [sin ψ, cos ψ, 0], [0, 0, 1]]
-    // and getYaw extracts ψ via atan2(R[1,0], R[0,0]).
-    cv::Mat R_GtoI_;    // 3x3 rotation Global-to-IMU (world->body, Z-up world)
-    cv::Mat b_g_;       // 3x1 gyro bias
-    cv::Mat v_G_;       // 3x1 velocity in global frame
-    cv::Mat b_a_;       // 3x1 accel bias
-    cv::Mat p_G_;       // 3x1 position in global frame
-
-    // Full covariance: (19 + 6*N_clones) x (19 + 6*N_clones).
-    // IMU block rows 0..18; clone blocks follow; SLAM block at the end.
-    cv::Mat P_;
-
-    // MSCKF Sliding Window
-    std::deque<CameraPose> window_;
-    int next_state_id_{0};
-    bool full_initialized_{false};
-
-    // ── Plan Step 6 (ADR-012): snapshot mutex ────────────────────────────────
-    // Guards `window_` against torn reads from the BA worker thread. Camera-
-    // thread writers (addClone, marginalizeOldestClone, pruneWindow) take it
-    // briefly while splicing; getCloneSnapshot takes it for the deque walk.
-    // mutable because getCloneSnapshot is const and locks for read.
-    mutable std::mutex snapshot_mutex_;
-
-    // Online time-offset calibration.
-    // t_offset_cam_imu_ is the mean estimate (seconds). δt_d (row 15 of the
-    // error state) is the CORRECTION — each MSCKF update adds dx[15] to this
-    // mean and P_(15,15) tracks the variance. P_td_ is kept only as the
-    // pre-initializeFull fallback for getTimeOffsetStd() and setTimeOffset().
-    double t_offset_cam_imu_{0.010};
-    double P_td_{0.005 * 0.005};  // pre-init variance fallback (s²)
-
-    // ── Plan Step 8b: body→camera extrinsics (online calibration) ────────────
-    //
-    // R_bc_ is the nominal (best-estimate) body→camera rotation matrix.
-    // Updated in-place by every applyMSCKFUpdate: R_bc_ = R_bc_ * Exp(δφ_bc).
-    //
-    // Default initialisation: diag(1, -1, -1) — the canonical rear-camera /
-    // vertical-phone convention NavSight uses (camera +X = body +X, camera +Y =
-    // body -Y, camera +Z = body -Z). This is the same matrix that was previously
-    // hardcoded at three sites in Tracker.cpp (lines ~1129, ~2066, ~3440).
-    //
-    // Caller sets the real value via setExtrinsicsRotation() before the first
-    // processFrame, using Android's CameraCharacteristics.SENSOR_ORIENTATION
-    // combined with the device mounting geometry. The default keeps the system
-    // functional for devices not providing the rotation at startup.
-    cv::Matx33d R_bc_{1.0,  0.0,  0.0,
-                      0.0, -1.0,  0.0,
-                      0.0,  0.0, -1.0};
-
-    bool initialized_{false};
-
-    // FEJ Global Locking
-    cv::Mat global_first_estimate_R_;
-    cv::Mat global_first_estimate_p_;
-    bool global_fej_initialized_{false};
-
-    // IMU noise parameters (continuous-time, used for covariance propagation)
-    double sigma_g_{0.01};      // gyro noise density (rad/s/sqrt(Hz))
-    double sigma_a_{0.1};       // accel noise density (m/s^2/sqrt(Hz))
-    double sigma_bg_{0.0001};   // gyro random walk
-    double sigma_ba_{0.001};    // accel random walk
-
-    // Constants
-    static constexpr double SIGMA_SCALE_RW = 0.001;
-    static constexpr double SIGMA_SCALE_MEAS = 0.1;
-
-    // ── Plan Step 3a (ADR-008): MSCKF damping + Huber state ────────────────
-    // ADR-006 documented 5–11 m teleportations when MSCKF corrections were
-    // applied without damping. We re-enable MSCKF (Plan Step 3a) but ramp
-    // the position-correction in linearly across the first ≤5 frames after
-    // each "quiet" period (≥ MSCKF_QUIET_PROPAGATION steps without an MSCKF
-    // call). Velocity / attitude / bias corrections are NOT damped — only
-    // the world-frame δp rows (12..14 of the IMU error-state).
-    int msckf_frames_since_call_{0};   // # propagateIMU calls since last MSCKF
-    int msckf_damping_step_{0};        // 0..5+; 0=>0.5x, ramps to 1.0 at 5
-    int msckf_huber_rejected_count_{0};
-    int extr_log_skip_{0};             // throttle extrinsics angle logging (every 30 updates)
-
-    static constexpr int MSCKF_QUIET_PROPAGATION = 5;
-    static constexpr int MSCKF_DAMPING_RAMP_FRAMES = 5;
-    // Huber kernel for MSCKF residuals. δ = √χ²(0.95, 2 dof) ≈ 2.4477.
-    // Hard-reject (weight = 0) above 3δ.
-    static constexpr double MSCKF_HUBER_DELTA = 2.4477;
-
-    // Returns the position-correction damping factor for the current call:
-    //   call 0 (first after quiet period): 0.5
-    //   call 1: 0.6, 2: 0.7, 3: 0.8, 4: 0.9, ≥5: 1.0
-    double computeMSCKFDampingFactor() const;
-
-    // ── Plan Step 3b (ADR-009): SLAM feature internals ───────────────────────
     struct SlamFeature {
         int feature_id{-1};
         int anchor_clone_id{-1};
@@ -632,31 +735,6 @@ private:
         double last_obs_rms{0.0};
         int    rms_bad_run{0};
     };
-    std::vector<SlamFeature> slam_features_;
-
-    // 2026-05-09 telemetry fix — see takeLastMarginalizedSlamFeatureIds().
-    // Drained by Tracker after every addClone(). Cleared at the head of
-    // addClone() so multiple internal marginalisations within a single
-    // addClone (pruneWindow path) accumulate.
-    std::vector<int> last_marginalized_slam_feature_ids_;
-
-    // Cached camera intrinsics for SLAM reprojection (see setSlamIntrinsics).
-    // Default 500/500/320/240 matches the test fixture in test_slam_msckf.cpp.
-    double slam_fx_{500.0};
-    double slam_fy_{500.0};
-    double slam_cx_{320.0};
-    double slam_cy_{240.0};
-
-    // Plan Step 6 (ADR-012): caller already holds `snapshot_mutex_`. Public
-    // marginalizeOldestClone / pruneWindow / addClone delegate here so the
-    // single-locking discipline doesn't deadlock against itself.
-    void marginalizeOldestCloneNoLock();
-
-    // Returns starting row/col of `slot` in the full P_. -1 on invalid slot.
-    int slamFeatureCovIdxInternal(int slot) const;
-    // Returns the column offset where the SLAM block starts in P_. Equal to
-    // IMU_STATE_DIM + window_.size() * CLONE_DIM. Only valid when P_ is sized.
-    int slamBlockStart() const;
 
     // Build the 2x5 reprojection Jacobian (∂h/∂α, ∂h/∂β, ∂h/∂ρ, 0, 0) for a
     // SLAM feature observed from a specific clone, plus the 2x6 Jacobian
@@ -674,4 +752,166 @@ private:
                                   cv::Mat& H_feature_2x5,
                                   cv::Mat& H_clone_2x6,
                                   cv::Point2d& pred_uv) const;
+
+    // Direct access to SLAM features for updaters.
+    std::vector<SlamFeature>& getSlamFeatures() { return slam_features_; }
+    const std::vector<SlamFeature>& getSlamFeatures() const { return slam_features_; }
+
+    // Phase 1 Step 4a: transfer a SLAM feature's anchor to a new clone,
+    // preserving its world position. Called from marginalizeOldestCloneNoLock
+    // before the oldest clone is popped from the window. Returns false if the
+    // re-projection into the new anchor's FEJ camera frame is geometrically
+    // degenerate (Zc <= 0.01 m).
+    bool reanchorSlamFeature(int slot, int new_anchor_id);
+
+private:
+    // Legacy scale estimation state
+    double scale_;
+    double scale_fej_{-1.0};
+    double P_scale_;
+
+    // Full IMU state (mean)
+    cv::Mat R_GtoI_;    // 3x3 rotation Global-to-IMU (world->body, Z-up world)
+    cv::Mat b_g_;       // 3x1 gyro bias
+    cv::Mat v_G_;       // 3x1 velocity in global frame
+    cv::Mat b_a_;       // 3x1 accel bias
+    cv::Mat p_G_;       // 3x1 position in global frame
+
+    // Full covariance: (19 + 6*N_clones) x (19 + 6*N_clones).
+    cv::Mat P_;
+
+    // MSCKF Sliding Window
+    std::deque<CameraPose> window_;
+    int next_state_id_{0};
+    bool full_initialized_{false};
+
+    // Plan Step 6 (ADR-012): snapshot mutex protecting window_.
+    mutable std::mutex snapshot_mutex_;
+
+    // Online time-offset calibration.
+    double t_offset_cam_imu_{0.010};
+    double P_td_{0.005 * 0.005};  // pre-init variance fallback (s²)
+
+    // Plan Step 8b: body→camera extrinsics (online calibration).
+    cv::Matx33d R_bc_{1.0,  0.0,  0.0,
+                      0.0, -1.0,  0.0,
+                      0.0,  0.0, -1.0};
+
+    bool initialized_{false};
+
+    // FEJ Global Locking
+    cv::Mat global_first_estimate_R_;
+    cv::Mat global_first_estimate_p_;
+    bool global_fej_initialized_{false};
+
+    // IMU noise parameters (continuous-time).
+    //
+    // !!! TODO 2026-05-16 — REQUIRES ALLAN-VARIANCE MEASUREMENT !!!
+    //
+    // These values are uncalibrated placeholders inherited from project history.
+    // A 2026-05-16 review attempted to "fix" them to allegedly-published values
+    // (sigma_g=0.005, sigma_a=0.003, sigma_bg=5e-5, sigma_ba=2e-4) attributed to
+    // Geneva et al. 2020 ICRA §V-B. That citation was NOT verified against the
+    // actual paper. The fix was REVERTED on the same day to avoid shipping a
+    // magic number under a fabricated citation. The implementor skill bans
+    // magic-number tuning without data citation (anti-pattern #3).
+    //
+    // To replace these properly:
+    //   1. Capture a 4+ hour stationary IMU log on the Samsung Galaxy S21 Ultra
+    //      (SM-G998B, Exynos 2100). Sample at 200 Hz.
+    //   2. Run Allan-deviation analysis (e.g., gyro_allan, Skog & Händel 2012):
+    //      ARW = gyro Allan dev at τ=1 s
+    //      BI  = gyro Allan dev minimum
+    //   3. Set sigma_g_ = ARW (rad/s/√Hz), sigma_bg_ = BI (rad/s/√Hz).
+    //   4. Same for accel: sigma_a_ = VRW, sigma_ba_ = accel BI.
+    //   5. Cite the captured log file timestamp and Allan-dev plot in this
+    //      comment block when shipping the change.
+    //
+    // The Q matrix being too large or too small here directly affects how
+    // tightly the EKF trusts IMU vs. visual evidence and is one of the
+    // longest-running uncertainties in the codebase.
+    //
+    // 2026-05-17 — CALIBRATED via Allan variance.
+    //   Source: tests/sims/allan/imu_calibration_20260517_021657.csv
+    //   Duration: 7200 s   Sample rate: 500 Hz   Samples: 3,600,002
+    //   Phone: S21 Ultra (SM-G998B), flat screen-up on stable surface
+    //   Analyzer: scripts/allan_variance/calibrate.py (worst-axis aggregation)
+    //
+    // Comparison to prior uncalibrated values (kept below as SUPERSEDED):
+    //   sigma_g:  0.01    -> 1.98e-4   (50.5× tighter)
+    //   sigma_a:  0.1     -> 1.63e-3   (61.3× tighter)
+    //   sigma_bg: 1e-4    -> 7.46e-7   (134× tighter)
+    //   sigma_ba: 1e-3    -> 5.41e-4   (1.85× tighter)
+    //
+    // Sanity check vs published Bosch BMI260 spec: our gyro 1.98e-4 rad/s/√Hz
+    // = 0.0114°/s/√Hz vs spec 0.014°/s/√Hz; our accel 166 µg/√Hz vs spec
+    // 130 µg/√Hz. Both within ~30% of vendor spec — clean recording.
+    // 2026-05-17 (evening) — σ_bg + σ_ba RAISED above Allan steady-state values.
+    //
+    // Cause: Allan-measured σ_bg = 7.46e-7 is correct for the phone's TRUE
+    // bias drift rate, but the EKF's bias estimate after the 5-second
+    // stationary cal can be off by ~0.02 rad/s due to:
+    //   (a) the cal's variance-gate filter accepting only the lowest-noise
+    //       subset of samples, biasing the averaged bias toward zero
+    //   (b) ambient vibration / micro-motion the cal misclassifies as zero
+    // With σ_bg = 7.46e-7, the EKF's Kalman gain for bias correction is so
+    // small that ZRUP fires can't drive the estimate to truth — observed as
+    // persistent 1.15°/s yaw drift on a verifiably-stationary phone (v38
+    // walk, 04:09-04:12 logcat, gyro=0.020 rad/s after correction).
+    //
+    // Change: σ_bg raised from 7.46e-7 → 1e-5 (13.4× looser than Allan,
+    // but still 10× tighter than the old uncalibrated 1e-4). σ_ba follows
+    // the same logic, raised from 5.4e-4 → 2e-3 (3.7× looser).
+    //
+    // Falsifier: post-fix stationary observation should show heading drift
+    // < 0.3°/s sustained (vs current 1.15°/s). If drift unchanged, the
+    // residual gyro reading isn't bias at all — it's environmental
+    // vibration the IMU is correctly reporting and we have a different
+    // problem (surface or building motion).
+    double sigma_g_{1.98e-4};   // gyro noise density (rad/s/sqrt(Hz))         — Allan 2026-05-17
+    double sigma_a_{1.63e-3};   // accel noise density (m/s^2/sqrt(Hz))        — Allan 2026-05-17
+    double sigma_bg_{1.0e-5};   // gyro bias RW — Allan 7.46e-7, raised 13× for init-error tolerance
+    double sigma_ba_{2.0e-3};   // accel bias RW — Allan 5.41e-4, raised 3.7× for init-error tolerance
+    /* SUPERSEDED 2026-05-17 — Allan calibration replaced the uncalibrated
+       placeholders. Kept for archival; do not re-enable without re-running
+       a fresh stationary recording.
+    double sigma_g_{0.01};      // gyro noise density (rad/s/sqrt(Hz))   — UNCALIBRATED
+    double sigma_a_{0.1};       // accel noise density (m/s^2/sqrt(Hz))  — UNCALIBRATED
+    double sigma_bg_{0.0001};   // gyro random walk                       — UNCALIBRATED
+    double sigma_ba_{0.001};    // accel random walk                      — UNCALIBRATED
+    */
+
+    // Constants
+    static constexpr double SIGMA_SCALE_RW = 0.001;
+    static constexpr double SIGMA_SCALE_MEAS = 0.1;
+
+    // Plan Step 3a (ADR-008): MSCKF damping + Huber state
+    int msckf_frames_since_call_{0};
+    int msckf_damping_step_{0};
+    int msckf_huber_rejected_count_{0};
+    int extr_log_skip_{0};
+
+    static constexpr int MSCKF_QUIET_PROPAGATION = 5;
+    static constexpr int MSCKF_DAMPING_RAMP_FRAMES = 5;
+    static constexpr double MSCKF_HUBER_DELTA = 2.4477;
+
+    double computeMSCKFDampingFactor() const;
+
+    // Plan Step 3b (ADR-009): SLAM feature internals
+    std::vector<SlamFeature> slam_features_;
+
+    // 2026-05-09 telemetry fix — see takeLastMarginalizedSlamFeatureIds().
+    std::vector<int> last_marginalized_slam_feature_ids_;
+
+    // Cached camera intrinsics for SLAM reprojection.
+    double slam_fx_{500.0};
+    double slam_fy_{500.0};
+    double slam_cx_{320.0};
+    double slam_cy_{240.0};
+
+    // Plan Step 6 (ADR-012): no-lock variant for re-entrant call sites.
+    void marginalizeOldestCloneNoLock();
+
+    int slamFeatureCovIdxInternal(int slot) const;
+    int slamBlockStart() const;
 };

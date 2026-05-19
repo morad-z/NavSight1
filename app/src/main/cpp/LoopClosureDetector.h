@@ -127,6 +127,28 @@ public:
     //                         p_now_world = R_world_cam_match *
     //                                       t_now_to_match
     //                                     + t_cam_world_match.
+    // 2026-05-13 Phase 1 Step 5 (post_v19_sprint_plan.md): apply a 4-DOF
+    // correction (Δp, Δyaw) to a stored keyframe's pose, in place.
+    //
+    // After PoseGraph::optimize() runs at LC accept, each keyframe between
+    // K_match and K_now gets a per-node correction. This method writes those
+    // corrections back into the stored keyframe DB so:
+    //   * Future BoW matches resolve against corrected poses (not pre-drift)
+    //   * PnP at revisit operates on consistent 3D points + reference pose
+    //   * The heading gate uses the corrected yaw_rad
+    //
+    // Convention: Δp is added to t_cam_world (Z-up world meters). Δyaw is
+    // applied as a left-multiplication of R_world_cam by R_z(Δyaw), i.e.
+    // a rotation around world-Z. yaw_rad is incremented and wrapped to
+    // [-π, π]. The stored ORB descriptors / keypoints / pts3d_world are
+    // NOT touched — only the pose-frame they reference moves.
+    //
+    // Thread-safe: takes the internal mutex briefly while iterating the
+    // keyframe vector. Returns false if kf_id is unknown.
+    bool applyKeyframePoseCorrection(uint64_t kf_id,
+                                      double dx, double dy, double dz,
+                                      double dyaw);
+
     struct LoopMatch {
         uint64_t    matched_kf_id        = 0;
         double      bow_score            = 0.0;
@@ -172,6 +194,31 @@ public:
                        double current_yaw_rad,
                        LoopMatch& out_match);
 
+    // ── Phase 6.4c — Spatial pre-filter overload ──────────────────────────
+    //
+    // Same pipeline as tryDetectLoop above (adaptive BoW gate, heading,
+    // BFMatcher Lowe ratio, PnP-RANSAC), but the DBoW2 query is restricted
+    // to keyframes whose kf_id appears in `candidate_kf_ids`. Use this when
+    // the caller has a position estimate and wants to suppress geographic
+    // false positives (visually-similar places that are physically far).
+    //
+    // Pass an EMPTY `candidate_kf_ids` to fall back to the full-database
+    // search semantics of tryDetectLoop (a safety net for when the
+    // LandmarkMap is still seeding or for queries far from any mapped
+    // landmark). The caller is responsible for counting fallbacks via the
+    // EventCounters loop_closure_spatial_* fields.
+    //
+    // Thread-safe: same locking as tryDetectLoop.
+    bool tryDetectLoopWithCandidates(
+        uint64_t now_kf_id, int64_t now_ns,
+        const cv::Mat& descriptors,
+        const std::vector<cv::KeyPoint>& keypoints,
+        double fx, double fy, double cx, double cy,
+        int64_t temporal_exclusion_ns,
+        double current_yaw_rad,
+        const std::vector<uint64_t>& candidate_kf_ids,
+        LoopMatch& out_match);
+
     // ── Step 7.1 — Geometric loop closure (additive to BoW) ────────────────
     //
     // Direction-invariant detection that bypasses ORB descriptors entirely.
@@ -184,8 +231,12 @@ public:
     //      predicted current camera (predicted_R_world_cam, predicted_t_cam_world).
     //   3. Reject candidates with < kGeomMinInFrame projections in-frame
     //      with positive depth in [0.5, 50] m.
-    //   4. NN-match each in-frame projection to the closest current KLT
-    //      corner within kGeomMatchRadiusPx px.
+    //   4. For each in-frame projection: find current ORB keypoints within
+    //      kGeomMatchRadiusPx px, pick the one with min Hamming distance
+    //      to the stored keyframe descriptor. Reject pair if min Hamming
+    //      > kGeomDescriptorMaxDistance. 2026-05-13 Step 7.1 fix: replaces
+    //      the appearance-blind KLT-corner NN that admitted false positives
+    //      in low-texture scenes.
     //   5. solvePnPRansac on the (3D world, 2D current image) pairs; same
     //      thresholds as the BoW path.
     //   6. Build LoopMatch identical to the BoW return value so the EKF
@@ -202,9 +253,21 @@ public:
     //
     //   now_kf_id                 caller-assigned id for the query frame
     //   now_ns                    monotonic-clock timestamp of query frame
-    //   current_klt_corners       KLT-tracked corners in the current frame
-    //                             (image px). Must already be undistorted /
-    //                             match the same intrinsics as `fx,fy,cx,cy`.
+    //   current_descriptors       CV_8U Nx32 ORB descriptors for the current
+    //                             frame (same matrix the BoW path consumes).
+    //                             2026-05-13 Step 7.1 fix: replaces
+    //                             current_klt_corners. The KLT-corner NN
+    //                             matcher admitted appearance-blind
+    //                             correspondences in low-texture indoor
+    //                             scenes (v24 walk: geom accept with r_R=37°
+    //                             passed chi² because var_p was inflated by
+    //                             drift_path). Hamming verification against
+    //                             stored ORB descriptors gates that out per
+    //                             ORB-SLAM3 standard (plan Step 6 line 280).
+    //   current_keypoints         per-row keypoints aligned with
+    //                             current_descriptors (size ==
+    //                             current_descriptors.rows). The keypoint's
+    //                             .pt is the 2D pixel used in the PnP pair.
     //   predicted_R_world_cam     EKF's predicted current camera→world
     //                             rotation. For NavSight: ekf.getRotation()
     //                             (R_GtoI = world→body) inverted ×
@@ -222,7 +285,8 @@ public:
     //   out_match                 populated on success.
     bool tryDetectLoopGeometric(
         uint64_t now_kf_id, int64_t now_ns,
-        const std::vector<cv::Point2f>& current_klt_corners,
+        const cv::Mat& current_descriptors,
+        const std::vector<cv::KeyPoint>& current_keypoints,
         const cv::Matx33d& predicted_R_world_cam,
         const cv::Vec3d&   predicted_t_cam_world,
         double fx, double fy, double cx, double cy,
@@ -239,6 +303,18 @@ public:
     bool isReady() const;
 
 private:
+    // Phase 6.4c — shared core. If `candidate_kf_ids` is non-empty, BoW
+    // results are intersected against it before geometric verification.
+    bool tryDetectLoopImpl(
+        uint64_t now_kf_id, int64_t now_ns,
+        const cv::Mat& descriptors,
+        const std::vector<cv::KeyPoint>& keypoints,
+        double fx, double fy, double cx, double cy,
+        int64_t temporal_exclusion_ns,
+        double current_yaw_rad,
+        const std::vector<uint64_t>* candidate_kf_ids,
+        LoopMatch& out_match);
+
     // PIMPL-ish: DBoW2 types are template-heavy and dragging them into
     // this header forces every Tracker translation unit to recompile
     // when third_party/DBoW2 changes. Keep the BoW types behind a forward

@@ -1,0 +1,12 @@
+numpy>=1.24
+Pillow>=10.0
+huggingface-hub>=0.24
+transformers>=4.40
+onnx>=1.16
+onnxruntime>=1.18
+onnx2tf>=1.22
+tensorflow>=2.16
+# Note: install torch + torchvision separately with the CUDA wheel index, e.g.
+#   pip install torch torchvision --index-url https://download.pytorch.org/whl/cu126
+# This file does NOT pin torch because the user has Python 3.13 and an RTX 4070
+# SUPER — needs the CUDA-12 wheels from pytorch.org, not the CPU PyPI wheel.

@@ -48,6 +48,9 @@ object NativeBridge {
     external fun setDepthMap(depthData: FloatArray, width: Int, height: Int)
     external fun setIntrinsics(fx: Double, fy: Double, cx: Double, cy: Double)
     external fun setInitialHeading(azimuthRad: Double)
+    // 2026-05-13 heading-startup fix: seed Madgwick yaw without waiting
+    // for VIO init. Safe to call multiple times (re-init on each call).
+    external fun seedMadgwickYaw(yawRad: Double)
     external fun setUserHeight(heightM: Float)
     // DEAD CODE: never called from Kotlin — mag heading is captured via orientationTracker at init, not via this JNI
     // external fun setMagnetometerHeading(yawRad: Float)
@@ -112,11 +115,14 @@ object NativeBridge {
     external fun getLastTrackedPointAges(out: IntArray): Int
 
     // Phase 3: flat snapshot of currently-active SLAM features.
-    // Layout per feature (4 floats): [feature_id, world_x, world_y, world_z]
-    // in Y-up world frame (X=East, Y=Up, Z=North) — same convention as the
-    // existing Kotlin pose pipeline. Returns the number of features written
-    // (≤ out.size / 4). Caller preallocates FloatArray(48) (4 ×
-    // MAX_SLAM_FEATURES = 12). Returns 0 if EKF has no SLAM features yet.
+    // Audit Finding 8 (2026-05-16): KDoc previously said stride=4 / FloatArray(48)
+    // which was stale after v23.11 increased the stride from 4 → 7.
+    // Layout per feature (7 floats):
+    //   [feature_id, world_x, world_y, world_z, obs_u, obs_v, has_obs]
+    // in Y-up world frame (X=East, Y=Up, Z=North).
+    // Returns the number of features written (≤ out.size / 7).
+    // Caller preallocates FloatArray(7 * MAX_SLAM_FEATURES) = FloatArray(84).
+    // Returns 0 if EKF has no SLAM features yet.
     external fun getSlamSnapshot(out: FloatArray): Int
 
     // Phase 3: current camera pose for SLAM-point reprojection. 16 floats:
@@ -133,4 +139,17 @@ object NativeBridge {
     // "LOOP CLOSURE" flash banner. Lock-free atomic read — cheap to
     // call every frame.
     external fun getLoopClosureCorrectionsApplied(): Long
+
+    // ── Phase 1 Step 6 (post_v19_sprint_plan.md §205-298): LandmarkMap snapshot
+    //
+    /**
+     * Returns the persistent LandmarkMap snapshot. Float array with stride 5:
+     *   [0]=id, [1]=x (Y-up), [2]=y (Y-up), [3]=z (Y-up),
+     *   [4]=observed_this_frame (1.0 if matched in the most recent keyframe, 0.0 otherwise).
+     *
+     * Empty array if VIO is not initialized or the map is empty.
+     *
+     * @see app/src/main/cpp/native-lib.cpp getLandmarkSnapshot
+     */
+    external fun getLandmarkSnapshot(): FloatArray
 }

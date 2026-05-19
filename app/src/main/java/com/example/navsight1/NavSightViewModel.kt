@@ -398,7 +398,8 @@ class NavSightViewModel(application: Application) : AndroidViewModel(application
 
     fun toggleSimulationRecording(getExternalFilesDir: (String?) -> java.io.File?, filesDir: java.io.File) {
         if (!isRecordingSimulation) {
-            simulationDataPoints.clear()
+            // Use same monitor as saveSimulationData for consistency (Finding 11 fix).
+            synchronized(simulationDataPoints) { simulationDataPoints.clear() }
             simFrameStats = null
             // Zero the native EventCounters so this recording's
             // event_summary reflects only what happened during the walk.
@@ -581,7 +582,13 @@ class NavSightViewModel(application: Application) : AndroidViewModel(application
         val recorderToStop = if (isRecordingSimulation) {
             sensorRepository.setFrameRecorder(null)
             isRecordingSimulation = false
-            simulationDataPoints.clear()
+            // Audit Finding 11 (2026-05-16): simulationDataPoints.clear() was
+            // called on the main thread without synchronization. saveSimulationData
+            // on the IO thread uses synchronized(simulationDataPoints) { toList() }.
+            // Two threads mutating the same ArrayList concurrently → ConcurrentModificationException.
+            // Fix: use the same monitor object as the read site.
+            synchronized(simulationDataPoints) { simulationDataPoints.clear() }
+            Log.i("NavSightViewModel", "resetAll: simulationDataPoints cleared under lock (Finding 11 fix)")
             simFrameRecorder.also {
                 simFrameRecorder = null
                 simFrameStats = null

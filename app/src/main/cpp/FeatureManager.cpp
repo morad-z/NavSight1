@@ -1,5 +1,6 @@
 #include "FeatureManager.h"
 #include "EventCounters.h"
+#include "LensCorrector.h"
 #include <opencv2/video/tracking.hpp>
 #include <algorithm>
 #include <cmath>
@@ -396,6 +397,14 @@ void FeatureManager::setSlamSlot(int feature_id, int slam_slot) {
     lc.slam_slot = slam_slot;
     if (slam_slot < 0) {
         lc.rms_bad_consecutive = 0;
+        // 2026-05-12: clear stale RMS so a track that survived demotion
+        // can re-qualify for promotion. Otherwise the getPromotable
+        // Features gate (FeatureManager.cpp:440) sees the high RMS that
+        // got the feature demoted in the first place and excludes it
+        // permanently — even though rms_bad_consecutive was reset.
+        // Cost: zero; the SLAM RMS update path overwrites this on the
+        // first frame after a successful re-promotion.
+        lc.last_rms_px = 0.0;
     }
     // Step 9 (ADR-014) — SLAM lifetime histogram.
     if (prev_slot < 0 && slam_slot >= 0) {
@@ -417,9 +426,17 @@ void FeatureManager::setSlamSlot(int feature_id, int slam_slot) {
 }
 
 std::vector<int> FeatureManager::getPromotableFeatures(
+        const std::vector<int>& window_clone_ids,
         int min_obs, int min_kf, double max_init_rms_px) const {
     std::vector<int> out;
     out.reserve(8);
+    // 2026-05-12: build an in-window clone-id lookup. Promotion candidates
+    // must have ≥2 observations whose clone is still in the sliding window;
+    // raw age is insufficient because pruneObservations strips out-of-window
+    // entries every frame.
+    std::unordered_set<int> window_set(window_clone_ids.begin(),
+                                        window_clone_ids.end());
+    std::lock_guard<std::mutex> lock(snapshot_mutex_);
     for (const auto& [fid, lc] : lifecycle_) {
         if (lc.slam_slot >= 0)               continue;     // already promoted
         if (lc.age      < min_obs)           continue;
@@ -438,28 +455,83 @@ std::vector<int> FeatureManager::getPromotableFeatures(
         // un-triangulated candidates through means the promotion path
         // gets a chance to triangulate them itself.
         if (lc.last_rms_px > max_init_rms_px && lc.last_rms_px > 0.0) continue;
+        // 2026-05-12: count observations whose clone is still in the EKF
+        // window. Need ≥2 to support the triangulation loop's anchor+far
+        // requirement. This is the structural fix that unblocks the
+        // promotion starvation pattern (13 promotes in 4 min vs v22's 65).
+        auto track_it = active_tracks_.find(fid);
+        if (track_it == active_tracks_.end()) continue;
+        int in_window = 0;
+        for (const auto& obs : track_it->second) {
+            if (window_set.count(obs.clone_state_id)) {
+                if (++in_window >= 2) break;
+            }
+        }
+        if (in_window < 2) continue;
         out.push_back(fid);
     }
     return out;
 }
 
-void FeatureManager::markSlamFeatureRMS(int feature_id, double rms_px) {
+void FeatureManager::markSlamFeatureRMS(int feature_id, double rms_px,
+                                          float obs_u, float obs_v,
+                                          bool has_obs) {
     // Plan Step 6 (ADR-012): writes lifecycle_ on the camera thread.
     std::lock_guard<std::mutex> lock(snapshot_mutex_);
     auto it = lifecycle_.find(feature_id);
     if (it == lifecycle_.end()) return;
     it->second.last_rms_px = rms_px;
-    if (rms_px > 3.0) {
+    if (has_obs) {
+        it->second.last_obs_u = obs_u;
+        it->second.last_obs_v = obs_v;
+        it->second.has_last_obs = true;
+    }
+    // v23.10 (2026-05-11): loosened RMS gate further from 8 px → 20 px.
+    // Walking motion gives larger transient residuals (camera rotates
+    // during steps, brief out-of-distortion observations). v23.8 walk
+    // showed many features at 12-18 px RMS getting demoted within 3
+    // frames; user reports "dots disappear so fast even on walks". The
+    // 20 px gate still catches outright broken features (50+ px residuals
+    // from triangulation explosion) but tolerates the normal walking
+    // residual band. Combined with v23.6 parallax update gate to prevent
+    // depth runaway, this lets features stay alive long enough to be
+    // useful for loop closure.
+    if (rms_px > 20.0) {
         it->second.rms_bad_consecutive++;
     } else {
         it->second.rms_bad_consecutive = 0;
     }
 }
 
+void FeatureManager::noteSlamLastObs(int feature_id, float u, float v) {
+    std::lock_guard<std::mutex> lock(snapshot_mutex_);
+    auto it = lifecycle_.find(feature_id);
+    if (it == lifecycle_.end()) return;
+    it->second.last_obs_u = u;
+    it->second.last_obs_v = v;
+    it->second.has_last_obs = true;
+}
+
+bool FeatureManager::getSlamFeatureLastObs(int feature_id,
+                                            float& u, float& v) const {
+    std::lock_guard<std::mutex> lock(snapshot_mutex_);
+    auto it = lifecycle_.find(feature_id);
+    if (it == lifecycle_.end()) return false;
+    if (!it->second.has_last_obs) return false;
+    u = it->second.last_obs_u;
+    v = it->second.last_obs_v;
+    return true;
+}
+
 std::vector<int> FeatureManager::getDemoteCandidates() const {
     std::vector<int> out;
     for (const auto& [fid, lc] : lifecycle_) {
-        if (lc.slam_slot >= 0 && lc.rms_bad_consecutive >= 3) {
+        // v23.10: streak threshold raised from 3 → 6 frames. Combined
+        // with the wider 20 px RMS gate, this gives features ~0.4 s
+        // (at 14 FPS) of sustained bad residuals before demotion,
+        // tolerating brief walking-motion blips while still catching
+        // permanently-broken features within ~half a second.
+        if (lc.slam_slot >= 0 && lc.rms_bad_consecutive >= 6) {
             out.push_back(fid);
         }
     }
@@ -558,7 +630,8 @@ void FeatureManager::storeKeyframeDescriptors(
         double ts_ns,
         const cv::Mat& gray,
         const std::vector<cv::Point2f>& corner_pts,
-        const std::vector<int>& corner_feature_ids) {
+        const std::vector<int>& corner_feature_ids,
+        const LensCorrector* lens) {
 
     if (gray.empty()) return;
     if (gray.type() != CV_8UC1) return;
@@ -593,6 +666,19 @@ void FeatureManager::storeKeyframeDescriptors(
     rec.timestamp_ns = ts_ns;
     orb_extractor_->detectAndCompute(blurred, cv::noArray(),
                                      rec.keypoints, rec.descriptors);
+    // 2026-05-19 ORB_KP0 diag: when ORB returns 0 keypoints, log image stats
+    // so we can see if the camera frame was uniform/dark vs ORB threshold too
+    // strict. v53 had 36% of KFs with kp=0; sample reveals whether ORB needs
+    // tuning or the image content is the limit.
+    if (rec.keypoints.empty()) {
+        cv::Scalar mean_s, stddev_s;
+        cv::meanStdDev(blurred, mean_s, stddev_s);
+        LOGI("ORB_KP0: kf=%llu mean=%.1f stddev=%.1f w=%d h=%d "
+             "fast_thresh=%d target_features=%d",
+             (unsigned long long)kf_id, mean_s[0], stddev_s[0],
+             blurred.cols, blurred.rows,
+             ORB_FAST_THRESHOLD, ORB_TARGET_FEATURES);
+    }
 
     // Inherit FeatureManager ids from the supplied tracked KLT corners by
     // spatial proximity (≤ ORB_KLT_MATCH_RADIUS). corner_pts /
@@ -615,6 +701,36 @@ void FeatureManager::storeKeyframeDescriptors(
                 }
             }
             rec.feature_ids[k] = best_fid;
+        }
+    }
+
+    // 2026-05-19 — ORB-distortion root cause fix.
+    //
+    // Populate `keypoints_ud` with lens-undistorted keypoint positions so
+    // every downstream math consumer (LandmarkMap triangulation, MSCKF
+    // observation, local-map match, LC PnP) projects through the linear
+    // pinhole intrinsics K with pixels that LIVE IN THE SAME SPACE. The
+    // raw ORB keypoint positions in `keypoints` are biased by lens
+    // distortion (5-20 px at image edges for calibrated S21 Ultra coeffs);
+    // mixing them with K → cm-scale 3D position error per landmark, which
+    // is the dominant source of orange-dot drift the user has been
+    // reporting.
+    //
+    // If `lens` is null OR the lens isn't calibrated, fall through to a
+    // straight copy. Consumers can read keypoints_ud unconditionally; the
+    // "lens passthrough when uncalibrated" path means the new field is at
+    // worst a copy of the raw keypoints (legacy behaviour preserved).
+    rec.keypoints_ud = rec.keypoints;
+    if (lens && lens->isReady() && lens->hasDistortion() &&
+        !rec.keypoints_ud.empty()) {
+        std::vector<cv::Point2f> raw_pts;
+        raw_pts.reserve(rec.keypoints_ud.size());
+        for (const auto& kp : rec.keypoints_ud) raw_pts.push_back(kp.pt);
+        lens->undistortPoints(raw_pts);
+        // Re-write into keypoints_ud (size guaranteed equal — undistortPoints
+        // preserves cardinality even if internally swaps containers).
+        for (size_t i = 0; i < rec.keypoints_ud.size() && i < raw_pts.size(); ++i) {
+            rec.keypoints_ud[i].pt = raw_pts[i];
         }
     }
 

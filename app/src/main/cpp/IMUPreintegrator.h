@@ -146,6 +146,14 @@ public:
     // was corrupted by centripetal acceleration during fast rotation.
     // Returns (q0=w, q1=x, q2=y, q3=z).
     void getOrientationQuaternion(double& q0, double& q1, double& q2, double& q3) const;
+
+    // 2026-05-16 v27 fix: returns Madgwick's current orientation as R_GtoI
+    // (world→body, 3x3 CV_64F). Empty cv::Mat if Madgwick is not yet
+    // initialized — caller should fall back. Composed directly from the
+    // internal Hamilton quaternion: R_btw = R(q) (body→world), R_GtoI =
+    // R_btw^T. Used by Tracker to seed the EKF with full roll/pitch/yaw
+    // instead of the pure-yaw Rz(azimuth) that was historically passed.
+    cv::Mat getRotationGtoI() const;
     // Heading (yaw) in radians, CW-positive (navigation convention,
     // North=0, East=+π/2). Wraps to [-π, π].
     float getHeading() const;
@@ -163,6 +171,15 @@ public:
     // ignoring the magnetometer-derived setInitialHeading and starting at
     // yaw=0.
     void setInitialMadgwickYaw(float azimuth_rad_nav);
+
+    // 2026-05-18: ARCHITECTURAL FIX for loop-closure heading correction.
+    // Without this, LC corrects EKF yaw (via updateAbsolutePose) but Madgwick
+    // keeps integrating gyro independently — so user-visible heading (read from
+    // getHeading = Madgwick) never benefits from LC corrections. Apply this in
+    // the LC consume path right after updateAbsolutePose succeeds; delta is the
+    // EKF yaw_after - yaw_before in nav convention. Implementation: left-mult
+    // the body→world quaternion by a world-Z rotation of equivalent magnitude.
+    void nudgeMadgwickYawAroundWorldZ(double delta_yaw_nav_rad);
 
 private:
     mutable std::mutex mutex_;
@@ -283,9 +300,20 @@ private:
     int64_t last_mag_update_ns_{0};
     static constexpr float HEADING_CORRECTION_DAMPING = 0.95f;  // Smooth fusion
 
-    // Noise parameters
+    // Noise parameters — CALIBRATED 2026-05-17 (Allan variance).
+    // Source: tests/sims/allan/imu_calibration_20260517_021657.csv
+    // Matches EKFState.h sigma_g_/sigma_a_/sigma_bg_/sigma_ba_; both filters
+    // must use the same noise model or the EKF and the preintegrator will
+    // disagree on the IMU's trustworthiness.
+    float accel_noise_sigma_{1.63e-3f};  // m/s^2/sqrt(Hz)
+    float gyro_noise_sigma_{1.98e-4f};   // rad/s/sqrt(Hz)
+    float accel_rw_sigma_{5.41e-4f};     // m/s^2/sqrt(s)
+    float gyro_rw_sigma_{7.46e-7f};      // rad/s/sqrt(s)
+    /* SUPERSEDED 2026-05-17 — uncalibrated placeholders replaced by
+       Allan-variance measurements. Kept for archival.
     float accel_noise_sigma_{0.1f};   // m/s^2/sqrt(Hz)
     float gyro_noise_sigma_{0.01f};    // rad/s/sqrt(Hz)
     float accel_rw_sigma_{0.001f};     // m/s^3/sqrt(Hz)
     float gyro_rw_sigma_{0.0001f};     // rad/s^2/sqrt(Hz)
+    */
 };

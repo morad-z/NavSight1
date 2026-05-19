@@ -16,6 +16,7 @@ import kotlinx.coroutines.*
 import kotlinx.coroutines.flow.MutableStateFlow
 import kotlinx.coroutines.flow.asStateFlow
 import kotlin.math.sqrt
+import java.util.concurrent.atomic.AtomicBoolean
 
 // Plan Step 7 (ADR-013): on-device filename for the ORB DBoW2 vocabulary.
 // SensorRepository.pushLoopClosureVocabularyToNative copies the ORB
@@ -119,6 +120,11 @@ class SensorRepository(private val context: Context) : SensorEventListener {
 
     // Depth estimation at ~1Hz for scale constraint
     private var depthExecutor: java.util.concurrent.ExecutorService = newDepthExecutor()
+    // Audit Finding 5 (2026-05-16): @Volatile required for ARM memory-model
+    // correctness. CameraX analyzer thread reads at the needsDepth gate;
+    // depthExecutor (or repositoryScope coroutine after Fix 2) writes in finally.
+    // Without @Volatile, the read and write may never synchronize on ARM's
+    // weak memory model — identical pattern to vioProcessing at line 79.
     @Volatile private var depthProcessing = false
     private var lastDepthTimeMs = 0L
 
@@ -139,6 +145,13 @@ class SensorRepository(private val context: Context) : SensorEventListener {
         if (depthEstimatorClosed) depthEstimator = newDepthEstimator()
     }
     private val DEPTH_THROTTLE_MS = 1000L // 1Hz depth — conservative for battery
+
+    // 2026-05-13 heading-startup fix: track whether Madgwick has been seeded
+    // with the compass yaw. Set on first valid compass reading (with no
+    // declination); flipped to "with declination" once GPS lands and the
+    // re-seed fires. Prevents repeated re-init calls flooding Madgwick.
+    private var madgwickYawSeeded = false
+    private var madgwickYawSeededWithDeclination = false
 
     private val _orientationState = MutableStateFlow(DeviceOrientationTracker.OrientationResult(
         pitch = 0f, roll = 0f, azimuth = 0f,
@@ -198,7 +211,9 @@ class SensorRepository(private val context: Context) : SensorEventListener {
     // does not allocate. The agesBuf trims via copyOf when fewer features
     // are returned. SLAM is bounded by MAX_SLAM_FEATURES = 12 (ADR-009).
     private val agesBuf = IntArray(512)
-    private val slamBuf = FloatArray(4 * 12)
+    // v23.11: stride increased from 4 → 7 floats per feature
+    // (fid, wx, wy, wz, obs_u, obs_v, has_obs).
+    private val slamBuf = FloatArray(7 * 12)
     private val cameraPoseBuf = FloatArray(16)
     private val emptyFloats = FloatArray(0)
     private val emptyInts = IntArray(0)
@@ -213,8 +228,14 @@ class SensorRepository(private val context: Context) : SensorEventListener {
     private var locationTokenSource: CancellationTokenSource? = null
 
     // VIO Init state
-    var wasVioInitialized = false
-        private set
+    // Audit Finding 7 (2026-05-16): TOCTOU race — handleVioInitialized runs on
+    // NavSight-VIO thread and checks-then-sets wasVioInitialized. Plain var with
+    // @Volatile does NOT make check-then-set atomic; two rapid VIO-init callbacks
+    // can both pass the `!wasVioInitialized` guard and call setInitialHeading twice
+    // (explains "3 EKF re-inits" in v26 logcat). AtomicBoolean.compareAndSet(false,
+    // true) is the only correct fix for this TOCTOU.
+    private val _wasVioInitialized = AtomicBoolean(false)
+    val wasVioInitialized: Boolean get() = _wasVioInitialized.get()
     var vioInitAzimuth = 0f
         private set
 
@@ -272,7 +293,16 @@ class SensorRepository(private val context: Context) : SensorEventListener {
                 pushStoredCalibrationToNative()
                 pushCameraIntrinsicsToNative()
                 pushLoopClosureVocabularyToNative()
-                pushExtrinsicsRotationToNative()   // Step 8b
+                // 2026-05-18 DISABLED: Kotlin Rz(-θ)*R_bc_default math produces
+                // R_bc that's 90° from correct diag(1,-1,-1) for SENSOR_ORIENTATION=90
+                // (S21 Ultra back camera). v40 walk confirmed extrinsics_rotation_angle
+                // _mdeg = 90000, MSCKF chi² rejection rate 44%, LC rotation residual
+                // up to 57° late in the walk. The C++ compile-time default
+                // diag(1,-1,-1) at EKFState.cpp:63 is the correct value for this
+                // device; the Kotlin push was a 2026-05-11 (v23.8) "fix" that
+                // moved the bug instead of fixing it. Re-enable only after
+                // re-deriving the math against a non-90°-orientation device.
+                // pushExtrinsicsRotationToNative()   // Step 8b
                 startInitStatusPoller()
             } else {
                 Log.e(TAG, "Cannot start VIO: native library not loaded")
@@ -429,7 +459,25 @@ class SensorRepository(private val context: Context) : SensorEventListener {
             )
 
             // R_bc_default row-major: [1,0,0, 0,-1,0, 0,0,-1]
-            // R_bc = R_bc_default * Rz(-θ)  (matrix multiply 3×3)
+            //
+            // v23.8 (2026-05-11): switched composition from RIGHT-multiply
+            // (R_bc = R_bc_default * Rz(-θ)) to LEFT-multiply
+            // (R_bc = Rz(-θ) * R_bc_default).
+            //
+            // The sensor rotation is a transformation IN THE CAMERA FRAME
+            // (sensor mounted rotated θ° in the phone). The correct
+            // composition is therefore left-multiplication: first map
+            // body → un-rotated camera via R_bc_default, then apply the
+            // camera-frame rotation Rz(-θ).
+            //
+            // Right-multiply (the previous code) instead rotated the BODY
+            // input by -θ before the default mapping, which produces a
+            // mirror-image R_bc with opposite signs on the off-diagonal
+            // entries. Diagnostic: v23.6 had the sensor-rotation applied
+            // via right-multiply and user reported phone-L/R → dots-U/D
+            // (90° axis swap). v23.7 force-defaulted R_bc and the symptom
+            // persisted (because sensor IS rotated 90° physically). v23.8
+            // applies the rotation in the correct frame.
             val def = floatArrayOf(
                 1f,  0f,  0f,
                 0f, -1f,  0f,
@@ -440,14 +488,16 @@ class SensorRepository(private val context: Context) : SensorEventListener {
                 for (col in 0..2) {
                     var sum = 0f
                     for (k in 0..2) {
-                        sum += def[row * 3 + k] * rz[k * 3 + col]
+                        // LEFT-multiply: R_bc = Rz(-θ) * R_bc_default
+                        // out[r,c] = sum_k rz[r,k] * def[k,c]
+                        sum += rz[row * 3 + k] * def[k * 3 + col]
                     }
                     R_bc[row * 3 + col] = sum
                 }
             }
 
             NativeBridge.nativeSetExtrinsicsRotation(R_bc)
-            Log.i(TAG, "Extrinsics R_bc seeded from SENSOR_ORIENTATION=${sensorOrientation}°")
+            Log.i(TAG, "Extrinsics R_bc seeded from SENSOR_ORIENTATION=${sensorOrientation}° via LEFT-multiply (v23.8)")
         } catch (e: Throwable) {
             Log.e(TAG, "pushExtrinsicsRotationToNative failed: ${e.message}", e)
         }
@@ -575,17 +625,16 @@ class SensorRepository(private val context: Context) : SensorEventListener {
             }
             
             locationCallback?.let {
-                // Use safe location request with proper permission checks
-                if (android.os.Build.VERSION.SDK_INT >= android.os.Build.VERSION_CODES.S) {
-                    fusedLocationClient.requestLocationUpdates(
-                        request, it, android.os.Looper.getMainLooper()
-                    )
-                } else {
-                    @Suppress("MissingPermission")
-                    fusedLocationClient.requestLocationUpdates(
-                        request, it, android.os.Looper.getMainLooper()
-                    )
-                }
+                // Audit Finding 4 (2026-05-16): both API-31+ and pre-31 branches
+                // made identical requestLocationUpdates calls — the version split
+                // served no purpose and the @Suppress hid a real SecurityException
+                // risk if permission is revoked between check and call. Collapsed
+                // to one call; SecurityException is already caught by the outer
+                // try/catch and logged.
+                @Suppress("MissingPermission")  // guarded by granted param check above
+                fusedLocationClient.requestLocationUpdates(
+                    request, it, android.os.Looper.getMainLooper()
+                )
             }
             Log.d(TAG, "GPS updates started for simulation")
         } catch (e: SecurityException) {
@@ -729,6 +778,45 @@ class SensorRepository(private val context: Context) : SensorEventListener {
             lastOrientationUpdateNs = ts
             val orientation = orientationTracker.getOrientation()
             _orientationState.value = orientation
+
+            // 2026-05-13 heading-startup fix: seed Madgwick's yaw the moment
+            // the compass is stable, DECOUPLED from vio.isInitialized.
+            //
+            // Before this fix, the only path that pushed compass heading to
+            // Madgwick was handleVioInitialized → setInitialHeading, gated on
+            // the EKF static-init period (1-3 s). Until then Madgwick ran with
+            // its default yaw seed of 0 (North), so scalar_heading_ (which
+            // Tracker.cpp:1748 reads from imu.getHeading()) showed 0 regardless
+            // of actual orientation. The radar rotated in place when phone was
+            // still because gyro integration accumulates from yaw=0 with bias
+            // noise. User symptom: "after a few seconds heading starts tracking
+            // correctly" — the few seconds = VIO init duration.
+            //
+            // Fires twice at most: once on first valid compass reading
+            // (declination=0 if GPS not yet fixed), again with declination
+            // applied if GPS lands later. Both fires call into Madgwick's
+            // idempotent re-init path.
+            val az = orientation.azimuth
+            if (az.isFinite() && !madgwickYawSeededWithDeclination) {
+                val haveLoc = _startLocation.value != null
+                if (haveLoc || !madgwickYawSeeded) {
+                    var declinationDeg = 0f
+                    val loc = _startLocation.value
+                    if (loc != null) {
+                        val geoField = android.hardware.GeomagneticField(
+                            loc.latitude.toFloat(), loc.longitude.toFloat(), 0f,
+                            System.currentTimeMillis()
+                        )
+                        declinationDeg = geoField.declination
+                    }
+                    val correctedAz = az + declinationDeg
+                    val yawRad = Math.toRadians(correctedAz.toDouble())
+                    NativeBridge.seedMadgwickYaw(yawRad)
+                    Log.i(TAG, "Madgwick yaw seeded early: az=${az}° + decl=${declinationDeg}° = ${correctedAz}° (haveLoc=$haveLoc)")
+                    madgwickYawSeeded = true
+                    if (haveLoc) madgwickYawSeededWithDeclination = true
+                }
+            }
         }
     }
 
@@ -883,37 +971,53 @@ class SensorRepository(private val context: Context) : SensorEventListener {
         if (yBytesForDepth != null) {
             depthProcessing = true
             lastDepthTimeMs = nowMs
-            try {
-                depthExecutor.execute {
-                    try {
-                        val bitmap = android.graphics.Bitmap.createBitmap(w, h, android.graphics.Bitmap.Config.ARGB_8888)
-                        val pixels = IntArray(w * h)
-                        for (i in yBytesForDepth.indices) {
-                            val lum = yBytesForDepth[i].toInt() and 0xFF
-                            pixels[i] = (0xFF shl 24) or (lum shl 16) or (lum shl 8) or lum
-                        }
-                        bitmap.setPixels(pixels, 0, w, 0, 0, w, h)
-                        val depthMap = kotlinx.coroutines.runBlocking { depthEstimator.estimateDepth(bitmap) }
-                        if (depthMap != null) {
-                            NativeBridge.setDepthMap(depthMap, 256, 256)
-                        }
-                        bitmap.recycle()
-                    } catch (e: Exception) {
-                        Log.e(TAG, "Depth processing error: ${e.message}")
-                    } finally {
-                        depthProcessing = false
+            // Audit Finding 2 (2026-05-16): the prior code bridged from the
+            // depthExecutor thread into coroutines via runBlocking, which:
+            //   1. Swallows CancellationException (coroutine cancellation is lost).
+            //   2. Burns a thread-pool thread while waiting on inferenceDispatcher.
+            //   3. Serially couples two executor contexts unnecessarily.
+            // Fix: launch a coroutine directly in repositoryScope.
+            // DepthEstimator.estimateDepth is already a suspend fun that dispatches
+            // to its own inferenceDispatcher internally — no bridge needed.
+            // depthExecutor still exists for backwards-compat (ensureExecutorsAlive
+            // recreates it) but is no longer used for the depth pipeline.
+            // Cancellation propagates normally; a cancelled scope simply does not
+            // call setDepthMap, leaving the previous depth map in effect (safe).
+            repositoryScope.launch(Dispatchers.Default) {
+                try {
+                    val bitmap = android.graphics.Bitmap.createBitmap(w, h, android.graphics.Bitmap.Config.ARGB_8888)
+                    val pixels = IntArray(w * h)
+                    for (i in yBytesForDepth.indices) {
+                        val lum = yBytesForDepth[i].toInt() and 0xFF
+                        pixels[i] = (0xFF shl 24) or (lum shl 16) or (lum shl 8) or lum
                     }
+                    bitmap.setPixels(pixels, 0, w, 0, 0, w, h)
+                    // estimateDepth is a suspend fun; it handles its own
+                    // inferenceDispatcher internally — no runBlocking needed.
+                    val depthMap = depthEstimator.estimateDepth(bitmap)
+                    if (depthMap != null) {
+                        NativeBridge.setDepthMap(depthMap, 256, 256)
+                    }
+                    bitmap.recycle()
+                } catch (e: CancellationException) {
+                    // Coroutine was cancelled (e.g. stopSensors) — rethrow so
+                    // structured concurrency propagates cancellation correctly.
+                    throw e
+                } catch (e: Exception) {
+                    Log.e(TAG, "Depth processing error: ${e.message}")
+                } finally {
+                    depthProcessing = false
                 }
-            } catch (e: java.util.concurrent.RejectedExecutionException) {
-                Log.w(TAG, "depthExecutor rejected frame (executor shut down); dropping")
-                depthProcessing = false
             }
         }
     }
 
     private fun handleVioInitialized(vio: VioData) {
-        if (vio.isInitialized && !wasVioInitialized) {
-            wasVioInitialized = true
+        // Audit Finding 7 (2026-05-16): compareAndSet(false, true) is atomic —
+        // only the thread that wins the CAS proceeds into the heading-set block.
+        // Prevents double setInitialHeading + double magnetometer unregister.
+        if (vio.isInitialized && _wasVioInitialized.compareAndSet(false, true)) {
+            Log.i(TAG, "VIO initialized: setting initial heading (atomic CAS, no re-init possible)")
             vioInitAzimuth = _orientationState.value.azimuth
 
             // Apply magnetic declination correction if we have a GPS fix
@@ -1031,7 +1135,8 @@ class SensorRepository(private val context: Context) : SensorEventListener {
 
         // Phase 3: SLAM positions (Y-up world). Bounded by MAX_SLAM_FEATURES.
         val slamCount = NativeBridge.getSlamSnapshot(slamBuf)
-        val slamArr: FloatArray = if (slamCount > 0) slamBuf.copyOf(slamCount * 4)
+        // v23.11: stride 7 (fid, wx, wy, wz, obs_u, obs_v, has_obs).
+        val slamArr: FloatArray = if (slamCount > 0) slamBuf.copyOf(slamCount * 7)
         else emptyFloats
 
         // Phase 3: camera pose (Y-up world). Empty when EKF not ready.
@@ -1054,7 +1159,7 @@ class SensorRepository(private val context: Context) : SensorEventListener {
         NativeBridge.resetVIO()
         _vioState.value = VioData()
         orientationTracker.reset()
-        wasVioInitialized = false
+        _wasVioInitialized.set(false)
         vioInitAzimuth = 0f
         consecutiveVioFailures = 0
         _showCameraBlocked.value = false
@@ -1090,13 +1195,24 @@ class SensorRepository(private val context: Context) : SensorEventListener {
         _currentLocation.value = null
         _showCameraBlocked.value = false
         _initStatus.value = InitStatus.WAIT_STATIONARY
-        wasVioInitialized = false
+        _wasVioInitialized.set(false)
         vioInitAzimuth = 0f
         consecutiveVioFailures = 0
         accelMagnitudeHistory.clear()
         intrinsicsInitialized = false
         calibratedIntrinsicsLoaded = false
         rollingShutterSkewNs = 0L
+        // Audit Finding 1 (2026-05-16): madgwickYawSeeded flags were NOT reset here,
+        // so after a "Rides" reset the 2026-05-13 heading-startup fix silently
+        // re-introduced itself: both flags stayed true, the early-seed block at
+        // onSensorChanged:780-797 exited immediately on every orientation update,
+        // and Madgwick was never re-seeded on the second session.
+        // Falsifier: after reset, expect "Madgwick yaw seeded early:" in logcat
+        // within the first compass reading. If absent (but present on cold-start),
+        // the bug is confirmed.
+        madgwickYawSeeded = false
+        madgwickYawSeededWithDeclination = false
+        Log.i(TAG, "resetAll: Madgwick yaw seed flags cleared (Finding 1 fix)")
         // Defensive: if a frame slipped between stopSensors's executor
         // shutdown and ensureExecutorsAlive's recreate, the per-frame
         // guards may have latched true. Reset here so the first new

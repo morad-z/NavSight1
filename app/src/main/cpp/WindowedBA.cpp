@@ -34,6 +34,7 @@
 // Therefore J_pose = [-J_proj*R, -J_proj*R*[q]_x] where q = p_w - t.
 
 #include "WindowedBA.h"
+#include "EventCounters.h"
 
 #include <algorithm>
 #include <chrono>
@@ -46,9 +47,11 @@
 #include <android/log.h>
 #define TAG "NavSight-BA"
 #define LOGI(...) __android_log_print(ANDROID_LOG_INFO,  TAG, __VA_ARGS__)
+#define LOGW(...) __android_log_print(ANDROID_LOG_WARN,  TAG, __VA_ARGS__)
 #define LOGE(...) __android_log_print(ANDROID_LOG_ERROR, TAG, __VA_ARGS__)
 #else
 #define LOGI(...) (void)0
+#define LOGW(...) (void)0
 #define LOGE(...) (void)0
 #endif
 
@@ -411,6 +414,9 @@ WindowedBA::Result WindowedBA::solve(std::vector<PoseObs>&    poses,
                 if (std::abs(det) < 1e-30) {
                     // landmark unobservable — set inv to small identity so
                     // the Schur reduction reduces to a pose-only step for it.
+                    LOGW("BA: singular landmark Hessian (det=%.3e < 1e-30) — regularizing with 1e6*I", det);
+                    navsight::eventCounters().ba_singular_landmarks.fetch_add(
+                        1, std::memory_order_relaxed);
                     Hll_inv[j] = cv::Matx33d::eye() * 1e6;
                     continue;
                 }

@@ -1,5 +1,6 @@
 #include "UpdaterMSCKF.h"
 #include "EKFState.h"
+#include "EventCounters.h"
 #include <cmath>
 #include <algorithm>
 
@@ -8,9 +9,11 @@
 #define TAG "NavSight-MSCKF"
 #define LOGI(...) __android_log_print(ANDROID_LOG_INFO,  TAG, __VA_ARGS__)
 #define LOGD(...) __android_log_print(ANDROID_LOG_DEBUG, TAG, __VA_ARGS__)
+#define LOGW(...) __android_log_print(ANDROID_LOG_WARN,  TAG, __VA_ARGS__)
 #else
 #define LOGI(...) (void)0
 #define LOGD(...) (void)0
+#define LOGW(...) (void)0
 #endif
 
 // ── Triangulation (DLT) ────────────────────────────────────────────────────
@@ -25,12 +28,19 @@ bool UpdaterMSCKF::triangulate(const LostFeature& feat, const EKFState& state,
 
     for (int i = 0; i < M; i++) {
         const auto& obs = feat.observations[i];
-        cv::Mat R_CtoG, p_C;
-        if (!state.getClonePose(obs.clone_state_id, R_CtoG, p_C)) return false;
+        cv::Mat R_GtoC, p_C;
+        if (!state.getClonePose(obs.clone_state_id, R_GtoC, p_C)) return false;
 
-        // Projection matrix P = K * [R | -R*p] but we use normalized coords
-        // so P = [R^T | -R^T * p] (3x4)
-        cv::Mat R_GtoC = R_CtoG.t();
+        // 2026-05-12: `getClonePose` returns the clone's R_GtoC = world→camera.
+        // Standard DLT for normalised image coordinates needs P = [R | -R*p]
+        // where R is world→camera. Previously this code transposed (R = R_CtoG.t())
+        // — which was a misnomer-driven bug: the local variable was misleadingly
+        // named R_CtoG but actually held world→camera, so .t() produced
+        // camera→world and the DLT system minimised the wrong projection model.
+        // Result: triangulated points came out in a rotated frame, the chirality
+        // check and feature Jacobian inherited the same wrong rotation, and
+        // every MSCKF feature update was injecting wrong-direction residuals
+        // into the EKF state. Removing the .t() restores the canonical form.
         cv::Mat t_GtoC = -R_GtoC * p_C;
         cv::Mat P(3, 4, CV_64F);
         R_GtoC.copyTo(P(cv::Range(0,3), cv::Range(0,3)));
@@ -56,11 +66,13 @@ bool UpdaterMSCKF::triangulate(const LostFeature& feat, const EKFState& state,
     pt3d_out.y = V.at<double>(1, 3) / w;
     pt3d_out.z = V.at<double>(2, 3) / w;
 
-    // Validate: check positive depth in all cameras
+    // Validate: check positive depth in all cameras.
+    // Same frame-fix as the DLT loop above — R_GtoC from getClonePose is
+    // already world→camera; do not transpose. pt_C = R_GtoC * (pt_world - p_cam_world)
+    // is then the point expressed in the camera's coordinate frame.
     for (const auto& obs : feat.observations) {
-        cv::Mat R_CtoG, p_C;
-        if (!state.getClonePose(obs.clone_state_id, R_CtoG, p_C)) return false;
-        cv::Mat R_GtoC = R_CtoG.t();
+        cv::Mat R_GtoC, p_C;
+        if (!state.getClonePose(obs.clone_state_id, R_GtoC, p_C)) return false;
         cv::Mat pt_G = (cv::Mat_<double>(3,1) << pt3d_out.x, pt3d_out.y, pt3d_out.z);
         cv::Mat pt_C = R_GtoC * (pt_G - p_C);
         if (pt_C.at<double>(2) <= 0.1) return false;  // Behind camera
@@ -86,16 +98,24 @@ void UpdaterMSCKF::getFeatureJacobian(const LostFeature& feat, const EKFState& s
 
     for (int i = 0; i < M; i++) {
         const auto& obs = feat.observations[i];
-        cv::Mat R_CtoG, p_C;
+        cv::Mat R_GtoC, p_C;
         // Use FEJ clone pose for Jacobians (observability preservation).
         // If the clone has been evicted between triangulation and Jacobian
         // construction, leave this row at zeros (contributes nothing to the
         // null-space projection or χ² gate) instead of running on
-        // uninitialised R_CtoG/p_C. Mirrors the guarded pattern at lines 29
+        // uninitialised R_GtoC/p_C. Mirrors the guarded pattern at lines 29
         // and 62 in triangulate().
-        if (!state.getCloneFEJ(obs.clone_state_id, R_CtoG, p_C)) continue;
+        // 2026-05-12: getCloneFEJ returns R_FEJ which is world→camera (same
+        // convention as R_GtoC after Option C). Do NOT transpose — the previous
+        // `R_GtoC = R_CtoG.t()` pattern was a variable-naming bug producing
+        // camera→world, which broke every MSCKF feature Jacobian. See companion
+        // fix in triangulate() above.
+        if (!state.getCloneFEJ(obs.clone_state_id, R_GtoC, p_C)) {
+            navsight::eventCounters().fej_clone_miss.fetch_add(1, std::memory_order_relaxed);
+            LOGW("getCloneFEJ miss: clone_state_id=%d evicted before Jacobian build", obs.clone_state_id);
+            continue;
+        }
 
-        cv::Mat R_GtoC = R_CtoG.t();
         cv::Mat p_f_C = R_GtoC * (p_f - p_C);  // Feature in camera frame
 
         double X = p_f_C.at<double>(0);
@@ -243,11 +263,20 @@ int UpdaterMSCKF::processLostFeatures(EKFState& state,
         S = S + sigma2 * cv::Mat::eye(dof, dof, CV_64F);
 
         cv::Mat S_inv;
-        if (!cv::invert(S, S_inv, cv::DECOMP_CHOLESKY)) continue;
+        if (!cv::invert(S, S_inv, cv::DECOMP_CHOLESKY)) {
+            navsight::eventCounters().msckf_inversion_failed.fetch_add(1, std::memory_order_relaxed);
+            LOGW("MSCKF: Cholesky inversion failed (NaN/Inf in feature covariance S)");
+            continue;
+        }
 
         cv::Mat chi2_mat = cv::Mat(res.t() * S_inv * res);
         double chi2 = chi2_mat.at<double>(0);
-        if (chi2 > getChi2Threshold(dof)) continue;
+        if (chi2 > getChi2Threshold(dof)) {
+            navsight::eventCounters().msckf_chi2_rejected.fetch_add(1, std::memory_order_relaxed);
+            LOGI("MSCKF: feature chi2=%.2f > threshold=%.2f (dof=%d) — rejected",
+                 chi2, getChi2Threshold(dof), dof);
+            continue;
+        }
 
         H_stack.push_back(H_x);
         r_stack.push_back(res);
@@ -280,9 +309,30 @@ int UpdaterMSCKF::processLostFeatures(EKFState& state,
     // Apply EKF update
     double sigma2 = options_.pixel_noise * options_.pixel_noise;
     cv::Mat R_noise = sigma2 * cv::Mat::eye(total_rows, total_rows, CV_64F);
+
+    // 2026-05-16 velocity-divergence diagnostic — capture state BEFORE update.
+    // If MSCKF chi² is rejecting nearly everything but the few that pass
+    // produce big position/velocity corrections in the right direction, we
+    // know the gate is over-tight. If passes produce no correction, the H
+    // Jacobian itself is wrong.
+    const cv::Mat v_pre = state.getVelocity().clone();
+    const cv::Mat p_pre = state.getPosition().clone();
+    const double  r_norm_pre = cv::norm(r_all);
+
     state.applyMSCKFUpdate(H_all, r_all, R_noise);
 
+    const cv::Mat v_post = state.getVelocity();
+    const cv::Mat p_post = state.getPosition();
+    const cv::Mat dv = v_post - v_pre;
+    const cv::Mat dp = p_post - p_pre;
+
     int used = static_cast<int>(H_stack.size());
-    LOGI("MSCKF: updated with %d features (%d measurement rows)", used, total_rows);
+    LOGI("MSCKF: updated with %d features (%d measurement rows) "
+         "r_norm=%.3f dv=(%+.3f,%+.3f,%+.3f) dp=(%+.3f,%+.3f,%+.3f) "
+         "|dv|=%.3f |dp|=%.3f",
+         used, total_rows, r_norm_pre,
+         dv.at<double>(0), dv.at<double>(1), dv.at<double>(2),
+         dp.at<double>(0), dp.at<double>(1), dp.at<double>(2),
+         cv::norm(dv), cv::norm(dp));
     return used;
 }

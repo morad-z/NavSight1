@@ -271,15 +271,53 @@ PreintegratedMeasurement IMUPreintegrator::integrate(int64_t start_ns, int64_t e
 
         double dt = (t_next - t_curr) * 1e-9;
         
+        // 2026-05-19 V-SHAPE ROOT CAUSE FIX.
+        //
+        // Cause:    The first iteration of this loop has gi == 0 and ai == 0,
+        //           because the loop never pre-advances them past start_ns.
+        //           With the original `if (gi > 0)` gate, w stayed at (0,0,0)
+        //           for the leading sub-interval [start_ns → first_sample_ts].
+        //           For a 500 Hz IMU this gap is up to ~2 ms; per camera frame
+        //           at ω ≈ 0.25 rad/s walking rate the missed rotation is
+        //           ~0.5 mrad = 0.029°. At 30 fps × 132 s = 3960 frames the
+        //           accumulated under-rotation reaches ~115° — exactly the
+        //           107° EKF-Madgwick gap observed in v50. Madgwick integrates
+        //           at IMU rate with no such leading gap, so it tracked truth
+        //           while EKF systematically fell behind.
+        //
+        // Change:   Initialise w (and a) from the FIRST sample in the window
+        //           (zero-order forward hold) instead of zero. The leading gap
+        //           gets the same gyro/accel as the sample that immediately
+        //           follows it — better than zero, and the standard
+        //           extrapolation when no prior sample is available.
+        //
+        // Falsifier: post-fix, the HEADING log M-EKF_gap should remain in
+        //           single-digit ° throughout a two-loop walk (was growing to
+        //           ~100°). Cumulative EKF rotation should match Madgwick's
+        //           within a few ° on a 2-loop walk (was off by 107°).
         cv::Mat w = (cv::Mat_<double>(3,1) << 0,0,0);
         cv::Mat a = (cv::Mat_<double>(3,1) << 0,0,0);
-        if (gi > 0) w = (cv::Mat_<double>(3,1) << g_samples[gi-1].x - gyro_bias_.x, 
-                                                 g_samples[gi-1].y - gyro_bias_.y, 
-                                                 g_samples[gi-1].z - gyro_bias_.z);
-        // Subtract accel bias (Bug #2: was missing — only gyro bias was subtracted)
-        if (ai > 0) a = (cv::Mat_<double>(3,1) << a_samples[ai-1].x - b_a_.x,
-                                                   a_samples[ai-1].y - b_a_.y,
-                                                   a_samples[ai-1].z - b_a_.z);
+        if (gi > 0) {
+            w = (cv::Mat_<double>(3,1) << g_samples[gi-1].x - gyro_bias_.x,
+                                          g_samples[gi-1].y - gyro_bias_.y,
+                                          g_samples[gi-1].z - gyro_bias_.z);
+        } else if (!g_samples.empty()) {
+            // Leading gap: zero-order forward hold from the first sample.
+            w = (cv::Mat_<double>(3,1) << g_samples[0].x - gyro_bias_.x,
+                                          g_samples[0].y - gyro_bias_.y,
+                                          g_samples[0].z - gyro_bias_.z);
+        }
+        if (ai > 0) {
+            a = (cv::Mat_<double>(3,1) << a_samples[ai-1].x - b_a_.x,
+                                          a_samples[ai-1].y - b_a_.y,
+                                          a_samples[ai-1].z - b_a_.z);
+        } else if (!a_samples.empty()) {
+            // Same forward-hold fix for accel (was also returning zero for
+            // the leading gap → under-integrated velocity / position).
+            a = (cv::Mat_<double>(3,1) << a_samples[0].x - b_a_.x,
+                                          a_samples[0].y - b_a_.y,
+                                          a_samples[0].z - b_a_.z);
+        }
 
         // ── Rotation: proper SO(3) via exponential map (Rodrigues) ──────────
         // Bug #1 fix: never add matrices on SO(3). Use R_new = R * Exp(w*dt).
@@ -747,6 +785,36 @@ void IMUPreintegrator::setInitialMadgwickYaw(float azimuth_rad_nav) {
          madgwick_init_.load() ? "re-initialized" : "pending accel");
 }
 
+void IMUPreintegrator::nudgeMadgwickYawAroundWorldZ(double delta_yaw_nav_rad) {
+    std::lock_guard<std::mutex> lock(mutex_);
+    if (!madgwick_init_.load()) return;
+    if (!std::isfinite(delta_yaw_nav_rad) || std::abs(delta_yaw_nav_rad) < 1e-6) return;
+
+    // Madgwick stores body→world quaternion q. getHeading returns yaw_nav
+    // (CW-positive North=0), while the internal q is Hamilton math convention
+    // (CCW-positive). yaw_nav = -yaw_math, so to add +Δ to yaw_nav we apply
+    // a world-frame Z rotation of α_math = -Δ. The world-frame rotation
+    // pre-multiplies (left-multiplies) the body→world q:
+    //   q_world_rot = (cos(α/2), 0, 0, sin(α/2))
+    //               = (cos(Δ/2), 0, 0, -sin(Δ/2))   substituting α = -Δ
+    //   q_new = q_world_rot ⊗ q_old   (Hamilton product)
+    const double cz = std::cos(delta_yaw_nav_rad * 0.5);
+    const double sz = std::sin(delta_yaw_nav_rad * 0.5);
+    // a=cz, b=0, c=0, d=-sz  applied to q=(q0,q1,q2,q3) via Hamilton product
+    const double q0n = cz * q0_ + sz * q3_;
+    const double q1n = cz * q1_ + sz * q2_;
+    const double q2n = cz * q2_ - sz * q1_;
+    const double q3n = cz * q3_ - sz * q0_;
+    q0_ = q0n; q1_ = q1n; q2_ = q2n; q3_ = q3n;
+    // Renormalise (Hamilton product of unit quats stays unit modulo float
+    // error, but normalise defensively).
+    const double n = std::sqrt(q0_*q0_ + q1_*q1_ + q2_*q2_ + q3_*q3_);
+    if (n > 1e-9) {
+        const double inv = 1.0 / n;
+        q0_ *= inv; q1_ *= inv; q2_ *= inv; q3_ *= inv;
+    }
+}
+
 void IMUPreintegrator::updateMadgwickLocked(int64_t timestamp_ns,
                                             float gx_raw, float gy_raw, float gz_raw) {
     if (!madgwick_init_.load()) {
@@ -853,6 +921,20 @@ void IMUPreintegrator::getOrientationQuaternion(double& q0, double& q1,
                                                 double& q2, double& q3) const {
     std::lock_guard<std::mutex> lock(mutex_);
     q0 = q0_; q1 = q1_; q2 = q2_; q3 = q3_;
+}
+
+cv::Mat IMUPreintegrator::getRotationGtoI() const {
+    std::lock_guard<std::mutex> lock(mutex_);
+    if (!madgwick_init_.load()) return cv::Mat();
+    // R_btw (body→world) from Hamilton quaternion (q0=w, q1=x, q2=y, q3=z).
+    // Standard formula, Sola "Quaternion kinematics" eq. 116. R_GtoI is
+    // world→body = R_btw^T.
+    const double q0 = q0_, q1 = q1_, q2 = q2_, q3 = q3_;
+    cv::Mat R_btw = (cv::Mat_<double>(3, 3) <<
+        1.0 - 2.0*(q2*q2 + q3*q3),  2.0*(q1*q2 - q0*q3),       2.0*(q1*q3 + q0*q2),
+        2.0*(q1*q2 + q0*q3),        1.0 - 2.0*(q1*q1 + q3*q3), 2.0*(q2*q3 - q0*q1),
+        2.0*(q1*q3 - q0*q2),        2.0*(q2*q3 + q0*q1),       1.0 - 2.0*(q1*q1 + q2*q2));
+    return R_btw.t();
 }
 
 float IMUPreintegrator::getHeading() const {

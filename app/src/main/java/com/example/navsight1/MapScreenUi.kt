@@ -53,6 +53,9 @@ fun MainScreen(viewModel: NavSightViewModel, pal: NavPalette, isNight: Boolean, 
     var gpxMessage          by remember { mutableStateOf<String?>(null) }
     var debugVisible        by remember { mutableStateOf(false) }
     var calibrationVisible  by remember { mutableStateOf(false) }
+    // 2026-05-17 — Allan-variance IMU recorder overlay. Standalone, does not
+    // run VIO/camera/GPS. Long-running (1-2 hours) for noise characterization.
+    var imuCalibrationVisible by remember { mutableStateOf(false) }
     var bottomSheetExpanded by rememberSaveable { mutableStateOf(false) }
     val scope               = rememberCoroutineScope()
     val context             = LocalContext.current
@@ -98,6 +101,12 @@ fun MainScreen(viewModel: NavSightViewModel, pal: NavPalette, isNight: Boolean, 
                     // when geometry/points aren't available yet.
                     if (cameraVisible) {
                         CameraFeatureOverlay(viewModel, pal)
+                        // Phase 6.5 (post_v19_sprint_plan.md §205-298):
+                        // persistent LandmarkMap dots (orange = observed
+                        // this frame, gray = dormant). Drawn BEFORE
+                        // SlamFeatureOverlay so the live EKF SLAM dots
+                        // sit on top of the static landmark layer.
+                        LandmarkOverlay(viewModel, pal)
                         // Phase 3: world-anchored 3D SLAM points (orange
                         // dots with white ring outline). Reprojected each
                         // frame from the EKF state, so they stick to
@@ -298,6 +307,26 @@ fun MainScreen(viewModel: NavSightViewModel, pal: NavPalette, isNight: Boolean, 
                         calibrationVisible = false
                         viewModel.refreshCalibrationLoaded()
                     },
+                    onOpenImuCalibration = {
+                        calibrationVisible = false
+                        imuCalibrationVisible = true
+                    },
+                )
+            }
+        }
+
+        // 2026-05-17 — Allan-variance IMU calibration overlay. Independent
+        // of camera calibration; opened via a button on the CalibrationScreen.
+        AnimatedVisibility(
+            imuCalibrationVisible,
+            enter = fadeIn(tween(200)),
+            exit  = fadeOut(tween(200)),
+            modifier = Modifier.fillMaxSize(),
+        ) {
+            Box(Modifier.fillMaxSize().background(pal.bg)) {
+                ImuCalibrationScreen(
+                    pal = pal,
+                    onClose = { imuCalibrationVisible = false },
                 )
             }
         }

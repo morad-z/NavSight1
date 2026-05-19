@@ -146,7 +146,35 @@ void InertialInitializer::addImuData(int64_t timestamp_ns,
     } else if (state_ == Status::WAIT_MOTION) {
         if (detectMotion(ax, ay, az)) {
             state_ = Status::READY;
-            LOGI("Motion DETECTED: VIO ready.");
+            // 2026-05-16 v26 diagnostic: quantify orientation drift between
+            // the calibration window and the first detected motion. If the
+            // user holds the phone tilted during WAIT_STATIONARY then
+            // straightens it before walking, the EKF's R_GtoI is seeded
+            // from the tilted accel mean and subsequent MSCKF visual
+            // updates apply large corrections. v26 evidence: 0.59 rad
+            // first MSCKF correction → 91° r_R at first LC.
+            const double a_mag = std::sqrt(ax*ax + ay*ay + az*az);
+            double tilt_drift_deg = 0.0;
+            if (calibration_mean_a_valid_) {
+                const cv::Point3f& m = calibration_mean_a_;
+                const double m_mag = std::sqrt(m.x*m.x + m.y*m.y + m.z*m.z);
+                if (a_mag > 1e-6 && m_mag > 1e-6) {
+                    const double dot = (ax*m.x + ay*m.y + az*m.z) / (a_mag * m_mag);
+                    const double clamped = std::max(-1.0, std::min(1.0, dot));
+                    tilt_drift_deg = std::acos(clamped) * 180.0 / M_PI;
+                }
+                LOGI("Motion DETECTED: VIO ready. a_at_motion=(%.3f,%.3f,%.3f) "
+                     "|a|=%.3f calib_mean_a=(%.3f,%.3f,%.3f) "
+                     "tilt_drift_calib_to_motion_deg=%.2f",
+                     static_cast<double>(ax), static_cast<double>(ay),
+                     static_cast<double>(az), a_mag,
+                     m.x, m.y, m.z, tilt_drift_deg);
+            } else {
+                LOGI("Motion DETECTED: VIO ready. a_at_motion=(%.3f,%.3f,%.3f) "
+                     "|a|=%.3f (no calibration baseline)",
+                     static_cast<double>(ax), static_cast<double>(ay),
+                     static_cast<double>(az), a_mag);
+            }
         }
     }
 }
@@ -252,9 +280,18 @@ bool InertialInitializer::runStationaryCalibration() {
     double bias_mag = std::sqrt(mean_g.x * mean_g.x
                               + mean_g.y * mean_g.y
                               + mean_g.z * mean_g.z);
+    // 2026-05-16 v26 diagnostic: also publish the calibration-window mean
+    // accel so the WAIT_MOTION→READY log line can be compared against it
+    // to detect bootstrap-vs-walk orientation discontinuity (the root
+    // cause of v26's 91° |r_R| residuals at first LC).
+    calibration_mean_a_ = mean_a;
+    calibration_mean_a_valid_ = true;
     LOGI("Init gate PASS: var_a=%.5f var_g=%.6f "
+         "mean_a=(%.3f,%.3f,%.3f) |a|=%.3f "
          "gyro_bias=(%.4f,%.4f,%.4f) |bias|=%.4f rad/s samples=%zu",
-         var_a, var_g, mean_g.x, mean_g.y, mean_g.z, bias_mag, accel_window_.size());
+         var_a, var_g, mean_a.x, mean_a.y, mean_a.z,
+         std::sqrt(mean_a.x*mean_a.x + mean_a.y*mean_a.y + mean_a.z*mean_a.z),
+         mean_g.x, mean_g.y, mean_g.z, bias_mag, accel_window_.size());
     return true;
 }
 

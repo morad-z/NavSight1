@@ -70,6 +70,29 @@ add_library(
         src/main/cpp/TrackKLT.cpp
         src/main/cpp/UpdaterZeroVelocity.cpp
         src/main/cpp/UpdaterMSCKF.cpp
+        src/main/cpp/UpdaterSLAM.cpp
+        # 2026-05-13: PoseGraph (Phase 1 Step 5 of post_v19_sprint_plan.md)
+        # rewritten as 4-DOF (x, y, z, yaw) Gauss-Newton. Legacy SE(2)
+        # implementation preserved as commented block in PoseGraph.cpp.
+        src/main/cpp/PoseGraph.cpp
+        # 2026-05-16: Phase 1 Step 6 — LandmarkMap (visual-only persistent
+        # 3D landmark database). Replaces the deferred VisualMap scaffold
+        # noted below. See docs/study/post_v19_sprint_plan.md §205-298
+        # and LandmarkMap.h header for ORB-SLAM3 citations + design.
+        # Phase 6.1 ships the class + unit tests; Tracker wire-up follows
+        # in Phase 6.2-6.5.
+        src/main/cpp/LandmarkMap.cpp
+        # 2026-05-17: PC live-viewer HTTP server. Minimal BSD-socket server
+        # bound to 0.0.0.0:8765. Serves embedded HTML on / and JSON state
+        # on /state.json at 5 Hz polling cadence. Used for debugging the
+        # 3D map + pose + trajectory from a PC on the same WiFi.
+        src/main/cpp/ViewerServer.cpp
+        # 2026-05-12: VisualMap scaffold reverted from the build per the
+        # post_v19_sprint_plan.md — persistent landmark map belongs to
+        # Phase 1 Step 6 (proper LandmarkMap with KD-tree + descriptor
+        # matching + per-frame MSCKF updates), not as a rendering cache.
+        # The .h/.cpp files remain on disk as scaffolding for that step.
+        # src/main/cpp/VisualMap.cpp
         src/main/cpp/InertialInitializer.cpp
         src/main/cpp/ScaleEstimatorVI.cpp
         src/main/cpp/ScaleFuser.cpp

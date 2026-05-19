@@ -7,14 +7,23 @@
 #ifdef __ANDROID__
 #include <android/log.h>
 #define TAG "NavSight-EKF"
-#define LOGI(...) __android_log_print(ANDROID_LOG_INFO, TAG, __VA_ARGS__)
+#define LOGI(...) __android_log_print(ANDROID_LOG_INFO,  TAG, __VA_ARGS__)
+#define LOGW(...) __android_log_print(ANDROID_LOG_WARN,  TAG, __VA_ARGS__)
 #define LOGE(...) __android_log_print(ANDROID_LOG_ERROR, TAG, __VA_ARGS__)
 #else
 #define LOGI(...) (void)0
+#define LOGW(...) (void)0
 #define LOGE(...) (void)0
 #endif
 
-EKFState::EKFState() { reset(); }
+EKFState::EKFState() {
+    reset();
+    // 2026-05-17 — log loaded noise constants so post-hoc analysis can confirm
+    // the Allan-calibrated values are in effect. If a future change reverts
+    // them silently, this LOGI exposes the regression in logcat.
+    LOGI("EKF_NOISE: sigma_g=%.4e sigma_a=%.4e sigma_bg=%.4e sigma_ba=%.4e (Allan 2026-05-17)",
+         sigma_g_, sigma_a_, sigma_bg_, sigma_ba_);
+}
 
 void EKFState::reset() {
     // Plan Step 6 (ADR-012): hold snapshot_mutex_ across the window clear so
@@ -49,11 +58,88 @@ void EKFState::reset() {
     slam_features_.clear();
     last_marginalized_slam_feature_ids_.clear();
 
-    // Plan Step 8b: reset extrinsics to the default body→camera convention.
-    // diag(1,-1,-1): rear camera, vertical phone (camera +X=body +X, +Y=body -Y, +Z=body -Z).
+    // 2026-05-19 R_bc DERIVED — first-principles for SENSOR_ORIENTATION=90
+    // rear camera, vertical portrait phone.
+    //
+    // Body convention (SensorRepository.kt:401):
+    //   +X = forward (device top), +Y = your left, +Z = up (out of screen)
+    // Held vertically in portrait, rear camera faces body +X (forward).
+    //
+    // OpenCV camera frame:
+    //   +X = image right (column ++), +Y = image down (row ++), +Z = optical fwd
+    //
+    // SENSOR_ORIENTATION=90 = "rotate raw 90° CW to get upright". So:
+    //   raw image axes map to scene:
+    //     raw top    = upright right  = scene right = body -Y
+    //     raw right  = upright bottom = scene down  = body -Z
+    //     raw bottom = upright left   = scene left  = body +Y
+    //     raw left   = upright top    = scene up    = body +Z
+    //
+    //   ∴ camera axes in body coords:
+    //     camera +X (raw right) = body -Z
+    //     camera +Y (raw down ≡ raw bottom direction) = body +Y
+    //     camera +Z (optical fwd) = body +X
+    //
+    // R_bc maps body → camera. Columns = camera coords of body basis vectors:
+    //   body +X → camera +Z  → col0 = (0, 0, 1)
+    //   body +Y → camera +Y  → col1 = (0, 1, 0)
+    //   body +Z → camera -X  → col2 = (-1, 0, 0)
+    //
+    //   R_bc = ((0, 0, -1),
+    //           (0, 1,  0),
+    //           (1, 0,  0))
+    //
+    // Verification: R_bc · (1,0,0)body = (0,0,1)cam = camera +Z (forward) ✓
+    //               R_bc · (0,0,1)body = (-1,0,0)cam = camera -X (image left) ✓
+    //                                                  (sky points to image-left)
+    //
+    // Falsifier: SLAM orange dots should stay anchored to scene features when
+    // user rotates the phone in place. Per v51 visual: KLT (cyan/green/yellow)
+    // anchored fine but SLAM dots drifted → projection R_bc · R_GtoI wrong.
+    // V-shape fix proved R_GtoI is now correct → R_bc is the remaining error.
+    // 2026-05-19 FINAL R_bc — re-derived carefully and confirmed by visual
+    // test (user reported "much better, dots anchored, moved only slightly").
+    //
+    // The previous "first principles" attempt had a sign error from
+    // conflating "looking at the scene through the lens" vs "photographer's
+    // perspective behind the camera." Correct derivation:
+    //
+    //   For back camera (optical axis = body -Z), photographer stands behind
+    //   the screen looking through camera in body -Z direction.
+    //   - Photographer's "right" (camera +X / image right):
+    //       (body -Z) × (body +X) = (0,0,-1) × (1,0,0) = (0,-1,0) = body -Y
+    //   - Photographer's "down" (camera +Y / image down):
+    //       scene down (in portrait body, +X is up against gravity)
+    //                                                            = body -X
+    //   - Camera +Z = body -Z (optical fwd opposite to screen-out)
+    //
+    //   R_bc columns = camera coords of body basis vectors:
+    //     body +X → camera -Y → col0 = (0, -1, 0)
+    //     body +Y → camera -X → col1 = (-1, 0, 0)
+    //     body +Z → camera -Z → col2 = (0, 0, -1)
+    //
+    //   R_bc = ((0,-1,0),(-1,0,0),(0,0,-1))     det = +1 ✓
+    //
+    // Equivalent to diag(1,-1,-1) · Rz(+90°) — the "v23.7 sign-flipped"
+    // version that was never tried before today. Residual "dots move
+    // slightly" likely comes from sub-degree variation in actual sensor
+    // mounting (Step 8b online R_bc calibration is currently SKIPPED;
+    // re-enabling it could absorb this residual but is a separate task).
+    R_bc_ = cv::Matx33d(0.0, -1.0,  0.0,
+                       -1.0,  0.0,  0.0,
+                        0.0,  0.0, -1.0);
+    /* SUPERSEDED 2026-05-19 — wrong-sign first-principles attempt
+       (drifted in opposite direction):
+    R_bc_ = cv::Matx33d(0.0, 0.0, -1.0,
+                        0.0, 1.0,  0.0,
+                        1.0, 0.0,  0.0);
+    */
+    /* SUPERSEDED 2026-05-19 — pre-derivation default (was for some other body
+       convention or sensor orientation; SLAM orange dots drifted on rotation):
     R_bc_ = cv::Matx33d(1.0,  0.0,  0.0,
                         0.0, -1.0,  0.0,
                         0.0,  0.0, -1.0);
+    */
 }
 
 void EKFState::initialize(double initial_scale) {
@@ -111,6 +197,38 @@ void EKFState::initializeFull(const cv::Mat& R_GtoI, const cv::Point3f& gyro_bia
     }
 
     full_initialized_ = true;
+
+    // 2026-05-16 v26 diagnostic: emit the initial R_GtoI's tilt vs gravity
+    // at the moment of full-init. R_GtoI maps world→body. World +Z is
+    // up. R_GtoI · (0,0,1)_world tells us where "up" lives in the body
+    // frame. For a perfectly vertical phone (body Y aligned with world Z),
+    // R_GtoI · (0,0,1) = (0, 1, 0). The angle between that and (0,1,0)
+    // is the "tilt from vertical" at init. v26 evidence: bootstrap with
+    // a tilted phone caused subsequent MSCKF chaos; this log will let
+    // us see the tilt magnitude per session and correlate with downstream
+    // r_R residuals.
+    if (R_GtoI_.rows == 3 && R_GtoI_.cols == 3 && R_GtoI_.type() == CV_64F) {
+        const double up_body_x = R_GtoI_.at<double>(0, 2);
+        const double up_body_y = R_GtoI_.at<double>(1, 2);
+        const double up_body_z = R_GtoI_.at<double>(2, 2);
+        // Tilt-from-vertical = angle between (up_body_x, up_body_y, up_body_z)
+        // and the expected (0, 1, 0) for vertical phone. For phone-flat
+        // expected would be (0, 0, 1); we report against vertical-hold
+        // since that's the documented use case.
+        const double dot_vertical = up_body_y;  // dot with (0,1,0)
+        const double dot_flat     = up_body_z;  // dot with (0,0,1)
+        const double tilt_vert_deg = std::acos(std::max(-1.0, std::min(1.0, dot_vertical)))
+                                      * 180.0 / M_PI;
+        const double tilt_flat_deg = std::acos(std::max(-1.0, std::min(1.0, dot_flat)))
+                                      * 180.0 / M_PI;
+        LOGI("EKF_INIT_TILT: up_body=(%.3f,%.3f,%.3f) "
+             "tilt_from_vertical_deg=%.2f tilt_from_flat_deg=%.2f "
+             "R_bc_angle_from_initial_deg=%.2f",
+             up_body_x, up_body_y, up_body_z,
+             tilt_vert_deg, tilt_flat_deg,
+             getExtrinsicsAngleDeg());
+    }
+
     LOGI("EKF full state initialized (19-DOF: δθ,δb_g,δv,δb_a,δp,δt_d,δφ_bc)");
 }
 
@@ -122,7 +240,21 @@ void EKFState::propagateIMU(const cv::Mat& deltaR, const cv::Mat& deltaV,
                              const cv::Mat& J_R_bg, const cv::Mat& J_V_bg,
                              const cv::Mat& J_V_ba, const cv::Mat& J_P_bg,
                              const cv::Mat& J_P_ba) {
-    if (!full_initialized_ || dt <= 0 || P_.empty()) return;
+    if (!full_initialized_ || dt <= 0 || P_.empty()) {
+        // Count sub-reasons so the JSON event_summary shows exactly which gate fired.
+        auto& ec = navsight::eventCounters();
+        ec.propagate_skipped.fetch_add(1, std::memory_order_relaxed);
+        if (!full_initialized_) {
+            ec.propagate_skipped_not_init.fetch_add(1, std::memory_order_relaxed);
+        } else if (dt <= 0) {
+            ec.propagate_skipped_dt_nonpositive.fetch_add(1, std::memory_order_relaxed);
+            LOGW("propagateIMU: dt=%f <= 0 (timestamp wraparound or JNI unit mismatch)", dt);
+        } else {
+            ec.propagate_skipped_p_empty.fetch_add(1, std::memory_order_relaxed);
+            LOGW("propagateIMU: P_ is empty (covariance not initialized)");
+        }
+        return;
+    }
 
     // Plan Step 3a (ADR-008): tick the "frames since last MSCKF" counter so
     // the damping ramp resets after a quiet period (≥ MSCKF_QUIET_PROPAGATION
@@ -193,10 +325,37 @@ void EKFState::propagateIMU(const cv::Mat& deltaR, const cv::Mat& deltaV,
         block.copyTo(Phi(cv::Range(0,3), cv::Range(3,6)));     // dθ/db_g
     }
 
-    // dv/dθ: R^T * [deltaV]_x
+    // dv/dθ: -[R_ItoG · deltaV_body]_× = -skew(Rt * deltaV)
+    //
+    // Cause:  OLD code computed `Rt * skew(deltaV)`.  For a LEFT-perturbation
+    //         world-frame EKF, R*skew(v) ≠ skew(R*v) in general, so the block
+    //         was wrong in both sign and skew/rotation order.
+    // Change: Forster 2017 TRO eq. (A22) for LEFT-perturbation world-frame:
+    //           ∂δv/∂δθ = -[R_ItoG · deltaV_body]_× = -skew(Rt * deltaV)
+    // Falsifier: unit test with deltaR=I, deltaV=(1,0,0), R_GtoI_=I:
+    //            expected Phi(6:9, 0:3) = -skew((1,0,0)) = [[0,0,0],[0,0,1],[0,-1,0]]
+    //            OLD code produced +[[0,0,0],[0,0,1],[0,-1,0]] — wrong sign.
+    // Date:   2026-05-16 (ekf_audit.md Finding 3)
+    /* OLD (2026-05-16 superseded):
     if (!deltaV.empty()) {
         cv::Mat dv_dtheta = Rt * skew(deltaV);
         dv_dtheta.copyTo(Phi(cv::Range(6,9), cv::Range(0,3)));
+    }
+    */
+    if (!deltaV.empty()) {
+        // 2026-05-16 Tier 1 revert (agent A2): swarm's Finding-3 sign flip was
+        // mathematically incorrect. Original `+Rt * skew(deltaV)` is correct for
+        // NavSight's world-frame δθ on world→body R_GtoI convention (pinned by
+        // EKFState.cpp:1006, 1474-1477, 1895-1896, 1976). Falsifier (verified
+        // by A2): with R=I, deltaV=(1,0,0)_body, yaw δθ_z=ε rotates body-X
+        // toward world-Y, so ∂v_y/∂δθ_z = 1, giving block [[0,0,0],[0,0,1],
+        // [0,-1,0]] = +skew((1,0,0)) — matches OLD `+Rt*skew(v)`, NOT new form.
+        cv::Mat dv_dtheta = Rt * skew(deltaV);
+        dv_dtheta.copyTo(Phi(cv::Range(6,9), cv::Range(0,3)));
+        /* SUPERSEDED 2026-05-16 Tier 1 revert: sign was inverted by swarm.
+        cv::Mat dv_dtheta = -skew(Rt * deltaV);
+        dv_dtheta.copyTo(Phi(cv::Range(6,9), cv::Range(0,3)));
+        */
     }
 
     // dv/db_g: -R^T * J_V_bg
@@ -211,10 +370,31 @@ void EKFState::propagateIMU(const cv::Mat& deltaR, const cv::Mat& deltaV,
         block.copyTo(Phi(cv::Range(6,9), cv::Range(9,12)));
     }
 
-    // dp/dθ: R^T * [deltaP]_x
+    // dp/dθ: -[R_ItoG · deltaP_body]_× = -skew(Rt * deltaP)
+    //
+    // Cause:  Same wrong-frame skew as dv/dθ above.  See Forster 2017 TRO
+    //         eq. (A22).  The negative sign was missing AND the matrix
+    //         product order was reversed (R·skew ≠ skew·R in general).
+    // Change: Use -skew(Rt * deltaP), consistent with LEFT-perturbation.
+    // Falsifier: with deltaR=I, deltaP=(0,1,0), R_GtoI_=I:
+    //            expected Phi(12:15, 0:3) = -skew((0,1,0))
+    //            OLD code produced +skew((0,1,0)) — wrong sign.
+    // Date:   2026-05-16 (ekf_audit.md Finding 3)
+    /* OLD (2026-05-16 superseded):
     if (!deltaP.empty()) {
         cv::Mat dp_dtheta = Rt * skew(deltaP);
         dp_dtheta.copyTo(Phi(cv::Range(12,15), cv::Range(0,3)));
+    }
+    */
+    if (!deltaP.empty()) {
+        // 2026-05-16 Tier 1 revert (agent A2): same as dv_dtheta above — the
+        // OLD form `+Rt * skew(deltaP)` matches the world-frame δθ convention.
+        cv::Mat dp_dtheta = Rt * skew(deltaP);
+        dp_dtheta.copyTo(Phi(cv::Range(12,15), cv::Range(0,3)));
+        /* SUPERSEDED 2026-05-16 Tier 1 revert:
+        cv::Mat dp_dtheta = -skew(Rt * deltaP);
+        dp_dtheta.copyTo(Phi(cv::Range(12,15), cv::Range(0,3)));
+        */
     }
 
     // dp/dv: I * dt
@@ -237,13 +417,40 @@ void EKFState::propagateIMU(const cv::Mat& deltaR, const cv::Mat& deltaV,
     cv::Mat Q = cv::Mat::zeros(IMU_STATE_DIM, IMU_STATE_DIM, CV_64F);
     // Use preintegration covariance if available, otherwise construct from noise params
     if (!imu_cov.empty() && imu_cov.rows >= 9) {
-        // Map 9x9 preintegration cov (R,V,P) to 19x19 state noise
-        // Rotation noise -> θ block
+        // Map 9x9 preintegration covariance (R,V,P order) to 19x19 Q.
+        //
+        // Cause:  OLD code only copied the 3 diagonal 3×3 blocks (R-R, V-V,
+        //         P-P), discarding the 6 off-diagonal cross-blocks (R-V, R-P,
+        //         V-P and their transposes).  Dropping cross-terms underestimates
+        //         the noise covariance and breaks the positive-semi-definiteness
+        //         guarantee of Q when preintegration produces significant
+        //         off-diagonal noise (e.g. at high angular velocity).
+        // Change: Copy all 9 sub-blocks of the 9×9 preintegration covariance
+        //         into the correct slots in Q, preserving full correlation.
+        //         Index mapping: imu_cov rows/cols 0-2=R, 3-5=V, 6-8=P;
+        //         Q rows/cols: 0-2=θ, 6-8=v, 12-14=p.
+        // Falsifier: build Q from imu_cov; verify Q symmetry and PSD
+        //            via Cholesky.  Q.at<double>(0,6) must equal
+        //            imu_cov.at<double>(0,3) (R-V cross-term).
+        // Date:   2026-05-16 (ekf_audit.md Finding 2 / preintegration Q)
+        /* OLD (2026-05-16 superseded — diagonal-only copy):
         imu_cov(cv::Range(0,3), cv::Range(0,3)).copyTo(Q(cv::Range(0,3), cv::Range(0,3)));
-        // Velocity noise -> v block
         imu_cov(cv::Range(3,6), cv::Range(3,6)).copyTo(Q(cv::Range(6,9), cv::Range(6,9)));
-        // Position noise -> p block
         imu_cov(cv::Range(6,9), cv::Range(6,9)).copyTo(Q(cv::Range(12,15), cv::Range(12,15)));
+        */
+        // Diagonal blocks
+        imu_cov(cv::Range(0,3), cv::Range(0,3)).copyTo(Q(cv::Range(0,3),   cv::Range(0,3)));
+        imu_cov(cv::Range(3,6), cv::Range(3,6)).copyTo(Q(cv::Range(6,9),   cv::Range(6,9)));
+        imu_cov(cv::Range(6,9), cv::Range(6,9)).copyTo(Q(cv::Range(12,15), cv::Range(12,15)));
+        // Off-diagonal: R-V
+        imu_cov(cv::Range(0,3), cv::Range(3,6)).copyTo(Q(cv::Range(0,3),   cv::Range(6,9)));
+        imu_cov(cv::Range(3,6), cv::Range(0,3)).copyTo(Q(cv::Range(6,9),   cv::Range(0,3)));
+        // Off-diagonal: R-P
+        imu_cov(cv::Range(0,3), cv::Range(6,9)).copyTo(Q(cv::Range(0,3),   cv::Range(12,15)));
+        imu_cov(cv::Range(6,9), cv::Range(0,3)).copyTo(Q(cv::Range(12,15), cv::Range(0,3)));
+        // Off-diagonal: V-P
+        imu_cov(cv::Range(3,6), cv::Range(6,9)).copyTo(Q(cv::Range(6,9),   cv::Range(12,15)));
+        imu_cov(cv::Range(6,9), cv::Range(3,6)).copyTo(Q(cv::Range(12,15), cv::Range(6,9)));
     } else {
         double dt2 = dt * dt;
         for (int i = 0; i < 3; i++) {
@@ -299,6 +506,78 @@ void EKFState::propagateIMU(const cv::Mat& deltaR, const cv::Mat& deltaV,
         }
     }
 
+    // ── FIX 3: P_bc cross-covariance decoupling ─────────────────────────────
+    // Cause:  δφ_bc has no measurement update (H_bc=0, rows 16-18 of dx never
+    //         applied — see applyStateCorrection ~line 808).  Yet Phi*P*Phi^T
+    //         propagates P_(0:3, 16:19) every frame via Phi(0:3,0:3)=deltaR^T,
+    //         growing unconstrained cross-correlation between δθ_IMU and δφ_bc.
+    //         Over 1000 frames this deflects the Kalman gain for θ in a direction
+    //         with no physical measurement backing (ekf_audit.md Finding 2).
+    // Change: After propagation, zero the entire P_(16:19, :) row block and
+    //         P_(:, 16:19) column block so δφ_bc stays fully decoupled while
+    //         its update is disabled (Step 8b bypass).
+    // Falsifier: log cv::norm(P_(cv::Range(0,3), cv::Range(16,19))) after 500
+    //            frames of walking.  Must remain < 1e-10 with this fix.
+    // Date:   2026-05-16 (ekf_audit.md Finding 2)
+    // 2026-05-16 Tier 1 revert (agent A10): P_bc cross-cov zeroing every frame
+    // breaks the symmetry/PSD invariants the Joseph form relies on, and could
+    // trigger silent Cholesky fallbacks in MSCKF. Existing 1e-8 process-noise
+    // regularization (see Q matrix init) is sufficient to bound unconstrained
+    // growth of P_(0:3, 16:19) cross-correlation. Keep δφ_bc state in place
+    // but stop the per-frame zeroing.
+    /* SUPERSEDED 2026-05-16 Tier 1 revert:
+    static bool pbc_decouple_logged_ = false;
+    if (total_dim >= IMU_STATE_DIM) {
+        // EXTR_STATE_OFFSET = 16, EXTR_STATE_DIM = 3 (δφ_bc rows 16-18).
+        P_(cv::Range(EXTR_STATE_OFFSET, EXTR_STATE_OFFSET + EXTR_STATE_DIM),
+           cv::Range(0, total_dim)).setTo(0.0);
+        P_(cv::Range(0, total_dim),
+           cv::Range(EXTR_STATE_OFFSET, EXTR_STATE_OFFSET + EXTR_STATE_DIM)).setTo(0.0);
+        if (!pbc_decouple_logged_) {
+            LOGI("P_BC_DECOUPLE: zeroed cross-cov rows 16-18 (Step 8b consistency fix)");
+            pbc_decouple_logged_ = true;
+        }
+    }
+    */
+
+    // 2026-05-16 velocity-divergence diagnostic (v29 walk showed v sitting at
+    // 5 m/s clamp for entire walk with 467 clamp events / 622 ticks). To
+    // identify whether divergence is from (A) accel bias init wrong, (B)
+    // gravity not canceling, or (C) propagation math error, log every Nth
+    // call the components feeding v_new:
+    //   - gravity contribution g·dt
+    //   - body-frame deltaV rotated to world (R^T · deltaV)
+    //   - resulting velocity v_new
+    //   - current accel bias estimate b_a_
+    //   - current gyro bias estimate
+    // If g*dt + R^T*deltaV doesn't sum to ~0 when stationary, gravity isn't
+    // cancelling (bug A or B). If b_a_ drifts during motion, bias estimate is
+    // absorbing motion (bug B variant).
+    static int prop_dbg_counter = 0;
+    if ((prop_dbg_counter++ % 30) == 0) {
+        const cv::Mat g_dt        = g * dt;
+        const cv::Mat dV_world    = R_GtoI_.t() * deltaV;
+        const cv::Mat sum         = g_dt + dV_world;
+        LOGI("EKF_PROP_DBG: dt=%.4f "
+             "g_dt=(%+.3f,%+.3f,%+.3f) "
+             "R^T*dV=(%+.3f,%+.3f,%+.3f) "
+             "sum=(%+.3f,%+.3f,%+.3f) "
+             "v_pre=(%+.3f,%+.3f,%+.3f) |v_pre|=%.3f "
+             "v_new=(%+.3f,%+.3f,%+.3f) |v_new|=%.3f "
+             "b_a=(%+.4f,%+.4f,%+.4f) "
+             "b_g=(%+.5f,%+.5f,%+.5f)",
+             dt,
+             g_dt.at<double>(0), g_dt.at<double>(1), g_dt.at<double>(2),
+             dV_world.at<double>(0), dV_world.at<double>(1), dV_world.at<double>(2),
+             sum.at<double>(0), sum.at<double>(1), sum.at<double>(2),
+             v_G_.at<double>(0), v_G_.at<double>(1), v_G_.at<double>(2),
+             cv::norm(v_G_),
+             v_new.at<double>(0), v_new.at<double>(1), v_new.at<double>(2),
+             cv::norm(v_new),
+             b_a_.at<double>(0), b_a_.at<double>(1), b_a_.at<double>(2),
+             b_g_.at<double>(0), b_g_.at<double>(1), b_g_.at<double>(2));
+    }
+
     // Update mean state
     R_GtoI_ = R_new;
     v_G_ = v_new;
@@ -307,6 +586,8 @@ void EKFState::propagateIMU(const cv::Mat& deltaR, const cv::Mat& deltaV,
     // Clamp velocity to physically reasonable bounds (pedestrian: max 5 m/s)
     double v_norm = cv::norm(v_G_);
     if (v_norm > 5.0) {
+        LOGW("propagateIMU: velocity clamped from %.2f m/s to 5.0 m/s (preintegration bug?)", v_norm);
+        navsight::eventCounters().velocity_clamped.fetch_add(1, std::memory_order_relaxed);
         v_G_ *= 5.0 / v_norm;
     }
 }
@@ -324,7 +605,12 @@ void EKFState::updateScale(double observed_scale, double confidence) {
     double innov = observed_scale - scale_;
 
     double S = P_scale_ + R;
-    if ((innov * innov) / S > 9.0) return;
+    if ((innov * innov) / S > 9.0) {
+        LOGI("updateScale: chi2 reject (innov=%.4f S=%.6f chi2=%.2f > 9.0)",
+             innov, S, (innov * innov) / S);
+        navsight::eventCounters().scale_chi2_rejected.fetch_add(1, std::memory_order_relaxed);
+        return;
+    }
     double K = P_scale_ / S;
     scale_ += K * innov;
     scale_ = std::max(0.005, std::min(20.0, scale_));
@@ -362,6 +648,124 @@ void EKFState::updateZUPT() {
             }
         }
     }
+}
+
+// ── Zero-Rotation-Rate Update (ZRUP) ────────────────────────────────────────
+// 2026-05-16: dual of updateZUPT. ZUPT observes v=0 when stationary; ZRUP
+// observes ω=0 by the equivalent formulation: when stationary, the TRUE
+// angular velocity is zero, so the gyro reading equals the bias by
+// definition. Innovation: mean(gyro_window) - b_g_, with H = -I on rows
+// 3:6 (the b_g_ error-state block). Standard Kalman update propagates the
+// observation into b_g_ and reduces P_(3:6, 3:6). The EKF→Madgwick gyro-
+// bias feedback loop (Tracker.cpp:914) then correctly propagates the
+// improved estimate to Madgwick's integrator.
+//
+// Cause: when stationary, no visual update fires (no parallax) so b_g_
+//        was previously frozen indefinitely. Gyro integration with stale
+//        bias produced ~0.5-1°/s heading drift — exactly the symptom
+//        user reported 2026-05-16 ("heading slowly rotating when standing
+//        still, SLAM dots sliding top-right").
+// Change: dual-of-ZUPT Kalman update. Fires alongside updateZUPT at the
+//        same is_stationary trigger.
+// Falsifier: 60s stationary → b_g_ converges to gyro mean in ~3s;
+//        zrup_fired_total > 0; heading drift < 1° over the window;
+//        SLAM dots stay anchored on screen.
+//
+// Returns true if the update fired, false if full state not initialized
+// or window size N < 1 (insufficient data).
+bool EKFState::updateZRUP(double mean_gx, double mean_gy, double mean_gz,
+                           double sigma_gyro_per_sample, int N_samples) {
+    if (!full_initialized_) return false;
+    if (P_.empty() || P_.rows < IMU_STATE_DIM) return false;
+    if (N_samples < 1) return false;
+    if (sigma_gyro_per_sample <= 0.0) return false;
+
+    const int dim = P_.rows;
+
+    // Residual: r = mean(gyro_window) - b_g_  (3x1)
+    cv::Mat r = (cv::Mat_<double>(3, 1) <<
+                  mean_gx - b_g_.at<double>(0, 0),
+                  mean_gy - b_g_.at<double>(1, 0),
+                  mean_gz - b_g_.at<double>(2, 0));
+
+    // 2026-05-18 falsifier instrumentation: emit entry log so we can
+    // time-align ZRUP fires against the anonymous MSCKF_DX_BLOCKS lines
+    // that pump b_g during stationary boot. If a ZRUP_FIRE timestamp
+    // matches an MSCKF_DX_BLOCKS dbg!=0 line, ZRUP is the b_g-leak source.
+    // If b_g moves AWAY from mean_gyro after the update, the H-sign at the
+    // lines below is wrong (treating x_true = x_est + δx as error-state).
+    LOGI("ZRUP_FIRE: mean_g=(%+.5f,%+.5f,%+.5f) pre_b_g=(%+.5f,%+.5f,%+.5f) "
+         "r=(%+.5f,%+.5f,%+.5f) sigma_g_sample=%.3e N=%d",
+         mean_gx, mean_gy, mean_gz,
+         b_g_.at<double>(0, 0), b_g_.at<double>(1, 0), b_g_.at<double>(2, 0),
+         r.at<double>(0, 0), r.at<double>(1, 0), r.at<double>(2, 0),
+         sigma_gyro_per_sample, N_samples);
+
+    // 2026-05-18 SIGN FIX (root cause of the multi-week 1°/s stationary
+    // heading drift documented in HANDOFF_2026_05_18.md).
+    //
+    // Cause:   H was -I on b_g rows. With Kalman gain K = P·H^T·S^(-1), a
+    //          negative H produced K_bg = -P_bg/(P_bg+R) (negative gain), so
+    //          δb_g = K_bg · r pushed b_g AWAY from the observed gyro mean
+    //          on every fire. Falsifier instrumentation (ZRUP_FIRE/POST)
+    //          captured 374/374 fires where residual GREW post-update —
+    //          structural, not noise. b_g.z then saturated near ±0.011-0.017
+    //          rad/s when gain decayed to match process-noise injection. The
+    //          every-6-frame Tracker.cpp:1243 push broadcast this corrupted
+    //          estimate to Madgwick, producing the user-visible drift at
+    //          exactly EKF.b_g_.z °/s.
+    //
+    // Change:  H = +I on b_g rows (standard error-state convention).
+    //          Derivation: z = h(x_true) + ε, h(x) = b_g (when stationary).
+    //          x_true = x_est + δx (additive bias state).
+    //          h(x_est + δx) = b_g_est + (∂h/∂δb_g)·δb_g = b_g_est + (+I)·δb_g.
+    //          Therefore H = +I, NOT -I. The author's original comment
+    //          ("residual ≈ -δb_g") conflated the residual r = z - h(x_est)
+    //          with the linearization h(x_est + δx) - h(x_est), getting one
+    //          sign flipped.
+    //
+    // Falsifier: post-fix ZRUP_POST residual must be SMALLER than ZRUP_FIRE
+    //          residual every fire (b_g converging toward mean_gyro). b_g.z
+    //          should stay within Allan σ_bg = 7.46e-7 √Hz · √t of zero on
+    //          a calibrated stationary phone — well under 1e-4 rad/s after
+    //          10s. Madgwick stationary heading drift must drop from ~1°/s
+    //          to <0.05°/s (Allan-predicted).
+    cv::Mat H = cv::Mat::zeros(3, dim, CV_64F);
+    H.at<double>(0, 3) = +1.0;
+    H.at<double>(1, 4) = +1.0;
+    H.at<double>(2, 5) = +1.0;
+    /* SUPERSEDED 2026-05-18 (sign-flip bug, drove the multi-week heading-drift symptom):
+    // H: 3 rows, -I at cols 3:6 (b_g_ error-state block), 0 elsewhere.
+    // Sign is negative because the error-state convention is x_true = x_est + δx;
+    // raw_gyro - b_g_true = 0 → raw - (b_g_est + δb_g) = -δb_g → residual ≈ -δb_g.
+    H.at<double>(0, 3) = -1.0;
+    H.at<double>(1, 4) = -1.0;
+    H.at<double>(2, 5) = -1.0;
+    */
+
+    // R: combined noise — IMU sensor noise (sigma_g²) divided by sample count
+    // (averaging N samples reduces variance by N) + an extra "stationarity
+    // assumption" term that we leave at zero here because the is_stationary
+    // detector already gated the window for low variance.
+    const double r_var = (sigma_gyro_per_sample * sigma_gyro_per_sample) /
+                          static_cast<double>(N_samples);
+    cv::Mat R_noise = cv::Mat::eye(3, 3, CV_64F) * r_var;
+
+    // Standard Joseph-form Kalman update via the existing pipeline.
+    applyMSCKFUpdate(H, r, R_noise);
+
+    // 2026-05-18 falsifier: post-update b_g tells us if the H sign above is
+    // correct. After ZRUP, b_g should move TOWARD mean_gyro (residual shrinks).
+    // If post_b_g moves AWAY from mean_gyro (residual grows), the H = -I
+    // convention at line 617-620 is inverted vs the standard error-state
+    // x_true = x_est + δx, and ZRUP is pumping b_g instead of draining it.
+    LOGI("ZRUP_POST: post_b_g=(%+.5f,%+.5f,%+.5f) post_r=(%+.5f,%+.5f,%+.5f)",
+         b_g_.at<double>(0, 0), b_g_.at<double>(1, 0), b_g_.at<double>(2, 0),
+         mean_gx - b_g_.at<double>(0, 0),
+         mean_gy - b_g_.at<double>(1, 0),
+         mean_gz - b_g_.at<double>(2, 0));
+
+    return true;
 }
 
 // DEAD CODE: checkConsistency — never called
@@ -528,6 +932,52 @@ void EKFState::marginalizeOldestClone() {
 void EKFState::marginalizeOldestCloneNoLock() {
     if (window_.empty()) return;
 
+    // Phase 1 Step 4a (post_v19_sprint_plan.md): try to re-anchor SLAM
+    // features whose anchor clone is about to fall off the sliding window.
+    // This MUST happen before the P_ splice and the window_.pop_front() so
+    // that getClonePose() can still find both the old and new anchors.
+    //
+    // v23.8 (2026-05-11): switched new-anchor choice from window_.back()
+    // (newest) to window_[1] (second-oldest).
+    //
+    // Rationale: re-anchor's Zc<0.01 geometry gate (reanchorSlamFeature
+    // line 1659) was rejecting features when the new anchor's pose differs
+    // significantly from the dropping anchor — feature projects behind /
+    // too close to the new view. window_.back() has the MAXIMUM baseline
+    // from window_.front(), so it has the highest chance of triggering
+    // the gate. window_[1] has near-identical pose to window_.front()
+    // (added in the very next addClone after it), so geometric change
+    // across re-anchor is essentially zero. Trade-off: feature must
+    // re-anchor every frame (since window_[1] becomes window_.front()
+    // next marginalize), but each re-anchor is cheap and near-lossless.
+    //
+    // User-visible symptom this addresses: SLAM dots disappear within ~1 s
+    // (= MAX_CLONES at ~14 FPS) of promotion, because the first re-anchor
+    // attempt was failing and falling back to removeSlamFeature.
+    const int dropped_id    = window_.front().state_id;
+    const int new_anchor_id = (window_.size() >= 2) ? (window_.begin() + 1)->state_id : -1;
+
+    std::vector<int> slots_to_remove;
+    {
+        auto& ec_re = navsight::eventCounters();
+        for (int slot = static_cast<int>(slam_features_.size()) - 1; slot >= 0; --slot) {
+            if (slam_features_[slot].anchor_clone_id != dropped_id) continue;
+            if (new_anchor_id < 0) {
+                // Window had only one clone — no surviving anchor candidate.
+                ec_re.slam_reanchor_failed_no_clone.fetch_add(1, std::memory_order_relaxed);
+                slots_to_remove.push_back(slot);
+                continue;
+            }
+            if (reanchorSlamFeature(slot, new_anchor_id)) {
+                ec_re.slam_reanchor_total.fetch_add(1, std::memory_order_relaxed);
+            } else {
+                // Geometry failed (Zc <= 0.01, NaN, etc.) — fall back to remove.
+                ec_re.slam_reanchor_failed_geometry.fetch_add(1, std::memory_order_relaxed);
+                slots_to_remove.push_back(slot);
+            }
+        }
+    }
+
     if (full_initialized_ && !P_.empty() && P_.rows > IMU_STATE_DIM) {
         // Plan Step 3b (ADR-009): the oldest clone sits at rows/cols
         // [IMU_STATE_DIM, IMU_STATE_DIM + CLONE_DIM). The SLAM block sits at
@@ -572,35 +1022,31 @@ void EKFState::marginalizeOldestCloneNoLock() {
         }
     }
 
-    // SLAM features that were anchored at the marginalised clone are now
-    // un-anchored. We drop them — keeping them with a stale anchor would
-    // make the FEJ Jacobian reference a pose that no longer exists in the
-    // window, and the chi² test would diverge. This is the conservative
-    // choice; a later optimisation could re-anchor to a surviving clone.
+    // Phase 1 Step 4a: features successfully re-anchored above now have
+    // anchor_clone_id == new_anchor_id and survive this marginalization. Only
+    // the slots that failed to re-anchor (collected in slots_to_remove) are
+    // dropped here. Pre-Step-4a behaviour was to drop ALL features anchored at
+    // the dropping clone — that was the "flashing dots" bug (v22 had
+    // slam_promotions_total=65, slam_lifetime_count=0, i.e. EVERY feature
+    // dying before accumulating lifetime).
     //
-    // Order matters: the P_ splice above already shifted the SLAM block
-    // up by CLONE_DIM, so `slamBlockStart()` (which uses window_.size())
-    // is wrong until we pop the front clone. Pop first, then call
-    // removeSlamFeature in reverse-slot order so erase() doesn't shift
-    // the remaining slots out from under the loop.
-    int dropped_id = -1;
-    if (!window_.empty()) dropped_id = window_.front().state_id;
+    // Order matters: the P_ splice above already shifted the SLAM block up by
+    // CLONE_DIM, so `slamBlockStart()` (which uses window_.size()) is wrong
+    // until we pop the front clone. Pop first, then call removeSlamFeature.
+    // slots_to_remove is in reverse-slot order (we iterated --slot above) so
+    // erase() inside removeSlamFeature doesn't shift the remaining slots out
+    // from under the loop.
     window_.pop_front();
-    if (dropped_id >= 0) {
-        for (int slot = static_cast<int>(slam_features_.size()) - 1; slot >= 0; --slot) {
-            if (slam_features_[slot].anchor_clone_id == dropped_id) {
-                // 2026-05-09 telemetry fix: capture the dropped feature_id
-                // BEFORE removeSlamFeature erases the entry. Tracker drains
-                // this list after addClone() and forwards each id to
-                // FeatureManager::setSlamSlot(-1) + dropLifecycle so the
-                // lifetime-histogram demotion path runs.
-                const int dropped_fid = slam_features_[slot].feature_id;
-                if (dropped_fid >= 0) {
-                    last_marginalized_slam_feature_ids_.push_back(dropped_fid);
-                }
-                removeSlamFeature(slot);
-            }
+    for (int slot : slots_to_remove) {
+        // 2026-05-09 telemetry: capture the dropped feature_id BEFORE
+        // removeSlamFeature erases the entry. Tracker drains this list after
+        // addClone() and forwards each id to FeatureManager::setSlamSlot(-1)
+        // + dropLifecycle so the lifetime-histogram demotion path runs.
+        const int dropped_fid = slam_features_[slot].feature_id;
+        if (dropped_fid >= 0) {
+            last_marginalized_slam_feature_ids_.push_back(dropped_fid);
         }
+        removeSlamFeature(slot);
     }
 }
 
@@ -624,7 +1070,7 @@ double EKFState::computeMSCKFDampingFactor() const {
 }
 
 void EKFState::applyMSCKFUpdate(const cv::Mat& H, const cv::Mat& res,
-                                 const cv::Mat& R_noise) {
+                                 const cv::Mat& R_noise, bool apply_huber) {
     if (!full_initialized_ || P_.empty()) return;
     int state_dim = P_.rows;
     if (H.cols != state_dim) return;
@@ -648,7 +1094,15 @@ void EKFState::applyMSCKFUpdate(const cv::Mat& H, const cv::Mat& res,
     cv::Mat H_w = H.clone();
     cv::Mat res_w = res.clone();
     msckf_huber_rejected_count_ = 0;
-    {
+    // v23.14 (2026-05-12): skip Huber for hard-physical-constraint updates
+    // (gravity-alignment). For those, large normalised residuals ARE the
+    // signal the EKF needs to act on — they reflect attitude error the
+    // Kalman update is supposed to absorb. Huber-rejecting them creates a
+    // self-reinforcing trap where the state never gets corrected. Caller
+    // sets apply_huber=false when the input is a physical constraint
+    // already pre-validated by a gate (e.g. updateGravityAlignment's accel
+    // magnitude + gyro band gate in Tracker.cpp).
+    if (apply_huber) {
         cv::Mat S_pre = H * P_ * H.t() + R_noise;
         const double delta = MSCKF_HUBER_DELTA;
         const double hard_reject = 3.0 * delta;
@@ -682,7 +1136,12 @@ void EKFState::applyMSCKFUpdate(const cv::Mat& H, const cv::Mat& res,
     // K = P * H_w^T * S^{-1}
     cv::Mat S_inv;
     if (!cv::invert(S, S_inv, cv::DECOMP_CHOLESKY)) {
-        if (!cv::invert(S, S_inv, cv::DECOMP_SVD)) return;
+        if (!cv::invert(S, S_inv, cv::DECOMP_SVD)) {
+            LOGW("applyMSCKFUpdate: both Cholesky and SVD inversion failed — update dropped (NaN/Inf in S?)");
+            navsight::eventCounters().applyMSCKFUpdate_inversion_failed.fetch_add(
+                1, std::memory_order_relaxed);
+            return;
+        }
     }
 
     cv::Mat K = P_ * H_w.t() * S_inv;
@@ -721,29 +1180,31 @@ void EKFState::applyMSCKFUpdate(const cv::Mat& H, const cv::Mat& res,
         // Clamp to ±100 ms — physical camera-IMU lag cannot exceed this on
         // any mobile device (Li & Mourikis 2014, §III-B practical bound).
         t_offset_cam_imu_ += dx.at<double>(15, 0);
-        t_offset_cam_imu_ = std::max(-0.1, std::min(0.1, t_offset_cam_imu_));
+        {
+            double td_unclamped = t_offset_cam_imu_;
+            double td_clamped   = std::max(-0.1, std::min(0.1, td_unclamped));
+            if (td_clamped != td_unclamped) {
+                LOGW("applyMSCKFUpdate: time offset clamped from %.4f s to %.4f s (±100ms bound saturated)",
+                     td_unclamped, td_clamped);
+                navsight::eventCounters().time_offset_clamped.fetch_add(
+                    1, std::memory_order_relaxed);
+            }
+            t_offset_cam_imu_ = td_clamped;
+        }
 
-        // Step 8b: apply body→camera rotation correction (rows 16-18 = δφ_bc).
-        //
-        // Lie-algebra update: R_bc = Exp(δφ_bc) * R_bc_hat   (LEFT-multiply).
-        //
-        // This matches the H_bc Jacobian derivation at applyMSCKFFeature
-        // line 1973: H_bc = dproj_dpC * (-[p_C_F]_×).
-        // Pre-2026-05-09 the update was right-multiply (`R_bc * dR_bc`) while
-        // the Jacobian was the left-mult formula. The mismatch caused the EKF
-        // to push δφ_bc in the wrong direction every measurement update; on
-        // every walk Step 8b extrinsics drift hit 90° within ~30s as R_bc
-        // wandered. Bug source confirmed by Geneva et al. 2020 ICRA
-        // eq. (10) which is the LEFT-mult convention.
-        //
-        // Clamp the correction magnitude to 30° per call to guard against
-        // a single bad measurement irrecoverably corrupting R_bc_.
         // Step 8b: R_bc update SKIPPED (NavSight 2026-05-09 Step 7 fix).
         // Clones bake R_bc at storage time, and H_bc is disabled in both
         // applyMSCKFFeature and slamReprojectionJacobian — so δφ_bc has no
         // measurement coupling and Kalman gain on those rows is always zero.
         // Defensive skip prevents process-noise drift from silently moving
         // R_bc and desynchronising clone storage from live R_bc.
+        //
+        // PHASE_A_8B_REENABLE_2026_05_19 REVERTED — Phase A attempt to
+        // re-enable produced dphi_bc=0 in 8769/8769 MSCKF events. H_bc was
+        // perfectly correlated with H_clone_theta (both = dproj_dpC · -skew(p_C_F))
+        // → linearly dependent columns → null-space projection killed both.
+        // Architectural incompatibility with Option C clone storage; would
+        // need un-baking R_bc from clones to fix properly.
     }
 
     // Apply clone corrections
@@ -812,6 +1273,57 @@ void EKFState::applyMSCKFUpdate(const cv::Mat& H, const cv::Mat& res,
     }
     LOGI("MSCKF update applied: max_correction=%.4f damping=%.2f huber_rejected=%d",
          cv::norm(dx, cv::NORM_INF), damping, msckf_huber_rejected_count_);
+
+    // 2026-05-16 v26 walk diagnostic: per-block correction magnitudes so we
+    // can see WHICH error-state component is being moved by each MSCKF
+    // update. v26 evidence: max_correction=0.59 rad on the first MSCKF
+    // update at bootstrap — that magnitude could go entirely into δθ
+    // (orientation), or into δb_g (gyro bias), or into δp (position), or be
+    // split. Without per-block logging we can't tell which.
+    // Block layout (per IMU error-state §):
+    //   0-2:   δθ      (rotation rad)
+    //   3-5:   δb_g    (gyro bias rad/s)
+    //   6-8:   δv      (velocity m/s)
+    //   9-11:  δb_a    (accel bias m/s²)
+    //   12-14: δp      (position m)
+    //   15:    δt_d    (camera-IMU time offset s)
+    //   16-18: δφ_bc   (extrinsics rad — skipped per defensive policy)
+    // L2 norm of each block; for δθ also report as deg for legibility.
+    if (dx.rows >= IMU_STATE_DIM) {
+        auto blockNorm = [&dx](int row0, int n_rows) {
+            double s = 0.0;
+            for (int i = 0; i < n_rows; ++i) {
+                const double v = dx.at<double>(row0 + i, 0);
+                s += v * v;
+            }
+            return std::sqrt(s);
+        };
+        const double n_dtheta = blockNorm(0, 3);
+        const double n_dbg    = blockNorm(3, 3);
+        const double n_dv     = blockNorm(6, 3);
+        const double n_dba    = blockNorm(9, 3);
+        const double n_dp     = blockNorm(12, 3);
+        const double n_dtd    = std::abs(dx.at<double>(15, 0));
+        const double n_dphi   = blockNorm(16, 3);
+        // 2026-05-18 diag A+B: per-axis dbg AND per-axis dtheta.
+        // - dbg_xyz attributes b_g leaks across update callers.
+        // - dtheta_xyz lets us see WORLD-Z (yaw) component of each rotation
+        //   correction. v47/v48 showed EKF and Madgwick diverge at -0.35°/s
+        //   on average, with both responding to gyro but visual updates
+        //   pulling EKF independently. Summing dtheta_xyz[2] across update
+        //   call sites identifies which is the systematic-bias source for
+        //   the V-shape under-rotation (engine trace observation that EKF
+        //   under-rotates fast turns by ~20°/turn).
+        LOGI("MSCKF_DX_BLOCKS: dtheta_rad=%.5f dtheta_deg=%.3f "
+             "dtheta_xyz=(%+.5f,%+.5f,%+.5f) "
+             "dbg=%.5f dbg_xyz=(%+.5f,%+.5f,%+.5f) "
+             "dv=%.5f dba=%.5f dp=%.4f dtd=%.5f dphi_bc=%.5f",
+             n_dtheta, n_dtheta * 180.0 / M_PI,
+             dx.at<double>(0, 0), dx.at<double>(1, 0), dx.at<double>(2, 0),
+             n_dbg,
+             dx.at<double>(3, 0), dx.at<double>(4, 0), dx.at<double>(5, 0),
+             n_dv, n_dba, n_dp, n_dtd, n_dphi);
+    }
     // EventCounters: one applied update = one log line. Sum the huber
     // rejections across every applied update so the total tells us how
     // many measurement rows the robust kernel rejected over the recording.
@@ -892,13 +1404,28 @@ bool EKFState::updateRelativeRotation(const cv::Mat& R_meas_body,
     if (clone_cov_idx + CLONE_DIM > dim) return false;
     if (R_clone.rows != 3 || R_clone.cols != 3) return false;
 
+    // 2026-05-12: post Option C (2026-05-09) clones store R_GtoC = R_bc·R_GtoI
+    // (world→camera, see Tracker.cpp:1919), NOT world→body. Recover the
+    // clone's world→body rotation by stripping R_bc:
+    //     R_GtoI(clone) = R_bc.t() * R_clone.
+    // The clone covariance δθ_c is the LEFT perturbation of R_GtoC, so post
+    // Option C it lives in CAMERA frame. The body-frame measurement
+    // linearisation
+    //     r ≈ δθ_current - R_meas_body · δθ_c(body)
+    // requires δθ_c(body) = R_bc.t() · δθ_c(camera). The clone-column
+    // Jacobian therefore picks up an extra R_bc.t() factor compared with
+    // the pre-Option-C form (which was `-R_meas_body` directly).
+    cv::Mat R_bc_cv(3, 3, CV_64F);
+    for (int rr = 0; rr < 3; ++rr) {
+        for (int cc = 0; cc < 3; ++cc) {
+            R_bc_cv.at<double>(rr, cc) = R_bc_(rr, cc);
+        }
+    }
+    cv::Mat R_GtoI_clone = R_bc_cv.t() * R_clone;
+
     // Predicted body-frame rotation from clone to current:
-    //   R_pred = R_GtoI_(current) * R_GtoC(clone).t()
-    // R_GtoI_ takes world→current-body. R_clone takes world→clone-body
-    // (treating the clone as the body pose at clone-time). So
-    // R_clone.t() takes clone-body→world, and the product takes
-    // clone-body→current-body, matching the convention of R_meas_body.
-    cv::Mat R_pred = R_GtoI_ * R_clone.t();
+    //   R_pred = R_GtoI_(current) * R_GtoI(clone).t()
+    cv::Mat R_pred = R_GtoI_ * R_GtoI_clone.t();
 
     // Residual on SO(3) in the Lie algebra:  r = log(R_meas * R_pred^T)
     cv::Mat R_err = R_meas_body * R_pred.t();
@@ -915,17 +1442,17 @@ bool EKFState::updateRelativeRotation(const cv::Mat& R_meas_body,
         r_vec.at<double>(i, 0) = v;
     }
 
-    // Jacobian (3 x dim) for the small-angle relative-rotation residual.
-    // For δθ (current body) and δθ_c (clone body) the linearisation is
-    //     r ≈ δθ - R_meas_body * δθ_c
-    // i.e. +I on the current-pose δθ block (cols 0..2) and -R_meas_body
-    // on the clone's δθ_c block (the first 3-vector of CLONE_DIM at
-    // clone_cov_idx + 0..2).
+    // Jacobian (3 x dim).
+    //   +I on current-pose δθ block (cols 0..2)
+    //   -R_meas_body · R_bc.t() on clone-pose δθ_c block (cols
+    //   clone_cov_idx + 0..2), because δθ_c lives in CAMERA frame and the
+    //   residual lives in body frame.
+    cv::Mat H_clone_block = -R_meas_body * R_bc_cv.t();
     cv::Mat H = cv::Mat::zeros(3, dim, CV_64F);
     for (int i = 0; i < 3; i++) {
         H.at<double>(i, i) = 1.0;
         for (int j = 0; j < 3; j++) {
-            H.at<double>(i, clone_cov_idx + j) = -R_meas_body.at<double>(i, j);
+            H.at<double>(i, clone_cov_idx + j) = H_clone_block.at<double>(i, j);
         }
     }
 
@@ -1152,6 +1679,14 @@ bool EKFState::updateGravityAlignedYaw(double yaw_meas, double var,
 
     cv::Mat res = (cv::Mat_<double>(1, 1) << res_val);
     cv::Mat R_noise = (cv::Mat_<double>(1, 1) << std::max(var, 1e-6));
+    // 2026-05-18 diag B: log every visual-yaw injection so we can see if
+    // these are pumping EKF yaw during walking. v42 showed Madgwick yaw
+    // drift -0.31°/s during walking with b_g stable (so b_g is innocent);
+    // updateGravityAlignedYaw injecting wrong residuals into EKF then
+    // bleeding via b_g push is the next-most-likely suspect.
+    LOGI("LC_YAW_FIRE: yaw_meas=%.2f° yaw_pred=%.2f° residual=%+.3f° var=%.4e",
+         yaw_meas * 180.0 / M_PI, yaw_pred * 180.0 / M_PI,
+         res_val * 180.0 / M_PI, var);
     applyMSCKFUpdate(H, res, R_noise);
     return true;
 }
@@ -1174,6 +1709,319 @@ bool EKFState::updatePDRStep(double dx_world, double dy_world, double var) {
     cv::Mat R_noise = cv::Mat::eye(2, 2, CV_64F) * std::max(var, 1e-6);
     applyMSCKFUpdate(H, res, R_noise);
     return true;
+}
+
+// ── Phase 1 Step 6.3 — fixed-landmark pose-only measurement update ──────────
+//
+// ORB-SLAM3 "Tracking" pattern (Campos et al. 2021, IEEE TR0, §III.B):
+// the camera pose is updated against fixed map points so the landmark
+// columns of the Jacobian are zero. The active blocks are δθ (rows 0..2)
+// and δp_G (rows 12..14) of the IMU error state; everything else picks
+// up corrections only through the covariance correlation in applyMSCKFUpdate.
+//
+// Sign convention — matches updateAbsolutePose (EKFState.cpp:1285) and the
+// left-perturbation derivation documented there: the EKF carries world→body
+// as R_GtoI with the update model `R_GtoI ← Rodrigues(dθ) · R_GtoI`
+// (applyMSCKFUpdate line 968), i.e. LEFT perturbation in the body frame.
+// Under that convention, for the residual r = z − h(x) the camera-frame
+// derivative chain is:
+//
+//   p_I = R_GtoI · (p_world − p_G)
+//   p_C = R_bc · p_I
+//   ∂p_C / ∂δθ   = −R_bc · skew(p_I)
+//   ∂p_C / ∂δp_G = −R_bc · R_GtoI
+//
+// and the residual gradient gets a MINUS sign on top of that (because
+// r = z − h(x), so ∂r/∂x = −∂h/∂x). The two minus signs cancel for the
+// δθ block via the skew anti-symmetry argument that already underpins
+// updateRelativeRotation. Net result: H is built as
+//     H_θ = J_proj · (−R_bc · skew(p_I))
+//     H_p = J_proj · (−R_bc · R_GtoI)
+// exactly as the math contract specifies. This is the same sign the
+// existing visual updaters use, so the Joseph form in applyMSCKFUpdate
+// drives the correction in the direction that zeros the residual.
+//
+// Per-obs gates:
+//   1. depth gate (camera-frame Zc band) — matches LandmarkMap's
+//      [kDepthMinM, kDepthMaxM] so observations folded back into the EKF
+//      have the same physical envelope as the observations folded into
+//      LandmarkMap during keyframe storage.
+//   2. in-image gate — only ever fires when something upstream is wrong
+//      (data association handed us a landmark that does not project into
+//      this frame). We count it instead of silently masking it.
+//   3. per-obs χ² gate — χ²(0.95, 2-DOF) = 5.991 (standard table value).
+//   4. per-obs Huber kernel — δ = 3.0 px (eyeballed to project a 3σ
+//      residual under nominal σ ≈ 1.0 px; matches the upstream MSCKF
+//      Huber semantics qualitatively). Hard reject above 5·δ; linear
+//      de-weighting in (δ, 5·δ).
+EKFState::LandmarkUpdateResult EKFState::applyLandmarkObservations(
+    const std::vector<LandmarkObservation>& obs,
+    const cv::Matx33d& R_bc,
+    double fx, double fy,
+    double cx, double cy,
+    int img_width, int img_height) {
+
+    LandmarkUpdateResult result;
+
+    // χ²(0.95, 2-DOF) — Abramowitz & Stegun Table 26.8 (standard chi-square
+    // critical value for the two-tailed 95% confidence level at 2 DOF).
+    static constexpr double kLandmarkChi2Gate95 = 5.991;
+    // Huber threshold in pixels — eyeball ~3σ on σ_px ≈ 1.0 px; matches the
+    // qualitative behaviour of the MSCKF Huber kernel (EKFState.cpp:893,
+    // MSCKF_HUBER_DELTA = √χ²(0.95, 2) = 2.4477) applied per-residual-row.
+    static constexpr double kLandmarkHuberPx = 3.0;
+    // Camera-frame depth band. Must match LandmarkMap's kDepthMinM /
+    // kDepthMaxM so a landmark accepted at storage time is also accepted
+    // at re-observation time; mismatched bands would silently shrink the
+    // observable map.
+    static constexpr double kLandmarkDepthMinM = 0.5;
+    static constexpr double kLandmarkDepthMaxM = 50.0;
+
+    if (!full_initialized_ || P_.empty()) {
+        LOGI("LM_APPLY: rejected_all reason=not_initialized obs=%zu",
+             obs.size());
+        return result;
+    }
+    if (obs.empty()) {
+        return result;
+    }
+    if (!(fx > 0.0) || !(fy > 0.0) || img_width <= 0 || img_height <= 0) {
+        LOGI("LM_APPLY: rejected_all reason=bad_intrinsics fx=%.2f fy=%.2f W=%d H=%d obs=%zu",
+             fx, fy, img_width, img_height, obs.size());
+        return result;
+    }
+
+    const int dim = P_.rows;
+    if (dim < IMU_STATE_DIM) {
+        return result;
+    }
+
+    // Local skew helper. Matches the convention used by propagateIMU
+    // (EKFState.cpp:228) — row 0 of skew(v) cross-multiplies to v × x.
+    auto skew = [](const cv::Vec3d& v) -> cv::Matx33d {
+        return cv::Matx33d(
+             0.0,  -v[2],   v[1],
+             v[2],   0.0,  -v[0],
+            -v[1],  v[0],   0.0);
+    };
+
+    // Read state once. R_GtoI is world→body (left-perturbation convention).
+    cv::Matx33d R_GtoI;
+    cv::Vec3d   p_G;
+    {
+        for (int i = 0; i < 3; ++i) {
+            for (int j = 0; j < 3; ++j) {
+                R_GtoI(i, j) = R_GtoI_.at<double>(i, j);
+            }
+            p_G[i] = p_G_.at<double>(i, 0);
+        }
+    }
+
+    // ── Pass 1: per-obs gating + Jacobian row build ──────────────────────
+    //
+    // Stack accepted rows in a 2N × dim matrix with zeros except at cols
+    // 0..2 (δθ) and 12..14 (δp_G). We also stack the per-obs noise
+    // (Huber-weighted) into the diagonal of R_noise and the residual into
+    // r_stack. Pre-gate Mahalanobis is computed using only the 6×6
+    // pose-pose covariance block; that's exactly the variance the
+    // pose-only Jacobian sees through S = H·P·H^T + R_noise (off-diagonal
+    // δp_G ↔ velocity / bias coupling shows up only after the full Joseph
+    // step propagates correlation back into those rows).
+    cv::Matx66d P_pose_pose;
+    for (int i = 0; i < 3; ++i) {
+        for (int j = 0; j < 3; ++j) {
+            P_pose_pose(i,     j)     = P_.at<double>(0  + i, 0  + j);  // δθ ↔ δθ
+            P_pose_pose(i,     j + 3) = P_.at<double>(0  + i, 12 + j);  // δθ ↔ δp
+            P_pose_pose(i + 3, j)     = P_.at<double>(12 + i, 0  + j);  // δp ↔ δθ
+            P_pose_pose(i + 3, j + 3) = P_.at<double>(12 + i, 12 + j);  // δp ↔ δp
+        }
+    }
+
+    struct AcceptedRow {
+        cv::Matx<double, 2, 3> H_theta;  // ∂r / ∂δθ   (2×3)
+        cv::Matx<double, 2, 3> H_p;      // ∂r / ∂δp_G (2×3)
+        cv::Vec2d              r;        // residual (huber-weighted)
+        double                 sigma_px; // measurement noise σ (huber-weighted)
+        int                    landmark_id;
+    };
+    std::vector<AcceptedRow> rows;
+    rows.reserve(obs.size());
+
+    for (const auto& o : obs) {
+        // p_I = R_GtoI · (p_world − p_G)
+        const cv::Vec3d dpw(o.p_world[0] - p_G[0],
+                            o.p_world[1] - p_G[1],
+                            o.p_world[2] - p_G[2]);
+        const cv::Vec3d p_I = R_GtoI * dpw;
+
+        // p_C = R_bc · p_I
+        const cv::Vec3d p_C = R_bc * p_I;
+
+        // Depth gate.
+        if (!(p_C[2] >= kLandmarkDepthMinM) || !(p_C[2] <= kLandmarkDepthMaxM)) {
+            result.rejected_depth++;
+            LOGI("LM_APPLY_REJECT: reason=depth fid=%d depth_m=%.2f",
+                 o.landmark_id, p_C[2]);
+            continue;
+        }
+
+        // Predicted pixel.
+        const double inv_z = 1.0 / p_C[2];
+        const double u_pred = fx * p_C[0] * inv_z + cx;
+        const double v_pred = fy * p_C[1] * inv_z + cy;
+
+        // In-image gate.
+        if (!(u_pred >= 0.0) || !(u_pred < static_cast<double>(img_width)) ||
+            !(v_pred >= 0.0) || !(v_pred < static_cast<double>(img_height))) {
+            result.rejected_outside_image++;
+            LOGI("LM_APPLY_REJECT: reason=image fid=%d u_pred=%.1f v_pred=%.1f W=%d H=%d",
+                 o.landmark_id, u_pred, v_pred, img_width, img_height);
+            continue;
+        }
+
+        // Residual r = z − h(x). 2×1.
+        const double r_u = static_cast<double>(o.pixel_meas.x) - u_pred;
+        const double r_v = static_cast<double>(o.pixel_meas.y) - v_pred;
+
+        // Pixel Jacobian wrt camera-frame point (2×3):
+        //   J_proj = (1/z) · [fx, 0, -fx·x/z;
+        //                      0, fy, -fy·y/z]
+        cv::Matx<double, 2, 3> J_proj;
+        J_proj(0, 0) = fx * inv_z;
+        J_proj(0, 1) = 0.0;
+        J_proj(0, 2) = -fx * p_C[0] * inv_z * inv_z;
+        J_proj(1, 0) = 0.0;
+        J_proj(1, 1) = fy * inv_z;
+        J_proj(1, 2) = -fy * p_C[1] * inv_z * inv_z;
+
+        // ∂p_C / ∂δθ   = −R_bc · skew(p_I)
+        // ∂p_C / ∂δp_G = −R_bc · R_GtoI
+        // (signs match updateAbsolutePose / updateRelativeRotation — see
+        // header comment block above for the left-perturbation derivation.)
+        const cv::Matx33d J_pC_theta = -R_bc * skew(p_I);
+        const cv::Matx33d J_pC_p     = -R_bc * R_GtoI;
+
+        const cv::Matx<double, 2, 3> H_theta = J_proj * J_pC_theta;
+        const cv::Matx<double, 2, 3> H_p     = J_proj * J_pC_p;
+
+        // ── Per-obs χ² (pose-only block) ─────────────────────────────────
+        // Build H_pose (2×6) = [H_theta | H_p], then
+        //   S = H_pose · P_pose_pose · H_pose^T + σ² · I_2
+        cv::Matx<double, 2, 6> H_pose;
+        for (int i = 0; i < 2; ++i) {
+            for (int j = 0; j < 3; ++j) {
+                H_pose(i, j)     = H_theta(i, j);
+                H_pose(i, j + 3) = H_p(i, j);
+            }
+        }
+        const double sigma_px_safe = std::max(o.sigma_px, 1e-3);
+        const double sigma_sq      = sigma_px_safe * sigma_px_safe;
+
+        const cv::Matx22d S = H_pose * P_pose_pose * H_pose.t()
+                            + cv::Matx22d(sigma_sq, 0.0, 0.0, sigma_sq);
+        const double det_S = S(0,0) * S(1,1) - S(0,1) * S(1,0);
+        if (!(std::abs(det_S) > 1e-12) || !std::isfinite(det_S)) {
+            result.rejected_chi2++;
+            LOGI("LM_APPLY_REJECT: reason=chi2_singular fid=%d det_S=%.3e",
+                 o.landmark_id, det_S);
+            continue;
+        }
+        // S^-1 by closed-form 2×2 inverse.
+        const double inv_det = 1.0 / det_S;
+        const cv::Matx22d S_inv(
+             S(1,1) * inv_det, -S(0,1) * inv_det,
+            -S(1,0) * inv_det,  S(0,0) * inv_det);
+
+        const cv::Vec2d r_vec(r_u, r_v);
+        const cv::Vec2d Sinv_r = S_inv * r_vec;
+        const double m2 = r_vec[0] * Sinv_r[0] + r_vec[1] * Sinv_r[1];
+
+        if (!(m2 <= kLandmarkChi2Gate95) || !std::isfinite(m2)) {
+            result.rejected_chi2++;
+            LOGI("LM_APPLY_REJECT: reason=chi2 fid=%d m2=%.3f gate=%.3f",
+                 o.landmark_id, m2, kLandmarkChi2Gate95);
+            continue;
+        }
+
+        // ── Per-obs Huber kernel (pixel residual norm) ────────────────────
+        const double r_px = std::sqrt(r_u * r_u + r_v * r_v);
+        double huber_w = 1.0;
+        if (r_px > kLandmarkHuberPx) {
+            if (r_px > 5.0 * kLandmarkHuberPx) {
+                result.rejected_huber++;
+                LOGI("LM_APPLY_REJECT: reason=huber fid=%d r_px=%.2f",
+                     o.landmark_id, r_px);
+                continue;
+            }
+            huber_w = kLandmarkHuberPx / r_px;
+        }
+
+        // Accept. Stash the row, Huber-scale residual + sigma so the
+        // downstream Joseph step sees a consistent (H, R, r) triple.
+        // Row scaling by huber_w applied to both res and H is mathematically
+        // equivalent to inflating R by 1/w² (the IRLS form used in
+        // applyMSCKFUpdate); we follow the per-residual scale here for
+        // clarity since each row has its own w.
+        AcceptedRow row;
+        row.H_theta     = H_theta * huber_w;
+        row.H_p         = H_p     * huber_w;
+        row.r           = cv::Vec2d(r_u * huber_w, r_v * huber_w);
+        row.sigma_px    = sigma_px_safe;  // R uses unweighted σ; H/r carry the weight
+        row.landmark_id = o.landmark_id;
+        rows.push_back(row);
+
+        result.accepted++;
+        result.chi2_total += m2;  // accumulate ONLY accepted observations
+    }
+
+    // ── Pass 2: assemble and apply the batched update ────────────────────
+    if (rows.empty()) {
+        LOGI("LM_APPLY: obs=%zu accepted=0 rej_chi2=%d rej_huber=%d rej_depth=%d rej_image=%d chi2_total=0.00",
+             obs.size(), result.rejected_chi2, result.rejected_huber,
+             result.rejected_depth, result.rejected_outside_image);
+        return result;
+    }
+
+    const int N = static_cast<int>(rows.size());
+    cv::Mat H_stack = cv::Mat::zeros(2 * N, dim, CV_64F);
+    cv::Mat r_stack = cv::Mat::zeros(2 * N, 1, CV_64F);
+    cv::Mat R_stack = cv::Mat::zeros(2 * N, 2 * N, CV_64F);
+
+    for (int i = 0; i < N; ++i) {
+        const AcceptedRow& row = rows[i];
+        for (int r_off = 0; r_off < 2; ++r_off) {
+            const int dst_row = 2 * i + r_off;
+            // δθ block (cols 0..2)
+            for (int j = 0; j < 3; ++j) {
+                H_stack.at<double>(dst_row, 0 + j) = row.H_theta(r_off, j);
+            }
+            // δp_G block (cols 12..14)
+            for (int j = 0; j < 3; ++j) {
+                H_stack.at<double>(dst_row, 12 + j) = row.H_p(r_off, j);
+            }
+            r_stack.at<double>(dst_row, 0) = row.r[r_off];
+            // R_stack diagonal (per-residual σ²). Block-diagonal: residual
+            // u and v of the same observation are uncorrelated noise samples
+            // by the pinhole model, so the 2×2 sub-block is σ²·I.
+            R_stack.at<double>(dst_row, dst_row) =
+                row.sigma_px * row.sigma_px;
+        }
+    }
+
+    // Hand off to the existing Joseph-form / Huber path. apply_huber=false
+    // because we've already applied a per-observation Huber here; the
+    // downstream Huber works per-row of the stacked matrix and would
+    // double-de-weight the rows we've already softened. The downstream
+    // χ² gate (rows in applyMSCKFUpdate) sees only the post-Huber
+    // residuals so its hard-reject still has correct semantics.
+    applyMSCKFUpdate(H_stack, r_stack, R_stack, /*apply_huber=*/false);
+
+    LOGI("LM_APPLY: obs=%zu accepted=%d rej_chi2=%d rej_huber=%d rej_depth=%d rej_image=%d chi2_total=%.2f",
+         obs.size(), result.accepted, result.rejected_chi2,
+         result.rejected_huber, result.rejected_depth,
+         result.rejected_outside_image, result.chi2_total);
+
+    return result;
 }
 
 bool EKFState::updateGravityAlignment(const cv::Mat& accel_body, double var) {
@@ -1273,7 +2121,16 @@ bool EKFState::updateGravityAlignment(const cv::Mat& accel_body, double var) {
     // these lines feed cross-checking against.
     LOGI("LC_GA: a_norm=%.4f r_norm=%.6f var_unit=%.6e",
          a_norm, cv::norm(r), var_unit);
-    applyMSCKFUpdate(H, r, R_noise);
+    // v23.14: bypass Huber. Gravity is a HARD physical constraint with
+    // pre-validated input (accel magnitude band + gyro gate already applied
+    // upstream in Tracker.cpp). Huber-rejecting these treats real attitude
+    // errors as "outliers" and creates a self-reinforcing trap where R_GtoI
+    // never gets corrected, gyro bias integrates unchecked, clone poses
+    // drift, and SLAM dots wander. Pre-fix logcat: 1882/2011 = 93.6% Huber
+    // rejection rate on these 3-row updates → R_GtoI corrections of only
+    // ~0.003 rad per fired update → no chance to overcome real attitude
+    // drift.
+    applyMSCKFUpdate(H, r, R_noise, /*apply_huber=*/false);
     return true;
 }
 
@@ -1396,6 +2253,39 @@ double EKFState::getYaw(double roll, double pitch) const {
     // walks. Verified via scripts/test_z_up_conventions.py.
     return std::atan2(R_aligned.at<double>(1, 0),
                       R_aligned.at<double>(0, 0));
+}
+
+// ── Fix B (2026-05-16 audit) — canonical single-source heading ───────────────
+//
+// Cause: architecture audit Finding 2.1 documented 4 distinct yaw-extraction
+// formulas across the codebase. scalar_heading_ (Tracker mirror of Madgwick) and
+// global_R_ (Tracker mirror of EKF R_GtoI) diverge when EKF and Madgwick drift
+// apart (v26: 55° by 53s). Every consumer that crossed the boundary amplified
+// rather than corrected the drift.
+//
+// Change: expose getWorldHeadingRad() as the single EKF-internal heading query.
+// Derives roll/pitch from R_GtoI_ col-2 (gravity direction in body frame) using
+// the same tilt-angle decomposition that getYaw(roll,pitch) performs, removing
+// the dependency on the caller to supply Madgwick angles.
+//
+// Falsifier: with a horizontal phone (R_GtoI = I), col-2 = (0,0,1) → roll=0,
+// pitch=0 → getWorldHeadingRad() == getYaw(0,0). With a vertical phone facing
+// North, col-2 ≈ (0,-1,0) → pitch ≈ -π/2 → R_align removes the tilt → atan2
+// extracts the nav heading correctly. Unit-test expectations documented in
+// EKFState.h getWorldHeadingRad() declaration.
+double EKFState::getWorldHeadingRad() const {
+    if (!full_initialized_ || R_GtoI_.empty()) return 0.0;
+    // Extract roll and pitch from R_GtoI_ column 2 (world-Z in body frame).
+    // R_GtoI_ col 2 = R_GtoI_ * (0,0,1)^T = body-frame gravity direction
+    // (i.e. which body axis is "up" in world frame).
+    const double gx = R_GtoI_.at<double>(0, 2);  // body-x component of world-Z
+    const double gy = R_GtoI_.at<double>(1, 2);  // body-y component of world-Z
+    const double gz = R_GtoI_.at<double>(2, 2);  // body-z component of world-Z
+    // Tait-Bryan ZYX: pitch = asin(-gx), roll = atan2(gy, gz).
+    // Matches IMUPreintegrator.cpp:704-707 and the standard gravity→RPY formula.
+    const double pitch = std::asin(std::max(-1.0, std::min(1.0, -gx)));
+    const double roll  = std::atan2(gy, gz);
+    return getYaw(roll, pitch);
 }
 
 // ── Clone Accessors ─────────────────────────────────────────────────────────
@@ -1578,6 +2468,69 @@ bool EKFState::getSlamFeatureGlobalPosition(int slot, cv::Mat& p_global_out) con
     return true;
 }
 
+// Phase 1 Step 4a (post_v19_sprint_plan.md). Transfer the feature's inverse-
+// depth parameterisation (α, β, ρ) from its current anchor clone to
+// `new_anchor_id`, preserving the world-frame position. Must be called BEFORE
+// the old anchor is popped from window_; both clones must currently be present.
+// Covariance is intentionally not transformed (plan §4a) — the EKF absorbs the
+// small numerical mismatch on the next measurement update.
+bool EKFState::reanchorSlamFeature(int slot, int new_anchor_id) {
+    if (slot < 0 || slot >= static_cast<int>(slam_features_.size())) return false;
+    auto& f = slam_features_[slot];
+    if (f.anchor_clone_id == new_anchor_id) return true;  // already anchored there
+
+    // OpenVINS-style FEJ-consistent re-anchoring (v23.1 fix, 2026-05-11):
+    // The earlier draft of this function computed p_world from the OLD anchor's
+    // CURRENT pose (via getClonePose) and then projected into the NEW anchor's
+    // CURRENT pose. That captured the OLD anchor's pose drift since promotion
+    // INTO the new state, making the new (α, β, ρ) inconsistent with what the
+    // residual + Jacobian expect. Visible in v23.1 logcat: 112 "SLAM demote
+    // (bad RMS streak)" events in 1 min as features failed the 3px reprojection
+    // gate within 3 frames of being re-anchored.
+    //
+    // Correct algorithm: use the locked FIRST-ESTIMATE world point
+    // (f.p_global_FEJ) and the NEW anchor's FEJ pose (getCloneFEJ). That way
+    // the new (α, β, ρ) is consistent with the new anchor_R_FEJ + anchor_p_FEJ
+    // we store, and slamReprojectionJacobian's FEJ-based linearisation stays
+    // self-consistent across re-anchors. World point is preserved exactly
+    // (same physical 3D point) because we re-use f.p_global_FEJ verbatim.
+
+    if (f.p_global_FEJ.empty() ||
+        f.p_global_FEJ.rows != 3 || f.p_global_FEJ.cols != 1) return false;
+
+    // NEW anchor's FEJ pose. Fall back to current pose if FEJ wasn't recorded
+    // (matches the convention in addSlamFeature for fresh clones).
+    cv::Mat R_new_FEJ, p_new_FEJ;
+    if (!getCloneFEJ(new_anchor_id, R_new_FEJ, p_new_FEJ) ||
+        R_new_FEJ.empty() || p_new_FEJ.empty()) {
+        if (!getClonePose(new_anchor_id, R_new_FEJ, p_new_FEJ)) return false;
+    }
+    if (R_new_FEJ.rows != 3 || R_new_FEJ.cols != 3 ||
+        p_new_FEJ.rows != 3 || p_new_FEJ.cols != 1) return false;
+
+    // Project the locked FEJ world point into the NEW anchor's FEJ camera
+    // frame. Same formula as addSlamFeature line 1612.
+    cv::Mat p_new_cam = R_new_FEJ * (f.p_global_FEJ - p_new_FEJ);
+    const double Xc = p_new_cam.at<double>(0, 0);
+    const double Yc = p_new_cam.at<double>(1, 0);
+    const double Zc = p_new_cam.at<double>(2, 0);
+    if (!std::isfinite(Xc) || !std::isfinite(Yc) || !std::isfinite(Zc)) return false;
+    if (Zc < 0.01) return false;  // behind / too close — would produce degenerate ρ
+
+    // Update state mean to new parameterisation.
+    f.state.at<double>(0, 0) = Xc / Zc;
+    f.state.at<double>(1, 0) = Yc / Zc;
+    f.state.at<double>(2, 0) = 1.0 / Zc;
+    // pad rows 3, 4 stay zero — never updated by any measurement.
+
+    // Update anchor metadata to NEW anchor's FEJ pose. p_global_FEJ is
+    // preserved — it's the same physical 3D point in the world.
+    f.anchor_clone_id = new_anchor_id;
+    f.anchor_R_FEJ    = R_new_FEJ.clone();
+    f.anchor_p_FEJ    = p_new_FEJ.clone();
+    return true;
+}
+
 int EKFState::addSlamFeature(int feature_id,
                              const cv::Mat& p_global_init,
                              const CameraPose& anchor_clone) {
@@ -1650,7 +2603,23 @@ int EKFState::addSlamFeature(int feature_id,
     // need to be PSD-positive for the Joseph update to stay PSD.
     cv::Mat P_ff = cv::Mat::zeros(SLAM_FEATURE_DIM, SLAM_FEATURE_DIM, CV_64F);
     const double rho       = 1.0 / Zc;
+    // sigma_uv = 1 pixel of bearing uncertainty in normalised image coords = 1/focal.
+    //
+    // Cause:  OLD value 1.0/500.0 hardcoded an assumed focal of 500 px.  The
+    //         Samsung S21 Ultra rear camera at the working zoom delivers
+    //         slam_fx_ ≈ 700-900 px (set by Tracker::setIntrinsics -> setSlamIntrinsics).
+    //         500 overstates bearing uncertainty 40-80%, making P_ff at promotion
+    //         too large and slowing SLAM dot convergence (ekf_audit.md Finding 6).
+    // Change: Use 1.0/slam_fx_ (actual focal from live intrinsics).
+    //         slam_fx_ defaults to 500.0 (EKFState.h:643) until setSlamIntrinsics
+    //         is called, so this is safe before calibration initialises.
+    // Falsifier: At runtime print slam_fx_ and sigma_uv.  For S21 Ultra at 1x zoom,
+    //            slam_fx_ ≈ 750 → sigma_uv ≈ 0.00133 (was 0.002).
+    // Date:   2026-05-16 (ekf_audit.md Finding 6)
+    /* OLD (2026-05-16 superseded):
     const double sigma_uv  = 1.0 / 500.0;  // ≈1px / 500-focal — calibrated trend
+    */
+    const double sigma_uv  = 1.0 / std::max(slam_fx_, 1.0);  // 1px / actual focal
     const double sigma_ab  = std::max(sigma_uv, 1e-3);
     const double sigma_rho = std::max(0.5 * rho, 1e-3);
     P_ff.at<double>(0, 0) = sigma_ab  * sigma_ab;
@@ -1926,11 +2895,22 @@ bool EKFState::slamReprojectionJacobian(const SlamFeature& f,
     // Jacobian w.r.t. observing clone (δθ_c, δp_c):
     //   ∂p_C / ∂δθ_c = -[clone_R_F * (p_world - clone_p)]_x = -[p_C_F]_x
     //   ∂p_C / ∂δp_c = -clone_R_F
-    auto skew = [](const cv::Mat& v) {
-        return (cv::Mat_<double>(3, 3) <<
+    // Explicit -> cv::Mat return type AND materialize via a local: without
+    // this, auto deduction made the return type cv::MatCommaInitializer_<double>,
+    // which holds a pointer to the temporary Mat_<double>(3,3) constructed
+    // inline. That temporary was destroyed at end-of-return — leaving the
+    // returned MatCommaInitializer with a dangling pointer. The caller's
+    // implicit conversion to Mat then read freed memory, manifesting downstream
+    // as "Matrix operand is an empty matrix" at step=13 (skew(p_C_F) * -1.0).
+    // v22 logcat: 104 occurrences; v23 with Step 4 keeping features alive: 131
+    // occurrences in seconds. Same pattern as the line 180 skew lambda which
+    // already had the explicit return type fix.
+    auto skew = [](const cv::Mat& v) -> cv::Mat {
+        cv::Mat result = (cv::Mat_<double>(3, 3) <<
                 0.0,                 -v.at<double>(2, 0),  v.at<double>(1, 0),
                 v.at<double>(2, 0),   0.0,                -v.at<double>(0, 0),
                -v.at<double>(1, 0),   v.at<double>(0, 0),  0.0);
+        return result;
     };
     // Final defensive sanity on clone_R_F before unary minus — the
     // crash on 2026-05-04 hit cv::operator- here and the abort came
@@ -2021,6 +3001,10 @@ bool EKFState::updateSlamFeature(int slot,
             p_FEJ = p_now.clone();
         }
 
+        // Skip self-observation: anchor clone observing itself has zero
+        // baseline by definition; the residual is degenerate.
+        if (f.anchor_clone_id == clone_id) continue;
+
         cv::Mat H_feat, H_clone;
         cv::Point2d pred;
         if (!slamReprojectionJacobian(f, R_FEJ, p_FEJ, R_now, p_now,
@@ -2029,30 +3013,15 @@ bool EKFState::updateSlamFeature(int slot,
         }
 
         // Sparse 2 x dim Jacobian:
-        //   - clone slot        at [clone_cov, clone_cov+6)
-        //   - SLAM slot         at [slam_idx, slam_idx+5)
-        //   - extrinsics slot   at [EXTR_STATE_OFFSET, EXTR_STATE_OFFSET+3) (Step 8b)
+        //   - clone slot at [clone_cov, clone_cov+6)
+        //   - SLAM slot  at [slam_idx, slam_idx+5)
         cv::Mat H = cv::Mat::zeros(2, dim, CV_64F);
         H_clone.copyTo(H(cv::Range::all(),
                          cv::Range(clone_cov, clone_cov + CLONE_DIM)));
-        H_feat .copyTo(H(cv::Range::all(),
-                         cv::Range(slam_idx, slam_idx + SLAM_FEATURE_DIM)));
+        H_feat.copyTo(H(cv::Range::all(),
+                        cv::Range(slam_idx, slam_idx + SLAM_FEATURE_DIM)));
 
-        // Step 8b: extrinsics Jacobian for SLAM feature reprojection.
-        // p_C_F is the feature in camera frame at the FEJ linearisation point.
-        // slamReprojectionJacobian stores dpC_dtheta = skew(p_C_F)*-1.0 (=-skew(p_C_F)).
-        // The H_bc for δφ_bc follows the same formula as in applyMSCKFFeature:
-        //   H_bc = dproj_dpC * (-skew(p_C_F))
-        // We can derive it from H_clone's first 3 columns, which equal
-        //   H_clone_theta = dproj_dpC * (-skew(p_C_F)).
-        // So H_bc == H_clone_theta = H_clone[:, 0:3].
-        // This is consistent: the extrinsics error acts like a clone rotation
-        // error on p_C_F (both perturb p_C by -[p_C_F]_× * δφ).
-        // Step 8b: SLAM H_bc DISABLED, same rationale as the MSCKF path
-        // (R_bc baked into clone storage at addClone time; no double-counting).
-        // (H is zero-initialized at line 1827; EXTR columns remain 0.)
-
-        // Residual = obs - predicted (normalised image coords).
+        // Residual = obs - predicted (pixel coords).
         cv::Mat r = (cv::Mat_<double>(2, 1) <<
                      observations[k].x - pred.x,
                      observations[k].y - pred.y);
@@ -2077,6 +3046,42 @@ bool EKFState::updateSlamFeature(int slot,
     }
     cv::Mat R_noise = cv::Mat::eye(2 * K, 2 * K, CV_64F)
                       * std::max(pixel_noise_sq, 1e-8);
+
+    // v23.13 (2026-05-12): per-update chi² gate (OpenVINS doctrine,
+    // rpng/open_vins UpdaterSLAM.cpp:520-556).
+    //
+    //   chi² = r^T · (H·P·H^T + R)^-1 · r
+    //   reject if chi² > chi2_multipler · χ²_{0.95}(dof=2K)
+    //
+    // OpenVINS defaults: chi2_multipler = 5, σ_pix = 1.0.
+    // Replaces the previous parallax gate which blocked valid corrections
+    // on slow motion / still phone, letting clone-pose drift accumulate.
+    {
+        cv::Mat S_chi = H_stack * P_ * H_stack.t() + R_noise;
+        cv::Mat S_inv_chi;
+        bool ok = cv::invert(S_chi, S_inv_chi, cv::DECOMP_CHOLESKY);
+        if (!ok) ok = cv::invert(S_chi, S_inv_chi, cv::DECOMP_SVD);
+        if (ok) {
+            cv::Mat chi2_mat = r_stack.t() * S_inv_chi * r_stack;
+            const double chi2 = chi2_mat.at<double>(0, 0);
+            const double chi2_095_table[] = {
+                0.0, 3.841, 5.991, 7.815, 9.488,
+                11.070, 12.592, 14.067, 15.507
+            };
+            const int dof = 2 * K;
+            const double base = (dof >= 1 && dof < 9)
+                                 ? chi2_095_table[dof]
+                                 : (5.991 + 2.0 * (dof - 2));
+            const double thresh = 5.0 * base;   // chi2_multipler = 5
+            if (!std::isfinite(chi2) || chi2 > thresh) {
+                if (rms_n > 0) {
+                    f.last_obs_rms = std::sqrt(rms_acc /
+                                                static_cast<double>(rms_n));
+                }
+                return false;
+            }
+        }
+    }
 
     // Inherit Step 3a's damping + Huber kernel by going through the
     // canonical update path.
@@ -2115,11 +3120,22 @@ bool EKFState::applyMSCKFFeature(const std::vector<cv::Point2f>& observations,
     std::vector<cv::Mat> H_f_rows;   // 2 x 3
     std::vector<cv::Mat> r_rows;     // 2 x 1
 
-    auto skew = [](const cv::Mat& v) {
-        return (cv::Mat_<double>(3, 3) <<
+    // Explicit -> cv::Mat return type AND materialize via a local: without
+    // this, auto deduction made the return type cv::MatCommaInitializer_<double>,
+    // which holds a pointer to the temporary Mat_<double>(3,3) constructed
+    // inline. That temporary was destroyed at end-of-return — leaving the
+    // returned MatCommaInitializer with a dangling pointer. The caller's
+    // implicit conversion to Mat then read freed memory, manifesting downstream
+    // as "Matrix operand is an empty matrix" at step=13 (skew(p_C_F) * -1.0).
+    // v22 logcat: 104 occurrences; v23 with Step 4 keeping features alive: 131
+    // occurrences in seconds. Same pattern as the line 180 skew lambda which
+    // already had the explicit return type fix.
+    auto skew = [](const cv::Mat& v) -> cv::Mat {
+        cv::Mat result = (cv::Mat_<double>(3, 3) <<
                 0.0,                 -v.at<double>(2, 0),  v.at<double>(1, 0),
                 v.at<double>(2, 0),   0.0,                -v.at<double>(0, 0),
                -v.at<double>(1, 0),   v.at<double>(0, 0),  0.0);
+        return result;
     };
 
     // Step 8a (ADR-014): per-observation index into the VALID observations list.
@@ -2178,16 +3194,6 @@ bool EKFState::applyMSCKFFeature(const std::vector<cv::Point2f>& observations,
 
         cv::Mat H_f = dproj_dpC * dpC_dpw;          // 2x3
 
-        // Step 8b: extrinsics Jacobian H_bc (columns EXTR_STATE_OFFSET..+2).
-        // Perturbation model: R_bc_new = R_bc * Exp(δφ_bc).
-        // The camera-frame point p_C = R_bc * p_body, so:
-        //   d(R_bc * p_body)/dδφ_bc |_{δφ=0} = -[p_C]_×
-        //
-        // FEJ: use p_C_F (from FEJ clone poses) as the linearisation point,
-        // consistent with the clone rotation block above (dpC_dtheta = -skew(p_C_F)).
-        //
-        // Source: OpenVINS online extrinsic calibration (Geneva et al. 2020,
-        // ICRA, eq. (10)): ∂z/∂φ_bc = (∂z/∂p_C) * (-[p_C]_×).
         // Step 8b: H_bc DISABLED (NavSight 2026-05-09 Step 7 fix).
         // R_bc is baked into clone storage at addClone time (Tracker.cpp:1622),
         // so live R_bc no longer factors into projection — treating it as a
@@ -2195,6 +3201,10 @@ bool EKFState::applyMSCKFFeature(const std::vector<cv::Point2f>& observations,
         // fixed-mount value read from Android SENSOR_ORIENTATION; online
         // estimation is unnecessary for a fixed-mount phone camera.
         // (H_x is zero-initialized; the EXTR columns remain 0.)
+        //
+        // PHASE_A_8B_REENABLE_2026_05_19 REVERTED — re-enabling H_bc here
+        // produced dphi_bc=0 because H_bc was perfectly correlated with
+        // H_clone_theta. R_bc unobservable under Option C clone storage.
 
         cv::Mat r = (cv::Mat_<double>(2, 1) <<
                      observations[k].x - pred_u,
@@ -2241,10 +3251,26 @@ bool EKFState::applyMSCKFFeature(const std::vector<cv::Point2f>& observations,
         const double dpx_du = (observations[src_next].x - observations[src_prev].x) / dt_fd;
         const double dpx_dv = (observations[src_next].y - observations[src_prev].y) / dt_fd;
 
-        // Convert to normalised image coordinates (1/s). H_td = -v_normalised.
-        // This directly fills H_x(row, 15) = -v_normalised for the 2-DOF row pair.
+        // H_td in PIXEL velocity (px/s), consistent with the pixel-space residual.
+        //
+        // Cause:  OLD code divided by slam_fx_/slam_fy_ to convert to normalised
+        //         image velocity (1/s).  But the residual r (line ~2452) is in PIXEL
+        //         coords (observations are pixels, pred_u/v from slam_fx_*pC/zC+cx).
+        //         The unit mismatch made the Kalman gain on δt_d ~700× wrong
+        //         (focal ≈ 700 px), causing dtd to oscillate rather than converge.
+        //         All other H columns (H_clone) are already in pixels/radian and
+        //         pixels/meter — H_td must match (ekf_audit.md Finding 5).
+        // Change: Remove the /slam_fx_ and /slam_fy_ divisions so H_td stays px/s.
+        // Falsifier: with slow walking (feature velocity ~150 px/s), H_td should be
+        //            ~150.  With the OLD code it was ~150/700 ≈ 0.21.  Log column 15
+        //            of H_x_rows[ai] and verify its magnitude matches pixel velocity.
+        // Date:   2026-05-16 (ekf_audit.md Finding 5)
+        /* OLD (2026-05-16 superseded — wrong unit: normalised, not pixels):
         const double h_td_u = -dpx_du / slam_fx_;
         const double h_td_v = -dpx_dv / slam_fy_;
+        */
+        const double h_td_u = -dpx_du;
+        const double h_td_v = -dpx_dv;
 
         // ai maps to rows [2*ai, 2*ai+1] in H_x_rows — already stored.
         // We need to write into column td_col of the stored H_x matrix.
@@ -2339,6 +3365,122 @@ EKFState::getCloneSnapshot(int max_clones) const {
             p.p_G.at<double>(1, 0),
             p.p_G.at<double>(2, 0));
         out.push_back(s);
+    }
+    return out;
+}
+
+// 2026-05-16: single-snapshot consistency fix (per ekf-inv-dot-investigation agent)
+//
+// Consolidated read of every EKF field consumed by the JNI overlay path. All
+// reads happen under one snapshot_mutex_ acquisition so the camera pose and
+// SLAM feature world positions are guaranteed to be derived from the SAME
+// state-version (no mid-snapshot processFrame mutation). The mutex is the
+// same one addClone / marginalizeOldestClone / pruneWindow take while
+// splicing window_ + slam_features_, so we never observe a torn deque or
+// vector here. R_GtoI_/p_G_/R_bc_ are read in the same critical section;
+// the camera thread does not take snapshot_mutex_ for those individually,
+// but bundling the reads in one function call closes the dominant gap
+// (multi-millisecond Kotlin-side gap between separate JNI hops).
+EKFState::OverlaySnapshot EKFState::snapshotForOverlay() const {
+    OverlaySnapshot out;
+    std::lock_guard<std::mutex> lock(snapshot_mutex_);
+
+    out.full_initialized = full_initialized_;
+    if (!full_initialized_) return out;
+
+    // IMU state (R_GtoI, p_G) — copy into POD types so the caller has no
+    // dangling cv::Mat headers into our internal storage.
+    if (R_GtoI_.rows == 3 && R_GtoI_.cols == 3 && R_GtoI_.type() == CV_64F) {
+        for (int r = 0; r < 3; ++r) {
+            for (int c = 0; c < 3; ++c) {
+                out.R_GtoI(r, c) = R_GtoI_.at<double>(r, c);
+            }
+        }
+    }
+    if (p_G_.rows == 3 && p_G_.cols == 1 && p_G_.type() == CV_64F) {
+        out.p_G = cv::Vec3d(p_G_.at<double>(0, 0),
+                            p_G_.at<double>(1, 0),
+                            p_G_.at<double>(2, 0));
+    }
+
+    // Body→camera extrinsic (already a Matx33d — direct copy).
+    out.R_bc = R_bc_;
+
+    // Cached SLAM intrinsics.
+    out.slam_fx = slam_fx_;
+    out.slam_fy = slam_fy_;
+    out.slam_cx = slam_cx_;
+    out.slam_cy = slam_cy_;
+
+    // Walk SLAM features inline (no helper calls — keep everything in one
+    // critical section). Math is the same as getSlamFeatureGlobalPosition:
+    //   p_anchor_pt = (α/ρ, β/ρ, 1/ρ)
+    //   p_world     = R_anchor^T · p_anchor_pt + p_anchor_world
+    out.slam_features.reserve(slam_features_.size());
+    for (const SlamFeature& f : slam_features_) {
+        if (f.state.empty() || f.state.rows < 3) continue;
+        const double alpha = f.state.at<double>(0, 0);
+        const double beta  = f.state.at<double>(1, 0);
+        const double rho   = f.state.at<double>(2, 0);
+        if (std::abs(rho) < 1e-9) continue;
+
+        // Find the anchor clone in window_ (same scan getClonePose does, but
+        // inline so we stay under our one mutex acquisition and don't risk
+        // a future refactor adding a second lock site to getClonePose).
+        cv::Matx33d R_anchor_x(1.0, 0.0, 0.0,  0.0, 1.0, 0.0,  0.0, 0.0, 1.0);
+        cv::Vec3d   p_anchor_w(0.0, 0.0, 0.0);
+        bool found = false;
+        for (const CameraPose& cp : window_) {
+            if (cp.state_id != f.anchor_clone_id) continue;
+            if (cp.R_GtoC.rows != 3 || cp.R_GtoC.cols != 3 ||
+                cp.p_G.rows    != 3 || cp.p_G.cols    != 1) continue;
+            for (int r = 0; r < 3; ++r) {
+                for (int c = 0; c < 3; ++c) {
+                    R_anchor_x(r, c) = cp.R_GtoC.at<double>(r, c);
+                }
+            }
+            p_anchor_w = cv::Vec3d(cp.p_G.at<double>(0, 0),
+                                   cp.p_G.at<double>(1, 0),
+                                   cp.p_G.at<double>(2, 0));
+            found = true;
+            break;
+        }
+        if (!found) continue;  // anchor marginalised; skip silently (existing semantics)
+
+        const cv::Vec3d p_anchor_pt(alpha / rho, beta / rho, 1.0 / rho);
+        // p_world = R_anchor^T · p_anchor_pt + p_anchor_w
+        const cv::Vec3d p_world = R_anchor_x.t() * p_anchor_pt + p_anchor_w;
+
+        OverlaySnapshot::SlamFeatureEntry e;
+        e.feature_id = f.feature_id;
+        e.p_world    = p_world;
+        out.slam_features.push_back(e);
+    }
+
+    // 2026-05-19 — Orange-dot anchor-relative render support. Copy the live
+    // (state_id, R_GtoC, p_G) of every clone in window_ so getLandmarkSnapshot
+    // can look up each landmark's host clone CURRENT pose under the same
+    // snapshot_mutex_ tick that produced R_GtoI / p_G / slam_features above.
+    // Field types match OverlaySnapshot::CloneEntry — cheap POD copy out of
+    // the cv::Mat-backed CameraPose storage. Skip clones with degenerate
+    // matrices (defensive; shouldn't occur in healthy operation).
+    out.clones.reserve(window_.size());
+    for (const CameraPose& cp : window_) {
+        if (cp.R_GtoC.rows != 3 || cp.R_GtoC.cols != 3 ||
+            cp.R_GtoC.type() != CV_64F) continue;
+        if (cp.p_G.rows != 3 || cp.p_G.cols != 1 ||
+            cp.p_G.type() != CV_64F) continue;
+        OverlaySnapshot::CloneEntry ce;
+        ce.state_id = cp.state_id;
+        for (int r = 0; r < 3; ++r) {
+            for (int c = 0; c < 3; ++c) {
+                ce.R_GtoC(r, c) = cp.R_GtoC.at<double>(r, c);
+            }
+        }
+        ce.p_G = cv::Vec3d(cp.p_G.at<double>(0, 0),
+                            cp.p_G.at<double>(1, 0),
+                            cp.p_G.at<double>(2, 0));
+        out.clones.push_back(ce);
     }
     return out;
 }

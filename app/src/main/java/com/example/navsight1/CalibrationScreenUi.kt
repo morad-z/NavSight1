@@ -137,6 +137,9 @@ fun CalibrationScreen(
     viewModel: NavSightViewModel,
     pal: NavPalette,
     onClose: () -> Unit,
+    // 2026-05-17 — entry point for the Allan-variance IMU recorder overlay
+    // (handled by the parent MainScreen). Default no-op for legacy callers.
+    onOpenImuCalibration: () -> Unit = {},
 ) {
     val context = LocalContext.current
     var step by remember { mutableStateOf(CalibrationStep.Onboarding) }
@@ -159,6 +162,7 @@ fun CalibrationScreen(
                 onSquareMmChange = { squareMmText = it },
                 onStart = { if (openCvOk) step = CalibrationStep.Capturing },
                 onClose = onClose,
+                onOpenImuCalibration = onOpenImuCalibration,
             )
             CalibrationStep.Capturing -> CalibrationCapturing(
                 pal = pal,
@@ -232,6 +236,7 @@ private fun CalibrationOnboarding(
     onSquareMmChange: (String) -> Unit,
     onStart: () -> Unit,
     onClose: () -> Unit,
+    onOpenImuCalibration: () -> Unit = {},
 ) {
     Column(
         Modifier.fillMaxSize().padding(20.dp).statusBarsPadding(),
@@ -288,6 +293,15 @@ private fun CalibrationOnboarding(
             Icon(Icons.Default.PlayArrow, null, tint = Color.White)
             Spacer(Modifier.width(8.dp))
             Text("Start calibration", color = Color.White, fontSize = 16.sp, fontWeight = FontWeight.Bold)
+        }
+        // 2026-05-17 — Allan-variance IMU recorder entry. Distinct flow from
+        // camera calibration; both happen on this screen because both are
+        // "calibrate the device sensors" tasks.
+        TextButton(
+            onClick = onOpenImuCalibration,
+            modifier = Modifier.fillMaxWidth(),
+        ) {
+            Text("IMU Allan-variance recorder →", color = pal.teal, fontSize = 14.sp)
         }
     }
 }

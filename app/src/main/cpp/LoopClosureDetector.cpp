@@ -20,7 +20,7 @@
 
 #ifdef __ANDROID__
 #include <android/log.h>
-#define TAG "LoopClosureDetector"
+#define TAG "NavSight-LC"
 #define LOGI(...) __android_log_print(ANDROID_LOG_INFO,  TAG, __VA_ARGS__)
 #define LOGD(...) __android_log_print(ANDROID_LOG_DEBUG, TAG, __VA_ARGS__)
 #define LOGE(...) __android_log_print(ANDROID_LOG_ERROR, TAG, __VA_ARGS__)
@@ -138,10 +138,22 @@ constexpr int kGeomMinInFrame = 30;
 
 // kGeomMatchRadiusPx
 //   Image-space radius for nearest-neighbour matching projected-3D-points
-//   to current-frame KLT corners. Tracker MIN_DIST = 10 px is the spacing
+//   to current-frame ORB keypoints. Tracker MIN_DIST = 10 px is the spacing
 //   between corners by construction; 15 px gives margin for projection
 //   error from EKF orientation drift.
 constexpr double kGeomMatchRadiusPx = 15.0;
+
+// kGeomDescriptorMaxDistance
+//   2026-05-13 Phase 1 Step 7.1 fix: maximum Hamming distance for an ORB
+//   correspondence to be admitted into the PnP solve. 50 is the ORB-SLAM3
+//   standard (cited in docs/study/post_v19_sprint_plan.md Step 6 line 280)
+//   and matches the value the BoW path's BFMatcher uses via Lowe-ratio
+//   semantics. Why this matters: the prior implementation matched on pixel
+//   distance alone, which in low-texture indoor scenes (v24 walk:
+//   filled_3d=0 on 98% of keyframes) admitted appearance-blind
+//   correspondences and yielded PnP poses with r_R=37° / r_p=5 m that
+//   subsequently passed chi² because var_p was inflated by drift_path.
+constexpr int kGeomDescriptorMaxDistance = 50;
 
 // Reuse the same depth gates as the BoW path's two-keyframe triangulation
 // at Tracker.cpp:2567-2570 — points behind the camera or too far for any
@@ -229,6 +241,46 @@ LoopClosureDetector::LoopClosureDetector()
     : impl_(std::make_unique<Impl>()) {}
 
 LoopClosureDetector::~LoopClosureDetector() = default;
+
+// 2026-05-13 Phase 1 Step 5 (post_v19_sprint_plan.md): pose-graph back-write
+// site. Mutates a stored keyframe's pose by (Δp, Δyaw); descriptors and
+// triangulated landmarks stay attached to the (now-corrected) pose.
+bool LoopClosureDetector::applyKeyframePoseCorrection(
+        uint64_t kf_id,
+        double dx, double dy, double dz, double dyaw) {
+    if (!impl_) return false;
+    std::lock_guard<std::mutex> lk(impl_->mutex);
+    for (auto& kf : impl_->keyframes) {
+        if (kf.kf_id != kf_id) continue;
+        kf.t_cam_world[0] += dx;
+        kf.t_cam_world[1] += dy;
+        kf.t_cam_world[2] += dz;
+        // Δyaw as left-mult by R_z(Δyaw). Per the math in PoseGraph.h:
+        // R_world_cam stores cam→world; rotating it on the LEFT by R_z(Δyaw)
+        // means "the world the camera was looking at has been rotated by
+        // Δyaw around world-Z", which is the convention the optimizer
+        // outputs when nodes' yaw fields update.
+        const double c = std::cos(dyaw);
+        const double s = std::sin(dyaw);
+        const cv::Matx33d R_dyaw(
+              c, -s, 0.0,
+              s,  c, 0.0,
+            0.0, 0.0, 1.0);
+        kf.R_world_cam = R_dyaw * kf.R_world_cam;
+        // Keep the scalar yaw cache (heading gate consumer) in sync.
+        kf.yaw_rad += dyaw;
+        while (kf.yaw_rad >  M_PI) kf.yaw_rad -= 2.0 * M_PI;
+        while (kf.yaw_rad < -M_PI) kf.yaw_rad += 2.0 * M_PI;
+        LOGI("POSE_GRAPH_APPLY_KF: kf_id=%llu dx=%.3f dy=%.3f dz=%.3f "
+             "dyaw_deg=%.2f new_t=[%.3f %.3f %.3f] new_yaw_deg=%.2f",
+             static_cast<unsigned long long>(kf_id),
+             dx, dy, dz, dyaw * 180.0 / M_PI,
+             kf.t_cam_world[0], kf.t_cam_world[1], kf.t_cam_world[2],
+             kf.yaw_rad * 180.0 / M_PI);
+        return true;
+    }
+    return false;
+}
 
 // ─── Vocabulary loading ──────────────────────────────────────────────────
 bool LoopClosureDetector::loadVocabulary(const std::string& vocab_path) {
@@ -354,7 +406,13 @@ void LoopClosureDetector::addKeyframe(
     // duplicate the store here — that would double-update with no value.
 }
 
-// ─── tryDetectLoop ───────────────────────────────────────────────────────
+// ─── tryDetectLoop / tryDetectLoopWithCandidates ─────────────────────────
+//
+// Both public entry points forward to tryDetectLoopImpl. tryDetectLoop
+// (the pre-Phase-6.4c API) passes nullptr for the candidate filter —
+// every keyframe in the BoW database is fair game. tryDetectLoopWithCandidates
+// (Phase 6.4c) passes a non-null pointer; when the vector is non-empty,
+// BoW results are intersected against it before geometric verification.
 bool LoopClosureDetector::tryDetectLoop(
     uint64_t now_kf_id, int64_t now_ns,
     const cv::Mat& descriptors,
@@ -362,6 +420,47 @@ bool LoopClosureDetector::tryDetectLoop(
     double fx, double fy, double cx, double cy,
     int64_t temporal_exclusion_ns,
     double current_yaw_rad,
+    LoopMatch& out_match)
+{
+    return tryDetectLoopImpl(now_kf_id, now_ns, descriptors, keypoints,
+                             fx, fy, cx, cy, temporal_exclusion_ns,
+                             current_yaw_rad, /*candidate_kf_ids=*/nullptr,
+                             out_match);
+}
+
+bool LoopClosureDetector::tryDetectLoopWithCandidates(
+    uint64_t now_kf_id, int64_t now_ns,
+    const cv::Mat& descriptors,
+    const std::vector<cv::KeyPoint>& keypoints,
+    double fx, double fy, double cx, double cy,
+    int64_t temporal_exclusion_ns,
+    double current_yaw_rad,
+    const std::vector<uint64_t>& candidate_kf_ids,
+    LoopMatch& out_match)
+{
+    // Empty candidate set ⇒ fall back to full-database search (preserves
+    // legacy semantics in case the LandmarkMap hasn't accumulated yet).
+    // The caller (Tracker) owns the loop_closure_spatial_fallback_total
+    // counter for this case.
+    if (candidate_kf_ids.empty()) {
+        return tryDetectLoopImpl(now_kf_id, now_ns, descriptors, keypoints,
+                                 fx, fy, cx, cy, temporal_exclusion_ns,
+                                 current_yaw_rad,
+                                 /*candidate_kf_ids=*/nullptr, out_match);
+    }
+    return tryDetectLoopImpl(now_kf_id, now_ns, descriptors, keypoints,
+                             fx, fy, cx, cy, temporal_exclusion_ns,
+                             current_yaw_rad, &candidate_kf_ids, out_match);
+}
+
+bool LoopClosureDetector::tryDetectLoopImpl(
+    uint64_t now_kf_id, int64_t now_ns,
+    const cv::Mat& descriptors,
+    const std::vector<cv::KeyPoint>& keypoints,
+    double fx, double fy, double cx, double cy,
+    int64_t temporal_exclusion_ns,
+    double current_yaw_rad,
+    const std::vector<uint64_t>* candidate_kf_ids,
     LoopMatch& out_match)
 {
     if (!impl_ || !impl_->ready.load(std::memory_order_acquire)) {
@@ -482,13 +581,29 @@ bool LoopClosureDetector::tryDetectLoop(
         // threshold. entry_to_index lookups are defensive; they should
         // always succeed because the index is updated atomically with
         // every db.add().
+        //
+        // Phase 6.4c — if a spatial pre-filter was supplied, intersect
+        // the BoW results against `candidate_kf_ids`. The filter is a
+        // small (≤ kLcMaxKeyframes=50) sorted vector; building a lookup
+        // set keeps the inner check O(log N) without allocating per query
+        // for the empty/disabled case.
+        std::vector<uint64_t> filter_sorted;
+        if (candidate_kf_ids != nullptr && !candidate_kf_ids->empty()) {
+            filter_sorted = *candidate_kf_ids;
+            std::sort(filter_sorted.begin(), filter_sorted.end());
+        }
         candidates_to_try.reserve(results.size());
         for (const auto& r : results) {
             if (r.Score < min_score) break;
             auto it = impl_->entry_to_index.find(r.Id);
             if (it == impl_->entry_to_index.end()) continue;
-            candidates_to_try.emplace_back(r.Score,
-                                           impl_->keyframes[it->second]);
+            const KeyframeRecord& kf = impl_->keyframes[it->second];
+            if (!filter_sorted.empty() &&
+                !std::binary_search(filter_sorted.begin(),
+                                    filter_sorted.end(), kf.kf_id)) {
+                continue;  // BoW hit, but physically far from EKF position.
+            }
+            candidates_to_try.emplace_back(r.Score, kf);
         }
     }
     // Lock is released. Heading + BFMatcher + PnP run lock-free below.
@@ -534,6 +649,9 @@ bool LoopClosureDetector::tryDetectLoop(
                     navsight::eventCounters().loop_closure_rejects_heading.fetch_add(
                         1, std::memory_order_relaxed);
                 }
+                // _total counts ALL candidates, not just ci==0, for full rejection visibility.
+                navsight::eventCounters().loop_closure_rejects_heading_total.fetch_add(
+                    1, std::memory_order_relaxed);
                 LOGD("LC heading reject: now_yaw=%.2f candidate_yaw=%.2f "
                      "diff=%.2f rad (cand_idx=%zu)",
                      current_yaw_rad, candidate.yaw_rad, hdiff, ci);
@@ -575,6 +693,9 @@ bool LoopClosureDetector::tryDetectLoop(
                 navsight::eventCounters().loop_closure_rejects_pnp.fetch_add(
                     1, std::memory_order_relaxed);
             }
+            // _total counts ALL candidates for full attribution visibility.
+            navsight::eventCounters().loop_closure_rejects_pnp_total.fetch_add(
+                1, std::memory_order_relaxed);
             LOGD("PnP reject: only %zu 2D-3D pairs (need %d) for kf %llu vs %llu (cand_idx=%zu)",
                  pts2d.size(), kPnpMinInliers,
                  static_cast<unsigned long long>(now_kf_id),
@@ -601,6 +722,8 @@ bool LoopClosureDetector::tryDetectLoop(
                 navsight::eventCounters().loop_closure_rejects_pnp.fetch_add(
                     1, std::memory_order_relaxed);
             }
+            navsight::eventCounters().loop_closure_rejects_pnp_total.fetch_add(
+                1, std::memory_order_relaxed);
             continue;
         }
 
@@ -609,6 +732,8 @@ bool LoopClosureDetector::tryDetectLoop(
                 navsight::eventCounters().loop_closure_rejects_pnp.fetch_add(
                     1, std::memory_order_relaxed);
             }
+            navsight::eventCounters().loop_closure_rejects_pnp_total.fetch_add(
+                1, std::memory_order_relaxed);
             LOGD("PnP reject: ok=%d inliers=%zu (need %d) for kf %llu vs %llu (cand_idx=%zu)",
                  pnp_ok ? 1 : 0, inliers.size(), kPnpMinInliers,
                  static_cast<unsigned long long>(now_kf_id),
@@ -707,7 +832,8 @@ bool LoopClosureDetector::isReady() const {
 // snapshot candidate KFs, then releases for the slow projection / PnP work.
 bool LoopClosureDetector::tryDetectLoopGeometric(
     uint64_t now_kf_id, int64_t now_ns,
-    const std::vector<cv::Point2f>& current_klt_corners,
+    const cv::Mat& current_descriptors,
+    const std::vector<cv::KeyPoint>& current_keypoints,
     const cv::Matx33d& predicted_R_world_cam,
     const cv::Vec3d&   predicted_t_cam_world,
     double fx, double fy, double cx, double cy,
@@ -722,7 +848,15 @@ bool LoopClosureDetector::tryDetectLoopGeometric(
     if (!impl_) return false;
     if (!impl_->ready.load(std::memory_order_acquire)) return false;
 
-    if (current_klt_corners.empty() || img_width <= 0 || img_height <= 0 ||
+    // 2026-05-13 Step 7.1 fix: require aligned ORB descriptors/keypoints
+    // for appearance verification. If the caller didn't supply them, the
+    // geom path is a no-op (no silent fall-through to the prior
+    // appearance-blind matcher).
+    if (current_descriptors.empty() ||
+        current_descriptors.type() != CV_8U ||
+        current_descriptors.cols != 32 ||
+        static_cast<int>(current_keypoints.size()) != current_descriptors.rows ||
+        img_width <= 0 || img_height <= 0 ||
         fx <= 0.0 || fy <= 0.0 ||
         position_search_radius_m <= 0.0) {
         eventCounters().loop_closure_geom_rejects_no_position.fetch_add(
@@ -731,12 +865,16 @@ bool LoopClosureDetector::tryDetectLoopGeometric(
     }
 
     // ── Stage 1: spatial filter under lock ────────────────────────────────
-    // Copy candidate keyframes' (pts3d_world, R, t, kf_id, ts_ns) out so the
-    // slow projection and PnP run lock-free. Same pattern as the BoW path.
+    // Copy candidate keyframes' (pts3d_world, descriptors, R, t, kf_id,
+    // ts_ns) out so the slow projection / descriptor match / PnP run
+    // lock-free. Same pattern as the BoW path. The descriptors copy is the
+    // 2026-05-13 Step 7.1 addition; descriptors and pts3d_world share row
+    // indices by addKeyframe API contract.
     struct Candidate {
         uint64_t                  kf_id        = 0;
         int64_t                   timestamp_ns = 0;
         std::vector<cv::Point3f>  pts3d_world;
+        cv::Mat                   descriptors;          // CV_8U Nx32, aligned with pts3d_world
         cv::Matx33d               R_world_cam  = cv::Matx33d::eye();
         cv::Vec3d                 t_cam_world  = cv::Vec3d(0, 0, 0);
     };
@@ -758,7 +896,8 @@ bool LoopClosureDetector::tryDetectLoopGeometric(
             Candidate c;
             c.kf_id        = kf.kf_id;
             c.timestamp_ns = kf.timestamp_ns;
-            c.pts3d_world  = kf.pts3d_world;   // copy under lock
+            c.pts3d_world  = kf.pts3d_world;     // copy under lock
+            kf.descriptors.copyTo(c.descriptors); // CV_8U Nx32 deep copy
             c.R_world_cam  = kf.R_world_cam;
             c.t_cam_world  = kf.t_cam_world;
             candidates.push_back(std::move(c));
@@ -780,17 +919,32 @@ bool LoopClosureDetector::tryDetectLoopGeometric(
     const cv::Matx33d R_cam_world_pred = predicted_R_world_cam.t();
     const Candidate* best_cand = nullptr;
     int best_in_frame = 0;
-    // Per-best-candidate output: world point + projected pixel for each
-    // in-frame projection. Reused below by the NN match step.
+    // Per-best-candidate output: world point + projected pixel + original
+    // keyframe row index for each in-frame projection. The row index is
+    // used by Stage 3 to fetch the stored ORB descriptor (cand.descriptors
+    // is row-aligned with cand.pts3d_world per addKeyframe API contract).
     std::vector<cv::Point3f> best_pts3d_world_inframe;
     std::vector<cv::Point2f> best_proj_inframe;
+    std::vector<int>         best_kf_row_inframe;
     for (const auto& cand : candidates) {
         if (cand.pts3d_world.empty()) continue;
+        // 2026-05-13 Step 7.1 fix: skip candidates with mismatched or empty
+        // descriptors. Without aligned descriptors there's no way to verify
+        // appearance and we'd be back in the prior false-positive regime.
+        if (cand.descriptors.empty() ||
+            cand.descriptors.rows != static_cast<int>(cand.pts3d_world.size()) ||
+            cand.descriptors.cols != 32 ||
+            cand.descriptors.type() != CV_8U) {
+            continue;
+        }
         std::vector<cv::Point3f> pts3d_inframe;
         std::vector<cv::Point2f> proj_inframe;
+        std::vector<int>         row_inframe;
         pts3d_inframe.reserve(cand.pts3d_world.size());
         proj_inframe.reserve(cand.pts3d_world.size());
-        for (const auto& p_world : cand.pts3d_world) {
+        row_inframe.reserve(cand.pts3d_world.size());
+        for (size_t i = 0; i < cand.pts3d_world.size(); ++i) {
+            const cv::Point3f& p_world = cand.pts3d_world[i];
             // Skip NaN-marked rows (the BoW path also stores these for
             // descriptor-only retrieval; they're useless to us here).
             if (!std::isfinite(p_world.x) ||
@@ -809,12 +963,14 @@ bool LoopClosureDetector::tryDetectLoopGeometric(
             pts3d_inframe.push_back(p_world);
             proj_inframe.emplace_back(static_cast<float>(u),
                                       static_cast<float>(v));
+            row_inframe.push_back(static_cast<int>(i));
         }
         if (static_cast<int>(pts3d_inframe.size()) > best_in_frame) {
             best_in_frame              = static_cast<int>(pts3d_inframe.size());
             best_cand                  = &cand;
             best_pts3d_world_inframe   = std::move(pts3d_inframe);
             best_proj_inframe          = std::move(proj_inframe);
+            best_kf_row_inframe        = std::move(row_inframe);
         }
     }
 
@@ -824,33 +980,99 @@ bool LoopClosureDetector::tryDetectLoopGeometric(
         return false;
     }
 
-    // ── Stage 3: NN-match projected points to current KLT corners ─────────
-    // Naive O(N·M) is fine here: N (in-frame projections) ≤ keyframe pts3d
-    // size ≈ 100, M (current KLT corners) ≤ MAX_FEATURES=200. ~20K dist
-    // computations per call, sub-millisecond.
+    // ── Stage 3: ORB-descriptor-verified NN match ─────────────────────────
+    // 2026-05-13 Phase 1 Step 7.1 fix. Prior implementation matched
+    // projected 3D points to nearest KLT corner by Euclidean pixel distance
+    // alone (15 px). In low-texture indoor scenes (v24 walk: filled_3d=0 on
+    // 98% of keyframes), this admitted appearance-blind correspondences
+    // and PnP-RANSAC converged on poses that subsequently passed chi²
+    // because var_p was inflated by drift_path.
+    //
+    // Fix: for each in-frame projection, find current ORB keypoints within
+    // kGeomMatchRadiusPx px, then pick the one with min Hamming distance
+    // to the stored keyframe descriptor at the original row. Reject the
+    // pair entirely if min Hamming > kGeomDescriptorMaxDistance (50, per
+    // ORB-SLAM3 standard and plan Step 6 line 280).
+    //
+    // Complexity: N (in-frame projections) ≤ ~100, M (current ORB kpts) ≤
+    // ~250, descriptor Hamming = 32-byte popcount xor. Worst case ~25K
+    // Hamming comparisons + ~25K distance checks per call, sub-millisecond
+    // on the S21 Ultra.
     const double radius2 = kGeomMatchRadiusPx * kGeomMatchRadiusPx;
     std::vector<cv::Point3f> pnp_pts3d;
     std::vector<cv::Point2f> pnp_pts2d;
     pnp_pts3d.reserve(best_in_frame);
     pnp_pts2d.reserve(best_in_frame);
+    // 2026-05-17 — diagnostic split (per sim-debugging skill: read the data
+    // before tuning). Sims v33 showed 358/379 stage3 rejects with the prior
+    // log line collapsing two distinct failures: (A) no current keypoint
+    // within kGeomMatchRadiusPx of the projection (spatial miss), (B)
+    // keypoint nearby but min Hamming > kGeomDescriptorMaxDistance
+    // (descriptor miss). The right fix depends on which dominates:
+    //   A dominant → projection geometry / pose / intrinsics bug
+    //   B dominant → appearance / viewpoint / ORB orientation issue
+    // Keep loop_closure_geom_rejects_descriptor as the combined total for
+    // backward compatibility with replay_scorer; add two new disambiguators.
+    int desc_rejects = 0;
+    int spatial_miss = 0;  // no keypoint within radius of projection
+    int hamming_miss = 0;  // keypoint nearby but Hamming > threshold
+    int hamming_min_sum_within_radius = 0;
+    int hamming_min_count_within_radius = 0;
     for (size_t i = 0; i < best_proj_inframe.size(); ++i) {
         const cv::Point2f& proj = best_proj_inframe[i];
-        double best_d2 = radius2;
-        const cv::Point2f* best_corner = nullptr;
-        for (const auto& corner : current_klt_corners) {
-            const float dx = corner.x - proj.x;
-            const float dy = corner.y - proj.y;
+        const int kf_row = best_kf_row_inframe[i];
+        const cv::Mat kf_desc_row = best_cand->descriptors.row(kf_row);
+        int best_hamming = kGeomDescriptorMaxDistance + 1;
+        int best_q_idx   = -1;
+        int min_h_in_radius = 257;  // unbounded sentinel (ORB descriptor is 32 bytes = 256 bits)
+        bool any_in_radius = false;
+        for (size_t q = 0; q < current_keypoints.size(); ++q) {
+            const cv::Point2f& qpt = current_keypoints[q].pt;
+            const float dx = qpt.x - proj.x;
+            const float dy = qpt.y - proj.y;
             const double d2 = static_cast<double>(dx)*dx + static_cast<double>(dy)*dy;
-            if (d2 < best_d2) {
-                best_d2     = d2;
-                best_corner = &corner;
+            if (d2 > radius2) continue;
+            any_in_radius = true;
+            // Hamming distance between two 32-byte ORB descriptors.
+            // cv::norm with NORM_HAMMING is the canonical OpenCV path —
+            // BFMatcher uses the same comparator internally.
+            const cv::Mat q_desc_row = current_descriptors.row(static_cast<int>(q));
+            const int h = static_cast<int>(cv::norm(kf_desc_row, q_desc_row, cv::NORM_HAMMING));
+            if (h < min_h_in_radius) min_h_in_radius = h;
+            if (h < best_hamming) {
+                best_hamming = h;
+                best_q_idx   = static_cast<int>(q);
             }
         }
-        if (best_corner != nullptr) {
-            pnp_pts3d.push_back(best_pts3d_world_inframe[i]);
-            pnp_pts2d.push_back(*best_corner);
+        if (any_in_radius) {
+            hamming_min_sum_within_radius += min_h_in_radius;
+            ++hamming_min_count_within_radius;
         }
+        if (best_q_idx < 0 || best_hamming > kGeomDescriptorMaxDistance) {
+            eventCounters().loop_closure_geom_rejects_descriptor.fetch_add(
+                1, std::memory_order_relaxed);
+            ++desc_rejects;
+            if (any_in_radius) {
+                ++hamming_miss;
+            } else {
+                ++spatial_miss;
+            }
+            continue;
+        }
+        pnp_pts3d.push_back(best_pts3d_world_inframe[i]);
+        pnp_pts2d.push_back(current_keypoints[best_q_idx].pt);
     }
+
+    const int mean_h = (hamming_min_count_within_radius > 0)
+        ? (hamming_min_sum_within_radius / hamming_min_count_within_radius)
+        : -1;
+    LOGI("LC_GEOM: stage3 in_frame=%d hamming_pairs=%zu desc_rejects=%d "
+         "spatial_miss=%d hamming_miss=%d mean_min_h_in_radius=%d "
+         "n_curr_kpts=%zu kf=%llu",
+         best_in_frame, pnp_pts3d.size(), desc_rejects,
+         spatial_miss, hamming_miss, mean_h,
+         current_keypoints.size(),
+         (unsigned long long)best_cand->kf_id);
 
     if (static_cast<int>(pnp_pts3d.size()) < kPnpMinInliers) {
         eventCounters().loop_closure_geom_rejects_pnp.fetch_add(

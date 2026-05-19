@@ -46,13 +46,34 @@ cv::Mat rotBody(double rx, double ry, double rz) {
     return R;
 }
 
+// Convert a body-frame Matx33d to cv::Mat for test composition.
+cv::Mat matxToMat(const cv::Matx33d& m) {
+    cv::Mat out(3, 3, CV_64F);
+    for (int rr = 0; rr < 3; ++rr) {
+        for (int cc = 0; cc < 3; ++cc) {
+            out.at<double>(rr, cc) = m(rr, cc);
+        }
+    }
+    return out;
+}
+
+// 2026-05-12 Option-C convention: addClone takes world→camera, NOT world→body.
+// Production caller composes R_bc into the clone at Tracker.cpp:1919; mirror
+// the same composition here so the tests exercise the same contract.
+void addBodyClone(EKFState& ekf, const cv::Mat& R_GtoI_body,
+                  const cv::Mat& p, int64_t ts_ns) {
+    const cv::Mat R_bc_cv = matxToMat(ekf.getExtrinsicsRotation());
+    const cv::Mat R_GtoC = R_bc_cv * R_GtoI_body;
+    ekf.addClone(R_GtoC, p, ts_ns);
+}
+
 // [run_tests fix] EKFState carries a std::mutex (ADR-012) so it cannot be
 // copied or moved. Helper now populates a passed-in reference; call sites
 // use INIT_EKF_CLONE(ekf) to keep the diff minimal.
 void initializeEKFWithIdentityClone(EKFState& ekf) {
     cv::Mat R_eye = cv::Mat::eye(3, 3, CV_64F);
     ekf.initializeFull(R_eye, cv::Point3f(0, 0, 0), cv::Point3f(0, 0, 0));
-    ekf.addClone(R_eye, cv::Mat::zeros(3, 1, CV_64F), 1'000'000'000LL);
+    addBodyClone(ekf, R_eye, cv::Mat::zeros(3, 1, CV_64F), 1'000'000'000LL);
 }
 #define INIT_EKF_CLONE(name) EKFState name; initializeEKFWithIdentityClone(name)
 
@@ -212,8 +233,9 @@ TEST(EKFStateRelativeRotation, FrameConvention_PredictionMatch_NoStateMove) {
     // current is (R_curr * R_clone.t()) when expressed as world-frame
     // composition; the *body-frame* relative rotation is R_clone.t() * R_curr,
     // which equals a +45° body-Y rotation either way for pure-yaw cases.
-    cv::Mat R_clone = rotBody(0.0, 45.0 * kDeg2Rad, 0.0);
-    ekf.addClone(R_clone, cv::Mat::zeros(3, 1, CV_64F), 1'000'000'000LL);
+    cv::Mat R_clone_body = rotBody(0.0, 45.0 * kDeg2Rad, 0.0);
+    addBodyClone(ekf, R_clone_body, cv::Mat::zeros(3, 1, CV_64F),
+                 1'000'000'000LL);
 
     int clone_id = ekf.getLatestCloneId();
     ASSERT_GE(clone_id, 0);

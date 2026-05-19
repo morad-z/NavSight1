@@ -16,10 +16,23 @@
 #include "TrackKLT.h"
 #include "UpdaterZeroVelocity.h"
 #include "UpdaterMSCKF.h"
+#include "UpdaterSLAM.h"
+// 2026-05-13: Phase 1 Step 5 — 4-DOF pose-graph back-end for retroactive
+// drift correction at loop closure. See PoseGraph.h header for math.
+#include "PoseGraph.h"
+#include <unordered_map>
+// 2026-05-12: VisualMap include reverted — see Tracker.h scaffold note below.
+// #include "VisualMap.h"
 #include "WindowedBA.h"
 
 #include "InertialInitializer.h"
 #include "LoopClosureDetector.h"
+// 2026-05-16: Phase 1 Step 6 (post_v19_sprint_plan.md §205-298) — visual-only
+// persistent 3D LandmarkMap, ORB-SLAM3-inspired. Phase 6.1 shipped the class +
+// unit tests; Phase 6.2 (this commit) instantiates the member and populates it
+// from keyframe triangulation. No EKF behavior change yet — that lands in
+// Phase 6.3-6.4.
+#include "LandmarkMap.h"
 
 #include <condition_variable>
 
@@ -77,7 +90,11 @@ public:
                        double k4, double k5, double k6,
                        double p1, double p2);
 
-    void setInitialHeading(double azimuth_rad);
+    // 2026-05-16 v27 fix: imu is now a required parameter so the post-init
+    // path can re-sync R_GtoI from Madgwick's full quaternion (preserving
+    // roll/pitch) instead of overwriting with pure-yaw Rz(azimuth) that
+    // assumed phone-flat orientation. Caller is VioEngine which owns both.
+    void setInitialHeading(double azimuth_rad, const IMUPreintegrator& imu);
     void setUserScaleCorrection(double correction);
 
     // Step 8c (Visual Production Plan) — rolling-shutter per-row time skew.
@@ -96,6 +113,10 @@ public:
     void setExtrinsicsRotation(const float* R_bc_flat);
 
     void reset();
+
+    // v23.11: expose FeatureManager for native-lib SLAM debug overlay
+    // (last observed obs pixel per SLAM feature for residual line viz).
+    const FeatureManager& getFeatureManager() const { return feature_mgr_; }
 
     // Handle IMU data for initialization
     void addImuData(int64_t ts, float ax, float ay, float az, float gx, float gy, float gz);
@@ -154,6 +175,47 @@ public:
     // and addKeyframe path stay strictly internal.
     LoopClosureDetector& getLoopClosureDetector() { return loop_closure_; }
 
+    // 2026-05-16 Phase 1 Step 6.4 — IDs of landmarks the EKF accepted on the
+    // most recent keyframe. Consumed by Phase 6.5 (native-lib.cpp overlay) to
+    // colour matched landmarks orange. Snapshot semantics: returns a copy
+    // under last_observed_mutex_, so the caller's vector is decoupled from
+    // the producer thread. Empty until the first keyframe-wide EKF update
+    // fires; cleared on reset().
+    std::vector<int> getLastObservedLandmarkIds() const {
+        std::lock_guard<std::mutex> lk(last_observed_mutex_);
+        return last_observed_landmark_ids_;
+    }
+
+    // 2026-05-19 — Orange-dot anchor fix #3. Per-landmark matched pixel from
+    // the last keyframe's local-map tracking pass. Render path (native-lib
+    // getLandmarkSnapshot) uses this so OBSERVED orange dots are drawn at
+    // their actual image-feature pixel instead of at the projection of a
+    // possibly-stale stored p_world. The residual "red line" then collapses
+    // to zero for observed dots — the user-visible falsifier for the bug.
+    // Returns false if `landmark_id` was not in last_observed_landmark_ids_
+    // (i.e. not matched this frame). Same lock as getLastObservedLandmarkIds.
+    bool getLastObservedLandmarkPixel(int landmark_id,
+                                       float& out_u, float& out_v) const {
+        std::lock_guard<std::mutex> lk(last_observed_mutex_);
+        for (size_t i = 0; i < last_observed_landmark_ids_.size(); ++i) {
+            if (last_observed_landmark_ids_[i] == landmark_id) {
+                if (i < last_observed_landmark_pixels_.size()) {
+                    out_u = last_observed_landmark_pixels_[i].x;
+                    out_v = last_observed_landmark_pixels_[i].y;
+                    return true;
+                }
+                return false;
+            }
+        }
+        return false;
+    }
+
+    // 2026-05-16 Phase 1 Step 6.5 — read-only access to the persistent
+    // LandmarkMap for the JNI getLandmarkSnapshot overlay path (native-lib.cpp).
+    // LandmarkMap is internally mutex-protected so the caller may invoke
+    // getLandmarksInRadius / getLandmark from any thread.
+    const navsight::LandmarkMap& getLandmarkMap() const { return landmark_map_; }
+
 private:
     double estimateScaleFromSteps(double vision_disp, int64_t dt_ns,
                                   IMUPreintegrator& imu);
@@ -206,21 +268,30 @@ private:
     std::vector<cv::Point2f> new_pts_buf_;
 
     // ── Step 8 Cleanup status (kept, NOT deleted) ───────────────────────────
-    // The production-readiness plan (Step 4 / Step 8) calls for removing
-    // these in favor of EKFState as the canonical owner of pose. They are
-    // retained per user request ("comment, don't delete") because they
-    // still serve TWO live roles:
-    //   1. Init-bootstrap seed before EKFState::isFullInitialized() — the
-    //      magnetometer one-shot writes here (Tracker.cpp:491,507) and the
-    //      InertialInitializer drains here (Tracker.cpp:397,420) before
-    //      ekf_.initializeFull is called.
-    //   2. Read-only mirror of ekf_.getRotation()/getPosition() refreshed
-    //      each frame (Tracker.cpp:1014-1015) for downstream consumers
-    //      that still read the legacy field directly (KeyframePair clone
-    //      seed at 945, addClone fallback at 1140-1141, log line 1373).
-    // When all consumers migrate to ekf_ accessors, this pair becomes dead.
-    cv::Mat global_R_;   // 3x3 CV_64F  — LEGACY mirror / bootstrap seed
-    cv::Mat global_t_;   // 3x1 CV_64F  — LEGACY mirror / bootstrap seed
+    // Fix B (2026-05-16 audit Finding 2.1): EKFState is the SSOT for rotation
+    // and position post-init. global_R_ and global_t_ are retained ONLY as
+    // bootstrap seeds (pre-EKF-init) and legacy mirrors (commented-out notes
+    // below document which role each site serves). Do not read global_R_ in
+    // new code post-init — use ekf_.getRotation() directly.
+    //
+    // global_R_ bootstrap write sites still active (pre-init only):
+    //   Tracker.cpp ctor ~L33, reset() ~L389, loadStoredCalibration ~L603,626,
+    //   mag one-shot ~L746, pending_init_heading_ apply ~L762,
+    //   setInitialHeading post-init re-sync ~L345 (reads Madgwick, not EKF).
+    // global_R_ post-init read sites migrated to ekf_.getRotation():
+    //   ScaleEstimatorVI kp.R_w_b ~L1726 (now ekf_.getRotation() — Fix B)
+    //   §9.0 mirror write ~L1845 (global_R_ = ekf_.getRotation() — still live)
+    //   addClone fallback ~L2033 (already ekf_.isFullInitialized() ? ekf_ : ...)
+    //   out.R output ~L3365  (already ekf_.isFullInitialized() ? ekf_ : ...)
+    // When ALL pre-init bootstrap sites are removed (i.e. EKF init fires
+    // unconditionally from Madgwick), comment out the declaration below.
+    cv::Mat global_R_;   // 3x3 CV_64F — LEGACY mirror / bootstrap seed
+                         // (2026-05-16 Fix B: post-init reads migrated to
+                         //  ekf_.getRotation(); pre-init bootstrap writes kept)
+    cv::Mat global_t_;   // 3x1 CV_64F — LEGACY mirror; Fix A makes EKF
+                         // authoritative for position. global_t_ is now a
+                         // read mirror refreshed by §11.9 in processFrame.
+                         // (2026-05-16 Fix A)
 
     double fx_{0.}, fy_{0.}, cx_{0.}, cy_{0.};
     // Step 8c: row read-out time skew from Camera2 SENSOR_ROLLING_SHUTTER_SKEW.
@@ -294,14 +365,17 @@ private:
     // Phase 5: Magnetometer heading used ONCE at startup only
     bool heading_initialized_{false};
 
-    // Heading cache (read-only mirror of EKFState yaw, refreshed each frame
-    // by processFrame). Step 4: EKFState owns yaw; this is a snapshot for
-    // const accessors and downstream consumers that want a scalar.
-    //
-    // Step 8 cleanup status: the plan calls for removing this mirror once
-    // all callers go through ekf_.getYaw() directly. Kept (not deleted) per
-    // user request — Tracker::getHeading() and the JNI layer still read it,
-    // and replay_harness::getPose relies on it as the canonical scalar yaw.
+    // Fix B (2026-05-16 audit Finding 2.1): scalar_heading_ is a per-frame
+    // cache of imu.getHeading() (Madgwick CW-positive nav yaw, Z-up ENU).
+    // It is WRITTEN each frame in §9.0 from imu.getHeading() — never from
+    // ekf_.getYaw() — because EKF yaw under-rotates fast turns (V-shape bug
+    // fixed 2026-05-03). Retained as a member because Tracker::getHeading()
+    // (JNI-called, no imu reference) and LC keyframe stores need the heading
+    // value AT a specific frame captured under pose_mutex_. When JNI migrates
+    // to a direct IMUPreintegrator query, this member can be removed.
+    // DO NOT derive heading from ekf_.getWorldHeadingRad() for position
+    // update math — use imu.getHeading() (same value, correct fast-turn
+    // behaviour).
     double scalar_heading_{0.0};
     // Cumulative odometric path length (metres). Incremented in both the
     // visual update path and the PDR step so the loop-closure dynamic sigma
@@ -311,6 +385,17 @@ private:
     // seed for ekf_.initializeFull on the first frame.
     double pending_init_heading_{0.0};
     bool   pending_init_heading_set_{false};
+    // Fix D (2026-05-16 audit): post-init setInitialHeading azimuth queued
+    // for retry on the next IMU sample when Madgwick is not yet ready.
+    // Set inside setInitialHeading() under pose_mutex_; consumed by
+    // processFrame §3.1-equiv retry block before §4 first-frame detection.
+    // Cause: silent "leaving EKF as-is" when Madgwick not ready at
+    //   setInitialHeading post-init means the azimuth update is lost.
+    // Change: queue it here; processFrame retries on the next camera frame.
+    // Falsifier: pending_post_init_heading_set_ == false after any walk
+    //   (always consumed within 1-2 frames).
+    double pending_post_init_azimuth_{0.0};
+    bool   pending_post_init_heading_set_{false};
     double filtered_yaw_rate_{0.0};  // Low-pass filtered yaw rate (removes step oscillation)
 
     // Step 2.3: heading_fej_ deleted — Madgwick is the heading reference.
@@ -363,6 +448,52 @@ private:
     // Invoked from `processFrame` section 11.1 against lost-feature candidates
     // returned by FeatureManager::getMSCKFCandidates(min_obs=4).
     UpdaterMSCKF msckf_updater_;
+    // 2026-05-12: SLAM-feature updater with parallax + depth-observability +
+    // per-observation chi² gates (OpenVINS doctrine). Without this, the older
+    // EKFState::updateSlamFeature path applied Kalman updates to ρ even when
+    // the camera had no parallax-bearing motion → ρ randomized → diverged to
+    // zero → produced 100+ km world positions that poisoned PnP via the
+    // keyframe pts3d_world buffer.
+    UpdaterSLAM slam_updater_;
+
+    // 2026-05-13: Phase 1 Step 5 — pose-graph back-end (post_v19_sprint_plan.md).
+    // pose_graph_ stores 4-DOF (x, y, z, yaw) keyframe poses + odometry /
+    // loop edges, and runs Gauss-Newton optimization on LC accept to
+    // redistribute drift across all keyframes between K_match and K_now.
+    //
+    // clone_id_to_pg_node_ maps the EKF clone-id used by LoopClosureDetector
+    // as its keyframe-id back to the pose-graph node-id assigned by
+    // pose_graph_.addNode(). When a loop edge fires, this mapping converts
+    // the LoopClosureDetector::LoopMatch.{matched_kf_id, now_kf_id} into
+    // pose-graph node ids for addLoopEdge.
+    //
+    // Implementor-skill note: the pose graph is wired but the back-write to
+    // LoopClosureDetector's stored keyframe poses (which would let loop 2
+    // visually overlay loop 1 in the live trajectory) requires a new
+    // LoopClosureDetector::updateStoredKeyframePose method — deferred to
+    // the next chunk of Step 5. For now optimize() runs and publishes
+    // counters; the math gets verified by event_summary residual ratios
+    // before the back-write is added.
+    PoseGraph pose_graph_;
+    std::unordered_map<uint64_t, int> clone_id_to_pg_node_;
+    // Reverse map for the post-optimize back-write loop. Tracker.cpp iterates
+    // pose_graph_.snapshotNodes() after optimize(); for each node-id this map
+    // resolves the corresponding LoopClosureDetector keyframe-id so
+    // applyKeyframePoseCorrection can find the stored KeyframeRecord by id.
+    std::unordered_map<int, uint64_t> pg_node_to_clone_id_;
+    // Latest pose-graph node id assigned. Tracks the "now" side of a future
+    // loop edge so consumeLoopClosureMatchIfReady can pair the matched
+    // keyframe's pg-node with the current end of the chain.
+    int last_pg_node_id_{-1};
+
+    // 2026-05-12: VisualMap member + getter reverted. Belongs to Phase 1
+    // Step 6 (persistent landmark map) per post_v19_sprint_plan.md, which
+    // is queued behind Step 5 (pose-graph back-end). Scaffolding kept on
+    // disk at app/src/main/cpp/VisualMap.{h,cpp} for that step.
+    // public:
+    //     const VisualMap& getVisualMap() const { return visual_map_; }
+    // private:
+    //     VisualMap visual_map_;
 
     // MSCKF feature ID tracking (parallel to prev_pts_)
     std::vector<int> feature_ids_;
@@ -480,6 +611,33 @@ private:
     //     canonical observation channel Step 2 already uses.
     LoopClosureDetector       loop_closure_;
 
+    // 2026-05-16 Phase 1 Step 6 (post_v19_sprint_plan.md §205-298) — visual-only
+    // persistent 3D landmark database. Populated at every keyframe storage
+    // event (Phase 6.2 wire-up; see Tracker.cpp §11.5). Landmarks are anchored
+    // to keyframe ids that match `loop_closure_`'s id-space; loop-closure
+    // back-write rotates/shifts landmarks via
+    // `landmark_map_.applyKeyframePoseCorrection(kf_id, dx, dy, dz, dyaw)`
+    // (Phase 6.4 wiring). EKF state is NOT coupled to landmark positions —
+    // landmarks remain fixed during the pose-only measurement update
+    // (Phase 6.3 EKFState::applyLandmarkObservations).
+    navsight::LandmarkMap     landmark_map_;
+
+    // 2026-05-16 Phase 1 Step 6.4 — accepted-this-frame landmark ids snapshot.
+    // Written from the camera thread at the end of the EKF landmark update
+    // block (Tracker.cpp §11.5b) under last_observed_mutex_. Read from any
+    // thread via getLastObservedLandmarkIds(); the lock guarantees the reader
+    // gets a coherent snapshot. Sized at most by the # of matched
+    // observations per keyframe — typically O(10s), never O(1000s).
+    mutable std::mutex        last_observed_mutex_;
+    std::vector<int>          last_observed_landmark_ids_;
+    // 2026-05-19 — Orange-dot anchor fix #3. Parallel array with
+    // last_observed_landmark_ids_: index i holds the matched current-frame
+    // pixel (KLT keypoint coords) for the landmark at ids[i]. Used by the
+    // JNI overlay path to draw observed orange dots AT their actual image
+    // feature instead of projecting a stale stored p_world through the
+    // current camera pose.
+    std::vector<cv::Point2f>  last_observed_landmark_pixels_;
+
     // Worker-thread plumbing.
     std::thread               loop_closure_thread_;
     std::atomic<bool>         loop_closure_should_stop_{false};
@@ -563,7 +721,7 @@ private:
     // relative-pose / relative-rotation correction through the canonical
     // EKF measurement channel (NOT a direct mean / covariance write —
     // ADR-006). Decrements the ramp counter on each call.
-    void consumeLoopClosureMatchIfReady();
+    void consumeLoopClosureMatchIfReady(IMUPreintegrator& imu);
 
     // Cleanly stop the worker thread. Sets should_stop_, notifies the cv,
     // and joins. Called from reset() and the destructor.

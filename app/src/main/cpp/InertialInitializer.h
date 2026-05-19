@@ -100,4 +100,12 @@ private:
     cv::Mat R_GtoI_init_;
     cv::Point3f gyro_bias_;
     cv::Point3f accel_bias_;
+
+    // 2026-05-16 v26 diagnostic: hold onto calibration-window mean accel so
+    // the WAIT_MOTION→READY transition log can quantify orientation drift
+    // between bootstrap and start-of-walk. Set by runStationaryCalibration
+    // on success; consumed (but never invalidated until next session) by
+    // detectMotion logging.
+    cv::Point3f calibration_mean_a_{0.f, 0.f, 0.f};
+    bool        calibration_mean_a_valid_{false};
 };

@@ -17,18 +17,15 @@ VioEngine::VioEngine() {
     // DISABLED: Mapper background thread — output was discarded (applyMapperResult was a no-op)
     // mapper_thread_ = std::thread(&VioEngine::mapperThreadFunc, this);
     LOGI("VioEngine created (Mapper pipeline disabled — output was discarded)");
+
+    // 2026-05-17 — start the PC live viewer HTTP server. Bound to
+    // 0.0.0.0:8765. PC on same WiFi opens http://<phone-ip>:8765/.
+    viewer_server_.start(&tracker_, 8765);
 }
 
 VioEngine::~VioEngine() {
-    // DISABLED: Mapper thread join
-    // {
-    //     std::lock_guard<std::mutex> lock(mapper_mutex_);
-    //     mapper_stop_.store(true);
-    //     mapper_cv_.notify_one();
-    // }
-    // if (mapper_thread_.joinable()) {
-    //     mapper_thread_.join();
-    // }
+    // Stop the viewer server first so its thread doesn't outlive Tracker.
+    viewer_server_.stop();
     LOGI("VioEngine destroyed");
 }
 
@@ -151,7 +148,7 @@ bool VioEngine::loadLoopClosureVocabulary(const std::string& vocab_path) {
 }
 
 void VioEngine::setInitialHeading(double azimuth_rad) {
-    tracker_.setInitialHeading(azimuth_rad);
+    tracker_.setInitialHeading(azimuth_rad, imu_);
     // Also seed Madgwick's internal quaternion. Without this, Madgwick
     // initializes at yaw=0 (North) regardless of the device's actual
     // compass heading, and the moment Tracker starts refreshing
@@ -161,6 +158,16 @@ void VioEngine::setInitialHeading(double azimuth_rad) {
     // surfaced 2026-05-09 on sim 1778258249750 ("at first heading is
     // correct then it instantly rotates 180 degrees").
     imu_.setInitialMadgwickYaw(static_cast<float>(azimuth_rad));
+}
+
+void VioEngine::seedMadgwickYaw(double yaw_rad) {
+    // 2026-05-13 heading-startup fix: separate from setInitialHeading
+    // because that path is gated on VIO init in SensorRepository, which
+    // takes 1-3 seconds. During that wait, Madgwick is initialized with
+    // yaw_seed=0 (North) so the radar shows wrong heading until VIO init
+    // fires. This call lets SensorRepository seed Madgwick the moment the
+    // compass is stable, decoupling display heading from EKF readiness.
+    imu_.setInitialMadgwickYaw(static_cast<float>(yaw_rad));
 }
 
 void VioEngine::setMagnetometerHeading(float yaw_rad) {
