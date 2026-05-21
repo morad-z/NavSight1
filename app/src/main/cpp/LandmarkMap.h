@@ -65,6 +65,7 @@
 //   under the lock.
 
 #include <cstdint>
+#include <functional>
 #include <memory>
 #include <mutex>
 #include <opencv2/core.hpp>
@@ -365,6 +366,46 @@ public:
             int                      min_obs) const;
 
     bool setLandmarkPosition(int landmark_id, const cv::Vec3d& p_world);
+
+    // 2026-05-19 Fix #9 — Re-anchor landmarks from current clone poses.
+    //
+    // Cause: each landmark's `p_world` is computed at addOrMergeLandmark
+    // time from the host clone's pose at that moment. After loop-closure
+    // ACCEPT propagates through the EKF covariance, the host clone's pose
+    // changes — but `p_world` doesn't. Projecting the corrected camera
+    // pose against uncorrected landmark world positions is what causes the
+    // orange-dot misalignment on revisit (diagnostic confirmed via the
+    // 2026-05-19 fix8_revisit walk: EKF.p_G ≠ Tracker.global_t_ by 0.88 m
+    // post-LC, ~554 px projection error at 1 m feature depth).
+    //
+    // This walks all landmarks with `has_anchor=true` and asks the caller
+    // for each clone's CURRENT pose via `clone_pose_lookup`. On a hit,
+    // recomputes
+    //     p_world = R_world_cam · p_anchor_cam + t_cam_world
+    // which is the inverse of the anchor compute in addOrMergeLandmarkImpl
+    // (LandmarkMap.cpp:163-164). Landmarks whose host_clone_id is no
+    // longer in the EKF window (lookup returns false) keep their stored
+    // `p_world` — they're already marginalised from the EKF and their
+    // anchor reference is gone.
+    //
+    // Convention: `R_world_cam_out` must be camera→world (transpose of
+    // EKFState's stored R_GtoC). `t_cam_world_out` is the camera position
+    // expressed in world coordinates (≈ p_G for NavSight's small lever arm).
+    //
+    // Caller is responsible for invoking this only when state has shifted
+    // (e.g., once per LC ACCEPT, k==0 frame in the damping ramp). Cost is
+    // O(N_landmarks) plus the clone-pose lookup per landmark — at 2400
+    // landmarks × ≤15 unique clones, well under 1 ms.
+    //
+    // Falsifier: post-fix walk with same-spot revisit must show
+    // `landmarks_reanchored_total` > 0 on LC ACCEPT AND visually, the
+    // orange landmark dots reappear within ~10 px of their feature on the
+    // wall after the revisit keyframe fires.
+    int reanchorLandmarksFromClonePoses(
+            const std::function<bool(int clone_id,
+                                      cv::Matx33d& R_world_cam_out,
+                                      cv::Vec3d&   t_cam_world_out)>&
+                clone_pose_lookup);
 
     // ─── Maintenance ──────────────────────────────────────────────────────
     //

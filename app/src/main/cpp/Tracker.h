@@ -134,6 +134,42 @@ public:
     // Depth-based scale constraint: receives MiDaS depth map at ~1Hz
     void setDepthMap(const float* depth_data, int width, int height);
 
+    // 2026-05-19 Fix #12 — MiDaS metric-depth sampler.
+    //
+    // Cause: SLAM (α, β, ρ) and LandmarkMap p_world both depend on metric
+    // depth, which today comes ONLY from triangulation across keyframes.
+    // Triangulation fails on pure-axial motion (walk-back/forward facing
+    // wall, scooter-straight) → ρ drifts → cascading bugs (LC PnP target
+    // 65 m off, chi² rejects all corrections, dots don't reappear). The
+    // 2026-05-19 fix9_revisit_v2 walk surfaced this. Independent depth
+    // source needed.
+    //
+    // Change: cache the VI-Depth affine fit `(s, t)` computed by
+    // applyDepthScaleConstraint (Phase 2 Step 4.2.1). When any consumer
+    // needs per-pixel metric depth, sample disparity at the requested
+    // pixel via bilinear interp on `depth_map_` and apply:
+    //     metric_depth = 1 / (s · disparity + t)
+    // Returns false when the affine fit isn't ready yet (no keyframe
+    // has fired with a successful fit), depth_map_ is empty, the pixel
+    // is off-grid, the MiDaS sample is < 0.01 (network's "very far /
+    // unstable" band), or the resulting metric depth is outside
+    // [kMinMidasDepthM, kMaxMidasDepthM] = [0.3, 30] m. The band matches
+    // the existing applyDepthScaleConstraint inlier band (lines 340-341,
+    // metric_z in [0.3, 12]) widened to 30 m to accommodate longer
+    // sightlines on a scooter.
+    //
+    // Threading: locks midas_affine_mutex_ for the cached (s, t) read,
+    // then depth_mutex_ for the disparity sample. Safe to call from
+    // camera thread (the producer) and any consumer thread (mutex
+    // serialises). Cost ≈ 1 µs per call (one mutex, four float reads,
+    // five multiplies).
+    //
+    // Falsifier: post-Fix-#12 walk should show midas_depth_samples > 0
+    // and slam_promotions_seeded_with_midas > 0 (when MiDaS depth
+    // disagrees with triangulation by > 2× — the case we want MiDaS to
+    // win on).
+    bool sampleMidasMetricDepth(float u, float v, double& depth_m_out) const;
+
     // Thread-safe read-only accessors
     double getSmoothScale() const;
     double getHeading() const;
@@ -638,6 +674,30 @@ private:
     // current camera pose.
     std::vector<cv::Point2f>  last_observed_landmark_pixels_;
 
+    // 2026-05-19 Fix #11 — per-frame landmark pixel refresh.
+    //
+    // Cause: last_observed_landmark_pixels_ is set ONCE per keyframe (~1 Hz)
+    // at the local-map descriptor-match site. Between keyframes (28-29 frames
+    // at 30 Hz), the stored pixel does NOT track the corresponding image
+    // feature as the camera moves — so orange dots draw at where the feature
+    // WAS at the last keyframe, not where it IS now. User-visible symptom:
+    // dots appear "stuck in screen space" while the image content slides
+    // past them. The 2026-05-19 fix10_revisit walk's
+    // landmarks_rendered_anchor_total = 58924 (~73/frame) but the user
+    // reported seeing essentially no anchored dots — this is the gap.
+    //
+    // Fix: at every keyframe match, also record the feature_id of the KLT
+    // track that descriptor-matched the landmark. Per-frame (after KLT
+    // tracking), walk the live KLT features and for any feature_id linked
+    // to a landmark, refresh the landmark's pixel from the live KLT pos.
+    // The dot now slides with its feature at full 30 Hz.
+    //
+    // Parallel array (same lifetime + lock as ids/pixels). feature_ids[k]
+    // = -1 means the link was lost (e.g., set when ids/pixels updated but
+    // we didn't capture a feature_id, or when KLT track died and the
+    // refresh detected the absence and cleared the link).
+    std::vector<int>          last_observed_landmark_feature_ids_;
+
     // Worker-thread plumbing.
     std::thread               loop_closure_thread_;
     std::atomic<bool>         loop_closure_should_stop_{false};
@@ -793,6 +853,23 @@ private:
                                     const std::vector<cv::Point3f>& pts3d,
                                     int img_width, int img_height,
                                     const IMUPreintegrator& imu);
+
+    // 2026-05-19 Fix #12 — Cached VI-Depth affine fit (s, t) such that
+    // inv_metric_depth = s · disparity + t. Updated by
+    // applyDepthScaleConstraint on each keyframe where the fit passes the
+    // ≥ 50 % inlier acceptance bar. Consumed by sampleMidasMetricDepth.
+    // `midas_affine_valid_` gates use until the first successful fit.
+    mutable std::mutex midas_affine_mutex_;
+    double midas_affine_s_{0.0};
+    double midas_affine_t_{0.0};
+    bool   midas_affine_valid_{false};
+
+    // Tuning constants for sampleMidasMetricDepth. See its declaration in
+    // the public section above for the derivation. Widened from the
+    // applyDepthScaleConstraint inlier band [0.3, 12] to [0.3, 30] to
+    // accommodate longer sightlines on a scooter / outdoor walks.
+    static constexpr double kMinMidasDepthM = 0.3;
+    static constexpr double kMaxMidasDepthM = 30.0;
 
     // Constants
     static constexpr int    MAX_FEATURES       = 200;  // OpenVINS default for monocular

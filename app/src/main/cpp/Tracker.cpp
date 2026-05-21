@@ -326,6 +326,18 @@ void Tracker::applyDepthScaleConstraint(
         return;
     }
 
+    // 2026-05-19 Fix #12 — cache the affine fit for per-pixel depth queries.
+    // Consumers (SLAM promotion, LandmarkMap add, future live-depth update)
+    // call sampleMidasMetricDepth(u, v) which reads these. Update only AFTER
+    // the inlier-ratio acceptance bar passes, so we don't poison consumers
+    // with a low-confidence fit.
+    {
+        std::lock_guard<std::mutex> lock(midas_affine_mutex_);
+        midas_affine_s_     = s_fit;
+        midas_affine_t_     = t_fit;
+        midas_affine_valid_ = true;
+    }
+
     // Convert each inlier feature to a metric/baseline ratio. Same shape
     // as the legacy `ratio = metric_z / pts3d[i].z` so the existing MAD +
     // Kalman fuser path consumes it unchanged.
@@ -515,6 +527,88 @@ void Tracker::applyDepthScaleConstraint(
     }
 }
 
+// 2026-05-19 Fix #12 — Per-pixel MiDaS metric depth sampler.
+// See Tracker.h declaration for full cause/change/falsifier writeup.
+bool Tracker::sampleMidasMetricDepth(float u, float v, double& depth_m_out) const {
+    // 1. Read cached affine fit.
+    double s_fit, t_fit;
+    {
+        std::lock_guard<std::mutex> lock(midas_affine_mutex_);
+        if (!midas_affine_valid_) return false;
+        s_fit = midas_affine_s_;
+        t_fit = midas_affine_t_;
+    }
+
+    // 2. Read depth map snapshot (small copy avoided — keep lock briefly
+    //    and sample under it; map is 256×256 typically). Bilinear interp
+    //    handles sub-pixel sampling.
+    std::lock_guard<std::mutex> lock(depth_mutex_);
+    if (depth_map_.empty() || depth_width_ <= 1 || depth_height_ <= 1) {
+        return false;
+    }
+
+    // Image-pixel → depth-grid coords. Per applyDepthScaleConstraint
+    // (lines 257-258), the image pixel (u, v) is scaled by (depth_w/img_w,
+    // depth_h/img_h). We don't have img_w/img_h here; the consumer passes
+    // u, v already in IMAGE pixel space, but the depth_map's grid is
+    // disparity at the MiDaS-resolved tile. The image-w/h is implicit in
+    // the analyzer frame size; getOutputDimensions() of the analyzer
+    // resolves to (640, 480) for S21 Ultra after FILL_CENTER. To keep
+    // this self-contained without yet another setter, use the cached
+    // intrinsics image dimensions — the optical centre (cx, cy) is
+    // ~ (img_w/2, img_h/2), so 2·cx ≈ img_w. Robust at < 1 % error for
+    // any reasonable intrinsics.
+    const double img_w = (cx_ > 0.0) ? (2.0 * cx_) : 640.0;
+    const double img_h = (cy_ > 0.0) ? (2.0 * cy_) : 480.0;
+
+    const double fdx = static_cast<double>(u) / img_w *
+                       static_cast<double>(depth_width_);
+    const double fdy = static_cast<double>(v) / img_h *
+                       static_cast<double>(depth_height_);
+    if (!std::isfinite(fdx) || !std::isfinite(fdy)) return false;
+    if (fdx < 0.0 || fdx >= static_cast<double>(depth_width_ - 1) ||
+        fdy < 0.0 || fdy >= static_cast<double>(depth_height_ - 1)) {
+        return false;
+    }
+
+    // Bilinear interp.
+    const int x0 = static_cast<int>(std::floor(fdx));
+    const int y0 = static_cast<int>(std::floor(fdy));
+    const int x1 = x0 + 1;
+    const int y1 = y0 + 1;
+    const double ax = fdx - x0;
+    const double ay = fdy - y0;
+    const float d00 = depth_map_[y0 * depth_width_ + x0];
+    const float d10 = depth_map_[y0 * depth_width_ + x1];
+    const float d01 = depth_map_[y1 * depth_width_ + x0];
+    const float d11 = depth_map_[y1 * depth_width_ + x1];
+    const double disp =
+        (1.0 - ax) * (1.0 - ay) * d00 +
+        ax        * (1.0 - ay) * d10 +
+        (1.0 - ax) * ay        * d01 +
+        ax        * ay        * d11;
+
+    // MiDaS < 0.01 is the network's "very far / unstable" range — same
+    // gate applyDepthScaleConstraint uses (line 262).
+    if (!std::isfinite(disp) || disp < 0.01) return false;
+
+    // Apply affine fit: metric_depth = 1 / (s · disparity + t).
+    const double inv_metric = s_fit * disp + t_fit;
+    if (!std::isfinite(inv_metric) || inv_metric <= 1e-4) return false;
+
+    const double depth_m = 1.0 / inv_metric;
+    if (!std::isfinite(depth_m) ||
+        depth_m < kMinMidasDepthM ||
+        depth_m > kMaxMidasDepthM) {
+        return false;
+    }
+
+    depth_m_out = depth_m;
+    navsight::eventCounters().midas_depth_samples.fetch_add(
+        1, std::memory_order_relaxed);
+    return true;
+}
+
 void Tracker::setInitialHeading(double azimuth_rad, const IMUPreintegrator& imu) {
     std::lock_guard<std::mutex> lock(pose_mutex_);
     // Build world→body Z-up matrix for compass-CW azimuth (matches the
@@ -632,6 +726,7 @@ void Tracker::reset() {
         std::lock_guard<std::mutex> lk(last_observed_mutex_);
         last_observed_landmark_ids_.clear();
         last_observed_landmark_pixels_.clear();
+        last_observed_landmark_feature_ids_.clear();
     }
     // 2026-05-12: visual_map_.clear() reverted alongside the VisualMap
     // member revert above. See Tracker.h scaffold note.
@@ -1259,18 +1354,63 @@ VisionOutput Tracker::processFrame(const uint8_t* yuv_data, int width, int heigh
         if ((frame_counter_ % 6) == 0) {
             cv::Mat ekf_bg = ekf_.getGyroBias();
             if (!ekf_bg.empty() && ekf_bg.rows == 3 && ekf_bg.type() == CV_64F) {
-                imu.setGyroBias(
-                    static_cast<float>(ekf_bg.at<double>(0, 0)),
-                    static_cast<float>(ekf_bg.at<double>(1, 0)),
-                    static_cast<float>(ekf_bg.at<double>(2, 0)));
+                // 2026-05-21 BUG-02 ROOT-CAUSE FIX — ADD-and-ZERO per
+                // EKFState.h:701-731.
+                //
+                // Cause: this block previously called
+                //   imu.setGyroBias(ekf_bg.x, ekf_bg.y, ekf_bg.z)
+                // which REPLACED the IMU's calibrated gyro_bias_ (~0.18 rad/s
+                // on a vertically-held S21 Ultra) with the EKF's RESIDUAL b_g_
+                // (~0.007 rad/s after MSCKF convergence). Net effect: ~0.17
+                // rad/s of un-subtracted gyro entered preintegration → phantom
+                // yaw drift of ~0.4°/s = +46° per 120s walk, matching the user's
+                // observed 30-60° displayed-heading drift per loop. Counter
+                // evidence: `ekf_bg_absorbed_total = 0` across all 6 walks
+                // 2026-05-19 to 2026-05-21 despite `gyro_bias_pushed_total
+                // = 391` — the absorb path was never engaged.
+                //
+                // Correct pattern (this fix): READ ekf b_g_, ADD it to the
+                // IMU's gyro_bias_ (absorbing the EKF residual into the IMU's
+                // full bias estimate), then call ekf_.setGyroBias(0,0,0) to
+                // zero the residual. Covariance P_ is intentionally NOT
+                // touched — uncertainty about the bias hasn't changed; we
+                // just transferred where the estimate is held. The next MSCKF
+                // update accumulates fresh residual on top of the now-correct
+                // full bias.
+                //
+                // Falsifier: post-fix walk →
+                //   ekf_bg_absorbed_total > 0 (this code path now firing)
+                //   debug-panel heading drift per 2 loops < 5° (was 30-60°)
+                //   Madgwick yaw-rate p99 during stationary < 0.5°/s (was
+                //                                              ~2.4°/s)
+                //
+                // Hard constraint: caller (this frame's processFrame) holds
+                // Tracker::pose_mutex_ — same convention as updateZRUP /
+                // applyMSCKFUpdate. setGyroBias on EKFState is documented as
+                // requiring this lock.
+                cv::Point3f imu_bg = imu.getGyroBias();
+                const float new_bg_x = imu_bg.x +
+                    static_cast<float>(ekf_bg.at<double>(0, 0));
+                const float new_bg_y = imu_bg.y +
+                    static_cast<float>(ekf_bg.at<double>(1, 0));
+                const float new_bg_z = imu_bg.z +
+                    static_cast<float>(ekf_bg.at<double>(2, 0));
+                imu.setGyroBias(new_bg_x, new_bg_y, new_bg_z);
+                ekf_.setGyroBias(0.0, 0.0, 0.0);
                 navsight::eventCounters().gyro_bias_pushed_total.fetch_add(
                     1, std::memory_order_relaxed);
+                navsight::eventCounters().ekf_bg_absorbed_total.fetch_add(
+                    1, std::memory_order_relaxed);
                 if ((frame_counter_ % 60) == 0) {
-                    LOGI("IMU_BG_PUSH: ekf_bg=(%+.5f,%+.5f,%+.5f) rad/s "
-                         "(frame=%d, ~5Hz cadence)",
+                    LOGI("IMU_BG_ABSORB: was_imu_bg=(%+.5f,%+.5f,%+.5f) "
+                         "ekf_residual=(%+.5f,%+.5f,%+.5f) "
+                         "new_imu_bg=(%+.5f,%+.5f,%+.5f) rad/s "
+                         "(frame=%d, ADD-and-ZERO)",
+                         imu_bg.x, imu_bg.y, imu_bg.z,
                          ekf_bg.at<double>(0, 0),
                          ekf_bg.at<double>(1, 0),
                          ekf_bg.at<double>(2, 0),
+                         new_bg_x, new_bg_y, new_bg_z,
                          frame_counter_);
                 }
             }
@@ -1538,32 +1678,153 @@ VisionOutput Tracker::processFrame(const uint8_t* yuv_data, int width, int heigh
     }
 
     // 2026-05-19 Fix #6 — per-frame refresh of SLAM observation pixel.
+    // (See SlamFeatureOverlay Fix #6 in CameraUi.kt for the full writeup.)
     //
-    // Cause: noteSlamLastObs was previously called only inside the
-    // keyframe-storage block's SLAM update loop (~2 Hz keyframe rate).
-    // Between keyframes the overlay's cyan crosshair AND the "draw orange
-    // dot at obs" path read STALE obs_u/obs_v values — from the last
-    // keyframe ~500 ms ago. KLT runs at 30 Hz and the actual image
-    // feature has moved relative to the last-keyframe pixel position in
-    // that gap. v57 SLAM_RMS logcat confirmed in-EKF residuals were
-    // 0.3-3 px at keyframes; the 60-100 px gap the user reported was
-    // entirely the 0.5 s of stale-obs lag visible on screen.
+    // 2026-05-19 Fix #7 — per-frame SLAM update against LIVE IMU state,
+    //               so the EKF (α, β, ρ) state tracks the live observation
+    //               at frame rate instead of waiting for the next keyframe.
     //
-    // Fix: every frame, for each SLAM-active feature still being KLT-
-    // tracked, push the current raw KLT pixel into obs_u/obs_v via
-    // noteSlamLastObs. Overlay then sees real-time observation pixels.
-    // Cost: n_slam ≤ 12 lifecycle lookups per frame ≈ 5 µs. Negligible.
-    // RAW pixel (not undistorted) is correct here: the camera preview
-    // shown to the user IS raw, and the overlay's cyan crosshair +
-    // orange dot must land on the visible image feature.
+    // 2026-05-19 Fix #8 — batched applySlamLiveBatch.
+    //
+    // Cause for batch: Fix #7's per-feature updateSlamFeatureLive loop
+    // ANR'd at 30 Hz × 12 SLAM features × O(n^3) Joseph form ≈ 1080 ms/sec
+    // of camera-thread work. Fix #7b throttle (1/3 frame) papered over it
+    // but was a frequency knob, not an architectural fix.
+    // Batch stacks all per-feature Jacobian rows into ONE (2K × dim) H
+    // matrix and runs a single Joseph-form update. Mathematically
+    // equivalent to N sequential updates (Kalman is linear). Cost drops
+    // from N × O(n^3) to 1 × O(n^3) — 12× speedup at K=12 features.
+    //
+    // Falsifier: post-Fix-#8 the throttle is removed (every frame batches)
+    // AND no ANR fires across a multi-minute walk. Counter
+    // `slam_live_batch_calls` ≈ frames-with-SLAM-features; ratio
+    // `slam_live_updates_fired / slam_live_batch_calls` shows per-call
+    // yield (should be ≥ 1 row applied on average when features are
+    // tracked and EKF state is healthy).
+
+    // 1. Overlay refresh — runs every frame regardless of EKF state so
+    //    the user sees orange dots stay anchored to KLT pixels even when
+    //    the EKF can't apply an update (blurry, static, not initialized).
+    //    Fix #6: overlay obs is RAW (distorted) pixel for camera-preview
+    //    alignment; the linear-K EKF projection uses the undistorted form.
+    //
+    // SLAM observation refresh loop (Fix #6).
     for (size_t i = 0;
          i < next_good_buf_.size() && i < feature_ids_.size(); ++i) {
         const int fid = feature_ids_[i];
         if (fid < 0) continue;
         const auto* lc = feature_mgr_.getLifecycle(fid);
-        if (!lc || lc->slam_slot < 0) continue;
-        feature_mgr_.noteSlamLastObs(
-            fid, next_good_buf_[i].x, next_good_buf_[i].y);
+        if (lc && lc->slam_slot >= 0) {
+            feature_mgr_.noteSlamLastObs(
+                fid, next_good_buf_[i].x, next_good_buf_[i].y);
+        }
+    }
+
+    // 2026-05-19 Fix #11b — Per-frame proximity-based landmark pixel
+    // refresh. Replaces the v11a feature_id-linkage approach which only
+    // landed 110 refreshes over 65k observed-dot render events because
+    // most ORB rows have feature_ids[t_idx] = -1 (no KLT-spatial-proximity
+    // link at descriptor-storage time per KeyframeDescriptors.h:11).
+    //
+    // Strategy: for each landmark in last_observed_landmark_pixels_, find
+    // the nearest CURRENT-FRAME KLT feature within `kRefreshRadiusPx`. If
+    // found, snap the landmark's observed pixel to that KLT position. The
+    // dot tracks the feature at full KLT rate (30 Hz) instead of being
+    // stuck at the last keyframe's pixel for 28-29 frames.
+    //
+    // Radius 5 px derived from: KLT inter-frame motion under walking
+    // (mean_flow typically 2-5 px at 30 Hz, S21 Ultra 640×480 analyzer
+    // frame) + 1 σ ORB localisation accuracy (~1 px). Larger radius
+    // risks landmark-grabbing-wrong-feature. Smaller risks the KLT
+    // feature drifting out of radius between keyframes (rebound at next
+    // keyframe). 5 px is the floor below which inter-frame KLT motion
+    // exceeds the radius.
+    //
+    // Falsifier: post-Fix-#11b walk should show
+    //   landmarks_pixel_refreshed_total ≈ landmarks_rendered_anchor_total
+    // (each observed-dot render gets a refresh). User-visible: orange
+    // dots track features as the camera moves instead of being stuck.
+    constexpr float kRefreshRadiusPx   = 5.0f;
+    constexpr float kRefreshRadiusSqPx = kRefreshRadiusPx * kRefreshRadiusPx;
+    std::vector<std::pair<size_t, cv::Point2f>> landmark_pixel_updates;
+    {
+        std::lock_guard<std::mutex> lk(last_observed_mutex_);
+        landmark_pixel_updates.reserve(last_observed_landmark_pixels_.size());
+        for (size_t k = 0; k < last_observed_landmark_pixels_.size(); ++k) {
+            const float u_old = last_observed_landmark_pixels_[k].x;
+            const float v_old = last_observed_landmark_pixels_[k].y;
+            // Find nearest KLT feature within radius.
+            float best_d2  = kRefreshRadiusSqPx;
+            size_t best_i  = SIZE_MAX;
+            for (size_t i = 0; i < next_good_buf_.size(); ++i) {
+                const float du = next_good_buf_[i].x - u_old;
+                const float dv = next_good_buf_[i].y - v_old;
+                const float d2 = du * du + dv * dv;
+                if (d2 < best_d2) {
+                    best_d2 = d2;
+                    best_i  = i;
+                }
+            }
+            if (best_i != SIZE_MAX) {
+                landmark_pixel_updates.emplace_back(k, next_good_buf_[best_i]);
+            }
+        }
+        // Apply updates under the same lock (avoids a second take).
+        for (const auto& [idx, pix] : landmark_pixel_updates) {
+            last_observed_landmark_pixels_[idx] = pix;
+        }
+    }
+    if (!landmark_pixel_updates.empty()) {
+        navsight::eventCounters().landmarks_pixel_refreshed_total.fetch_add(
+            static_cast<long long>(landmark_pixel_updates.size()),
+            std::memory_order_relaxed);
+    }
+
+    // 2. Batched live SLAM Kalman update — only when EKF is healthy.
+    //    is_static guard mirrors the keyframe SLAM update gate at line
+    //    ~3141 (during stationary, KLT subpixel noise was injecting δp
+    //    drift into p_G via SLAM residuals).
+    if (ekf_.isFullInitialized() && !frame_blurry_ && !is_static) {
+        // Bulk-undistort the current frame's KLT pixels once so the EKF
+        // sees linear-K coords. Skip when lens not calibrated.
+        std::vector<cv::Point2f> klt_ud;
+        klt_ud.reserve(next_good_buf_.size());
+        for (const auto& p : next_good_buf_) klt_ud.push_back(p);
+        if (lens_.isReady() && lens_.hasDistortion()) {
+            lens_.undistortPoints(klt_ud);
+        }
+
+        // Collect (slot, undistorted-pixel) for every KLT-tracked SLAM
+        // feature this frame. The batch helper handles per-row chi² +
+        // depth + early-out gates internally; rows that fail are not
+        // stacked.
+        std::vector<std::pair<int, cv::Point2f>> batch_obs;
+        batch_obs.reserve(next_good_buf_.size());
+        for (size_t i = 0;
+             i < next_good_buf_.size() && i < feature_ids_.size(); ++i) {
+            const int fid = feature_ids_[i];
+            if (fid < 0) continue;
+            const auto* lc = feature_mgr_.getLifecycle(fid);
+            if (!lc || lc->slam_slot < 0) continue;
+            const cv::Point2f& obs_ud =
+                (i < klt_ud.size()) ? klt_ud[i] : next_good_buf_[i];
+            batch_obs.emplace_back(lc->slam_slot, obs_ud);
+        }
+
+        if (!batch_obs.empty()) {
+            const int n_applied = ekf_.applySlamLiveBatch(batch_obs, /*sigma_px=*/1.0);
+            const int n_skipped = static_cast<int>(batch_obs.size()) - n_applied;
+            navsight::eventCounters().slam_live_batch_calls.fetch_add(
+                1, std::memory_order_relaxed);
+            if (n_applied > 0) {
+                navsight::eventCounters().slam_live_updates_fired.fetch_add(
+                    n_applied, std::memory_order_relaxed);
+            }
+            if (n_skipped > 0) {
+                navsight::eventCounters().slam_live_updates_skipped.fetch_add(
+                    n_skipped, std::memory_order_relaxed);
+            }
+        }
     }
 
     // ── 7. Mean flow + motion gates ──────────────────────────────────────────
@@ -1943,6 +2204,49 @@ VisionOutput Tracker::processFrame(const uint8_t* yuv_data, int width, int heigh
             // In OpenVINS, we often check if the translation is significant.
             double inlier_ratio = static_cast<double>(inlier_count_out) / tracked;
 
+            // 2026-05-20 ROOT-CAUSE FIX — translation-degeneracy via parallax,
+            // not |t_vo|.
+            //
+            // Cause: cv::recoverPose returns t as a unit vector (essential
+            // matrix only determines translation direction — see Hartley &
+            // Zisserman §9.6.2). The previous `t_norm < 0.001` and
+            // `mean_flow < 1.5 && t_norm < 0.01` checks were mathematically
+            // unreachable. Empirical proof in the 2026-05-20 heading_walk
+            // sims: every EMAT_FAIL line logged |t_vo|=1.0000 (sample at
+            // tests/sims/regression/visual/heading_walk_2026_05_20.logcat.txt
+            // 15:01:58.732 … 15:02:22.667, n=14, std=0.0000). With the gate
+            // hard-wired false, both downstream paths
+            //   - Tracker.cpp:2380 updateRelativeRotation  (per-frame, 30Hz)
+            //   - Tracker.cpp:3904 updateGravityAlignedYaw (per-keyframe, ~2Hz)
+            // accepted catastrophic recoverPose decompositions when the user
+            // walked toward a flat wall (low translation parallax → known
+            // 4-fold (R,t) ambiguity in essential-matrix decomposition flips
+            // sign frame-to-frame). hunt_ekf_yaw_jumps.py output: EKF R_GtoI
+            // yaw-rate p99 = 65°/s vs Madgwick p99 = 5.3°/s, 13 jumps >30°/s
+            // per walk. LC_ABS r_R median = 33-80°.
+            //
+            // Change: replace dead |t_vo| check with mean-parallax angle in
+            // radians (mean KLT pixel displacement divided by focal length).
+            // Threshold kVisualMinParallaxRad = 0.01 (≈ 0.57°) matches Fix #10
+            // (EKFState::kSlamMinParallaxCos = 0.99995 → angle threshold
+            // 0.57°), which itself cites OpenVINS UpdaterSLAM
+            // min_parallax_ratio = 0.01 (Geneva et al. 2020 §III.D).
+            //
+            // The mean-displacement loop below is the same computation
+            // already used in the EMAT_FAIL diagnostic at lines ~2138-2148;
+            // hoisting it from the failure-only conditional to every-frame
+            // execution adds ~150 µs/frame for typical N≈100 matches.
+            //
+            // Falsifier: re-walk facing a flat wall →
+            //   visual_translation_degenerate_total > 0 (gate firing)
+            //   OVERLAY_SNAPSHOT R_GtoI_yaw_deg tracks Madgwick within ±10°
+            //   LC_ABS r_R median < 15°
+            //   loop_closure_accepts climbs above 1/walk
+            //
+            // LEGACY: previous unreachable t_norm-based gate, kept commented
+            // per project no-deletion convention; remove only after this
+            // parallax gate is walk-validated on at least 3 sims.
+            /* LEGACY 2026-05-20:
             // Translation degeneracy: check if t_vo is too small (pure rotation)
             // NOTE: Do NOT use SVD condition of E — essential matrix is always rank 2
             // by definition (σ,σ,0), so condition number is always infinite.
@@ -1950,6 +2254,38 @@ VisionOutput Tracker::processFrame(const uint8_t* yuv_data, int width, int heigh
             if (t_norm < 0.001) translation_degenerate = true;
             // Also check: if flow is mostly explained by rotation (low parallax)
             if (mean_flow < 1.5 && t_norm < 0.01) translation_degenerate = true;
+            */
+            double sum_disp_px = 0.0;
+            int    n_disp_px   = 0;
+            const size_t n_pairs = std::min(prev_ud.size(), next_ud.size());
+            for (size_t i = 0; i < n_pairs; ++i) {
+                const double dx_p = next_ud[i].x - prev_ud[i].x;
+                const double dy_p = next_ud[i].y - prev_ud[i].y;
+                sum_disp_px += std::sqrt(dx_p * dx_p + dy_p * dy_p);
+                n_disp_px++;
+            }
+            const double mean_disp_px = n_disp_px > 0
+                ? sum_disp_px / static_cast<double>(n_disp_px)
+                : 0.0;
+            const double focal_px = K.at<double>(0, 0);
+            const double parallax_rad = focal_px > 1e-6
+                ? mean_disp_px / focal_px
+                : 0.0;
+            // 0.01 rad ≈ 0.57°. Mirrors Fix #10 (EKFState::kSlamMinParallaxCos).
+            constexpr double kVisualMinParallaxRad = 0.01;
+            if (parallax_rad < kVisualMinParallaxRad) {
+                translation_degenerate = true;
+                navsight::eventCounters()
+                    .visual_translation_degenerate_total
+                    .fetch_add(1, std::memory_order_relaxed);
+            }
+            if (frame_counter_ % 30 == 0) {
+                LOGI("PARALLAX_GATE: mean_disp_px=%.2f focal_px=%.1f "
+                     "parallax_rad=%.5f thresh=%.5f degenerate=%d",
+                     mean_disp_px, focal_px, parallax_rad,
+                     kVisualMinParallaxRad,
+                     translation_degenerate ? 1 : 0);
+            }
             double svd_cond = 0.0;  // kept for logging
 
             if (inlier_count_out >= MIN_INLIERS && inlier_ratio >= MIN_INLIER_RATIO) {
@@ -2161,7 +2497,67 @@ VisionOutput Tracker::processFrame(const uint8_t* yuv_data, int width, int heigh
                                (focal * std::sqrt(static_cast<double>(inlier_count_out))))
                             : 1e-2;
                         double sigma_axis_sq = sigma_axis * sigma_axis;
-                        if (!ekf_.updateRelativeRotation(R_vo_body, sigma_axis_sq,
+
+                        // 2026-05-21 BUG 4 ROOT-CAUSE FIX — gyro-vs-visual
+                        // consistency gate at the sensor-disagreement layer.
+                        //
+                        // Cause: cv::recoverPose decomposes E into 4 candidate
+                        // (R, t) solutions and picks via cheirality. On planar
+                        // / low-parallax scenes the vote is noisy and the wrong
+                        // (sign-flipped) R can be picked even at high inlier
+                        // counts. The previous chi² gate (now reverted) used
+                        // state covariance which self-defeats as P grows from
+                        // propagation-without-updates.
+                        //
+                        // Change: compare R_vo_body to the gyro-integrated
+                        // rotation between consecutive frames (imu_delta.deltaR
+                        // is body-frame rotation, computed by IMUPreintegrator
+                        // with bias correction). If they disagree by > 2°,
+                        // trust the gyro (its drift over 33ms is negligible)
+                        // and discard the visual measurement.
+                        //
+                        // Threshold derivation (sensor-physics):
+                        //   Madgwick yaw-rate p99               = 1.87°/s
+                        //   Frame interval                       = 33 ms
+                        //   Real body rotation per frame (3σ)    = 0.06°
+                        //   Plus turn rate (~30°/s × 33ms)        = 1.0°
+                        //   Plus visual measurement noise         = 0.1°
+                        //   Sum (worst legit disagreement)        ≈ 1.2°
+                        //   Safety factor 1.7×                    → 2°
+                        //
+                        // Falsifier: post-fix walk →
+                        //   visual_relative_rotation_gyro_mismatch_total > 0
+                        //   EKF R_GtoI yaw-rate p99 → < 10°/s
+                        constexpr double kFrameGyroVisualMaxDisagreeRad =
+                            2.0 * M_PI / 180.0;  // 2°
+                        bool gyro_visual_ok = true;
+                        if (!imu_delta.deltaR.empty() &&
+                            imu_delta.deltaR.rows == 3 &&
+                            imu_delta.deltaR.cols == 3 &&
+                            imu_delta.deltaR.type() == CV_64F) {
+                            cv::Mat R_disagree = R_vo_body * imu_delta.deltaR.t();
+                            cv::Mat r_axis;
+                            cv::Rodrigues(R_disagree, r_axis);
+                            const double mag = cv::norm(r_axis);
+                            if (std::isfinite(mag) &&
+                                mag > kFrameGyroVisualMaxDisagreeRad) {
+                                navsight::eventCounters()
+                                    .visual_relative_rotation_gyro_mismatch_total
+                                    .fetch_add(1, std::memory_order_relaxed);
+                                gyro_visual_ok = false;
+                                if (frame_counter_ % 30 == 0) {
+                                    LOGI("VISUAL_ROT_GYRO_REJECT: |R_vo·R_gyro^T|=%.2f° "
+                                         "threshold=%.2f° inliers=%d "
+                                         "(recoverPose sign-flip suspected)",
+                                         mag * 180.0 / M_PI,
+                                         kFrameGyroVisualMaxDisagreeRad * 180.0 / M_PI,
+                                         inlier_count_out);
+                                }
+                            }
+                        }
+
+                        if (gyro_visual_ok &&
+                            !ekf_.updateRelativeRotation(R_vo_body, sigma_axis_sq,
                                                          prev_clone_id)) {
                             navsight::eventCounters().relative_rotation_rejected.fetch_add(
                                 1, std::memory_order_relaxed);
@@ -3002,12 +3398,27 @@ VisionOutput Tracker::processFrame(const uint8_t* yuv_data, int width, int heigh
             auto promotable = feature_mgr_.getPromotableFeatures(
                 window_ids,
                 /*min_obs=*/8, /*min_kf=*/2, /*max_init_rms_px=*/1.5);
+            // 2026-05-20 promotion-gate instrumentation. Each `continue`
+            // increments a distinct counter so we can see which gate kills
+            // SLAM promotions in replay (slam_promotions_total stays 0 in
+            // the desktop harness despite landmarks_added_total > 0 and
+            // MSCKF firing). Per the implementor-skill rule: counters at
+            // every decision point.
+            navsight::eventCounters().slam_promo_candidates_total.fetch_add(
+                static_cast<long long>(promotable.size()),
+                std::memory_order_relaxed);
             for (int fid : promotable) {
                 if (ekf_.getSlamFeatureCount() >= EKFState::MAX_SLAM_FEATURES) {
+                    navsight::eventCounters().slam_promo_rejected_cap_total
+                        .fetch_add(1, std::memory_order_relaxed);
                     break;  // cap reached this frame; try again next frame
                 }
                 const auto* obs = feature_mgr_.getObservations(fid);
-                if (!obs || obs->size() < 2) continue;
+                if (!obs || obs->size() < 2) {
+                    navsight::eventCounters().slam_promo_rejected_no_obs_total
+                        .fetch_add(1, std::memory_order_relaxed);
+                    continue;
+                }
                 // Pick first / last observations whose clones still exist.
                 int   anchor_clone_id = -1;
                 int   far_clone_id    = -1;
@@ -3028,6 +3439,8 @@ VisionOutput Tracker::processFrame(const uint8_t* yuv_data, int width, int heigh
                 }
                 if (anchor_clone_id < 0 || far_clone_id < 0 ||
                     anchor_clone_id == far_clone_id) {
+                    navsight::eventCounters().slam_promo_rejected_no_anchor_far_total
+                        .fetch_add(1, std::memory_order_relaxed);
                     continue;
                 }
                 // v23.10 (2026-05-11): loosened promotion baseline gate
@@ -3039,7 +3452,11 @@ VisionOutput Tracker::processFrame(const uint8_t* yuv_data, int width, int heigh
                 // to filter "literally no parallax" (mm-scale) cases.
                 {
                     const double promo_baseline = cv::norm(p_far - p_anchor);
-                    if (promo_baseline < 0.015) continue;
+                    if (promo_baseline < 0.015) {
+                        navsight::eventCounters().slam_promo_rejected_baseline_total
+                            .fetch_add(1, std::memory_order_relaxed);
+                        continue;
+                    }
                 }
                 // Two-view midpoint triangulation in world frame.
                 //
@@ -3057,16 +3474,85 @@ VisionOutput Tracker::processFrame(const uint8_t* yuv_data, int width, int heigh
                 // Normalise the world-frame ray directions.
                 cv::Mat dAw_n = dAw / cv::norm(dAw);
                 cv::Mat dBw_n = dBw / cv::norm(dBw);
+
+                // 2026-05-20 PROMOTION PARALLAX GATE — mirrors Fix #10
+                // (EKFState::buildSlamLiveJacobianRow) and the visual front-
+                // end parallax gate at Tracker.cpp:2162-2225.
+                //
+                // Cause: the only pre-triangulation geometry filter before
+                // this point is the baseline gate at line 3349
+                // (`cv::norm(p_far - p_anchor) < 0.015 → reject`). Baseline
+                // ≠ parallax. Two cameras 5 cm apart looking at a wall
+                // 1.5 m away with NEARLY-PARALLEL rays produce midpoint
+                // triangulation depth ≈ baseline / sin(parallax_angle).
+                // parallax = 0.01° → depth ≈ 286 m, parallax = 0.1° →
+                // depth ≈ 28.6 m. The reprojection-RMS gate at line 3414
+                // doesn't catch these because RMS is in PIXEL space: when
+                // all observations of the feature are from low-parallax
+                // viewpoints, projecting the wrong-depth p_world through
+                // any of them gives ~the same pixel as the observation
+                // (the bad p_world sits ALONG the ray, not perpendicular
+                // to it). RMS gate is necessary-but-not-sufficient.
+                //
+                // Empirical evidence: parallax_fix_walk_2026_05_20 had
+                // 12 of 24 SLAM promotions get MiDaS-seeded — 6 of those
+                // at z_tri = 403-680 m with z_midas = 1.4-1.6 m (250-450×
+                // depth error) yet they all passed baseline+chirality+RMS.
+                //
+                // Change: compute cos(parallax) = dAw_n · dBw_n. Below
+                // threshold (cos > 0.99985 ⇔ angle < ~1°), skip promotion.
+                // The feature stays in the candidate pool and will be
+                // re-attempted as more observations accumulate; eventually
+                // parallax grows (user moves laterally past the wall) and
+                // promotion succeeds with a sane depth.
+                //
+                // Threshold derivation: kSlamPromoMinParallaxCos = 0.99985
+                // (≈ 1.0°). Matches ORB-SLAM3's triangulation-promotion
+                // threshold (Mur-Artal & Tardós 2017 §V.B "Triangulating
+                // Map Points": parallax ≥ 1°). Slightly looser than
+                // Fix #10's 0.99995 (0.57°) because promotion is one-shot
+                // and tolerates more uncertainty than per-frame depth
+                // refinement. Same family of constants as Fix #10 and the
+                // front-end parallax gate (kVisualMinParallaxRad = 0.01).
+                //
+                // Falsifier: post-fix walk →
+                //   slam_promo_rejected_parallax_total > 0 (gate firing)
+                //   SLAM_PROMOTE_MIDAS_SEED log shows no z_tri > 50 m
+                //   (the kMidasReplaceRatio = 2.0 gate should still fire
+                //   occasionally on borderline cases, but never on the
+                //   100s-of-metres outliers we saw)
+                //   slam_promotions_seeded_with_midas / slam_promotions_total
+                //   ratio drops from 0.50 (today) to < 0.10.
+                constexpr double kSlamPromoMinParallaxCos = 0.99985;
+                const double cos_parallax =
+                    dAw_n.dot(dBw_n) /
+                    (cv::norm(dAw_n) * cv::norm(dBw_n));
+                if (std::isfinite(cos_parallax) &&
+                    cos_parallax > kSlamPromoMinParallaxCos) {
+                    navsight::eventCounters()
+                        .slam_promo_rejected_parallax_total
+                        .fetch_add(1, std::memory_order_relaxed);
+                    continue;
+                }
+
                 cv::Mat M(3, 2, CV_64F);
                 dAw_n.copyTo(M(cv::Range::all(), cv::Range(0, 1)));
                 cv::Mat negB = -dBw_n;
                 negB.copyTo(M(cv::Range::all(), cv::Range(1, 2)));
                 cv::Mat rhs = p_far - p_anchor;
                 cv::Mat ts;
-                if (!cv::solve(M, rhs, ts, cv::DECOMP_SVD)) continue;
+                if (!cv::solve(M, rhs, ts, cv::DECOMP_SVD)) {
+                    navsight::eventCounters().slam_promo_rejected_solve_total
+                        .fetch_add(1, std::memory_order_relaxed);
+                    continue;
+                }
                 const double tA = ts.at<double>(0, 0);
                 const double tB = ts.at<double>(1, 0);
-                if (tA <= 0.05 || tB <= 0.05) continue;  // chirality gate
+                if (tA <= 0.05 || tB <= 0.05) {
+                    navsight::eventCounters().slam_promo_rejected_chirality_total
+                        .fetch_add(1, std::memory_order_relaxed);
+                    continue;  // chirality gate
+                }
                 cv::Mat p_world =
                     0.5 * ((p_anchor + dAw_n * tA) + (p_far + dBw_n * tB));
 
@@ -3086,9 +3572,95 @@ VisionOutput Tracker::processFrame(const uint8_t* yuv_data, int width, int heigh
                     rms2 += du * du + dv * dv;
                     n_used++;
                 }
-                if (n_used < 2) continue;
+                if (n_used < 2) {
+                    navsight::eventCounters().slam_promo_rejected_n_used_total
+                        .fetch_add(1, std::memory_order_relaxed);
+                    continue;
+                }
                 const double rms = std::sqrt(rms2 / static_cast<double>(n_used));
-                if (rms > 1.5) continue;
+                if (rms > 1.5) {
+                    navsight::eventCounters().slam_promo_rejected_rms_total
+                        .fetch_add(1, std::memory_order_relaxed);
+                    navsight::eventCounters().slam_promo_rms_milli_p95
+                        .store(static_cast<long long>(std::lround(rms * 1000.0)),
+                               std::memory_order_relaxed);
+                    continue;
+                }
+
+                // 2026-05-19 Fix #12 — MiDaS sanity check on the triangulated
+                // depth. Pure-axial motion (walk-back/forward facing scene,
+                // scooter-straight) gives degenerate triangulation; the
+                // result can be off by >2× even when the reprojection-RMS
+                // gate passes (RMS is in image space, not depth space, so
+                // a 5m-vs-15m world point projects nearly the same pixel
+                // for a stationary camera). Cross-check with MiDaS metric
+                // depth: if MiDaS available AND disagrees with triangulated
+                // depth in the anchor camera frame by > kMidasReplaceRatio,
+                // replace p_world with MiDaS-derived position. The MiDaS
+                // depth is independent of motion baseline, so it's the
+                // trustworthy source in axial-motion cases.
+                //
+                // Math: at anchor pixel (obs_anchor in normalised
+                // coords) and MiDaS depth z_midas, the point in anchor
+                // camera frame is (obs_anchor.x · z, obs_anchor.y · z, z).
+                // World point = R_anchor.t() · cam + p_anchor (R_anchor is
+                // world→camera per EKFState convention; transpose gives
+                // camera→world).
+                //
+                // Threshold derivation: 2× ratio matches the
+                // applyDepthScaleConstraint inlier band (lines 350,
+                // ratio ∈ [0.1, 10] is the absolute trust window; > 2×
+                // disagreement is the "geometry suspect, prefer MiDaS"
+                // band). Picked conservatively to avoid replacing healthy
+                // triangulations.
+                constexpr double kMidasReplaceRatio = 2.0;
+                {
+                    cv::Mat p_anchor_cam_mat = R_anchor * (p_world - p_anchor);
+                    const double z_tri = p_anchor_cam_mat.at<double>(2, 0);
+                    if (std::isfinite(z_tri) && z_tri > 0.05) {
+                        // Convert normalised obs_anchor to image pixel for
+                        // the MiDaS sample. fx_use / fy_use / cx_use /
+                        // cy_use are this frame's effective intrinsics
+                        // (post user-scale correction). Undistortion already
+                        // applied at addObservation time, so this is the
+                        // pinhole pixel; MiDaS distortion error is small
+                        // (< 5 px at frame edges with NavSight's k1=0.263).
+                        const float u_img = static_cast<float>(
+                            obs_anchor.x * fx_use + cx_use);
+                        const float v_img = static_cast<float>(
+                            obs_anchor.y * fy_use + cy_use);
+                        double z_midas = 0.0;
+                        if (sampleMidasMetricDepth(u_img, v_img, z_midas)) {
+                            const double ratio = z_midas / z_tri;
+                            if (ratio > kMidasReplaceRatio ||
+                                ratio < 1.0 / kMidasReplaceRatio) {
+                                // Triangulation disagrees with MiDaS — prefer
+                                // MiDaS. Reconstruct p_world from anchor pose
+                                // + obs ray + z_midas.
+                                cv::Mat p_cam_midas = (cv::Mat_<double>(3, 1) <<
+                                    obs_anchor.x * z_midas,
+                                    obs_anchor.y * z_midas,
+                                    z_midas);
+                                cv::Mat p_world_midas =
+                                    R_anchor.t() * p_cam_midas + p_anchor;
+                                LOGI("SLAM_PROMOTE_MIDAS_SEED: fid=%d "
+                                     "z_tri=%.2fm z_midas=%.2fm ratio=%.2f "
+                                     "p_tri=(%.2f,%.2f,%.2f) p_midas=(%.2f,%.2f,%.2f)",
+                                     fid, z_tri, z_midas, ratio,
+                                     p_world.at<double>(0, 0),
+                                     p_world.at<double>(1, 0),
+                                     p_world.at<double>(2, 0),
+                                     p_world_midas.at<double>(0, 0),
+                                     p_world_midas.at<double>(1, 0),
+                                     p_world_midas.at<double>(2, 0));
+                                p_world = p_world_midas;
+                                navsight::eventCounters()
+                                    .slam_promotions_seeded_with_midas
+                                    .fetch_add(1, std::memory_order_relaxed);
+                            }
+                        }
+                    }
+                }
 
                 // Build the anchor CameraPose. Use the EKF's stored FEJ.
                 CameraPose anchor;
@@ -3479,10 +4051,37 @@ VisionOutput Tracker::processFrame(const uint8_t* yuv_data, int width, int heigh
                             while (drift > M_PI) drift -= 2.0 * M_PI;
                             while (drift < -M_PI) drift += 2.0 * M_PI;
 
-                            // Correct drift if within reasonable range
-                            // Walking oscillation can cause 2-4°/step drift; allow up to 20°
-                            // to catch multi-step accumulation between keyframes
-                            if (std::abs(drift) < 20.0 * M_PI / 180.0) {
+                            // 2026-05-21 — tightened 20° → 3° per Bug 4 root-cause.
+                            //
+                            // Cause: 20° gate accepted nearly every visual-yaw
+                            // measurement (logged drift p99 ≈ 10°, never >20°).
+                            // But residuals 3-10° produce 30-78°/s EKF R_GtoI
+                            // jumps because the Kalman update applies them at
+                            // gain ≈ 0.75 against var_yaw_floor=(0.57°)².
+                            //
+                            // Threshold derivation (sensor-physics, not stats):
+                            //   Madgwick yaw-rate p99 (measured)  = 1.87°/s
+                            //   Keyframe interval                  = 0.5 s
+                            //   Real body rotation per KF (3σ)     = 0.94°
+                            //   Gyro bias drift per KF (×0.5s)     = 0.14°
+                            //   Sum (worst-case legit disagreement) ≈ 1.1°
+                            //   Safety factor 2.7×                 → 3°
+                            //
+                            // Anything above 3° is recoverPose returning a
+                            // sign-flipped or otherwise wildly wrong R from
+                            // E-matrix decomposition (known-unstable on
+                            // planar / low-parallax scenes even with high
+                            // inlier counts). Gyro is more trustworthy on
+                            // the 0.5s timescale than visual.
+                            //
+                            // Falsifier: post-fix walk → EKF R_GtoI yaw-rate
+                            // p99 drops from 78°/s to < 10°/s; trajectory
+                            // loop-bearing delta < 5°.
+                            //
+                            // LEGACY: was 20° before this fix.
+                            // /* legacy: if (std::abs(drift) < 20.0 * M_PI / 180.0) */
+                            constexpr double kKfHeadingDriftMaxRad = 3.0 * M_PI / 180.0;
+                            if (std::abs(drift) < kKfHeadingDriftMaxRad) {
                                 // Step 4 Phase B: feed visual yaw measurement into
                                 // EKFState as the single yaw-correction path.
                                 // The Joseph-form Kalman update applies its own
@@ -3573,6 +4172,81 @@ VisionOutput Tracker::processFrame(const uint8_t* yuv_data, int width, int heigh
                                     static_cast<void>(ekf_.updateGravityAlignedYaw(
                                         yaw_meas, var_yaw,
                                         current_roll, current_pitch));
+                                    }  // close inner else (is_static gate)
+
+                                    // 2026-05-21 BUG-02b ROOT-CAUSE FIX — Bug 5
+                                    // moved OUTSIDE the is_static/translation_degenerate
+                                    // /is_pure_rotation gate so it actually fires.
+                                    //
+                                    // Cause: pre-fix, Bug 5 was nested inside the
+                                    // `else { }` block (line 4140-4235) gated by
+                                    // `is_static || translation_degenerate ||
+                                    // is_pure_rotation`. Hive-worker-05 cross-walk
+                                    // analysis showed `madgwick_visual_yaw_nudges_total
+                                    // = 0` across all 6 walks 2026-05-19 to 2026-05-21
+                                    // despite `updateGravityAlignedYaw` (LC_YAW_FIRE)
+                                    // firing 8-16× per walk. Hive-worker-02 confirmed
+                                    // independently: 67% of `PARALLAX_GATE` logs show
+                                    // `parallax_rad < 0.01` → translation_degenerate
+                                    // skips both updates. Bug 5 was structurally
+                                    // unreachable in the typical walking scene
+                                    // (forward, low parallax against walls).
+                                    //
+                                    // Change: hoist Bug 5 out of the inner else.
+                                    // Still inside the outer `if (drift < 3°)` gate
+                                    // so we trust the visual yaw measurement (gyro-
+                                    // consistency proven), and still inside
+                                    // `if (aligned_ok && ekf_.isFullInitialized())`
+                                    // for safety. Recompute yaw_meas locally so we
+                                    // don't depend on the inner else's scope.
+                                    //
+                                    // Why is_static/translation_degenerate are NOT
+                                    // valid gates for Bug 5 specifically:
+                                    //   - is_static: Madgwick yaw drifts on bias
+                                    //     even when user is stationary; visual yaw
+                                    //     during is_static has zero motion-noise.
+                                    //     Pushing visual → Madgwick is HELPFUL.
+                                    //   - translation_degenerate: gyro-consistency
+                                    //     gate (drift < 3°) already ensures visual
+                                    //     agrees with gyro within 3°, so visual yaw
+                                    //     is trustworthy for Madgwick nudging.
+                                    //   - is_pure_rotation: visual yaw IS observable
+                                    //     during pure rotation (essential matrix
+                                    //     decomposes consistently for pure rotation),
+                                    //     so Bug 5 nudge is sound here too.
+                                    //
+                                    // Falsifier (post-BUG-02b walk):
+                                    //   madgwick_visual_yaw_nudges_total > 100 per
+                                    //                                           walk
+                                    //   Debug-panel heading drift across 2 loops < 5°
+                                    constexpr double kBug5SyncStrength    = 0.10;
+                                    constexpr double kBug5MaxResidualRad  = M_PI / 4.0;
+                                    double yaw_meas_b5 = kf_heading + visual_delta_heading;
+                                    while (yaw_meas_b5 >  M_PI) yaw_meas_b5 -= 2.0 * M_PI;
+                                    while (yaw_meas_b5 < -M_PI) yaw_meas_b5 += 2.0 * M_PI;
+                                    const double madg_now = imu.getHeading();
+                                    double yaw_resid_madg = yaw_meas_b5 - madg_now;
+                                    while (yaw_resid_madg > M_PI)
+                                        yaw_resid_madg -= 2.0 * M_PI;
+                                    while (yaw_resid_madg < -M_PI)
+                                        yaw_resid_madg += 2.0 * M_PI;
+                                    if (std::isfinite(yaw_resid_madg) &&
+                                        std::abs(yaw_resid_madg) < kBug5MaxResidualRad) {
+                                        imu.nudgeMadgwickYawAroundWorldZ(
+                                            kBug5SyncStrength * yaw_resid_madg);
+                                        navsight::eventCounters()
+                                            .madgwick_visual_yaw_nudges_total
+                                            .fetch_add(1, std::memory_order_relaxed);
+                                        if (frame_counter_ % 30 == 0) {
+                                            LOGI("MADG_VISUAL_SYNC: residual=%+.2f° "
+                                                 "applied=%+.2f° madg_was=%+.2f° "
+                                                 "(BUG-02b: now fires regardless of "
+                                                 "is_static/translation_degenerate)",
+                                                 yaw_resid_madg * 180.0 / M_PI,
+                                                 kBug5SyncStrength * yaw_resid_madg *
+                                                     180.0 / M_PI,
+                                                 madg_now * 180.0 / M_PI);
+                                        }
                                     }
                                 }
 
@@ -4165,6 +4839,12 @@ VisionOutput Tracker::processFrame(const uint8_t* yuv_data, int width, int heigh
                             // snapshot so JNI getLandmarkSnapshot can render
                             // observed dots AT the observation pixel.
                             std::vector<cv::Point2f>                  accepted_pixels_match;
+                            // 2026-05-19 Fix #11 — parallel feature-id array so
+                            // per-frame KLT loop can refresh observed pixels
+                            // between keyframes. See Tracker.h
+                            // `last_observed_landmark_feature_ids_` for the
+                            // cause/change writeup.
+                            std::vector<int>                          accepted_feature_ids_match;
                             if (!query_descriptors.empty() &&
                                 !kf_back.descriptors.empty() &&
                                 kf_back.descriptors.type() == CV_8U &&
@@ -4236,6 +4916,20 @@ VisionOutput Tracker::processFrame(const uint8_t* yuv_data, int width, int heigh
                                     // Math (BA, MSCKF) uses undistorted; this
                                     // is the only spot that needs raw.
                                     accepted_pixels_match.push_back(px_meas_raw);
+                                    // 2026-05-19 Fix #11 — capture the KLT
+                                    // feature_id linked to this landmark match
+                                    // so per-frame refresh can update the
+                                    // observed pixel between keyframes.
+                                    // kf_back.feature_ids is parallel to its
+                                    // keypoints array; -1 means the ORB row
+                                    // had no KLT-spatial-proximity link at
+                                    // descriptor-storage time.
+                                    const int linked_fid =
+                                        (t_idx >= 0 &&
+                                         t_idx < static_cast<int>(kf_back.feature_ids.size()))
+                                            ? kf_back.feature_ids[t_idx]
+                                            : -1;
+                                    accepted_feature_ids_match.push_back(linked_fid);
 
                                     // 2026-05-17 — touch landmark on every
                                     // matched observation (investigator
@@ -4441,6 +5135,13 @@ VisionOutput Tracker::processFrame(const uint8_t* yuv_data, int width, int heigh
                                 std::lock_guard<std::mutex> lk(last_observed_mutex_);
                                 last_observed_landmark_ids_    = std::move(accepted_ids);
                                 last_observed_landmark_pixels_ = std::move(accepted_pixels);
+                                // 2026-05-19 Fix #11 — parallel feature-id
+                                // array. Same lifetime + lock. Per-frame
+                                // refresh path (in the KLT-pixel loop) reads
+                                // these to know which KLT track maps to each
+                                // landmark observation.
+                                last_observed_landmark_feature_ids_ =
+                                    std::move(accepted_feature_ids_match);
                             }
                         }
                     }
@@ -5987,8 +6688,72 @@ void Tracker::consumeLoopClosureMatchIfReady(IMUPreintegrator& imu) {
     const double madg_pitch = imu.getMadgwickPitch();
     const double yaw_ekf_before = ekf_.getYaw(madg_roll, madg_pitch);
     cv::Mat p_G_before = ekf_.getPosition().clone();
-    const bool ok = ekf_.updateAbsolutePose(target_R_GtoI, target_p_world,
-                                             sigma_axis_sq_R, var_p);
+
+    // 2026-05-21 BUG 3 — post-PnP rotation-residual sanity gate.
+    //
+    // Cause: the existing heading-gate at LoopClosureDetector.cpp:649
+    // checks Madgwick yaw delta between candidate and current keyframes
+    // BEFORE PnP runs. It does NOT verify the PnP-derived target_R against
+    // current EKF R_GtoI. Planar scenes induce essential-matrix sign
+    // ambiguity: PnP can return a target_R that is π-flipped from truth
+    // even though the BoW score is good, the inlier count is high, and
+    // the heading-gate at retrieval passes. EKF chi² then correctly
+    // rejects all 10 damp-frame updates (wasted work), but if the
+    // rotation residual is just-shy of the chi² threshold the wrong
+    // target_R can leak into state.
+    //
+    // Evidence: 2026-05-20 walk parallax_fix_walk_2026_05_20 had one LC
+    // accept at 15:03:36 with r_R = [2.821 0.750 0.418] (≈ 169° axis-angle
+    // magnitude) and m²_R = 71 vs threshold 22.5 — chi² caught it ×10
+    // damp frames. Across both 2026-05-20 walks the median r_R was 13°
+    // and p99 was ~30°, so a 169° residual is a 5+ σ outlier under any
+    // reasonable physical model.
+    //
+    // Change: compute |r_R| = ||Rodrigues(target_R_GtoI · R_current.t())||
+    // directly here. If |r_R| > π/2 (90°), short-circuit updateAbsolutePose
+    // to false. Threshold rationale: matches the existing heading-gate
+    // (±π/2) at LoopClosureDetector.cpp retrieval — same physical intent
+    // ("the user is not facing a wildly different direction from the
+    // matched keyframe"), just applied to the geometric PnP solution
+    // instead of the Madgwick yaw. Keeps everything coherent and gates
+    // the right quantity at the right layer.
+    //
+    // Falsifier: post-fix walk →
+    //   loop_closure_rejects_rot_sanity_total > 0 ONLY if a bad PnP
+    //   solution arrived (which is rare); on a clean walk should stay
+    //   at 0. If it fires on EVERY LC, the threshold is too tight (look
+    //   for a real PnP rotation that's > 90° but legitimate — none seen
+    //   in 4 walks so far, but worth checking).
+    constexpr double kLcPostPnpMaxRotResidualRad = M_PI / 2.0;  // 90°
+    bool rot_sanity_ok = true;
+    {
+        cv::Mat R_current = ekf_.getRotation();
+        if (!R_current.empty() && R_current.rows == 3 && R_current.cols == 3 &&
+            R_current.type() == CV_64F) {
+            cv::Mat R_delta = target_R_GtoI * R_current.t();
+            cv::Mat r_axis;
+            cv::Rodrigues(R_delta, r_axis);
+            const double r_mag = cv::norm(r_axis);
+            if (std::isfinite(r_mag) && r_mag > kLcPostPnpMaxRotResidualRad) {
+                navsight::eventCounters()
+                    .loop_closure_rejects_rot_sanity_total
+                    .fetch_add(1, std::memory_order_relaxed);
+                if (fresh_match_picked_up || k == 0) {
+                    LOGI("LC_POST_PNP_ROT_REJECT: |r_R|=%.1f° threshold=%.1f° "
+                         "match_kf=%d (PnP target is π-flipped or essentially "
+                         "rotated from current EKF; aborting damp ramp)",
+                         r_mag * 180.0 / M_PI,
+                         kLcPostPnpMaxRotResidualRad * 180.0 / M_PI,
+                         matched_clone_id);
+                }
+                rot_sanity_ok = false;
+            }
+        }
+    }
+
+    const bool ok = rot_sanity_ok && ekf_.updateAbsolutePose(
+                                         target_R_GtoI, target_p_world,
+                                         sigma_axis_sq_R, var_p);
     if (ok) {
         const double yaw_ekf_after = ekf_.getYaw(madg_roll, madg_pitch);
         double delta_yaw_nav = yaw_ekf_after - yaw_ekf_before;
@@ -6023,6 +6788,59 @@ void Tracker::consumeLoopClosureMatchIfReady(IMUPreintegrator& imu) {
         // are smoothing tail.
         if (k == 0) {
             path_since_last_lc_m_ = 0.0;
+
+            // 2026-05-19 Fix #9 — re-anchor LandmarkMap entries from the
+            // corrected EKF clone poses. See LandmarkMap.h
+            // `reanchorLandmarksFromClonePoses` for the cause/change
+            // writeup. In short: the EKF clones just shifted via
+            // updateAbsolutePose's covariance propagation, but each
+            // landmark's `p_world` is still the snapshot from its host
+            // clone's PRE-correction pose. Recompute `p_world` from each
+            // landmark's stored `p_anchor_cam` against the host clone's
+            // CURRENT pose, so the dots project at their visible features
+            // on the very next render frame instead of waiting for a
+            // re-observation.
+            //
+            // The EKF stores `R_GtoC` (world→camera) in each clone. The
+            // LandmarkMap math expects `R_world_cam` (camera→world), so
+            // we transpose at the boundary. Camera position in world
+            // ≈ p_G (lever-arm to IMU centre is ≪ feature depth — same
+            // approximation as native-lib.cpp getCurrentCameraPose).
+            const int n_reanchored =
+                landmark_map_.reanchorLandmarksFromClonePoses(
+                    [this](int clone_id,
+                            cv::Matx33d& R_wc_out,
+                            cv::Vec3d&   t_cw_out) -> bool {
+                        cv::Mat R_GtoC_mat, p_G_mat;
+                        if (!ekf_.getClonePose(clone_id, R_GtoC_mat,
+                                                p_G_mat)) {
+                            return false;
+                        }
+                        if (R_GtoC_mat.empty() ||
+                            R_GtoC_mat.rows != 3 ||
+                            R_GtoC_mat.cols != 3 ||
+                            p_G_mat.rows != 3 || p_G_mat.cols != 1) {
+                            return false;
+                        }
+                        const cv::Mat R_cw_mat = R_GtoC_mat.t();
+                        for (int r = 0; r < 3; ++r) {
+                            for (int c = 0; c < 3; ++c) {
+                                R_wc_out(r, c) = R_cw_mat.at<double>(r, c);
+                            }
+                        }
+                        t_cw_out = cv::Vec3d(p_G_mat.at<double>(0, 0),
+                                              p_G_mat.at<double>(1, 0),
+                                              p_G_mat.at<double>(2, 0));
+                        return true;
+                    });
+            if (n_reanchored > 0) {
+                navsight::eventCounters()
+                    .landmarks_reanchored_total.fetch_add(
+                        n_reanchored, std::memory_order_relaxed);
+            }
+            LOGI("LC_REANCHOR: n_reanchored=%d (LC accepted, "
+                 "landmarks shifted from stale to current clone poses)",
+                 n_reanchored);
 
             // 2026-05-13 Phase 1 Step 5: pose-graph optimization fires once
             // per LC accept (first damp frame). The EKF updateAbsolutePose

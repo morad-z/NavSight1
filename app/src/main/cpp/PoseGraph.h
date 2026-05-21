@@ -195,12 +195,52 @@ public:
     // Floor on per-edge variance (m² / rad²) when deriving info from
     // covariance increments. Increments can be 0 or negative (after an LC
     // accept the EKF cov shrinks); without a floor we'd divide by 0 and
-    // the optimizer would treat odom edges as infinitely confident,
-    // freezing the loop edge entirely. Floor at (1 mm)² for position and
-    // (1 mrad)² for yaw — well below the EKF's noise floor on a clean
-    // walk, so this only kicks in for the LC-shrink case.
-    static constexpr double SIGMA_POS_FLOOR_SQ = 1e-6;  // (1 mm)² in m²
-    static constexpr double SIGMA_YAW_FLOOR_SQ = 1e-6;  // (1 mrad)² in rad²
+    // 2026-05-21 BUG-NEW-PG ROOT-CAUSE FIX — raised floors by 3 orders of
+    // magnitude (1mm² → 25cm², 1mrad² → 1°²).
+    //
+    // Cause: PoseGraph derives per-edge info_xy/info_yaw from the EKF's
+    // ABSOLUTE covariance INCREMENT (σ²_curr − σ²_prev) at PoseGraph.cpp:66-71.
+    // When the EKF runs MSCKF updates between keyframes, σ² often DECREASES
+    // (more measurements → tighter covariance) → dvar gets clamped to the
+    // SIGMA_POS_FLOOR_SQ = 1e-6 floor → info_xy = 1/1e-6 = **1,000,000**.
+    // Meanwhile loop-edge info_xy from PnP is ~0.25 (σ_p ≈ 2 m, var ≈ 4 m²).
+    // **4 million× ratio** means loop edges cannot deform the odom chain
+    // regardless of how good the loop closure is.
+    //
+    // Walk evidence (bug02b_walk_2026_05_21.logcat.txt):
+    //   POSE_GRAPH: N=110 odom=109 loop=4 iters=2 res_pre=2.614 res_post=2.614
+    //   ratio=1.000 max_corr_m=0.004 — Gauss-Newton terminates in 2 iters at
+    //   millimeter corrections because the chain is rigid.
+    //
+    // Threshold derivation (sensor-physics, not arbitrary statistical cuts):
+    //   Visual VO position noise:  ~5 mm/frame at decent parallax
+    //   × √(15 frames/keyframe at 30 Hz, 0.5 s spacing) ≈ 2 cm σ_xy per edge
+    //   IMU process noise over 0.5 s: ~1 cm σ_xy (S21 Ultra Allan analysis)
+    //   Combined RSS: ~2.5 cm σ_xy per edge
+    //   Safety factor 2× → 5 cm floor → (0.05)² = 2.5e-3 m²
+    //
+    //   For yaw:
+    //   Visual VO yaw: ~0.1°/frame × √15 ≈ 0.4° per edge
+    //   Gyro integration over 0.5 s: ~0.1° (Madgwick noise floor)
+    //   Combined RSS: ~0.5° per edge
+    //   Safety factor 2× → 1° floor → (0.01745)² ≈ 3e-4 rad²
+    //
+    // Resulting max info_xy = 400 (was 1,000,000); loop info_xy still ~0.25
+    // → ratio drops from 4M× to 1600×. Loop edges can now meaningfully
+    // deform the chain over multiple iterations.
+    //
+    // Falsifier (post-fix walk):
+    //   POSE_GRAPH log: iters > 2 on at least some solves
+    //   POSE_GRAPH log: ratio < 0.9 (residual actually drops)
+    //   max_corr_m > 0.05 (corrections at scale of real loop misalignment)
+    //   loop_closure_corrections_applied still healthy (LC chain unchanged)
+    //   Trajectory loop-bearing delta < 5° (was 11.6°)
+    //
+    // LEGACY: was 1e-6 each, kept for synthetic-test reference
+    // /* legacy SIGMA_POS_FLOOR_SQ = 1e-6;   (1 mm)² */
+    // /* legacy SIGMA_YAW_FLOOR_SQ = 1e-6;   (1 mrad)² */
+    static constexpr double SIGMA_POS_FLOOR_SQ = 2.5e-3;  // (5 cm)² in m²
+    static constexpr double SIGMA_YAW_FLOOR_SQ = 3.0e-4;  // (1°)² in rad²
 
 private:
     // Helper: compute summed squared residual norm across all edges, in

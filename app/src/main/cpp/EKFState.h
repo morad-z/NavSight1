@@ -2,6 +2,7 @@
 #include <vector>
 #include <deque>
 #include <mutex>
+#include <utility>
 #include <cstdint>
 #include <opencv2/core.hpp>
 
@@ -238,6 +239,110 @@ public:
                            const std::vector<cv::Point2f>& observations,
                            const std::vector<int>& clone_ids,
                            double pixel_noise_sq);
+
+    // 2026-05-19 Fix #7 — per-frame SLAM update against the LIVE IMU state.
+    //
+    // Cause: `updateSlamFeature` (above) requires `clone_ids` referencing
+    // clones in the EKF sliding window. NavSight only adds clones at
+    // KEYFRAME storage (~2 Hz). Between keyframes, the EKF IMU state moves
+    // (IMU integration + MSCKF on LandmarkMap observations every frame)
+    // but (α, β, ρ) of SLAM features stays frozen because no new clone
+    // has been added to attach an observation to. The rendered SLAM
+    // projection drifts from the actual image feature, then "snaps" each
+    // keyframe when UpdaterSLAM fires. v57 SLAM_RMS confirmed in-EKF
+    // residuals are 0.3-3 px AT keyframes but the user-visible projection
+    // gap is 60-100 px BETWEEN them.
+    //
+    // Change: this method observes a SLAM feature against the LIVE IMU
+    // state directly (R_GtoI_, p_G_, R_bc_), no clone reference needed.
+    // The Jacobian has non-zero blocks at:
+    //   * IMU rows  (0-2 δθ_w, 12-14 δp_G):  J_pC_θ = -R_bc·skew(p_I);
+    //                                        J_pC_p = -R_bc·R_GtoI
+    //     (identical to applyLandmarkObservations live projection,
+    //      EKFState.cpp:1900)
+    //   * Anchor clone slot (FEJ): same anchor block as
+    //     slamReprojectionJacobian, evaluated with R_GtoC_LIVE as the
+    //     observing camera.
+    //   * SLAM (α, β, ρ) slot:
+    //     ∂p_C/∂(α,β,ρ) = R_GtoC_LIVE · R_GtoC_a_FEJ^T · J_α(α,β,ρ)
+    //
+    // Residual: predicted pixel uses LIVE anchor pose for p_world, LIVE
+    // R_GtoI / p_G for projection. Jacobian uses FEJ anchor + LIVE IMU
+    // (no FEJ exists for the "current" state — the latest observation IS
+    // by definition the first estimate at this time).
+    //
+    // Gates: chi² (2-DOF 95% = 5.991) and depth (Z > 0.01) match
+    // updateSlamFeature. Caller is expected to call only when KLT has a
+    // valid track on this SLAM feature this frame.
+    //
+    // Returns true on a successful update applied to P_/state; false on
+    // any gate rejection or invalid input. Caller may use the return
+    // value for a per-feature counter.
+    //
+    // Falsifier: post-Fix-#7 SlamFeatureOverlay red residual lines should
+    // stay short continuously (no keyframe-rate snap pattern). New
+    // `SLAM_RMS_LIVE` log shows per-frame residual <3 px median when the
+    // EKF state is healthy.
+    bool updateSlamFeatureLive(int slot,
+                               const cv::Point2f& obs_pixel,
+                               double sigma_px);
+
+    // 2026-05-19 Fix #8 — production-grade batched live SLAM update.
+    //
+    // Cause for batch: first install of Fix #7 ANR'd at 30 Hz × 12 SLAM
+    // features × O(n^3) applyMSCKFUpdate per feature. CPU pressure avg60
+    // = 17%; camera thread blocked. Fix #7b throttle (1/3 frame) papered
+    // over it but is a frequency knob, not an architectural fix.
+    //
+    // Batch: stack all 12 SLAM features' (H_row, r_row) into ONE big H
+    // matrix (24 × dim) and ONE applyMSCKFUpdate. Math is identical to
+    // sequential single-feature updates (Kalman is linear so a stacked
+    // measurement is mathematically equivalent to N sequential ones,
+    // modulo numerical round-off ordering). Cost drops from N × O(n^3)
+    // to 1 × O(n^3) — a 12× speedup. Returns the number of rows that
+    // passed per-row chi² (95% 2-DOF = 5.991) + early-out gates and
+    // were applied.
+    //
+    // Sparse exploitation (Fix #8b — also in this PR): applyMSCKFUpdate
+    // remains dense, but the H_stack we build only touches the union of
+    // active state slots (IMU [0-2, 12-14] + each anchor clone + each
+    // SLAM block). For 12 features sharing up to 11 unique anchors,
+    // that's ~80 of 141 cols non-zero — modest 1.5-2× speedup from
+    // OpenCV's BLAS dropping the trailing zero work.
+    //
+    // Falsifier: post-Fix-#8 walk should show no ANR even at 30 Hz
+    // per-frame SLAM updates. Counters slam_live_batch_calls and
+    // slam_live_updates_fired together quantify rate + per-call yield.
+    int applySlamLiveBatch(
+        const std::vector<std::pair<int, cv::Point2f>>& observations,
+        double sigma_px);
+
+    // 2026-05-19 Fix #8 helper — pure projection + Jacobian build for a
+    // single (slot, obs_pixel). No state mutation. Used by both the
+    // single-feature `updateSlamFeatureLive` and the batched
+    // `applySlamLiveBatch`. See those for the cause/change writeup.
+    //
+    // Outputs:
+    //   H_row_out  2 × state_dim, sparse (only IMU + anchor + SLAM
+    //              slot columns non-zero). Caller is responsible for
+    //              copying into a stacked matrix or applying singly.
+    //   r_row_out  2 × 1 residual (obs - pred).
+    //   m2_out     scalar chi² of this row alone for diagnostics.
+    //
+    // Returns false (and outputs are not guaranteed valid) when ANY of:
+    //   - slot out of range / state malformed / rho near zero
+    //   - anchor clone missing from window
+    //   - predicted projection has degenerate depth (Z < 0.01)
+    //   - per-row chi² > 5.991 (95% 2-DOF gate)
+    //   - residual < 1.0 px (early-out — already converged)
+    //
+    // Math reference: EKFState.h `updateSlamFeatureLive` docstring.
+    bool buildSlamLiveJacobianRow(int slot,
+                                    const cv::Point2f& obs_pixel,
+                                    double sigma_px,
+                                    cv::Mat& H_row_out,
+                                    cv::Mat& r_row_out,
+                                    double& m2_out) const;
 
     // MSCKF feature update: a 2N-DOF stacked reprojection residual (one
     // 2-vector per observation) over a triangulated point that is NOT

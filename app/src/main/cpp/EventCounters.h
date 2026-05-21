@@ -219,6 +219,102 @@ struct EventCounters {
     // Step 7 only handles same-direction revisits; opposite-direction
     // approaches produce geometrically inconsistent 3D-2D pairs for PnP.
     std::atomic<long long> loop_closure_rejects_heading{0};
+    // 2026-05-21 Bug 4 — chi² gate on visual rotation measurement updates.
+    //
+    // Cause: even after the front-end parallax gate (Tracker.cpp:2162) and
+    // the SLAM promotion parallax gate (Tracker.cpp:~3372), EKF R_GtoI
+    // yaw still jumps 30-65°/s occasionally because some frames have
+    // adequate parallax (> 0.01 rad) but still produce noisy R_vo from
+    // recoverPose (motion blur during turn, low-texture wall stretch,
+    // KLT outliers, etc.). With var_yaw_floor = (0.57°)² (line 3895 in
+    // Tracker.cpp) and typical EKF P_yaw ≈ (1°)², the Kalman gain
+    // K = P / (P + R) ≈ 0.99 — a single bad measurement gets applied at
+    // ~99% strength, producing 30-65° R_GtoI jumps.
+    //
+    // These residual jumps mean the EKF R_GtoI yaw drifts ~10-15° between
+    // LC accepts even on the post-parallax-fix walks. Because trajectory
+    // `global_t_` is integrated via `R_GtoI.t() * t_scaled` per-frame,
+    // the trajectory shape rotates by the same amount → user sees the
+    // map showing a different orientation each loop pass.
+    //
+    // Measurement evidence: bug3_walk_2026_05_21.json showed loop-1 peak
+    // bearing -47.4° vs loop-2 peak bearing -62.8°, a 15° per-loop
+    // rotation despite Madgwick yaw drifting only 0.3° over the same
+    // span — confirming the rotation comes from EKF R_GtoI, not the
+    // gyro reference.
+    //
+    // Change: add per-measurement chi² gate on both visual rotation
+    // update paths.
+    //   * updateGravityAlignedYaw (1-DOF):  chi²(0.999, 1) = 10.83
+    //   * updateRelativeRotation  (3-DOF):  chi²(0.999, 3) = 16.27
+    // Mahalanobis = r^T · (H P H^T + R)^-1 · r. Above threshold, reject
+    // the measurement silently and increment the corresponding counter.
+    //
+    // Threshold rationale: chi²(0.999) is the Engineering-standard
+    // "obvious outlier" cutoff used everywhere else in NavSight (MSCKF
+    // per-row Huber, LC absolute-pose gate). For a measurement that
+    // legitimately differs from EKF prediction by <= 3.3 σ_total, the
+    // gate passes (admits the honest correction). For the 30-65° jumps
+    // we observe, m² is in the 100-300 range — well above 10.83/16.27.
+    //
+    // Falsifier: post-fix walk →
+    //   visual_yaw_chi2_rejected_total            > 0
+    //   visual_relative_rotation_chi2_rejected_total > 0
+    //   `OVERLAY_SNAPSHOT R_GtoI_yaw_deg` >= 30°/s jumps → 0
+    //   Trajectory bearing across loops within ±5°
+    //   `hunt_ekf_yaw_jumps.py` EKF p99 → < 5°/s (currently 50-65°/s)
+    // 2026-05-21 — chi² gate counters kept for back-compat after Bug 4 revert.
+    // Both will stay at 0 because the gates are now disabled (see LEGACY: blocks
+    // in EKFState.cpp). Their replacement counters are below.
+    std::atomic<long long> visual_yaw_chi2_rejected_total{0};
+    std::atomic<long long> visual_relative_rotation_chi2_rejected_total{0};
+
+    // 2026-05-21 — gyro-vs-visual consistency rejection (root-cause Bug 4 fix).
+    // Increments when the per-frame R_vo from recoverPose disagrees with the
+    // gyro-integrated rotation by more than the physical-bound threshold (2°
+    // for frame-to-frame). The threshold is grounded in measured Madgwick
+    // yaw-rate p99 = 1.87°/s × frame interval (33ms) + safety margin, NOT in
+    // statistical cuts that depend on EKF state covariance. recoverPose
+    // occasionally returns sign-flipped or otherwise wildly wrong R on
+    // planar / low-parallax scenes even with high inlier counts; this gate
+    // catches them at the sensor-disagreement layer before they reach the
+    // EKF.
+    //
+    // Falsifier: post-fix walks → this counter > 0 AND OVERLAY_SNAPSHOT
+    // R_GtoI_yaw_deg jumps >= 30°/s drop to 0.
+    std::atomic<long long> visual_relative_rotation_gyro_mismatch_total{0};
+
+    // 2026-05-21 Bug 5 — visual yaw → Madgwick direct sync.
+    // Increments every keyframe where the visual yaw estimate (from KLT
+    // dot rotation since the last keyframe) was used to nudge Madgwick
+    // toward the visual world reference. Combined with Tracker.cpp:3816
+    // gyro-consistency gate (which makes the visual yaw trustworthy),
+    // this bounds Madgwick gyro bias drift between LC accepts.
+    //
+    // Health: count / keyframes-per-walk should be ~50-100%. If much
+    // lower, the upstream gyro-consistency gate is rejecting too many
+    // visual measurements (look at KF_HEADING_CORR drift histogram).
+    std::atomic<long long> madgwick_visual_yaw_nudges_total{0};
+
+    // 2026-05-21 Bug 3 — post-PnP rotation-residual sanity gate.
+    // Increments when an LC accept's PnP-derived target_R is > π/2 (90°)
+    // away from current EKF R_GtoI. Counts each ramp-frame that hits the
+    // gate, so a single bad match contributes up to 10 (matching the damp-
+    // frame cadence). Distinct from loop_closure_rejects_heading (which is
+    // at BoW retrieval time, gates Madgwick yaw delta between candidate
+    // and current keyframes) and from loop_closure_chi2_rejected (which is
+    // the EKF's own chi² inside updateAbsolutePose). The PnP sanity gate
+    // sits BETWEEN those two: PnP produced a plausible inlier count + low
+    // BoW score, but the resulting target_R is geometrically impossible
+    // given how little the body actually rotated since the matched
+    // keyframe (Madgwick is stable). Catches the essential-matrix π-flip
+    // ambiguity that planar scenes induce. Evidence: 2026-05-20 walk
+    // 19:03 logged one LC with r_R = [2.821 0.750 0.418] ≈ 169° rotation
+    // residual; chi² correctly rejected all 10 damp frames (m²_R ≈ 72
+    // vs threshold 22.5) but the system still burned the work. This
+    // gate cuts the wasted effort AND defends against borderline cases
+    // where the bad PnP target marginally passes chi².
+    std::atomic<long long> loop_closure_rejects_rot_sanity_total{0};
     std::atomic<long long> loop_closure_kf_count_in_db{0};
     // Step 7 absolute-pose injection (ADR-013 §"Correction injection —
     // absolute pose path"). Completes accounting from detection to
@@ -476,6 +572,93 @@ struct EventCounters {
     std::atomic<long long> landmarks_refined_total{0};
     std::atomic<long long> landmark_obs_in_ba_history_min{0};
 
+    // 2026-05-19 Fix #11 — landmarks_pixel_refreshed_total.
+    //
+    // Increments by the number of landmark-observation pixels refreshed
+    // per frame from the KLT-tracked positions. At 30 Hz × ~50 active
+    // observed landmarks ≈ 1500/sec. If this is 0 across a walk where
+    // landmarks_matched_total > 0, the per-frame refresh path is broken
+    // (likely the feature_id ↔ landmark_id link isn't being captured at
+    // keyframe time). User-visible symptom of a broken refresh: orange
+    // dots appear stuck at the last keyframe's pixel positions while the
+    // image content moves past them.
+    std::atomic<long long> landmarks_pixel_refreshed_total{0};
+
+    // 2026-05-19 Fix #9 — landmarks_reanchored_total.
+    // Increments each time LoopClosureDetector accept fires AND the EKF
+    // updateAbsolutePose succeeds, by the number of LandmarkMap entries
+    // whose host_clone_id was still in the EKF window (so their p_world
+    // could be recomputed from the corrected clone pose). On a healthy
+    // revisit walk this should rise by ~50-500 per accepted LC (depends
+    // on map density). If LC ACCEPT fires but this stays at 0, the
+    // re-anchor lookup is missing all host clones — investigate clone
+    // window marginalisation cadence vs LC accept latency.
+    std::atomic<long long> landmarks_reanchored_total{0};
+
+    // 2026-05-19 Fix #7 — per-frame SLAM update against LIVE IMU state.
+    //   slam_live_updates_fired    increments per (frame × SLAM feature)
+    //                              that EKFState::updateSlamFeatureLive
+    //                              successfully applied (chi² passed,
+    //                              valid depth, valid pose lookup).
+    //   slam_live_updates_skipped  increments when the call returned false
+    //                              (gated by chi², degenerate depth, or
+    //                              missing anchor). Ratio fired/total
+    //                              indicates how often per-frame SLAM is
+    //                              converging on the EKF state.
+    // If fired is 0 across a walk but the EKF is initialized and SLAM
+    // features exist, something is gating updateSlamFeatureLive
+    // continuously — check chi² magnitudes and depth values.
+    std::atomic<long long> slam_live_updates_fired{0};
+    std::atomic<long long> slam_live_updates_skipped{0};
+
+    // 2026-05-19 Fix #10 — Parallax-baseline gate.
+    //
+    // Increments when EKFState::buildSlamLiveJacobianRow skips an update
+    // because the parallax angle between ray_anchor and ray_now is below
+    // the 0.57° threshold (cos > 0.99995). High counts during a pure-
+    // axial walk indicate the gate is doing its job: the SLAM (α, β, ρ)
+    // state stays stable because we refused to apply uninformative
+    // updates. If this stays at 0 across an axial walk, the gate isn't
+    // firing — investigate the parallax computation.
+    //
+    // Healthy ratios on a walk with mixed motion:
+    //   skipped_no_parallax / (fired + skipped_no_parallax) ≈ 20-50%
+    //   during purely-axial moments → 90%+, during lateral moves → < 10%.
+    std::atomic<long long> slam_live_skipped_no_parallax{0};
+
+    // 2026-05-19 Fix #8 — count batched applySlamLiveBatch invocations.
+    // Together with slam_live_updates_fired/skipped this tells us the
+    // average yield (rows applied per batch). A healthy walk should show
+    // slam_live_batch_calls ≈ frames-with-SLAM-features and
+    // slam_live_updates_fired ≈ slam_live_batch_calls × N_features.
+    // Replaces Fix #7b's 1/3-frame throttle — every frame now batches.
+    std::atomic<long long> slam_live_batch_calls{0};
+
+    // 2026-05-20 Visual-front-end parallax-baseline gate (mirror of Fix #10).
+    //
+    // Cause: the previous translation-degeneracy gate in Tracker.cpp tested
+    // `cv::norm(t_vo) < 0.001`, but cv::recoverPose returns t as a unit
+    // vector (essential matrix only determines translation direction).
+    // Empirical proof in 2026-05-20 walks: every EMAT_FAIL line logged
+    // |t_vo|=1.0000. The gate never fired → translation_degenerate was
+    // hard-wired false → both updateRelativeRotation (per-frame) and
+    // updateGravityAlignedYaw (per-keyframe) accepted catastrophic
+    // recoverPose decompositions when the user walked forward facing a
+    // flat wall (low translation parallax). Result: 13 catastrophic
+    // R_GtoI yaw jumps (>30°/s) per walk while Madgwick stayed at <5°/s.
+    //
+    // Increments when the visual front-end computes mean KLT parallax
+    // angle < kVisualMinParallaxRad (= 0.01 rad ≈ 0.57°). Same threshold
+    // and citation as Fix #10's slam_live_skipped_no_parallax (OpenVINS
+    // UpdaterSLAM min_parallax_ratio = 0.01, Geneva et al. 2020 §III.D).
+    //
+    // Falsifier: forward-walk past a flat wall →
+    //   visual_translation_degenerate_total > 0 (gate firing on the bad
+    //     frames). If it stays at 0 across a wall-facing walk, the focal-
+    //     length / parallax computation is broken — investigate before
+    //     trusting that the gate is doing its job.
+    std::atomic<long long> visual_translation_degenerate_total{0};
+
     // 2026-05-16 Phase 1 Step 6.4 — Tracker → EKF landmark-observation wire-up.
     //   landmarks_observed_total    Σ nearby_ids.size() per keyframe (all landmarks
     //                               returned by getLandmarksInRadius before any
@@ -560,6 +743,87 @@ struct EventCounters {
     std::atomic<long long> midas_affine_fit_inlier_ratio_milli{0};
     std::atomic<long long> midas_affine_fit_shift_milli{0};
 
+    // 2026-05-19 Fix #12 — Per-pixel MiDaS metric-depth sampler usage.
+    //
+    //   midas_depth_samples                  Tracker::sampleMidasMetricDepth
+    //                                        successful returns (valid metric
+    //                                        depth in [0.3, 30] m).
+    //   slam_promotions_seeded_with_midas    SLAM promotion sites that
+    //                                        replaced the triangulated depth
+    //                                        with the MiDaS metric depth
+    //                                        because the two disagreed
+    //                                        beyond `kMidasReplaceRatio` (2×).
+    //
+    // Health diagnostic: if midas_depth_samples > 0 across a walk but
+    // slam_promotions_seeded_with_midas stays 0, triangulation and MiDaS
+    // agree (no axial-motion divergence). On a pure-axial walk the
+    // replacement counter should be > 0.
+    std::atomic<long long> midas_depth_samples{0};
+    std::atomic<long long> slam_promotions_seeded_with_midas{0};
+
+    // 2026-05-20 — SLAM promotion gate instrumentation.
+    //
+    // `slam_promotions_total` (the success counter) was 0 in replay despite
+    // the rest of the pipeline firing (landmarks, MSCKF, BA, LC attempts).
+    // These per-gate counters expose which rejection reason dominates so we
+    // can fix the upstream cause instead of loosening the gate value.
+    //
+    //   slam_promo_candidates_total            features passed
+    //                                          getPromotableFeatures (age,
+    //                                          kf_count, in_window gates)
+    //   slam_promo_rejected_cap_total          MAX_SLAM_FEATURES reached
+    //   slam_promo_rejected_no_obs_total       getObservations returned <2
+    //   slam_promo_rejected_no_anchor_far_total no two distinct in-window
+    //                                          clones for triangulation
+    //   slam_promo_rejected_baseline_total     anchor-far baseline < 1.5 cm
+    //   slam_promo_rejected_solve_total        cv::solve numerical failure
+    //   slam_promo_rejected_chirality_total    tA or tB ≤ 0.05 m (behind
+    //                                          camera or too close)
+    //   slam_promo_rejected_n_used_total       <2 observations survived the
+    //                                          per-obs reprojection loop
+    //   slam_promo_rejected_rms_total          two-view RMS > 1.5 px
+    //   slam_promo_rejected_parallax_total     2026-05-20 — cos(angle between
+    //                                          dAw_n and dBw_n) > 0.99985
+    //                                          (parallax < ~1°). Mirrors
+    //                                          Fix #10 / front-end parallax
+    //                                          gate. Catches the case where
+    //                                          baseline ≥ 1.5 cm but the rays
+    //                                          are still near-parallel (user
+    //                                          walking slowly toward a wall)
+    //                                          → midpoint triangulation depth
+    //                                          blows up to 400-680 m even
+    //                                          though the reprojection RMS
+    //                                          gate passes (RMS is in pixel
+    //                                          space; at low parallax depth
+    //                                          error doesn't translate to
+    //                                          pixel error). Empirical
+    //                                          evidence: parallax_fix_walk_
+    //                                          2026_05_20 had 6 promotions
+    //                                          at z_tri=403-680 m vs MiDaS
+    //                                          z=1.4-1.6 m.
+    //   slam_promo_rms_milli_p95               GAUGE: latest rejected RMS
+    //                                          × 1000 — diagnose magnitude
+    //
+    // Health: if rejected_rms dominates, the EKF clone poses are wrong
+    // (heading drift, R_GtoI seeding error). If rejected_baseline
+    // dominates, the user wasn't moving enough. If rejected_chirality
+    // dominates, p_world is being computed behind the camera (sign-flip
+    // bug). If rejected_parallax dominates, the user IS moving (baseline
+    // gate passes) but always near a wall (no parallax) — promotions
+    // suppressed correctly. All-zero rejections suggests promotable came
+    // back empty.
+    std::atomic<long long> slam_promo_candidates_total{0};
+    std::atomic<long long> slam_promo_rejected_cap_total{0};
+    std::atomic<long long> slam_promo_rejected_no_obs_total{0};
+    std::atomic<long long> slam_promo_rejected_no_anchor_far_total{0};
+    std::atomic<long long> slam_promo_rejected_baseline_total{0};
+    std::atomic<long long> slam_promo_rejected_solve_total{0};
+    std::atomic<long long> slam_promo_rejected_chirality_total{0};
+    std::atomic<long long> slam_promo_rejected_n_used_total{0};
+    std::atomic<long long> slam_promo_rejected_rms_total{0};
+    std::atomic<long long> slam_promo_rejected_parallax_total{0};
+    std::atomic<long long> slam_promo_rms_milli_p95{0};
+
     // 2026-05-17 — translation gated because motion is rotation-only.
     // Catches "user sitting in chair rotating phone" that defeats is_static
     // (gyro != 0) and is_pure_rotation (Rayleigh threshold too strict).
@@ -628,6 +892,11 @@ struct EventCounters {
         loop_closure_rejects_low_score.store(0, std::memory_order_relaxed);
         loop_closure_rejects_pnp.store(0, std::memory_order_relaxed);
         loop_closure_rejects_heading.store(0, std::memory_order_relaxed);
+        loop_closure_rejects_rot_sanity_total.store(0, std::memory_order_relaxed);
+        visual_yaw_chi2_rejected_total.store(0, std::memory_order_relaxed);
+        visual_relative_rotation_chi2_rejected_total.store(0, std::memory_order_relaxed);
+        visual_relative_rotation_gyro_mismatch_total.store(0, std::memory_order_relaxed);
+        madgwick_visual_yaw_nudges_total.store(0, std::memory_order_relaxed);
         loop_closure_kf_count_in_db.store(0, std::memory_order_relaxed);
         loop_closure_chi2_rejected.store(0, std::memory_order_relaxed);
         loop_closure_corrections_applied.store(0, std::memory_order_relaxed);
@@ -678,6 +947,13 @@ struct EventCounters {
         landmarks_in_ba_solve_sum.store(0, std::memory_order_relaxed);
         landmarks_refined_total.store(0, std::memory_order_relaxed);
         landmark_obs_in_ba_history_min.store(0, std::memory_order_relaxed);
+        landmarks_reanchored_total.store(0, std::memory_order_relaxed);
+        landmarks_pixel_refreshed_total.store(0, std::memory_order_relaxed);
+        slam_live_updates_fired.store(0, std::memory_order_relaxed);
+        slam_live_updates_skipped.store(0, std::memory_order_relaxed);
+        slam_live_skipped_no_parallax.store(0, std::memory_order_relaxed);
+        slam_live_batch_calls.store(0, std::memory_order_relaxed);
+        visual_translation_degenerate_total.store(0, std::memory_order_relaxed);
         landmarks_observed_total.store(0, std::memory_order_relaxed);
         landmarks_matched_total.store(0, std::memory_order_relaxed);
         landmarks_msckf_accepted_total.store(0, std::memory_order_relaxed);
@@ -700,6 +976,19 @@ struct EventCounters {
         midas_affine_fit_low_inliers.store(0, std::memory_order_relaxed);
         midas_affine_fit_inlier_ratio_milli.store(0, std::memory_order_relaxed);
         midas_affine_fit_shift_milli.store(0, std::memory_order_relaxed);
+        midas_depth_samples.store(0, std::memory_order_relaxed);
+        slam_promotions_seeded_with_midas.store(0, std::memory_order_relaxed);
+        slam_promo_candidates_total.store(0, std::memory_order_relaxed);
+        slam_promo_rejected_cap_total.store(0, std::memory_order_relaxed);
+        slam_promo_rejected_no_obs_total.store(0, std::memory_order_relaxed);
+        slam_promo_rejected_no_anchor_far_total.store(0, std::memory_order_relaxed);
+        slam_promo_rejected_baseline_total.store(0, std::memory_order_relaxed);
+        slam_promo_rejected_solve_total.store(0, std::memory_order_relaxed);
+        slam_promo_rejected_chirality_total.store(0, std::memory_order_relaxed);
+        slam_promo_rejected_n_used_total.store(0, std::memory_order_relaxed);
+        slam_promo_rejected_rms_total.store(0, std::memory_order_relaxed);
+        slam_promo_rejected_parallax_total.store(0, std::memory_order_relaxed);
+        slam_promo_rms_milli_p95.store(0, std::memory_order_relaxed);
         global_t_gated_rotation_dominated_total.store(0, std::memory_order_relaxed);
         translation_heading_projection_total.store(0, std::memory_order_relaxed);
     }
@@ -774,6 +1063,11 @@ struct EventCounters {
         const long long v_loop_closure_rejects_low_score= loop_closure_rejects_low_score.load(std::memory_order_relaxed);
         const long long v_loop_closure_rejects_pnp      = loop_closure_rejects_pnp.load(std::memory_order_relaxed);
         const long long v_loop_closure_rejects_heading  = loop_closure_rejects_heading.load(std::memory_order_relaxed);
+        const long long v_loop_closure_rejects_rot_sanity_total = loop_closure_rejects_rot_sanity_total.load(std::memory_order_relaxed);
+        const long long v_visual_yaw_chi2_rejected_total = visual_yaw_chi2_rejected_total.load(std::memory_order_relaxed);
+        const long long v_visual_relative_rotation_chi2_rejected_total = visual_relative_rotation_chi2_rejected_total.load(std::memory_order_relaxed);
+        const long long v_visual_relative_rotation_gyro_mismatch_total = visual_relative_rotation_gyro_mismatch_total.load(std::memory_order_relaxed);
+        const long long v_madgwick_visual_yaw_nudges_total = madgwick_visual_yaw_nudges_total.load(std::memory_order_relaxed);
         const long long v_loop_closure_kf_count_in_db   = loop_closure_kf_count_in_db.load(std::memory_order_relaxed);
         const long long v_loop_closure_chi2_rejected    = loop_closure_chi2_rejected.load(std::memory_order_relaxed);
         const long long v_loop_closure_corrections_applied = loop_closure_corrections_applied.load(std::memory_order_relaxed);
@@ -823,7 +1117,14 @@ struct EventCounters {
         const long long v_landmarks_rendered_world_fixed_total = landmarks_rendered_world_fixed_total.load(std::memory_order_relaxed);
         const long long v_landmarks_in_ba_solve_sum      = landmarks_in_ba_solve_sum.load(std::memory_order_relaxed);
         const long long v_landmarks_refined_total        = landmarks_refined_total.load(std::memory_order_relaxed);
+        const long long v_landmarks_reanchored_total     = landmarks_reanchored_total.load(std::memory_order_relaxed);
+        const long long v_landmarks_pixel_refreshed_total = landmarks_pixel_refreshed_total.load(std::memory_order_relaxed);
         const long long v_landmark_obs_in_ba_history_min = landmark_obs_in_ba_history_min.load(std::memory_order_relaxed);
+        const long long v_slam_live_updates_fired        = slam_live_updates_fired.load(std::memory_order_relaxed);
+        const long long v_slam_live_updates_skipped      = slam_live_updates_skipped.load(std::memory_order_relaxed);
+        const long long v_slam_live_skipped_no_parallax  = slam_live_skipped_no_parallax.load(std::memory_order_relaxed);
+        const long long v_slam_live_batch_calls          = slam_live_batch_calls.load(std::memory_order_relaxed);
+        const long long v_visual_translation_degenerate_total = visual_translation_degenerate_total.load(std::memory_order_relaxed);
         const long long v_landmarks_observed_total  = landmarks_observed_total.load(std::memory_order_relaxed);
         const long long v_landmarks_matched_total   = landmarks_matched_total.load(std::memory_order_relaxed);
         const long long v_landmarks_msckf_accepted_total       = landmarks_msckf_accepted_total.load(std::memory_order_relaxed);
@@ -847,6 +1148,19 @@ struct EventCounters {
         const long long v_midas_affine_fit_low_inliers        = midas_affine_fit_low_inliers.load(std::memory_order_relaxed);
         const long long v_midas_affine_fit_inlier_ratio_milli = midas_affine_fit_inlier_ratio_milli.load(std::memory_order_relaxed);
         const long long v_midas_affine_fit_shift_milli        = midas_affine_fit_shift_milli.load(std::memory_order_relaxed);
+        const long long v_midas_depth_samples                 = midas_depth_samples.load(std::memory_order_relaxed);
+        const long long v_slam_promotions_seeded_with_midas   = slam_promotions_seeded_with_midas.load(std::memory_order_relaxed);
+        const long long v_slam_promo_candidates_total         = slam_promo_candidates_total.load(std::memory_order_relaxed);
+        const long long v_slam_promo_rejected_cap_total       = slam_promo_rejected_cap_total.load(std::memory_order_relaxed);
+        const long long v_slam_promo_rejected_no_obs_total    = slam_promo_rejected_no_obs_total.load(std::memory_order_relaxed);
+        const long long v_slam_promo_rejected_no_anchor_far_total = slam_promo_rejected_no_anchor_far_total.load(std::memory_order_relaxed);
+        const long long v_slam_promo_rejected_baseline_total  = slam_promo_rejected_baseline_total.load(std::memory_order_relaxed);
+        const long long v_slam_promo_rejected_solve_total     = slam_promo_rejected_solve_total.load(std::memory_order_relaxed);
+        const long long v_slam_promo_rejected_chirality_total = slam_promo_rejected_chirality_total.load(std::memory_order_relaxed);
+        const long long v_slam_promo_rejected_n_used_total    = slam_promo_rejected_n_used_total.load(std::memory_order_relaxed);
+        const long long v_slam_promo_rejected_rms_total       = slam_promo_rejected_rms_total.load(std::memory_order_relaxed);
+        const long long v_slam_promo_rejected_parallax_total  = slam_promo_rejected_parallax_total.load(std::memory_order_relaxed);
+        const long long v_slam_promo_rms_milli_p95            = slam_promo_rms_milli_p95.load(std::memory_order_relaxed);
         const long long v_global_t_gated_rotation_dominated_total = global_t_gated_rotation_dominated_total.load(std::memory_order_relaxed);
         const long long v_translation_heading_projection_total = translation_heading_projection_total.load(std::memory_order_relaxed);
 
@@ -904,6 +1218,11 @@ struct EventCounters {
         appendKv(out, "loop_closure_rejects_low_score", v_loop_closure_rejects_low_score); out += ',';
         appendKv(out, "loop_closure_rejects_pnp",      v_loop_closure_rejects_pnp);      out += ',';
         appendKv(out, "loop_closure_rejects_heading",  v_loop_closure_rejects_heading);  out += ',';
+        appendKv(out, "loop_closure_rejects_rot_sanity_total", v_loop_closure_rejects_rot_sanity_total); out += ',';
+        appendKv(out, "visual_yaw_chi2_rejected_total", v_visual_yaw_chi2_rejected_total); out += ',';
+        appendKv(out, "visual_relative_rotation_chi2_rejected_total", v_visual_relative_rotation_chi2_rejected_total); out += ',';
+        appendKv(out, "visual_relative_rotation_gyro_mismatch_total", v_visual_relative_rotation_gyro_mismatch_total); out += ',';
+        appendKv(out, "madgwick_visual_yaw_nudges_total", v_madgwick_visual_yaw_nudges_total); out += ',';
         appendKv(out, "loop_closure_kf_count_in_db",   v_loop_closure_kf_count_in_db);   out += ',';
         appendKv(out, "loop_closure_chi2_rejected",    v_loop_closure_chi2_rejected);    out += ',';
         appendKv(out, "loop_closure_corrections_applied", v_loop_closure_corrections_applied); out += ',';
@@ -953,7 +1272,14 @@ struct EventCounters {
         appendKv(out, "landmarks_rendered_world_fixed_total", v_landmarks_rendered_world_fixed_total); out += ',';
         appendKv(out, "landmarks_in_ba_solve_sum",      v_landmarks_in_ba_solve_sum);      out += ',';
         appendKv(out, "landmarks_refined_total",        v_landmarks_refined_total);        out += ',';
+        appendKv(out, "landmarks_reanchored_total",     v_landmarks_reanchored_total);     out += ',';
+        appendKv(out, "landmarks_pixel_refreshed_total", v_landmarks_pixel_refreshed_total); out += ',';
         appendKv(out, "landmark_obs_in_ba_history_min", v_landmark_obs_in_ba_history_min); out += ',';
+        appendKv(out, "slam_live_updates_fired",        v_slam_live_updates_fired);        out += ',';
+        appendKv(out, "slam_live_updates_skipped",      v_slam_live_updates_skipped);      out += ',';
+        appendKv(out, "slam_live_skipped_no_parallax",  v_slam_live_skipped_no_parallax);  out += ',';
+        appendKv(out, "slam_live_batch_calls",          v_slam_live_batch_calls);          out += ',';
+        appendKv(out, "visual_translation_degenerate_total", v_visual_translation_degenerate_total); out += ',';
         appendKv(out, "landmarks_observed_total",  v_landmarks_observed_total);  out += ',';
         appendKv(out, "landmarks_matched_total",   v_landmarks_matched_total);   out += ',';
         appendKv(out, "landmarks_msckf_accepted_total",       v_landmarks_msckf_accepted_total);       out += ',';
@@ -977,6 +1303,19 @@ struct EventCounters {
         appendKv(out, "midas_affine_fit_low_inliers",        v_midas_affine_fit_low_inliers);        out += ',';
         appendKv(out, "midas_affine_fit_inlier_ratio_milli", v_midas_affine_fit_inlier_ratio_milli); out += ',';
         appendKv(out, "midas_affine_fit_shift_milli",        v_midas_affine_fit_shift_milli);        out += ',';
+        appendKv(out, "midas_depth_samples",                 v_midas_depth_samples);                 out += ',';
+        appendKv(out, "slam_promotions_seeded_with_midas",   v_slam_promotions_seeded_with_midas);   out += ',';
+        appendKv(out, "slam_promo_candidates_total",         v_slam_promo_candidates_total);         out += ',';
+        appendKv(out, "slam_promo_rejected_cap_total",       v_slam_promo_rejected_cap_total);       out += ',';
+        appendKv(out, "slam_promo_rejected_no_obs_total",    v_slam_promo_rejected_no_obs_total);    out += ',';
+        appendKv(out, "slam_promo_rejected_no_anchor_far_total", v_slam_promo_rejected_no_anchor_far_total); out += ',';
+        appendKv(out, "slam_promo_rejected_baseline_total",  v_slam_promo_rejected_baseline_total);  out += ',';
+        appendKv(out, "slam_promo_rejected_solve_total",     v_slam_promo_rejected_solve_total);     out += ',';
+        appendKv(out, "slam_promo_rejected_chirality_total", v_slam_promo_rejected_chirality_total); out += ',';
+        appendKv(out, "slam_promo_rejected_n_used_total",    v_slam_promo_rejected_n_used_total);    out += ',';
+        appendKv(out, "slam_promo_rejected_rms_total",       v_slam_promo_rejected_rms_total);       out += ',';
+        appendKv(out, "slam_promo_rejected_parallax_total",  v_slam_promo_rejected_parallax_total);  out += ',';
+        appendKv(out, "slam_promo_rms_milli_p95",            v_slam_promo_rms_milli_p95);            out += ',';
         appendKv(out, "global_t_gated_rotation_dominated_total", v_global_t_gated_rotation_dominated_total); out += ',';
         appendKv(out, "translation_heading_projection_total",    v_translation_heading_projection_total);
         out += '}';

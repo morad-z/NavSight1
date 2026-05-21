@@ -595,6 +595,59 @@ bool LandmarkMap::projectIntoCamera(int                 landmark_id,
     return true;
 }
 
+// 2026-05-19 Fix #9 — Re-anchor landmarks from current clone poses.
+// See LandmarkMap.h declaration for full cause/change/falsifier writeup.
+int LandmarkMap::reanchorLandmarksFromClonePoses(
+        const std::function<bool(int clone_id,
+                                  cv::Matx33d& R_world_cam_out,
+                                  cv::Vec3d&   t_cam_world_out)>&
+            clone_pose_lookup) {
+    std::lock_guard<std::mutex> lock(mutex_);
+    int n_reanchored      = 0;
+    int n_skipped_orphan  = 0;
+    int n_skipped_no_anch = 0;
+
+    for (auto& [id, l] : landmarks_) {
+        if (!l.has_anchor || l.host_clone_id < 0) {
+            ++n_skipped_no_anch;
+            continue;
+        }
+
+        cv::Matx33d R_world_cam;
+        cv::Vec3d   t_cam_world;
+        if (!clone_pose_lookup(l.host_clone_id, R_world_cam, t_cam_world)) {
+            // Host clone marginalised out of the EKF window — no current
+            // pose available, so keep the stored p_world. The landmark is
+            // already past the LC correction's reach.
+            ++n_skipped_orphan;
+            continue;
+        }
+
+        // Inverse of the anchor compute in addOrMergeLandmarkImpl:
+        //   p_anchor = R_w2c · (p_world − t_cam_world)
+        // ⟹ p_world = R_world_cam · p_anchor + t_cam_world
+        const cv::Vec3d p_world_new =
+            R_world_cam * l.p_anchor_cam + t_cam_world;
+        if (!isFiniteVec(p_world_new)) {
+            // Defensive: clone pose returned NaN. Don't poison p_world.
+            ++n_skipped_orphan;
+            continue;
+        }
+
+        l.p_world = p_world_new;
+        ++n_reanchored;
+    }
+
+    if (n_reanchored > 0) {
+        // Spatial index now stale — next getLandmarksInRadius rebuilds.
+        kd_dirty_ = true;
+        LOGI("LandmarkMap.reanchor: n=%d orphan=%d no_anchor=%d total=%zu",
+             n_reanchored, n_skipped_orphan, n_skipped_no_anch,
+             landmarks_.size());
+    }
+    return n_reanchored;
+}
+
 // ─── Mutator API ─────────────────────────────────────────────────────────────
 
 int LandmarkMap::applyKeyframePoseCorrection(uint64_t kf_id,

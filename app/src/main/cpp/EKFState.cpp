@@ -3,6 +3,7 @@
 #include <cmath>
 #include <algorithm>
 #include <chrono>
+#include <limits>
 #include <opencv2/calib3d.hpp>
 #ifdef __ANDROID__
 #include <android/log.h>
@@ -1457,6 +1458,37 @@ bool EKFState::updateRelativeRotation(const cv::Mat& R_meas_body,
     }
 
     cv::Mat R_noise = cv::Mat::eye(3, 3, CV_64F) * std::max(sigma_axis_sq, 1e-8);
+
+    /* LEGACY 2026-05-21 — Bug 4 chi² gate REVERTED.
+     * Empirical evidence (bug4_walk_2026_05_21): rejected 503 measurements
+     * per walk but EKF R_GtoI yaw-rate p99 went UP 53°/s → 78°/s, trajectory
+     * loop-bearing delta got WORSE (15° → 113°). Reason: chi² gate uses
+     * state covariance S = HPH^T + R. When rejection rate is high, P grows
+     * from propagation without measurement updates, S grows, m² shrinks,
+     * gate self-defeats — accepts garbage during high-uncertainty phases.
+     *
+     * Replaced by gyro-vs-visual consistency gate at Tracker.cpp:2354,
+     * which uses sensor-physics-derived thresholds (not state covariance)
+     * and therefore does NOT have the self-defeating feedback loop.
+     * Per the project no-deletions convention this block stays in-tree
+     * commented so future readers see why chi² was the wrong layer.
+    constexpr double kVisualRotChi2Threshold = 16.27;  // chi²(0.999, 3)
+    {
+        cv::Mat S = H * P_ * H.t() + R_noise;
+        cv::Mat S_inv;
+        if (cv::invert(S, S_inv, cv::DECOMP_SVD) > 1e-20) {
+            cv::Mat m2_mat = r_vec.t() * S_inv * r_vec;
+            const double m2 = m2_mat.at<double>(0, 0);
+            if (std::isfinite(m2) && m2 > kVisualRotChi2Threshold) {
+                navsight::eventCounters()
+                    .visual_relative_rotation_chi2_rejected_total
+                    .fetch_add(1, std::memory_order_relaxed);
+                return false;
+            }
+        }
+    }
+    */
+
     applyMSCKFUpdate(H, r_vec, R_noise);
     return true;
 }
@@ -1679,6 +1711,35 @@ bool EKFState::updateGravityAlignedYaw(double yaw_meas, double var,
 
     cv::Mat res = (cv::Mat_<double>(1, 1) << res_val);
     cv::Mat R_noise = (cv::Mat_<double>(1, 1) << std::max(var, 1e-6));
+
+    /* LEGACY 2026-05-21 — Bug 4 chi² gate REVERTED.
+     * Same root cause as the updateRelativeRotation chi² gate above:
+     * state-covariance-dependent gates self-defeat as P grows from
+     * propagation-without-updates. Replaced by tightened gyro-vs-visual
+     * consistency gate at Tracker.cpp:3816 (20° → 3°). The 3° threshold
+     * is derived from Madgwick yaw-rate p99 (1.87°/s) × KF interval
+     * (0.5s) + gyro bias drift (0.14°) — physical sensor bounds, not
+     * arbitrary statistical cuts.
+    constexpr double kVisualYawChi2Threshold = 10.83;  // chi²(0.999, 1)
+    {
+        const double P_yaw_yaw = std::max(0.0, P_.at<double>(2, 2));
+        const double S_scalar  = P_yaw_yaw + std::max(var, 1e-6);
+        if (S_scalar > 0.0) {
+            const double m2 = (res_val * res_val) / S_scalar;
+            if (std::isfinite(m2) && m2 > kVisualYawChi2Threshold) {
+                navsight::eventCounters()
+                    .visual_yaw_chi2_rejected_total
+                    .fetch_add(1, std::memory_order_relaxed);
+                LOGI("LC_YAW_CHI2_REJECT: yaw_meas=%.2f° yaw_pred=%.2f° "
+                     "residual=%+.3f° var=%.4e m2=%.2f thresh=%.2f",
+                     yaw_meas * 180.0 / M_PI, yaw_pred * 180.0 / M_PI,
+                     res_val * 180.0 / M_PI, var, m2, kVisualYawChi2Threshold);
+                return false;
+            }
+        }
+    }
+    */
+
     // 2026-05-18 diag B: log every visual-yaw injection so we can see if
     // these are pumping EKF yaw during walking. v42 showed Madgwick yaw
     // drift -0.31°/s during walking with b_g stable (so b_g is innocent);
@@ -3092,6 +3153,348 @@ bool EKFState::updateSlamFeature(int slot,
         f.last_obs_rms = std::sqrt(rms_acc / static_cast<double>(rms_n));
     }
     return true;
+}
+
+// 2026-05-19 Fix #8 helper — pure (const) Jacobian build for one SLAM
+// observation. See EKFState.h declaration for full cause/change/falsifier.
+//
+// All gates and math identical to the original Fix #7 updateSlamFeatureLive,
+// minus the state mutation (applyMSCKFUpdate call + last_obs_rms write).
+// Caller decides whether to apply singly or stack into a batched update.
+bool EKFState::buildSlamLiveJacobianRow(int slot,
+                                         const cv::Point2f& obs_pixel,
+                                         double sigma_px,
+                                         cv::Mat& H_row_out,
+                                         cv::Mat& r_row_out,
+                                         double& m2_out) const {
+    // Initialise outputs to sentinel values so callers don't read garbage
+    // when we return false early.
+    m2_out = std::numeric_limits<double>::infinity();
+
+    // ── Validity gates ──────────────────────────────────────────────
+    if (!full_initialized_ || P_.empty()) return false;
+    if (slot < 0 || slot >= static_cast<int>(slam_features_.size())) return false;
+    if (R_GtoI_.empty() || R_GtoI_.rows != 3 || R_GtoI_.cols != 3) return false;
+    if (p_G_.empty()    || p_G_.rows != 3    || p_G_.cols != 1)    return false;
+
+    const SlamFeature& f = slam_features_[slot];
+    if (f.state.empty() || f.state.rows < 3) return false;
+    const double alpha = f.state.at<double>(0, 0);
+    const double beta  = f.state.at<double>(1, 0);
+    const double rho   = f.state.at<double>(2, 0);
+    if (!std::isfinite(alpha) || !std::isfinite(beta) || !std::isfinite(rho)) return false;
+    if (std::abs(rho) < 1e-9) return false;
+
+    // ── Anchor clone poses: LIVE for residual, FEJ for Jacobian ─────
+    cv::Mat anchor_R_now, anchor_p_now;
+    if (!getClonePose(f.anchor_clone_id, anchor_R_now, anchor_p_now)) return false;
+    cv::Mat anchor_R_FEJ, anchor_p_FEJ;
+    if (!getCloneFEJ(f.anchor_clone_id, anchor_R_FEJ, anchor_p_FEJ)) {
+        anchor_R_FEJ = anchor_R_now.clone();
+        anchor_p_FEJ = anchor_p_now.clone();
+    }
+
+    // ── Predicted pixel using LIVE state (residual side) ────────────
+    // p_anchor_cam = (1/ρ) · (α, β, 1)
+    // p_world_LIVE = R_GtoC_a_LIVE^T · p_anchor_cam + p_a_LIVE
+    // p_I_LIVE     = R_GtoI_LIVE · (p_world_LIVE - p_G_LIVE)
+    // p_C_LIVE     = R_bc · p_I_LIVE
+    // pred_uv      = K · p_C_LIVE / p_C_LIVE.z
+    const cv::Vec3d p_anchor_cam(alpha / rho, beta / rho, 1.0 / rho);
+
+    cv::Matx33d R_GtoI_mat;
+    cv::Matx33d R_a_now_mat;
+    cv::Matx33d R_a_FEJ_mat;
+    for (int rr = 0; rr < 3; ++rr) {
+        for (int cc = 0; cc < 3; ++cc) {
+            R_GtoI_mat (rr, cc) = R_GtoI_.at<double>(rr, cc);
+            R_a_now_mat(rr, cc) = anchor_R_now.at<double>(rr, cc);
+            R_a_FEJ_mat(rr, cc) = anchor_R_FEJ.at<double>(rr, cc);
+        }
+    }
+    const cv::Vec3d p_G_vec(p_G_.at<double>(0, 0),
+                              p_G_.at<double>(1, 0),
+                              p_G_.at<double>(2, 0));
+    const cv::Vec3d p_a_now_vec(anchor_p_now.at<double>(0, 0),
+                                  anchor_p_now.at<double>(1, 0),
+                                  anchor_p_now.at<double>(2, 0));
+    const cv::Vec3d p_a_FEJ_vec(anchor_p_FEJ.at<double>(0, 0),
+                                  anchor_p_FEJ.at<double>(1, 0),
+                                  anchor_p_FEJ.at<double>(2, 0));
+
+    const cv::Vec3d p_world_LIVE = R_a_now_mat.t() * p_anchor_cam + p_a_now_vec;
+
+    // 2026-05-19 Fix #10 — Parallax-baseline gate against axial-motion ρ-drift.
+    //
+    // Cause: with phone facing a fixed scene and pure-axial translation (the
+    // 2026-05-19 fix9_revisit_v2 walk), the per-feature observation gives
+    // ZERO depth information. At anchor camera position p_a and current p_G,
+    // both `ray_anchor = p_world − p_a` and `ray_now = p_world − p_G` point
+    // in the same world direction (parallel). The SLAM (α, β, ρ) block is
+    // unobservable from this observation; the Joseph form's numerical noise
+    // pumps ρ → 0 → p_world → ∞ → polluted pts3d_world feeding LC PnP →
+    // target_p emerges 65 m off (real measurement, r_p = 64.7 m at chi²
+    // 1123) → EKF rejects every LC → Fix #9 never triggers → user sees no
+    // anchored dots. This gate fixes the chain at its upstream source.
+    //
+    // Math: parallax angle α between rays. Apply update only when
+    // cos α < kSlamMinParallaxCos (≡ α > min angle). Below threshold, the
+    // (α, β, ρ) update would inject noise instead of adding information.
+    //
+    // Threshold derivation: 0.01 rad (≈ 0.57°), matching OpenVINS
+    // UpdaterSLAM `min_parallax_ratio = 0.01` (Geneva et al. 2020 §III.D).
+    // cos(0.01) ≈ 0.99995. ORB-SLAM3 uses 1.0° / 0.99985 for triangulation
+    // promotion — we're tighter here because the live-update path is more
+    // sensitive to bad geometry than initial triangulation.
+    //
+    // Falsifier: post-Fix-#10 axial-revisit walk should show
+    // `slam_live_skipped_no_parallax` >> 0 during the axial phase AND
+    // LC target_p − EKF p_G ≤ 5 m (was 65 m pre-fix) AND LC chi² accept.
+    constexpr double kSlamMinParallaxCos = 0.99995;
+    {
+        const cv::Vec3d ray_anchor_w = p_world_LIVE - p_a_now_vec;
+        const cv::Vec3d ray_now_w    = p_world_LIVE - p_G_vec;
+        const double ra_norm = cv::norm(ray_anchor_w);
+        const double rn_norm = cv::norm(ray_now_w);
+        if (ra_norm > 1e-6 && rn_norm > 1e-6) {
+            const double cos_parallax =
+                ray_anchor_w.dot(ray_now_w) / (ra_norm * rn_norm);
+            if (std::isfinite(cos_parallax) &&
+                cos_parallax > kSlamMinParallaxCos) {
+                navsight::eventCounters().slam_live_skipped_no_parallax
+                    .fetch_add(1, std::memory_order_relaxed);
+                return false;  // degenerate geometry — skip silently
+            }
+        }
+    }
+
+    const cv::Vec3d p_I_LIVE     = R_GtoI_mat * (p_world_LIVE - p_G_vec);
+    const cv::Vec3d p_C_LIVE     = R_bc_ * p_I_LIVE;
+
+    const double Z = p_C_LIVE[2];
+    if (!std::isfinite(Z) || Z < 0.01) return false;
+    const double inv_z = 1.0 / Z;
+
+    const double u_pred = slam_fx_ * p_C_LIVE[0] * inv_z + slam_cx_;
+    const double v_pred = slam_fy_ * p_C_LIVE[1] * inv_z + slam_cy_;
+    if (!std::isfinite(u_pred) || !std::isfinite(v_pred)) return false;
+
+    // ── Jacobian (FEJ-side for state consistency where FEJ exists) ──
+    const cv::Vec3d p_world_FEJ = R_a_FEJ_mat.t() * p_anchor_cam + p_a_FEJ_vec;
+    const cv::Vec3d p_I_F       = R_GtoI_mat * (p_world_FEJ - p_G_vec);
+
+    cv::Matx<double, 2, 3> J_proj;
+    J_proj(0, 0) =  slam_fx_ * inv_z;
+    J_proj(0, 1) =  0.0;
+    J_proj(0, 2) = -slam_fx_ * p_C_LIVE[0] * inv_z * inv_z;
+    J_proj(1, 0) =  0.0;
+    J_proj(1, 1) =  slam_fy_ * inv_z;
+    J_proj(1, 2) = -slam_fy_ * p_C_LIVE[1] * inv_z * inv_z;
+
+    auto skewVec = [](const cv::Vec3d& v) -> cv::Matx33d {
+        return cv::Matx33d(  0.0, -v[2],  v[1],
+                            v[2],   0.0, -v[0],
+                           -v[1],  v[0],   0.0);
+    };
+
+    // ── IMU block (cols 0-2 δθ_w, 12-14 δp_G) ───────────────────────
+    const cv::Matx33d J_pC_theta_imu = -(R_bc_ * skewVec(p_I_F));
+    const cv::Matx33d J_pC_p_imu     = -(R_bc_ * R_GtoI_mat);
+    const cv::Matx<double, 2, 3> H_theta_imu = J_proj * J_pC_theta_imu;
+    const cv::Matx<double, 2, 3> H_p_imu     = J_proj * J_pC_p_imu;
+
+    // ── LIVE world-to-camera rotation for anchor & SLAM blocks ──────
+    const cv::Matx33d R_GtoC_LIVE = R_bc_ * R_GtoI_mat;
+
+    // ── Anchor clone block (FEJ for consistency) ────────────────────
+    const cv::Matx33d R_GtoI_a_FEJ = R_bc_.t() * R_a_FEJ_mat;
+    const cv::Vec3d   s_F          = R_GtoI_a_FEJ * (p_world_FEJ - p_a_FEJ_vec);
+    const cv::Matx33d J_pworld_theta_anchor = R_GtoI_a_FEJ.t() * skewVec(s_F);
+    const cv::Matx33d J_pworld_p_anchor     = cv::Matx33d::eye();
+    const cv::Matx<double, 2, 3> H_theta_anchor =
+        J_proj * (R_GtoC_LIVE * J_pworld_theta_anchor);
+    const cv::Matx<double, 2, 3> H_p_anchor     =
+        J_proj * (R_GtoC_LIVE * J_pworld_p_anchor);
+
+    // ── SLAM (α, β, ρ) block ────────────────────────────────────────
+    const cv::Matx33d J_alpha(
+        1.0 / rho, 0.0,        -alpha / (rho * rho),
+        0.0,       1.0 / rho,  -beta  / (rho * rho),
+        0.0,       0.0,        -1.0   / (rho * rho));
+    const cv::Matx<double, 2, 3> H_slam_abr =
+        J_proj * (R_GtoC_LIVE * R_a_FEJ_mat.t() * J_alpha);
+
+    // ── Assemble sparse H (2 × dim) ─────────────────────────────────
+    const int dim = P_.rows;
+    cv::Mat H = cv::Mat::zeros(2, dim, CV_64F);
+
+    for (int i = 0; i < 2; ++i)
+        for (int j = 0; j < 3; ++j)
+            H.at<double>(i, j) = H_theta_imu(i, j);
+    for (int i = 0; i < 2; ++i)
+        for (int j = 0; j < 3; ++j)
+            H.at<double>(i, 12 + j) = H_p_imu(i, j);
+
+    const int anchor_cov = getCloneCovIdx(f.anchor_clone_id);
+    if (anchor_cov < 0) return false;
+    for (int i = 0; i < 2; ++i) {
+        for (int j = 0; j < 3; ++j) {
+            H.at<double>(i, anchor_cov     + j) = H_theta_anchor(i, j);
+            H.at<double>(i, anchor_cov + 3 + j) = H_p_anchor   (i, j);
+        }
+    }
+
+    const int slam_cov = slamFeatureCovIdxInternal(slot);
+    if (slam_cov < 0) return false;
+    for (int i = 0; i < 2; ++i)
+        for (int j = 0; j < 3; ++j)
+            H.at<double>(i, slam_cov + j) = H_slam_abr(i, j);
+
+    // ── Residual ─────────────────────────────────────────────────────
+    const double r_u = static_cast<double>(obs_pixel.x) - u_pred;
+    const double r_v = static_cast<double>(obs_pixel.y) - v_pred;
+
+    // Fix #7b early-out preserved verbatim — when state already agrees
+    // with observation within 1 px (≈ half ORB σ_pix), Joseph update
+    // would shift state by sub-mm. Cheaper to skip than apply.
+    const double r_px = std::sqrt(r_u * r_u + r_v * r_v);
+    if (r_px < 1.0) {
+        return false;
+    }
+
+    cv::Mat r = (cv::Mat_<double>(2, 1) << r_u, r_v);
+    const double sigma_safe = std::max(sigma_px, 1e-3);
+    const double var = sigma_safe * sigma_safe;
+    cv::Mat R_noise = (cv::Mat_<double>(2, 2) << var, 0.0, 0.0, var);
+
+    cv::Mat S = H * P_ * H.t() + R_noise;
+    cv::Mat S_inv;
+    bool inv_ok = cv::invert(S, S_inv, cv::DECOMP_CHOLESKY);
+    if (!inv_ok) inv_ok = cv::invert(S, S_inv, cv::DECOMP_SVD);
+    if (!inv_ok) return false;
+    cv::Mat m2_mat = r.t() * S_inv * r;
+    const double m2 = m2_mat.at<double>(0, 0);
+    if (!std::isfinite(m2) || m2 > 5.991) {
+        m2_out = m2;  // surface to caller for diagnostics
+        return false;
+    }
+
+    // Outputs.
+    H_row_out = H;
+    r_row_out = r;
+    m2_out    = m2;
+    return true;
+}
+
+// 2026-05-19 Fix #8 — thin wrapper around buildSlamLiveJacobianRow.
+//
+// Cause: see EKFState.h `applySlamLiveBatch` docstring. After Fix #8, the
+// camera thread no longer calls this path directly — Tracker uses the
+// batched form. Kept for testing + as the single-feature reference impl
+// (e.g., the offline replay harness that drives features one at a time).
+bool EKFState::updateSlamFeatureLive(int slot,
+                                      const cv::Point2f& obs_pixel,
+                                      double sigma_px) {
+    cv::Mat H, r;
+    double m2;
+    if (!buildSlamLiveJacobianRow(slot, obs_pixel, sigma_px, H, r, m2)) {
+        return false;
+    }
+
+    const double sigma_safe = std::max(sigma_px, 1e-3);
+    const double var = sigma_safe * sigma_safe;
+    cv::Mat R_noise = (cv::Mat_<double>(2, 2) << var, 0.0, 0.0, var);
+
+    applyMSCKFUpdate(H, r, R_noise);
+
+    slam_features_[slot].last_obs_rms = std::sqrt(
+        r.at<double>(0, 0) * r.at<double>(0, 0) +
+        r.at<double>(1, 0) * r.at<double>(1, 0));
+    return true;
+}
+
+// 2026-05-19 Fix #8 — batched live SLAM Kalman update.
+// See EKFState.h declaration for full cause/change/falsifier writeup.
+//
+// Kalman is linear: stacking N per-feature (H_row, r_row) rows into one
+// (2N × dim) matrix and running a single Joseph-form update is
+// mathematically equivalent to N sequential single-row updates (modulo
+// round-off ordering). The original sequential path costs N × O(dim³)
+// per frame because each update re-walks the dim × dim covariance. The
+// stacked path costs 1 × O(dim³) — a 12× constant-factor reduction at
+// N=12 SLAM features, which is what made the Fix #7 single-update path
+// ANR-prone at 30 Hz on the camera thread.
+//
+// Per-row gating in buildSlamLiveJacobianRow (validity, depth, chi²,
+// early-out) still happens before stacking — bad rows simply don't
+// contribute to the stack. We never run a stacked update with a row
+// that would have been rejected individually.
+//
+// Sparse exploitation (Fix #8b — queued, not yet implemented):
+// Each H_row is sparse (~14 non-zero cols of ~141). Stacked H_stack
+// has the union of those active cols (~80 cols when 12 features share
+// 6-11 unique anchors). The current dense applyMSCKFUpdate does
+// unnecessary work on the zero-padded cols. A future patch can build
+// H_active (2N × s) + active_cols index list and run a custom sparse
+// Joseph form for ~2× additional speedup. Today's batch is sufficient
+// to clear the ANR threshold; sparse remains queued behind real-walk
+// validation of the batch path.
+int EKFState::applySlamLiveBatch(
+    const std::vector<std::pair<int, cv::Point2f>>& observations,
+    double sigma_px) {
+
+    if (!full_initialized_ || P_.empty()) return 0;
+    if (observations.empty()) return 0;
+
+    const int dim = P_.rows;
+
+    std::vector<cv::Mat> H_rows;
+    std::vector<cv::Mat> r_rows;
+    std::vector<int>     slots_applied;
+    H_rows.reserve(observations.size());
+    r_rows.reserve(observations.size());
+    slots_applied.reserve(observations.size());
+
+    for (const auto& obs : observations) {
+        cv::Mat H_row, r_row;
+        double m2;
+        if (!buildSlamLiveJacobianRow(obs.first, obs.second, sigma_px,
+                                       H_row, r_row, m2)) {
+            continue;  // gated, degenerate, or early-out — skip row
+        }
+        H_rows.push_back(H_row);
+        r_rows.push_back(r_row);
+        slots_applied.push_back(obs.first);
+    }
+
+    if (H_rows.empty()) return 0;
+
+    const int K = static_cast<int>(H_rows.size());
+    cv::Mat H_stack = cv::Mat::zeros(2 * K, dim, CV_64F);
+    cv::Mat r_stack = cv::Mat::zeros(2 * K, 1, CV_64F);
+    for (int k = 0; k < K; ++k) {
+        H_rows[k].copyTo(H_stack(cv::Range(2 * k, 2 * k + 2), cv::Range::all()));
+        r_rows[k].copyTo(r_stack(cv::Range(2 * k, 2 * k + 2), cv::Range::all()));
+    }
+
+    const double sigma_safe = std::max(sigma_px, 1e-3);
+    const double var = sigma_safe * sigma_safe;
+    cv::Mat R_noise = cv::Mat::eye(2 * K, 2 * K, CV_64F) * var;
+
+    applyMSCKFUpdate(H_stack, r_stack, R_noise);
+
+    // RMS diagnostic per applied feature uses the pre-update residual.
+    // Post-update residual would need re-projection (extra cost) and is
+    // less interpretable since dx isn't fully attributed to any one
+    // feature in a joint update.
+    for (int k = 0; k < K; ++k) {
+        const cv::Mat& r_k = r_rows[k];
+        const double rms = std::sqrt(r_k.at<double>(0, 0) * r_k.at<double>(0, 0) +
+                                      r_k.at<double>(1, 0) * r_k.at<double>(1, 0));
+        slam_features_[slots_applied[k]].last_obs_rms = rms;
+    }
+
+    return K;
 }
 
 bool EKFState::applyMSCKFFeature(const std::vector<cv::Point2f>& observations,
