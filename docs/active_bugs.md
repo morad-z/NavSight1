@@ -116,13 +116,52 @@ Consistent positive bias of **30-50°** between GPS direction-of-travel and Madg
 
 **Conclusion**: Option B would have set the system's world frame to true-north-aligned from session start, making Madgwick heading match GPS bearing for the rest of the walk. The +32° heading drift the user observed wouldn't exist.
 
-**Design**:
-- In `Tracker::setInitialHeading` (or new `seedHeadingFromGpsBearing`), accept a GPS-derived bearing from Kotlin during init
-- Use GPS when: fix accuracy < 10m AND user has been moving > 0.5 m/s for ≥ 2 consecutive seconds
-- Fall back to magnetometer when no GPS fix (true indoor / jammed scenarios)
-- Allow re-arming if mag-init fired but GPS later becomes good — push a one-shot Madgwick nudge to GPS-derived value
-- **NEVER use GPS during tracking** — preserves the GPS-denied design philosophy (per `project_gps_jamming` memory)
-**Cost**: ~80 LOC Kotlin (GPS bearing computation + JNI call) + ~30 LOC C++ (acceptance gate + one-shot nudge)
+**Design — fallback hierarchy (CRITICAL: magnetometer is the always-available bedrock)**:
+
+| Priority | Source | Condition | Action |
+|---|---|---|---|
+| 1 | **Magnetometer (ALWAYS)** | session start, mag reading available | Set initial Madgwick yaw immediately (current behavior, unchanged) |
+| 2 | GPS bearing (when available) | fix accuracy < 10m AND speed > 0.5 m/s for ≥ 2 consecutive seconds, fires ONCE | One-shot nudge: replace Madgwick yaw with GPS-derived bearing |
+| 3 | Visual yaw (already shipped) | per-keyframe, gyro-consistency drift < 3° | Bug 5 continuous nudges (Tracker.cpp:4172) |
+
+**Critical: magnetometer remains the ALWAYS-AVAILABLE init source**. GPS-bearing is a one-shot REFINEMENT that fires only if GPS warms up and the user starts moving. If GPS never reaches the quality bar (indoor, jammed, urban canyon, cold start that never completes), the system stays on magnetometer-init exactly like today. Zero regression for GPS-denied scenarios.
+
+**Decision flow at runtime**:
+```
+session start:
+  imu.setMagYaw(magnetometer_reading + declination)   ← bedrock, always fires
+  mag_init_done = true
+
+every 1s during walk:
+  if (gps_fix_acc < 10m && gps_speed > 0.5 m/s for ≥ 2s
+      && !gps_bearing_oneshot_fired
+      && vio_initialized):
+    bearing = compute_gps_velocity_bearing()
+    delta = bearing - imu.getHeading()
+    imu.nudgeMadgwickYawAroundWorldZ(delta)            ← one-shot refinement
+    gps_bearing_oneshot_fired = true
+
+if (gps fails to reach the bar):
+  magnetometer-init remains the world-frame reference
+  visual evidence continues to refine via Bug 5 (per-keyframe)
+  Nothing breaks. NavSight stays GPS-denied-functional.
+```
+
+**Implementation locations**:
+- In `Tracker::setInitialHeading` (or new `seedHeadingFromGpsBearing`), accept a GPS-derived bearing from Kotlin
+- `SensorRepository.kt` tracks GPS history and computes bearing when criteria met
+- New `nativeApplyGpsHeadingNudge(double bearing_rad)` JNI call → C++ side calls `imu.nudgeMadgwickYawAroundWorldZ(delta)` once
+- Counter: `gps_heading_oneshot_fired` (0 or 1 per session — if 0, mag-only path was used)
+
+**Hard guarantees per `project_gps_jamming` and `feedback_no_magnetometer` memories**:
+- ✓ Magnetometer ALWAYS used at session start (no change to existing behavior)
+- ✓ GPS is REFINEMENT, never required
+- ✓ GPS NEVER used during tracking (only one-shot at startup)
+- ✓ GPS-jammed scenarios behave identically to today (mag-init + visual refinement)
+- ✓ Indoor scenarios behave identically (no GPS fix → no nudge → mag-only)
+- ✓ Cold-start with bad GPS for full walk → no nudge → mag-only
+
+**Cost**: ~80 LOC Kotlin (GPS bearing computation + JNI call + criteria gate) + ~30 LOC C++ (acceptance gate + one-shot nudge + counter)
 
 ---
 
