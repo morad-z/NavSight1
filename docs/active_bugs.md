@@ -91,15 +91,38 @@
 **Status**: design ready, ~20 LOC. Mostly redundant after Bug 3+5 but addresses 1-in-156 chi² outlier case where mid-ramp p_G shift produces m²_p=31.7 rejection.
 **Decision**: low priority; only fires on 0.6% of LC events.
 
-### GPS-bearing-aided initial heading (Option B — NEW)
+### 🟡 GPS-bearing-aided initial heading (Option B — PRIORITY HIGH after GPS analysis)
 **Scope**: STARTUP ONLY, mirrors existing magnetometer init pattern. NOT continuous use.
-**Rationale**: today's walk had 38° magnetometer init error (indoor magnetic anomaly). GPS bearing when moving > 0.5 m/s with fix accuracy < 10m gives 1-3° heading accuracy.
+**Rationale (UPDATED 2026-05-21 — walks confirmed OUTDOOR)**: today's walks were near-house outdoors with GPS available. Cross-checked GPS-derived bearing against Madgwick on `bug_newpg_walk_2026_05_21` (GPS coverage 98%, median accuracy **4.4 m**):
+
+| t_s | GPS bearing | Madgwick hdg | Δ |
+|---|---|---|---|
+| 28.7 | +71.6° | +2.7° | +68.9° |
+| 33.8 | +53.9° | +5.9° | +48.0° |
+| 41.0 | +16.5° | +343.2° | +33.2° |
+| 66.2 | +207.9° | +180.8° | +27.2° |
+| 86.6 | +42.3° | +0.2° | +42.0° |
+| 95.4 | +9.7° | +359.2° | +10.5° |
+
+Consistent positive bias of **30-50°** between GPS direction-of-travel and Madgwick heading. Part of this is user-holding-phone-at-angle relative to walking direction, but the persistent ~40° baseline matches the magnetometer-init error magnitude observed in the heading-convergence analysis. The system's world frame is rotated ~40° from true north because mag-init at session start was off by that much.
+
+**GPS quality across today's 3 walks**:
+
+| Walk | GPS coverage | Median accuracy | Notes |
+|---|---|---|---|
+| bug02_walk | 80% | 700m | GPS still cold-starting |
+| bug02b_walk | 85% | 95m | mixed quality |
+| bug_newpg_walk | 98% | **4.4m** | excellent — Option B would have triggered |
+
+**Conclusion**: Option B would have set the system's world frame to true-north-aligned from session start, making Madgwick heading match GPS bearing for the rest of the walk. The +32° heading drift the user observed wouldn't exist.
+
 **Design**:
 - In `Tracker::setInitialHeading` (or new `seedHeadingFromGpsBearing`), accept a GPS-derived bearing from Kotlin during init
 - Use GPS when: fix accuracy < 10m AND user has been moving > 0.5 m/s for ≥ 2 consecutive seconds
-- Fall back to magnetometer when no GPS fix (indoor / jammed scenarios)
+- Fall back to magnetometer when no GPS fix (true indoor / jammed scenarios)
+- Allow re-arming if mag-init fired but GPS later becomes good — push a one-shot Madgwick nudge to GPS-derived value
 - **NEVER use GPS during tracking** — preserves the GPS-denied design philosophy (per `project_gps_jamming` memory)
-**Cost**: ~80 LOC Kotlin (GPS bearing computation + JNI call) + ~30 LOC C++ (acceptance gate)
+**Cost**: ~80 LOC Kotlin (GPS bearing computation + JNI call) + ~30 LOC C++ (acceptance gate + one-shot nudge)
 
 ---
 
