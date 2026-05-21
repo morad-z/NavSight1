@@ -62,6 +62,12 @@
 **Root cause**: `Landmark.descriptor` never updated after first observation. Per-frame matches get 62.9% hits with 0.3-2s old descriptors; Step 7.1 with 30-80s old descriptors gets 0.05% hits.
 **Recommended fix**: Multi-descriptor median, updated in `LandmarkMap::touchLandmark` on every match (ORB-SLAM3 `MapPoint::ComputeDistinctiveDescriptors` pattern). HIGH impact, LOW risk.
 
+### BUG-01 SUB-A — Step 7.1 spatial_miss 67-79% (geometric, NOT appearance)
+**Investigator**: Agent 1 §3 + §5.2 (`docs/active_bugs/agent_01_descriptor_matching.md`)
+**Root cause**: dominant Step 7.1 failure is geometric — projected landmark lands in-image but no FAST corner exists within `kGeomMatchRadiusPx = 15px`. Three mechanisms: (1) EKF pose drift at 30s lookback shifts projections beyond 15px gate, (2) lighting / FAST repeatability between visits, (3) pose-graph back-write may not deliver to matched keyframe. Median min-Hamming-in-radius is 106 / 256 bits (random baseline 128) — the spatial gate is so loose that the matched kp is usually a DIFFERENT physical feature; descriptor verification correctly rejects but there's nothing for it to actually accept.
+**Recommended fix**: raise `kGeomMatchRadiusPx` to 30-40 px (derived from EKF pose-error budget at 30s lookback: 17°/loop × 30s × 0.5 m/s ÷ 10m depth × focal ≈ 25px) AND tighten `kGeomDescriptorMaxDistance` from 50 to 35-40 (ORB-SLAM3 "very distinctive" threshold). Loosening one without tightening the other admits false positives. ~10 LOC, MEDIUM risk (PnP false positives — mitigated by existing `kPnpMinInliers=15`).
+**Falsifier**: `loop_closure_geom_accepts > 0` AND `hamming_miss / hamming_pairs` ratio drops from ~50:1 to <5.
+
 ### BUG-04 F1+F2 — UI render flicker (per-keyframe is_observed refresh)
 **Investigator**: Agent 4 (`docs/active_bugs/agent_04_render_pipeline.md`)
 **Root causes**:
@@ -90,6 +96,12 @@
 **Investigator**: Agent 6 (`docs/active_bugs/agent_06_lc_soft_correction_and_trajectory.md`)
 **Status**: design ready, ~20 LOC. Mostly redundant after Bug 3+5 but addresses 1-in-156 chi² outlier case where mid-ramp p_G shift produces m²_p=31.7 rejection.
 **Decision**: low priority; only fires on 0.6% of LC events.
+
+### Hidden Bug #3 — SLAM promotion RMS chokepoint (separate from MiDaS Phase 2)
+**Investigator**: Agent 5 §Hidden Bug #3 (`docs/active_bugs/agent_05_cross_walk_analysis.md`)
+**Root cause**: across W3-W6, **60-69% of SLAM promo candidates are rejected on the RMS criterion**, NOT the parallax gate. The W4 parallax gate added 18.8% upfront reject but didn't move the dial — RMS was already the chokepoint. Result: promotions per walk = 0-24 out of 100,000+ candidates (≈0.001-0.02% promotion rate). MiDaS depth pipeline starves as downstream consequence (`midas_depth_samples`: 12 → 1 → 0 → 2 for W3→W4→W5→W6).
+**Status**: needs investigation before BUG-03 (MiDaS Phase 2) ships — Phase 2 helps ρ refinement but cannot fix the upstream promotion-funnel starvation. Suspect: `slam_promo_rms_milli_p95 = 2904` (the 1.5 px RMS gate is too tight, OR the EKF clone poses being passed to triangulation are themselves drifted, inflating reprojection RMS).
+**Action**: dump per-walk RMS distribution and find whether tightening the per-frame visual gates (already shipped) has changed the RMS landscape, or whether the gate constant itself needs re-derivation.
 
 ### 🟡 GPS-bearing-aided initial heading (Option B — PRIORITY HIGH after GPS analysis)
 **Scope**: STARTUP ONLY, mirrors existing magnetometer init pattern. NOT continuous use.
@@ -165,6 +177,34 @@ if (gps fails to reach the bar):
 
 ---
 
+## 🟦 P3 — Latent / cleanup (low priority, low risk)
+
+### F3 — `nearby_ids.empty()` clears ids but not pixels (size-invariant breach)
+**Investigator**: Agent 4 §C row F3 (`docs/active_bugs/agent_04_render_pipeline.md`)
+**File**: `Tracker.cpp:4717-4720`
+**Status**: latent — safe-by-luck today because `getLastObservedLandmarkPixel` iterates ids first, but the `ids.size() == pixels.size()` invariant is temporarily false on every keyframe with `nearby_ids.empty()`. Crash risk if iteration order ever changes.
+**Fix**: clear pixels alongside ids, OR add `assert(ids.size() == pixels.size())` at lookup site. ~3 LOC.
+
+### F4 — Per-keyframe race window in `getLastObservedLandmarkIds`
+**Investigator**: Agent 4 §C row F4 (`docs/active_bugs/agent_04_render_pipeline.md`)
+**Files**: `native-lib.cpp:1306` (reader), `Tracker.cpp:5075` (producer)
+**Symptom**: brief 1-frame color flip on keyframe boundary because the overlay snapshot reads `observed_ids` independently of `ensureOverlaySnapshot`, so two consecutive overlay calls 33ms apart may see different orange/gray populations.
+**Fix**: move `observed_ids` snapshot inside `ensureOverlaySnapshot` so the entire overlay tick reads a single coherent snapshot. ~10 LOC.
+
+### BUG-01 SUB-B — Pose-graph back-write may not reach matched keyframe
+**Investigator**: Agent 1 §3 mechanism #3 (`docs/active_bugs/agent_01_descriptor_matching.md`)
+**Suspected mechanism**: `LandmarkMap::applyKeyframePoseCorrection` shifts landmarks observed in `kf_id`, but the current-frame projection uses current EKF pose. The stored keyframe's pose may not have absorbed the corresponding correction → systematic offset → contributes to BUG-01 SUB-A spatial_miss rate.
+**Status**: needs verification post-BUG-NEW-PG (which raised PoseGraph floors so it now actually converges). Counter `pose_graph_apply_calls > 0` proves back-write fires; what's not proven is whether the corrected keyframe pose is delivered to LandmarkMap before the next projection.
+**Action**: log per-keyframe `R_world_cam` delta pre/post-correction; verify LandmarkMap entries reflect it.
+
+### Agent-2 H3 — `refineGyroBiasDuringZUPT` averages raw `gyro_buf_`, not bias-corrected
+**Investigator**: Agent 2 §Fix 3 / H3 (`docs/active_bugs/agent_02_madgwick_bias.md`)
+**File**: `IMUPreintegrator.cpp:1068-1074`
+**Mechanism**: now that BUG-02 ADD-and-ZERO correctly absorbs EKF residual into `gyro_bias_`, the ZUPT EMA toward raw-mean of `gyro_buf_[i].x` partially undoes the absorption (~1% per ZUPT call). At 0.3 Hz ZUPT vs 5 Hz absorption, the push wins — but the cleanup is principled.
+**Fix**: average `(gyro_buf_[i].x − gyro_bias_.x)` instead of raw. ~5 LOC. Defer until BUG-02 has walk-validated for several more sessions.
+
+---
+
 ## 🔵 BY-DESIGN, NOT BUGS
 
 ### HANDOFF #3 — Trajectory "freezes" at end of walk
@@ -210,6 +250,21 @@ Per `EKFState.cpp` comment from 2026-05-19, online R_bc calibration (Step 8b) is
 
 1. **GPS-bearing-aided initial heading** (Option B) — addresses today's mag-init error, ~110 LOC, low risk, startup-only
 2. **Heading confidence indicator** (UX) — communicates the converging-to-truth behavior to the user, ~50 LOC
-3. **BUG-01 multi-descriptor median** — fixes orange dot flicker at the source, high impact
-4. **BUG-04 F1+F2 render fixes** — companion to BUG-01 for full flicker elimination
-5. **BUG-03 MiDaS Phase 2** — depth observability during prolonged axial walks
+3. **BUG-01 multi-descriptor median** (§5.1) — fixes orange dot flicker at the source, high impact
+4. **BUG-01 SUB-A** widen `kGeomMatchRadiusPx` + tighten Hamming — unblocks Step 7.1 LC accepts (currently 0)
+5. **BUG-04 F1+F2 render fixes** — companion to BUG-01 for full flicker elimination
+6. **Hidden Bug #3** — SLAM RMS chokepoint investigation BEFORE shipping BUG-03 (Phase 2 alone can't fix structural promotion starvation)
+7. **BUG-03 MiDaS Phase 2** — depth observability during prolonged axial walks
+8. **P3 cleanups (F3, F4, Agent-2 H3, BUG-01 SUB-B)** when convenient
+
+## Bug count by status (end of 2026-05-21)
+
+| Status | Count |
+|---|---|
+| ✅ FIXED today | 9 |
+| 🟡 P1 OPEN (user-visible) | 5 |
+| 🟢 P2 OPEN (correctness) | 3 |
+| 🟦 P3 OPEN (latent / cleanup) | 4 |
+| 🔵 BY-DESIGN | 1 |
+| 🟦 COSMETIC | 2 |
+| **Total tracked** | **24** |
