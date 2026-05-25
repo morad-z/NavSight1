@@ -52,8 +52,11 @@ object NativeBridge {
     // for VIO init. Safe to call multiple times (re-init on each call).
     external fun seedMadgwickYaw(yawRad: Double)
     external fun setUserHeight(heightM: Float)
-    // DEAD CODE: never called from Kotlin — mag heading is captured via orientationTracker at init, not via this JNI
-    // external fun setMagnetometerHeading(yawRad: Float)
+    // 2026-05-25 re-enabled (professor approved continuous compass). Called
+    // every orientation tick when OS compass accuracy is HIGH/MEDIUM; native
+    // shim (native-lib.cpp Java_..._setMagnetometerHeading) forwards to
+    // IMUPreintegrator::setMagnetometerHeading for gentle gated yaw fusion.
+    external fun setMagnetometerHeading(yawRad: Float)
 
     // Step 5: Calibration & Initialization
     // Returns 0=WAIT_STATIONARY, 1=WAIT_MOTION, 2=READY, 3=TIMEOUT_NEEDS_USER

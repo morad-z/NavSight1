@@ -692,6 +692,9 @@ void IMUPreintegrator::reset() {
     gyro_bias_samples_ = 0;
     has_mag_heading_.store(false);  // Reset mag heading
     mag_heading_ = 0.f;
+    mag_initialized_once_ = false;  // re-snap the absolute heading on the next clean fix
+    mag_fuse_count_ = 0;
+    mag_reject_count_ = 0;
     // Madgwick state
     q0_ = 1.0; q1_ = 0.0; q2_ = 0.0; q3_ = 0.0;
     madgwick_last_ns_ = 0;
@@ -703,6 +706,7 @@ void IMUPreintegrator::resetOrientationFilter() {
     q0_ = 1.0; q1_ = 0.0; q2_ = 0.0; q3_ = 0.0;
     madgwick_last_ns_ = 0;
     madgwick_init_.store(false);
+    mag_initialized_once_ = false;  // orientation re-init -> re-snap absolute heading from compass
 }
 
 // ── Madgwick IMU-only attitude filter ───────────────────────────────────────
@@ -914,6 +918,93 @@ void IMUPreintegrator::updateMadgwickLocked(int64_t timestamp_ns,
     } else {
         // Catastrophic — reinit on next sample
         madgwick_init_.store(false);
+    }
+
+    // 2026-05-25 (rev 2) — GYRO-PRIMARY heading with a GATED compass correction.
+    // Supersedes the k=1.0 snap. Data (rv2 walk, straight-and-back): the OS
+    // rotation-vector compass read 22-65 deg on the RETURN legs where a U-turn
+    // from 150 deg needs ~330 (its azimuth jumped ~160 deg mid-turn = magnetic
+    // disturbance), while the gyro tracked the U-turns cleanly (158<->332). The
+    // snap piped that disturbance straight into the heading -> the heading-
+    // projected trajectory V-shaped. This is the standard AHRS / compass-app
+    // design: the gyro+accel Madgwick integration OWNS the heading (immune to
+    // magnetic disturbance, nails turns); the compass only (a) sets the absolute
+    // heading ONCE at startup, and (b) gently corrects slow gyro yaw drift when
+    // it AGREES with the gyro. A disagreement larger than kMagDisturbRejectRad is
+    // rejected as a disturbed field and the gyro is trusted. Inline: mutex_ is
+    // already held (called from addGyroReading) — must NOT call getHeading() /
+    // nudgeMadgwickYawAroundWorldZ() (they re-lock -> deadlock). Same world-Z
+    // quaternion nudge math as nudgeMadgwickYawAroundWorldZ.
+    //
+    /* LEGACY 2026-05-25 — superseded approaches, kept per no-deletions rule:
+       (1) complementary k=dt/tau, tau=4s — gentle pull toward the compass; then
+       (2) SNAP k=1.0 — "RV is the ONLY heading source" (user directive). Both
+       made the compass authoritative, so magnetic disturbance on the return legs
+       flowed into the heading -> V-shape. The snap was: const double k = 1.0; */
+    constexpr double kMagFusionTauS = 5.0;          // complementary time constant on a clean field
+    constexpr double kMagDisturbRejectRad = 0.611;  // 35 deg: reject compass past this gyro disagreement
+    mag_actively_fusing_.store(false, std::memory_order_relaxed);
+    if (madgwick_init_.load() && has_mag_heading_.load()) {
+        const int64_t mag_age_ns = timestamp_ns - last_mag_update_ns_;
+        constexpr int64_t kMagFreshnessNs = 300'000'000LL;  // 0.3s; Kotlin sends ~20Hz
+        if (mag_age_ns >= 0 && mag_age_ns < kMagFreshnessNs) {
+            // A fresh compass is the heading authority for this tick, so the
+            // visual / loop-closure yaw nudges stay OFF (they gate on
+            // isMagActivelyFusing()). The gyro still drives every tick the compass
+            // is rejected below — that is what keeps the turns correct.
+            mag_actively_fusing_.store(true, std::memory_order_relaxed);
+
+            const double siny = 2.0 * (q0_ * q3_ + q1_ * q2_);
+            const double cosy = 1.0 - 2.0 * (q2_ * q2_ + q3_ * q3_);
+            const double yaw_nav = -std::atan2(siny, cosy);  // matches getHeading()
+            double err = static_cast<double>(mag_heading_) - yaw_nav;
+            while (err >  M_PI) err -= 2.0 * M_PI;
+            while (err < -M_PI) err += 2.0 * M_PI;
+
+            double k;
+            const char* mode;
+            if (!mag_initialized_once_) {
+                // Startup: snap once to set the absolute initial heading (init is
+                // done holding steady, so the field is clean here).
+                k = 1.0;
+                mag_initialized_once_ = true;
+                mode = "INIT";
+            } else if (std::fabs(err) <= kMagDisturbRejectRad) {
+                // Clean field: gentle gyro-primary complementary correction.
+                k = dt / kMagFusionTauS;
+                if (k > 1.0) k = 1.0;
+                ++mag_fuse_count_;
+                mode = "FUSE";
+            } else {
+                // Disturbed field: reject the compass, trust the gyro.
+                k = 0.0;
+                ++mag_reject_count_;
+                mode = "REJECT";
+            }
+
+            if (k > 0.0) {
+                const double dyaw = k * err;
+                const double cz = std::cos(dyaw * 0.5);
+                const double sz = std::sin(dyaw * 0.5);
+                const double q0n = cz * q0_ + sz * q3_;
+                const double q1n = cz * q1_ + sz * q2_;
+                const double q2n = cz * q2_ - sz * q1_;
+                const double q3n = cz * q3_ - sz * q0_;
+                q0_ = q0n; q1_ = q1n; q2_ = q2n; q3_ = q3n;
+                const double nn = std::sqrt(q0_*q0_ + q1_*q1_ + q2_*q2_ + q3_*q3_);
+                if (nn > 1e-9) { const double iv = 1.0 / nn; q0_*=iv; q1_*=iv; q2_*=iv; q3_*=iv; }
+            }
+
+            if (timestamp_ns - last_mag_fuse_log_ns_ > 1'000'000'000LL) {
+                last_mag_fuse_log_ns_ = timestamp_ns;
+                LOGI("MAG_FUSE[%s]: mag=%.1fdeg gyro_yaw=%.1fdeg err=%.1fdeg k=%.4f fuse=%lld reject=%lld",
+                     mode,
+                     static_cast<double>(mag_heading_) * 180.0 / M_PI,
+                     yaw_nav * 180.0 / M_PI, err * 180.0 / M_PI, k,
+                     static_cast<long long>(mag_fuse_count_),
+                     static_cast<long long>(mag_reject_count_));
+            }
+        }
     }
 }
 

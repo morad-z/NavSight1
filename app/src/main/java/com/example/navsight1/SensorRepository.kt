@@ -47,7 +47,27 @@ class SensorRepository(private val context: Context) : SensorEventListener {
     private val sensorManager = context.getSystemService(Context.SENSOR_SERVICE) as SensorManager
     private val accelerometer = sensorManager.getDefaultSensor(Sensor.TYPE_ACCELEROMETER)
     private val magnetometer = sensorManager.getDefaultSensor(Sensor.TYPE_MAGNETIC_FIELD)
+    // 2026-05-25 continuous compass: latest OS-reported magnetometer accuracy,
+    // updated in onAccuracyChanged. Gates mag->VIO heading fusion to HIGH/MEDIUM
+    // ("relevant locations"). Default UNRELIABLE so we don't fuse until the OS
+    // confirms a trustworthy field.
+    private var magAccuracy: Int = SensorManager.SENSOR_STATUS_UNRELIABLE
+    // 2026-05-25 field-magnitude gate for continuous compass: total |B| (uT)
+    // from the raw magnetometer. Clean Earth field ~25-65 uT; out-of-band =
+    // local ferromagnetic anomaly. Used instead of OS accuracy (which stayed
+    // below MEDIUM the whole 2026-05-25 walk, so MAG_FUSE never fired).
+    private var magFieldMagnitude: Float = 0f
+    private var lastMagLogMs: Long = 0L
     private val gyroscope = sensorManager.getDefaultSensor(Sensor.TYPE_GYROSCOPE)
+    // 2026-05-25 PRIMARY heading: Android's fused, auto-calibrating orientation
+    // (gyro+accel+mag) — what compass apps use. Its yaw feeds the VIO heading
+    // (the raw magnetometer was uncalibrated: |B| 9-59uT, osAcc=LOW, wild azimuth
+    // -> heading flips/V-shapes). Gated on its own estimated heading accuracy.
+    private val rotationVector = sensorManager.getDefaultSensor(Sensor.TYPE_ROTATION_VECTOR)
+    // Cached magnetic declination (deg, location-dependent ~static) so the
+    // rotation-vector branch converts magnetic-north yaw to true north without
+    // recomputing GeomagneticField at sensor rate.
+    private var cachedDeclinationDeg: Float = 0f
     private val fusedLocationClient = LocationServices.getFusedLocationProviderClient(context)
 
     private val orientationTracker = DeviceOrientationTracker()
@@ -287,6 +307,12 @@ class SensorRepository(private val context: Context) : SensorEventListener {
                 sensorManager.registerListener(this, it, SensorManager.SENSOR_DELAY_GAME, mainHandler)
                 Log.d(TAG, "Gyroscope registered")
             } ?: Log.w(TAG, "Gyroscope not available on this device")
+
+            // 2026-05-25 rotation-vector heading source (compass-app approach).
+            rotationVector?.let {
+                sensorManager.registerListener(this, it, SensorManager.SENSOR_DELAY_GAME, mainHandler)
+                Log.d(TAG, "RotationVector registered")
+            } ?: Log.w(TAG, "RotationVector not available on this device")
 
             if (NativeBridge.isLoaded()) {
                 NativeBridge.startVIO()
@@ -768,9 +794,95 @@ class SensorRepository(private val context: Context) : SensorEventListener {
             }
             Sensor.TYPE_MAGNETIC_FIELD -> {
                 orientationTracker.updateMagnetometer(event.values)
+                // 2026-05-25 field-magnitude gate: total field strength (uT).
+                // Clean Earth field ~25-65 uT; far outside that band = local
+                // ferromagnetic anomaly (a bad-field "location" to skip).
+                val mx = event.values[0]; val my = event.values[1]; val mz = event.values[2]
+                magFieldMagnitude = kotlin.math.sqrt(mx * mx + my * my + mz * mz)
             }
             Sensor.TYPE_GYROSCOPE -> {
                 NativeBridge.processGyroscope(ts, event.values[0], event.values[1], event.values[2])
+            }
+            Sensor.TYPE_ROTATION_VECTOR -> {
+                // 2026-05-25 ONLY heading source: Android's fused, auto-
+                // calibrating orientation (what compass apps use). Extract yaw,
+                // gate on the device's OWN estimated heading accuracy
+                // (values[4], rad; API 18+), apply declination, feed it to the
+                // native heading filter which SNAPS Madgwick yaw to it (not
+                // fused) and gates the gyro/visual/LC heading nudges off.
+                if (cachedDeclinationDeg == 0f) {
+                    _startLocation.value?.let { loc ->
+                        cachedDeclinationDeg = android.hardware.GeomagneticField(
+                            loc.latitude.toFloat(), loc.longitude.toFloat(), 0f,
+                            System.currentTimeMillis()).declination
+                    }
+                }
+                val rv = if (event.values.size > 4) event.values.copyOfRange(0, 4)
+                         else event.values
+                val rvR = FloatArray(9)
+                SensorManager.getRotationMatrixFromVector(rvR, rv)
+                // 2026-05-25 (rev 3) — TILT-ADAPTIVE heading, the way compass apps
+                // work in ANY hold. getOrientation()'s azimuth assumes a FLAT phone
+                // (it reads the +Y/top edge); held upright camera-forward (NavSight's
+                // walking pose) +Y points at the sky -> gimbal lock -> ~95 deg offset
+                // + 200<->0 jumps (the bench test vs NOAA). Fix: pick the device axis
+                // that is currently HORIZONTAL and read its ground-plane bearing.
+                // rvR is device->world ENU (x=East, y=North, z=Up), row-major; a
+                // device axis in world = a COLUMN of rvR (world = rvR * axis):
+                //   - flat (screen up/down): forward = TOP edge (+Y) = column 1
+                //   - upright (camera fwd):  forward = CAMERA (-Z)   = -column 2
+                val screenUpComp = rvR[8]            // world-Up component of device +Z (screen normal)
+                val rvUpright = kotlin.math.abs(screenUpComp) <= 0.5f
+                val fwdEast: Float
+                val fwdNorth: Float
+                if (rvUpright) {
+                    fwdEast = -rvR[2]; fwdNorth = -rvR[5]   // camera (-Z) projected to ground
+                } else {
+                    fwdEast = rvR[1];  fwdNorth = rvR[4]    // top edge (+Y) projected to ground
+                }
+                // Azimuth CW from North (N=0, E=90) — matches Android/NOAA convention.
+                val rvAzimuthDeg = Math.toDegrees(
+                    kotlin.math.atan2(fwdEast.toDouble(), fwdNorth.toDouble())).toFloat()
+                // Estimated heading accuracy (rad) if reported; NaN if not.
+                val rvHeadingAccRad = if (event.values.size >= 5) event.values[4] else Float.NaN
+                // 2026-05-25 the S21 reports values[4] = -1 = heading accuracy
+                // UNAVAILABLE (NOT "bad"). Treating -1 as untrustworthy made the
+                // RV never engage -> heading fell back to the drifting gyro
+                // ("moves while stationary"). Trust the RV unless it EXPLICITLY
+                // reports poor accuracy (>= 0.5 rad). -1 / NaN (unavailable) ->
+                // trust: the RV is the OS-fused orientation and is stable while
+                // stationary, whereas the gyro fallback drifts.
+                val rvTrustworthy = rvHeadingAccRad.isNaN() || rvHeadingAccRad < 0.5f
+                if (rvAzimuthDeg.isFinite() && rvTrustworthy) {
+                    val yawRad = Math.toRadians(
+                        (rvAzimuthDeg + cachedDeclinationDeg).toDouble()).toFloat()
+                    NativeBridge.setMagnetometerHeading(yawRad)
+                }
+                val nowRvMs = System.currentTimeMillis()
+                if (nowRvMs - lastMagLogMs > 1000L) {
+                    lastMagLogMs = nowRvMs
+                    Log.i(TAG, "RV_SEND: az=${"%.1f".format(rvAzimuthDeg)} " +
+                            "mode=${if (rvUpright) "UPRIGHT" else "FLAT"} " +
+                            "hdgAccRad=${"%.2f".format(rvHeadingAccRad)} trust=$rvTrustworthy " +
+                            "decl=${"%.1f".format(cachedDeclinationDeg)} " +
+                            "sent=${rvAzimuthDeg.isFinite() && rvTrustworthy}")
+                    // 2026-05-25 DIAGNOSTIC (temporary): every candidate device-axis
+                    // bearing as a TRUE heading (declination folded in, 0-360). Hold
+                    // the phone exactly as you walk, point it at a known direction,
+                    // and whichever value matches the NOAA reading is the axis to use.
+                    fun trueAz(e: Float, n: Float): Int {
+                        var d = Math.toDegrees(kotlin.math.atan2(e.toDouble(), n.toDouble())) +
+                                cachedDeclinationDeg
+                        d = ((d % 360) + 360) % 360
+                        return d.toInt()
+                    }
+                    Log.i(TAG, "RV_DIAG (true hdg vs NOAA): " +
+                            "camZ=${trueAz(-rvR[2], -rvR[5])} " +
+                            "topY=${trueAz(rvR[1], rvR[4])} " +
+                            "rightX=${trueAz(rvR[0], rvR[3])} " +
+                            "leftNegX=${trueAz(-rvR[0], -rvR[3])} " +
+                            "screenUp=${"%.2f".format(screenUpComp)}")
+                }
             }
         }
 
@@ -817,10 +929,27 @@ class SensorRepository(private val context: Context) : SensorEventListener {
                     if (haveLoc) madgwickYawSeededWithDeclination = true
                 }
             }
+
+            // 2026-05-25 raw-magnetometer VIO heading send REMOVED. The compass
+            // was uncalibrated (|B| 9-59uT, osAcc=LOW, wild azimuth -> 90deg
+            // heading flips + V-shapes). The VIO heading now comes ONLY from the
+            // fused, auto-calibrating TYPE_ROTATION_VECTOR (onSensorChanged
+            // branch above). Raw mag still drives the on-screen compass arrow via
+            // orientationTracker; it just no longer touches the VIO heading.
+            // LEGACY raw-mag send:
+            //   val magFieldClean = magFieldMagnitude in 25f..70f
+            //   if (az.isFinite() && magFieldClean) { NativeBridge.setMagnetometerHeading(az+decl) }
         }
     }
 
-    override fun onAccuracyChanged(sensor: Sensor?, accuracy: Int) {}
+    override fun onAccuracyChanged(sensor: Sensor?, accuracy: Int) {
+        // 2026-05-25 continuous compass gating: remember the OS-reported
+        // magnetometer accuracy so the orientation tick only forwards the
+        // compass heading to VIO when the field is trustworthy (HIGH/MEDIUM).
+        if (sensor?.type == Sensor.TYPE_MAGNETIC_FIELD) {
+            magAccuracy = accuracy
+        }
+    }
 
     fun processCameraFrame(image: ImageProxy) {
         // Drop frame if VIO is still processing the previous one.
@@ -1035,10 +1164,14 @@ class SensorRepository(private val context: Context) : SensorEventListener {
             NativeBridge.setInitialHeading(azimuthRad)
             Log.i(TAG, "Initial heading set: ${vioInitAzimuth}° + declination ${declinationDeg}° = ${correctedAzimuth}° (${azimuthRad} rad)")
 
-            magnetometer?.let {
-                sensorManager.unregisterListener(this, it)
-                Log.i(TAG, "Magnetometer unregistered - initial heading captured.")
-            }
+            // 2026-05-25 continuous compass (professor approved): do NOT
+            // unregister the magnetometer after init — the compass heading is
+            // now fused continuously (gated to HIGH/MEDIUM OS accuracy), so it
+            // must keep streaming. LEGACY (no-mag-during-tracking rule):
+            // magnetometer?.let {
+            //     sensorManager.unregisterListener(this, it)
+            //     Log.i(TAG, "Magnetometer unregistered - initial heading captured.")
+            // }
         }
     }
 

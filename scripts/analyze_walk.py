@@ -93,6 +93,21 @@ def main():
             maxjump = max(maxjump, dd)
     print(f"  frames with >0.4m jump (LC ramp/teleport): {jumps}  max single jump: {maxjump:.2f} m")
 
+    # ---- coarse path trace: per-leg position + heading ----
+    # Lets us see whether heading reverses ~180 on each turn (then a non-
+    # retracing path is a translation bug) or stays flat (heading not reversing).
+    print("\n-- path trace (t, x=vx, z=vz, hdg_deg, vyaw_deg) --")
+    step = max(1, n // 28)
+    for i in range(0, n, step):
+        p = pts[i]
+        ts = (p.get("ts", t0) - t0) / 1000.0
+        hd = p.get("hdg")
+        vy = p.get("vyaw")
+        hd_d = math.degrees(hd) if hd is not None else float("nan")
+        vy_d = math.degrees(vy) if vy is not None else float("nan")
+        print(f"  t={ts:5.1f}s  x={p.get('vx', 0.0):7.2f}  z={p.get('vz', 0.0):7.2f}"
+              f"  hdg={hd_d:7.1f}  vyaw={vy_d:7.1f}")
+
     # ---- key counters ----
     print("\n-- key event_summary counters --")
     keys = [

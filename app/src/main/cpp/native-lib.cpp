@@ -1024,13 +1024,16 @@ Java_com_example_navsight1_NativeBridge_nativeSetExtrinsicsRotation(
     }
 }
 
-// DEAD CODE: setMagnetometerHeading JNI — Kotlin caller commented out in NativeBridge.kt
-// (IMUPreintegrator::setMagnetometerHeading itself is still live — called by InertialInitializer)
-/*
+// 2026-05-25 RE-ENABLED (professor approved continuous compass). The Kotlin
+// caller (NativeBridge.setMagnetometerHeading) is live again; this shim MUST be
+// compiled + linked or the call hits UnsatisfiedLinkError -> SIGABRT on the
+// first mag reading (regression seen 2026-05-25 — symbol was comment-wrapped).
+// Uses the shared_ptr pattern (matches setInitialHeading) so the engine stays
+// alive if stopVIO races mid-call.
 JNIEXPORT void JNICALL
 Java_com_example_navsight1_NativeBridge_setMagnetometerHeading(
-        JNIEnv*, jobject, jfloat yawRad) {
-    VioEngine* vision = nullptr;
+        JNIEnv*, jobject /* thiz */, jfloat yawRad) {
+    std::shared_ptr<VioEngine> vision;
     {
         std::lock_guard<std::mutex> lock(state_mutex);
         vision = g_vision;
@@ -1039,7 +1042,6 @@ Java_com_example_navsight1_NativeBridge_setMagnetometerHeading(
         vision->setMagnetometerHeading(static_cast<float>(yawRad));
     }
 }
-*/
 
 // ── Camera overlay Phase 2 / 3 (camera_overlay_phase23_plan.md) ──────────────
 //

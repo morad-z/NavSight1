@@ -4230,8 +4230,17 @@ VisionOutput Tracker::processFrame(const uint8_t* yuv_data, int width, int heigh
                                         yaw_resid_madg -= 2.0 * M_PI;
                                     while (yaw_resid_madg < -M_PI)
                                         yaw_resid_madg += 2.0 * M_PI;
+                                    // 2026-05-25 mag-primary: skip the visual yaw
+                                    // nudge while the magnetometer is actively
+                                    // fusing (clean field). The mag is the
+                                    // absolute heading reference; the visual
+                                    // estimate disagreed with gyro 253x on the
+                                    // 2026-05-25 walk, so it must NOT override the
+                                    // mag. Stays active as a fallback when the mag
+                                    // is unavailable (dirty field / indoors).
                                     if (std::isfinite(yaw_resid_madg) &&
-                                        std::abs(yaw_resid_madg) < kBug5MaxResidualRad) {
+                                        std::abs(yaw_resid_madg) < kBug5MaxResidualRad &&
+                                        !imu.isMagActivelyFusing()) {
                                         imu.nudgeMadgwickYawAroundWorldZ(
                                             kBug5SyncStrength * yaw_resid_madg);
                                         navsight::eventCounters()
@@ -6828,7 +6837,11 @@ void Tracker::consumeLoopClosureMatchIfReady(IMUPreintegrator& imu) {
         double delta_yaw_nav = yaw_ekf_after - yaw_ekf_before;
         while (delta_yaw_nav >  M_PI) delta_yaw_nav -= 2.0 * M_PI;
         while (delta_yaw_nav < -M_PI) delta_yaw_nav += 2.0 * M_PI;
-        if (std::abs(delta_yaw_nav) > 1e-5) {
+        // 2026-05-25 RV-only heading: loop closure must NOT move the displayed
+        // heading while the rotation-vector is the active source (it still
+        // corrects EKF position via updateAbsolutePose above). Only nudge
+        // Madgwick yaw when RV is unavailable (fallback).
+        if (std::abs(delta_yaw_nav) > 1e-5 && !imu.isMagActivelyFusing()) {
             imu.nudgeMadgwickYawAroundWorldZ(delta_yaw_nav);
             LOGI("LC_MADG_NUDGE: yaw_before=%.2f° yaw_after=%.2f° delta=%+.2f° "
                  "(Madgwick rotated by same delta around world-Z)",

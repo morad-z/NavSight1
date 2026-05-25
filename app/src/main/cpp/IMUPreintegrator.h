@@ -129,6 +129,10 @@ public:
     // float getCorrectedHeading(float gyro_yaw_rad);
     bool hasMagHeading() const { return has_mag_heading_.load(); }
     float getMagHeading() const { return mag_heading_; }
+    // 2026-05-25 mag-primary: true while the compass is actively fusing into
+    // Madgwick yaw (fresh + clean field). Tracker reads this to DEMOTE the
+    // visual yaw nudge so the mag stays the primary heading reference.
+    bool isMagActivelyFusing() const { return mag_actively_fusing_.load(); }
 
     // Gyro bias accessor (unified — Tracker no longer maintains its own)
     cv::Point3f getGyroBias() const;
@@ -299,6 +303,15 @@ private:
     std::atomic<bool> has_mag_heading_{false};
     int64_t last_mag_update_ns_{0};
     static constexpr float HEADING_CORRECTION_DAMPING = 0.95f;  // Smooth fusion
+    // 2026-05-25 continuous mag fusion telemetry (throttled MAG_FUSE log).
+    int64_t last_mag_fuse_log_ns_{0};
+    int64_t mag_fuse_count_{0};
+    int64_t mag_reject_count_{0};                       // compass-disturbance rejections (telemetry)
+    bool mag_initialized_once_{false};                  // compass has set the absolute startup heading
+    // 2026-05-25 mag-primary: true while the compass is actively fusing (fresh,
+    // clean field). Maintained on the gyro clock in updateMadgwickLocked; Tracker
+    // reads it (no cross-clock compare) to demote the visual yaw nudge.
+    std::atomic<bool> mag_actively_fusing_{false};
 
     // Noise parameters — CALIBRATED 2026-05-17 (Allan variance).
     // Source: tests/sims/allan/imu_calibration_20260517_021657.csv
