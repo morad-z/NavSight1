@@ -845,6 +845,24 @@ private:
     // 392 chi² rejects, 0 corrections with 3° sigma.
     static constexpr double  LOOP_CLOSURE_BASE_ROT_SIGMA_RAD  = 0.34907;  // 20°
 
+    // 2026-05-24 BUG (LC heading) — heading (world-Z yaw) uncertainty growth
+    // per metre walked since the last loop closure. In monocular VIO global yaw
+    // is UNOBSERVABLE, so its 1-σ should grow ~linearly with distance until an
+    // absolute heading fix (loop closure). Before each LC rotation update we
+    // inject σ²_yaw = (rate × path_since_last_lc_m_)² into P[2,2] so the update
+    // has Kalman gain on yaw (rotation analog of LOOP_CLOSURE_DRIFT_RATE for
+    // position). Derivation: observed heading drift ≈ 20° per ≈ 50 m loop in the
+    // 2026-05-22/24 walks → 0.349 rad / 50 m ≈ 0.007 rad/m. Cross-check: at a
+    // 50 m LC gap σ²_yaw = (0.007×50)² ≈ 0.122 rad² ≈ σ²_R (PnP rot floor
+    // 0.349² = 0.122), so LC yaw gain K = σ²_yaw/(σ²_yaw+σ²_R) ≈ 0.5.
+    static constexpr double  LOOP_CLOSURE_HEADING_DRIFT_RATE_RAD_PER_M = 0.007;
+
+    // 2026-05-24 BUG (LC heading) — cap on injected heading 1-σ. Bounds the
+    // single-update yaw gain so the 10-frame damping ramp still smooths rather
+    // than snapping in one step, and stays within the ±90° LC heading gate.
+    // π/4 (45°) → max K = (π/4)²/((π/4)²+0.122) ≈ 0.83.
+    static constexpr double  LOOP_CLOSURE_HEADING_MAX_SIGMA_RAD = 0.785398;  // 45°
+
     // Depth-based scale constraint (MiDaS)
     mutable std::mutex depth_mutex_;
     std::vector<float> depth_map_;

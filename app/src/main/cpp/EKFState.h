@@ -488,6 +488,26 @@ public:
                             double sigma_axis_sq_R,
                             double var_p);
 
+    // 2026-05-24 BUG (LC heading) — inject heading (world-Z yaw) uncertainty
+    // into the attitude error-state covariance BEFORE a loop-closure rotation
+    // update. In monocular VIO global yaw (δθ[2], the unobservable heading DOF)
+    // has no observability, yet MSCKF/landmark updates shrink P[2,2] toward 0;
+    // the LC rotation update's Kalman gain on yaw is then K ≈ P[2,2]/(P[2,2]+
+    // σ²_R) ≈ 0, so loop closure cannot move the heading. Adds var_yaw_rad2 to
+    // P[2,2] — the world-Z component of the WORLD-frame δθ block (verified:
+    // R_GtoI_ = Rodrigues(δθ)·R_GtoI_, left-multiply at EKFState.cpp:1172, so
+    // δθ is world-frame and yaw is index 2; a body-frame R_GtoI-column rank-1
+    // would be wrong off-level). Models the heading uncertainty accrued since
+    // the last absolute fix; transient (the LC update consumes it). Adding a
+    // positive value to a diagonal entry keeps P PSD. No-op if var ≤ 0.
+    void addYawUncertainty(double var_yaw_rad2);
+
+    // 2026-05-24 diagnostic — heading (world-Z yaw) variance = P[2,2] (rad²).
+    // In VIO yaw is unobservable so this should NOT collapse to ~0; if it does
+    // (especially right after a landmark/MSCKF update) the update is gaining
+    // spurious yaw info. Read-only. Returns -1 if state not ready.
+    double getYawVariance() const;
+
     // PDR step constraint: world-frame XZ position increment from a step
     // event. var is variance of each component (m²).
     [[nodiscard]] bool updatePDRStep(double dx_world, double dy_world, double var);
@@ -526,6 +546,14 @@ public:
         int    rejected_depth         = 0;
         int    rejected_outside_image = 0;
         double chi2_total             = 0.0;
+        // 2026-05-24 BUG-01 verified-only refresh — landmark ids whose
+        // observation passed ALL gates (depth, chi2, Huber) and was folded
+        // into the update. Only these are geometrically verified, so the
+        // Tracker refreshes a landmark's representative ORB descriptor ONLY
+        // for these ids. Refreshing from a pre-verification match corrupts the
+        // descriptor toward a wrong feature and regresses heading (the
+        // 2026-05-23 lesson).
+        std::vector<int> accepted_landmark_ids;
     };
 
     // Apply a batch of fixed-landmark observations as a 2N-row pose-only

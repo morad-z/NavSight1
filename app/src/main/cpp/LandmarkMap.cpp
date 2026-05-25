@@ -140,6 +140,12 @@ int LandmarkMap::addOrMergeLandmarkImpl(const cv::Vec3d&   p_world,
                 l.observation_pixels.erase(l.observation_pixels.begin());
             }
         }
+        // 2026-05-24 BUG-01 verified-only refresh — merge does NOT refresh the
+        // descriptor. A merge is a dedup hit at keyframe storage, not a
+        // chi2-verified EKF observation; refreshing here would reintroduce the
+        // pre-verification path that regresses heading (2026-05-23). Descriptor
+        // freshness comes from the fresh-add seed + refreshLandmarkDescriptor
+        // (called only for chi2-accepted ids).
         LOGD("LandmarkMap.merge: id=%d kf=%llu obs=%d",
              merge_id, static_cast<unsigned long long>(kf_id), l.times_observed);
         return merge_id;
@@ -150,6 +156,10 @@ int LandmarkMap::addOrMergeLandmarkImpl(const cv::Vec3d&   p_world,
     l.id                = next_id_++;
     l.p_world           = p_world;
     l.descriptor        = descriptor.clone();          // own a deep copy
+    // 2026-05-24 BUG-01 fix — seed the descriptor-history ring with this
+    // first observation so the representative stays consistent with
+    // `descriptor` and the ring is ready to accept future re-observations.
+    l.descriptor_history.push_back(descriptor.clone());
     l.observed_in_kfs.push_back(kf_id);
     l.first_seen_ts_ns  = ts_ns;
     l.last_seen_ts_ns   = ts_ns;
@@ -503,6 +513,84 @@ bool LandmarkMap::touchLandmark(int landmark_id, uint64_t kf_id, int64_t ts_ns,
     return true;
 }
 
+// 2026-05-24 BUG-01 verified-only refresh — push a chi2-VERIFIED match's
+// current-frame descriptor onto this landmark's descriptor_history ring (cap
+// kDescriptorHistoryCap) and recompute the representative `descriptor`
+// (ORB-SLAM3 distinctive). The Tracker calls this ONLY for landmark ids in
+// EKFState LandmarkUpdateResult::accepted_landmark_ids; refreshing from an
+// unverified per-frame match corrupts the descriptor toward a wrong feature
+// and regresses heading (the 2026-05-23 lesson). A malformed row (not
+// 1x32 CV_8U) is ignored. Returns true if the landmark exists and refreshed.
+bool LandmarkMap::refreshLandmarkDescriptor(int landmark_id,
+                                            const cv::Mat& descriptor) {
+    if (descriptor.empty() || descriptor.rows != 1 ||
+        descriptor.cols != 32 || descriptor.type() != CV_8U) {
+        return false;
+    }
+    std::lock_guard<std::mutex> lock(mutex_);
+    auto it = landmarks_.find(landmark_id);
+    if (it == landmarks_.end()) return false;
+    Landmark& lm = it->second;
+    lm.descriptor_history.push_back(descriptor.clone());
+    if (lm.descriptor_history.size() > kDescriptorHistoryCap) {
+        lm.descriptor_history.erase(lm.descriptor_history.begin());
+    }
+    recomputeDistinctiveDescriptorLocked(lm);
+    return true;
+}
+
+// 2026-05-24 BUG-01 fix — ORB-SLAM3 MapPoint::ComputeDistinctiveDescriptors.
+// Select the descriptor in lm.descriptor_history whose median Hamming
+// distance to all the others is smallest (the "most central" / most
+// representative observed descriptor) and store a clone in lm.descriptor.
+// Selecting an actually-observed sample (not a synthesized per-bit median)
+// guarantees the result is a valid ORB bit pattern. O(N²) Hamming over the
+// ring (N ≤ kDescriptorHistoryCap = 5 → ≤ 25 cv::norm calls on 32-byte rows),
+// negligible on the per-match hot path. Assumes mutex_ is held.
+void LandmarkMap::recomputeDistinctiveDescriptorLocked(Landmark& lm) {
+    const size_t n = lm.descriptor_history.size();
+    if (n == 0) return;
+    if (n == 1) {
+        lm.descriptor = lm.descriptor_history[0].clone();
+        return;
+    }
+    // Pairwise Hamming distance matrix (symmetric, zero diagonal).
+    std::vector<std::vector<int>> dist(n, std::vector<int>(n, 0));
+    for (size_t i = 0; i < n; ++i) {
+        for (size_t j = i + 1; j < n; ++j) {
+            const int d = hammingDistance(lm.descriptor_history[i],
+                                          lm.descriptor_history[j]);
+            dist[i][j] = d;
+            dist[j][i] = d;
+        }
+    }
+    // For each candidate take the median distance to the others; keep the
+    // candidate with the smallest median (ORB-SLAM3 uses the middle element
+    // of the sorted per-row distances).
+    int    best_median = std::numeric_limits<int>::max();
+    size_t best_idx    = 0;
+    for (size_t i = 0; i < n; ++i) {
+        std::vector<int> row;
+        row.reserve(n - 1);
+        for (size_t j = 0; j < n; ++j) {
+            if (j != i) row.push_back(dist[i][j]);
+        }
+        std::sort(row.begin(), row.end());
+        const int median = row[(row.size() - 1) / 2];
+        if (median < best_median) {
+            best_median = median;
+            best_idx    = i;
+        }
+    }
+    // Count the refresh only when the representative actually changes
+    // (diagnostic: distinguishes "ring grew" from "reference moved").
+    const cv::Mat& chosen = lm.descriptor_history[best_idx];
+    if (lm.descriptor.empty() || hammingDistance(lm.descriptor, chosen) > 0) {
+        ++descriptor_refreshes_total_;
+    }
+    lm.descriptor = chosen.clone();
+}
+
 // 2026-05-19 Fix #4 — gather BA-refinable landmarks. Returns landmarks
 // whose observation_pixels intersect `clone_ids_window` in ≥ `min_obs`
 // entries. Each result carries the FILTERED observation list (only entries
@@ -732,6 +820,7 @@ void LandmarkMap::reset() {
     landmarks_added_total_    = 0;
     landmarks_merged_total_   = 0;
     landmarks_culled_total_   = 0;
+    descriptor_refreshes_total_ = 0;   // 2026-05-24 BUG-01 fix
     LOGI("LandmarkMap.reset");
 }
 
@@ -745,5 +834,6 @@ int LandmarkMap::landmarksAddedTotal()   const { std::lock_guard<std::mutex> l(m
 int LandmarkMap::landmarksMergedTotal()  const { std::lock_guard<std::mutex> l(mutex_); return landmarks_merged_total_;  }
 int LandmarkMap::landmarksCulledTotal()  const { std::lock_guard<std::mutex> l(mutex_); return landmarks_culled_total_;  }
 int LandmarkMap::kdRebuildsTotal()       const { std::lock_guard<std::mutex> l(mutex_); return kd_rebuilds_total_;       }
+int LandmarkMap::descriptorRefreshesTotal() const { std::lock_guard<std::mutex> l(mutex_); return descriptor_refreshes_total_; }
 
 }  // namespace navsight

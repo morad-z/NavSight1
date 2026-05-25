@@ -4710,6 +4710,15 @@ VisionOutput Tracker::processFrame(const uint8_t* yuv_data, int width, int heigh
                         ec_lm.landmark_map_size.store(
                             static_cast<long long>(landmark_map_.size()),
                             std::memory_order_relaxed);
+                        // 2026-05-24 BUG-01 fix — mirror the monotonic
+                        // descriptor-refresh total (absolute store, like
+                        // landmark_map_size above). Captures refreshes from
+                        // both the merge path (this block) and the per-frame
+                        // local-map match (touchLandmark, later this tick).
+                        ec_lm.landmarks_descriptor_refreshed_total.store(
+                            static_cast<long long>(
+                                landmark_map_.descriptorRefreshesTotal()),
+                            std::memory_order_relaxed);
                         LOGI("LM_KF: kf=%d added=%d merged=%d culled=%d "
                              "invalid=%d map_size=%zu",
                              latest_clone_for_kf, lm_added_delta,
@@ -4845,6 +4854,12 @@ VisionOutput Tracker::processFrame(const uint8_t* yuv_data, int width, int heigh
                             // `last_observed_landmark_feature_ids_` for the
                             // cause/change writeup.
                             std::vector<int>                          accepted_feature_ids_match;
+                            // 2026-05-24 BUG-01 verified-only refresh — map
+                            // landmark_id -> its current-frame matched ORB
+                            // descriptor (deep clone). Populated in the match
+                            // loop; consumed AFTER applyLandmarkObservations to
+                            // refresh ONLY chi2-accepted landmarks' descriptors.
+                            std::unordered_map<int, cv::Mat>          matched_descriptors_match;
                             if (!query_descriptors.empty() &&
                                 !kf_back.descriptors.empty() &&
                                 kf_back.descriptors.type() == CV_8U &&
@@ -4952,11 +4967,26 @@ VisionOutput Tracker::processFrame(const uint8_t* yuv_data, int width, int heigh
                                     // observation must be in undistorted
                                     // pinhole space. Same root-cause fix as
                                     // KeyframeDescriptors::keypoints_ud.
+                                    // 2026-05-24 BUG-01 verified-only refresh —
+                                    // touch (retention + pixel ring) on every
+                                    // match, but DEFER the descriptor refresh:
+                                    // capture the matched current-frame
+                                    // descriptor here and apply it ONLY to
+                                    // landmarks the EKF chi2 gate accepts
+                                    // (below). Refreshing pre-verification
+                                    // corrupts the descriptor toward a wrong
+                                    // feature and regresses heading (2026-05-23).
+                                    // t_idx is the train-side (current-frame)
+                                    // index, bounds-checked above;
+                                    // descriptors.rows == keypoints.size() per
+                                    // the matcher guard, so .row(t_idx) valid.
                                     landmark_map_.touchLandmark(
                                         kept_ids[q_idx],
                                         static_cast<uint64_t>(latest_clone_for_kf),
                                         static_cast<int64_t>(timestamp_ns),
                                         px_meas_ud);
+                                    matched_descriptors_match[kept_ids[q_idx]] =
+                                        kf_back.descriptors.row(t_idx).clone();
                                 }
                             }
 
@@ -5088,6 +5118,19 @@ VisionOutput Tracker::processFrame(const uint8_t* yuv_data, int width, int heigh
                                         res.rejected_depth, std::memory_order_relaxed);
                                     ec_lm.landmarks_msckf_rejected_image_total.fetch_add(
                                         res.rejected_outside_image, std::memory_order_relaxed);
+                                    // 2026-05-24 BUG-01 verified-only refresh —
+                                    // the chi2 gate accepted these obs AND the
+                                    // update applied (|dp|<=1m, not rolled
+                                    // back), so refresh the representative ORB
+                                    // descriptor ONLY for these verified ids.
+                                    for (int acc_id : res.accepted_landmark_ids) {
+                                        auto dit =
+                                            matched_descriptors_match.find(acc_id);
+                                        if (dit != matched_descriptors_match.end()) {
+                                            landmark_map_.refreshLandmarkDescriptor(
+                                                acc_id, dit->second);
+                                        }
+                                    }
                                 }
                             }
                             /* SUPERSEDED PHASE_B_6_4_REENABLE_2026_05_19 — was
@@ -6748,6 +6791,32 @@ void Tracker::consumeLoopClosureMatchIfReady(IMUPreintegrator& imu) {
                 }
                 rot_sanity_ok = false;
             }
+        }
+    }
+
+    // 2026-05-24 BUG (LC heading) — inject world-Z yaw uncertainty so the LC
+    // rotation update can actually MOVE the heading. ROOT CAUSE (code-verified):
+    // VIO yaw is unobservable and P[2,2] collapses via MSCKF/landmark updates,
+    // so the LC yaw gain K ≈ P[2,2]/(P[2,2]+σ²_R) → 0; the EKF yaw barely moved,
+    // delta_yaw_nav ≈ 0, and nudgeMadgwickYawAroundWorldZ (user-visible heading)
+    // was skipped (two-loop walk 2026-05-24: 30 corrections, loop still 9.72 m
+    // open). Inject once per accept (k==0), only when about to apply the update
+    // (rot_sanity_ok), with the drift-based heading variance accrued since the
+    // last LC, capped. Rotation analog of the existing sigma_p_drift floor.
+    if (rot_sanity_ok && k == 0) {
+        double sigma_yaw = LOOP_CLOSURE_HEADING_DRIFT_RATE_RAD_PER_M *
+                           path_since_last_lc_m_;
+        if (sigma_yaw > LOOP_CLOSURE_HEADING_MAX_SIGMA_RAD) {
+            sigma_yaw = LOOP_CLOSURE_HEADING_MAX_SIGMA_RAD;
+        }
+        const double var_yaw_inject = sigma_yaw * sigma_yaw;
+        if (var_yaw_inject > 1e-9) {
+            const double p_yaw_before = ekf_.getYawVariance();
+            ekf_.addYawUncertainty(var_yaw_inject);
+            LOGI("LC_YAW_INJECT: path_since_lc=%.1fm sigma_yaw=%.1fdeg "
+                 "P_yaw: %.4e -> %.4e rad^2 (enabling LC heading gain)",
+                 path_since_last_lc_m_, sigma_yaw * 180.0 / M_PI,
+                 p_yaw_before, ekf_.getYawVariance());
         }
     }
 

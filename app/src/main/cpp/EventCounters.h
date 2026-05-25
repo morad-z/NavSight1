@@ -584,6 +584,20 @@ struct EventCounters {
     // image content moves past them.
     std::atomic<long long> landmarks_pixel_refreshed_total{0};
 
+    // 2026-05-24 BUG-01 fix — landmarks_descriptor_refreshed_total.
+    //
+    // Increments each time a landmark's representative ORB descriptor is
+    // recomputed to a DIFFERENT sample from its descriptor_history ring
+    // (LandmarkMap::recomputeDistinctiveDescriptorLocked, ORB-SLAM3
+    // ComputeDistinctiveDescriptors). This is the BUG-01 falsifier instrument:
+    // the stored descriptor used to be frozen at first observation, decaying
+    // the per-frame match rate as the viewpoint drifted. If this stays 0
+    // across a walk where landmarks_matched_total > 0, the 5-arg touchLandmark
+    // descriptor-refresh wiring is broken. Expected to rise steadily once the
+    // landmark map populates. Mirrored from
+    // LandmarkMap::descriptorRefreshesTotal().
+    std::atomic<long long> landmarks_descriptor_refreshed_total{0};
+
     // 2026-05-19 Fix #9 — landmarks_reanchored_total.
     // Increments each time LoopClosureDetector accept fires AND the EKF
     // updateAbsolutePose succeeds, by the number of LandmarkMap entries
@@ -949,6 +963,7 @@ struct EventCounters {
         landmark_obs_in_ba_history_min.store(0, std::memory_order_relaxed);
         landmarks_reanchored_total.store(0, std::memory_order_relaxed);
         landmarks_pixel_refreshed_total.store(0, std::memory_order_relaxed);
+        landmarks_descriptor_refreshed_total.store(0, std::memory_order_relaxed);
         slam_live_updates_fired.store(0, std::memory_order_relaxed);
         slam_live_updates_skipped.store(0, std::memory_order_relaxed);
         slam_live_skipped_no_parallax.store(0, std::memory_order_relaxed);
@@ -1119,6 +1134,7 @@ struct EventCounters {
         const long long v_landmarks_refined_total        = landmarks_refined_total.load(std::memory_order_relaxed);
         const long long v_landmarks_reanchored_total     = landmarks_reanchored_total.load(std::memory_order_relaxed);
         const long long v_landmarks_pixel_refreshed_total = landmarks_pixel_refreshed_total.load(std::memory_order_relaxed);
+        const long long v_landmarks_descriptor_refreshed_total = landmarks_descriptor_refreshed_total.load(std::memory_order_relaxed);
         const long long v_landmark_obs_in_ba_history_min = landmark_obs_in_ba_history_min.load(std::memory_order_relaxed);
         const long long v_slam_live_updates_fired        = slam_live_updates_fired.load(std::memory_order_relaxed);
         const long long v_slam_live_updates_skipped      = slam_live_updates_skipped.load(std::memory_order_relaxed);
@@ -1274,6 +1290,7 @@ struct EventCounters {
         appendKv(out, "landmarks_refined_total",        v_landmarks_refined_total);        out += ',';
         appendKv(out, "landmarks_reanchored_total",     v_landmarks_reanchored_total);     out += ',';
         appendKv(out, "landmarks_pixel_refreshed_total", v_landmarks_pixel_refreshed_total); out += ',';
+        appendKv(out, "landmarks_descriptor_refreshed_total", v_landmarks_descriptor_refreshed_total); out += ',';
         appendKv(out, "landmark_obs_in_ba_history_min", v_landmark_obs_in_ba_history_min); out += ',';
         appendKv(out, "slam_live_updates_fired",        v_slam_live_updates_fired);        out += ',';
         appendKv(out, "slam_live_updates_skipped",      v_slam_live_updates_skipped);      out += ',';

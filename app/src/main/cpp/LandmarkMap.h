@@ -80,6 +80,30 @@ struct Landmark {
     int                       id          = -1;
     cv::Vec3d                 p_world     = cv::Vec3d(0.0, 0.0, 0.0);
     cv::Mat                   descriptor;          // CV_8U, 1×32 ORB
+
+    // 2026-05-24 BUG-01 fix — ring buffer of recently-observed ORB
+    // descriptors for this landmark. `descriptor` above is the single
+    // representative (most-distinctive) descriptor selected from this ring
+    // via recomputeDistinctiveDescriptorLocked (ORB-SLAM3
+    // MapPoint::ComputeDistinctiveDescriptors, Campos et al. 2021 §III.B).
+    //
+    // Cause this exists: before this fix `descriptor` was frozen at the first
+    // observation (LandmarkMap.cpp:152 — the "p_world NOT updated here" merge
+    // comment applied to the descriptor too). After a landmark is re-observed
+    // from a changing viewpoint, that first sample is the LEAST representative
+    // of the camera's current view — agent_01_descriptor_matching.md §1.1
+    // measured per-frame LM_TRACK match rate decaying 100%→0% over a walk as
+    // the cohort's stored sample aged out. Storing the median-distinctive
+    // descriptor over recent observations keeps the matcher's reference
+    // current and is the root-cause fix for the orange-dot flicker (BUG-01).
+    //
+    // Populated at every re-observation: addOrMergeLandmarkImpl (fresh-add
+    // seed + merge path) and the 5-arg touchLandmark (per-frame local-map
+    // match). Capped at kDescriptorHistoryCap (oldest dropped) — recent-biased
+    // so it tracks the current viewpoint. Each entry is a deep clone (the
+    // source row is a view into the per-frame descriptor Mat that is freed
+    // next frame). Mutex-protected by mutex_ on all reads/writes.
+    std::vector<cv::Mat>      descriptor_history;
     std::vector<uint64_t>     observed_in_kfs;
     int64_t                   first_seen_ts_ns = 0;
     int64_t                   last_seen_ts_ns  = 0;
@@ -181,6 +205,19 @@ public:
     // its oldest obs ages out of the BA-visible window. Memory: 8 ×
     // (8 + 8) bytes per landmark = 128 B + std::vector overhead.
     static constexpr size_t   kObsHistoryCap            = 8;
+
+    // 2026-05-24 BUG-01 fix — Cap on per-landmark ORB descriptor history.
+    // recomputeDistinctiveDescriptorLocked selects the median-distinctive
+    // descriptor over this ring (ORB-SLAM3 ComputeDistinctiveDescriptors).
+    // 5 chosen deliberately recent-biased: ORB-SLAM3 keeps ALL observations,
+    // but for NavSight's viewpoint-drift failure mode the most-recent
+    // observations are the most representative of the current camera view, so
+    // a short recent ring adapts faster than a full history while staying
+    // robust to single-frame ORB noise via the median selection (≥3 samples
+    // outvote one bad frame). Memory: 5 × (32 B descriptor + cv::Mat header)
+    // ≈ 0.6 KB/landmark worst case; a typical landmark is observed < 5× so
+    // the ring rarely fills.
+    static constexpr size_t   kDescriptorHistoryCap     = 5;
 
     // kMinObservationsAfterGrace / kGracePeriodNs
     //   2026-05-17 relaxed per investigation agent (a17a49b).
@@ -329,6 +366,17 @@ public:
     bool touchLandmark(int landmark_id, uint64_t kf_id, int64_t ts_ns,
                         const cv::Point2f& matched_pixel);
 
+    // 2026-05-24 BUG-01 verified-only refresh — refresh a landmark's
+    // representative ORB descriptor from a chi2-VERIFIED match's current-frame
+    // descriptor: push onto descriptor_history (cap kDescriptorHistoryCap) and
+    // recompute the representative (ORB-SLAM3 distinctive). Call ONLY for ids
+    // in EKFState LandmarkUpdateResult::accepted_landmark_ids — refreshing from
+    // an unverified per-frame match corrupts the descriptor toward a wrong
+    // feature and regresses heading (the 2026-05-23 lesson). `descriptor` must
+    // be a 1x32 CV_8U row; a malformed row is ignored. Returns true if the
+    // landmark exists and was refreshed.
+    bool refreshLandmarkDescriptor(int landmark_id, const cv::Mat& descriptor);
+
     // ─── Mutator API (loop-closure pose-graph back-write) ─────────────────
     //
     // Apply a 4-DOF correction (Δp, Δyaw around world-Z) to every
@@ -422,11 +470,25 @@ public:
     int    landmarksMergedTotal()  const;
     int    landmarksCulledTotal()  const;
     int    kdRebuildsTotal()       const;
+    // 2026-05-24 BUG-01 fix — count of representative-descriptor recomputes
+    // that changed the stored descriptor (ring had ≥2 samples and the
+    // median-distinctive pick differed). Mirrored into
+    // EventCounters.landmarks_descriptor_refreshed_total by the caller.
+    int    descriptorRefreshesTotal() const;
 
 private:
     void rebuildKdTreeLocked() const;
     int  findMergeCandidateLocked(const cv::Vec3d& p_world,
                                     const cv::Mat& descriptor) const;
+
+    // 2026-05-24 BUG-01 fix — recompute `lm.descriptor` as the most-
+    // distinctive descriptor among lm.descriptor_history (the sample whose
+    // median Hamming distance to all others is smallest). ORB-SLAM3
+    // MapPoint::ComputeDistinctiveDescriptors. Assumes mutex_ is held. Bumps
+    // descriptor_refreshes_total_ when a recompute over ≥2 samples changes
+    // the representative descriptor. No-op for an empty history; copies the
+    // sole sample for a 1-entry history.
+    void recomputeDistinctiveDescriptorLocked(Landmark& lm);
 
     // Shared impl behind both addOrMergeLandmark overloads. set_anchor=false
     // skips the host-pose anchor computation (used by the legacy 4-arg path
@@ -459,6 +521,7 @@ private:
     int landmarks_added_total_{0};
     int landmarks_merged_total_{0};
     int landmarks_culled_total_{0};
+    int descriptor_refreshes_total_{0};   // 2026-05-24 BUG-01 fix
 };
 
 }  // namespace navsight

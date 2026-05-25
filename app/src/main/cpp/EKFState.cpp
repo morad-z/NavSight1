@@ -1660,6 +1660,23 @@ bool EKFState::updateAbsolutePose(const cv::Mat& target_R_world_imu,
     return true;
 }
 
+// 2026-05-24 BUG (LC heading) — see EKFState.h. Inflate the world-Z (yaw)
+// attitude covariance so a subsequent loop-closure rotation update has
+// non-zero Kalman gain on heading. δθ is WORLD-frame (R_GtoI_ = Rodrigues(δθ)·
+// R_GtoI_, left-multiply at EKFState.cpp:1172), so the heading/yaw DOF is the
+// world-Z component = index 2; inflating P[2,2] is the correct, tilt-invariant
+// injection (a body-frame R_GtoI-column rank-1 would be wrong off-level).
+void EKFState::addYawUncertainty(double var_yaw_rad2) {
+    if (P_.empty() || P_.rows < 3 || P_.type() != CV_64F) return;
+    if (!std::isfinite(var_yaw_rad2) || var_yaw_rad2 <= 0.0) return;
+    P_.at<double>(2, 2) += var_yaw_rad2;
+}
+
+double EKFState::getYawVariance() const {
+    if (P_.empty() || P_.rows < 3 || P_.type() != CV_64F) return -1.0;
+    return P_.at<double>(2, 2);  // world-Z (yaw) δθ variance, rad²
+}
+
 bool EKFState::updateGravityAlignedYaw(double yaw_meas, double var,
                                        double roll, double pitch) {
     if (!full_initialized_ || P_.empty()) return false;
@@ -2032,6 +2049,7 @@ EKFState::LandmarkUpdateResult EKFState::applyLandmarkObservations(
         rows.push_back(row);
 
         result.accepted++;
+        result.accepted_landmark_ids.push_back(o.landmark_id);  // 2026-05-24 BUG-01 verified-only refresh
         result.chi2_total += m2;  // accumulate ONLY accepted observations
     }
 
