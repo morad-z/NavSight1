@@ -1,11 +1,26 @@
-# NavSight Active Bugs — Status as of 2026-05-21 (end of day)
+# NavSight Active Bugs — Status as of 2026-05-25
 
-**Last updated**: 2026-05-21 18:48 (after 5 validation walks today)
-**Session shipped**: 12 fixes across 3 P0 bugs + 6 supporting changes
+**Last updated**: 2026-05-25 (heading saga root-caused + fixed; commit `4a9a212` on `morad`)
+**Session shipped**: 12 fixes across 3 P0 bugs + 6 supporting changes (2026-05-21); heading fix (2026-05-25)
 
 ---
 
-## 🟢 FIXED today (validated on real walks)
+## 🟢 FIXED 2026-05-25 — the multi-session heading saga (root cause found)
+
+### ✅ HEADING — gimbal-locked compass extraction + compass-snap (commit `4a9a212`)
+**Symptoms (recurring across many sessions)**: heading drifts while stationary; V-shape / no-overlay on straight-and-back walks; ~95° offset + 200↔0° jumps vs a NOAA-compass reference.
+**Root cause (data-proven)**: the rotation-vector heading was extracted with `getOrientation()`'s **flat-phone azimuth** (no `remapCoordinateSystem`), which **gimbal-locks** when the phone is held upright (NavSight's walking pose) → wrong azimuth + jumps. The prior `k=1.0` compass **SNAP** then forced the gyro yaw to follow that bad compass every frame, so disturbance flowed straight into the heading-projected trajectory → V-shape. The earlier "compass disturbed on returns" reading was this frame bug, **not** magnetic interference.
+**Fix** (`SensorRepository.kt`, `IMUPreintegrator.cpp/.h`, `native-lib.cpp`, `NativeBridge.kt`, `Tracker.cpp`):
+- **Gimbal-free RV extraction**: project the horizontal leading device edge to the ground plane instead of the flat azimuth (tilt-adaptive: upright → camera axis, flat → top edge). Forward axis validated against NOAA ground truth.
+- **Gyro-primary + gated compass**: gyro owns the heading (tracks turns cleanly); the compass snaps once at startup for absolute heading, then corrects slow drift only when it agrees with the gyro within 35° (`kMagDisturbRejectRad`); larger disagreement = disturbed field → reject. Standard AHRS / compass-app design.
+- Telemetry: `MAG_FUSE[INIT|FUSE|REJECT]`, `RV_SEND mode=FLAT|UPRIGHT`.
+**Validation**: user bench-compared app heading to the NOAA mobile compass — matches in the walking hold; stationary heading stable; gimbal jumps gone. **Walk-overlay confirmation pending** on the next straight-and-back.
+**Supersedes**: Option B (GPS-bearing init) below + the magnetometer-init-error analysis — the continuous gated compass now sets and maintains absolute heading, so the ~40° mag-init error Option B was designed to one-shot-correct no longer accumulates.
+**Note**: temporary `RV_DIAG` candidate-axis logging left in `SensorRepository` (harmless; strip in a follow-up).
+
+---
+
+## 🟢 FIXED 2026-05-21 (validated on real walks)
 
 ### ✅ BUG-02 — Madgwick self-injected gyro bias
 **File**: `Tracker.cpp:1357` (the REPLACE → ADD-and-ZERO pattern fix)
@@ -103,7 +118,8 @@
 **Status**: needs investigation before BUG-03 (MiDaS Phase 2) ships — Phase 2 helps ρ refinement but cannot fix the upstream promotion-funnel starvation. Suspect: `slam_promo_rms_milli_p95 = 2904` (the 1.5 px RMS gate is too tight, OR the EKF clone poses being passed to triangulation are themselves drifted, inflating reprojection RMS).
 **Action**: dump per-walk RMS distribution and find whether tightening the per-frame visual gates (already shipped) has changed the RMS landscape, or whether the gate constant itself needs re-derivation.
 
-### 🟡 GPS-bearing-aided initial heading (Option B — PRIORITY HIGH after GPS analysis)
+### ⚪ GPS-bearing-aided initial heading (Option B) — SUPERSEDED 2026-05-25
+**SUPERSEDED** by the gated-compass heading fix (see FIXED 2026-05-25 at top). The continuous gyro-primary + gated-compass heading now sets the absolute heading from the compass at startup AND corrects drift continuously, so the ~40° mag-init error this option was designed to one-shot-correct no longer accumulates. Kept below for history; revisit only if a future GPS-aided refinement is wanted on top of the compass.
 **Scope**: STARTUP ONLY, mirrors existing magnetometer init pattern. NOT continuous use.
 **Rationale (UPDATED 2026-05-21 — walks confirmed OUTDOOR)**: today's walks were near-house outdoors with GPS available. Cross-checked GPS-derived bearing against Madgwick on `bug_newpg_walk_2026_05_21` (GPS coverage 98%, median accuracy **4.4 m**):
 
@@ -246,16 +262,20 @@ Per `EKFState.cpp` comment from 2026-05-19, online R_bc calibration (Step 8b) is
 - [Agent 05 — Cross-walk analysis](active_bugs/agent_05_cross_walk_analysis.md)
 - [Agent 06 — LC soft correction + trajectory](active_bugs/agent_06_lc_soft_correction_and_trajectory.md)
 
-## Recommended next session order
+## Recommended next session order (updated 2026-05-25)
 
-1. **GPS-bearing-aided initial heading** (Option B) — addresses today's mag-init error, ~110 LOC, low risk, startup-only
-2. **Heading confidence indicator** (UX) — communicates the converging-to-truth behavior to the user, ~50 LOC
-3. **BUG-01 multi-descriptor median** (§5.1) — fixes orange dot flicker at the source, high impact
-4. **BUG-01 SUB-A** widen `kGeomMatchRadiusPx` + tighten Hamming — unblocks Step 7.1 LC accepts (currently 0)
-5. **BUG-04 F1+F2 render fixes** — companion to BUG-01 for full flicker elimination
-6. **Hidden Bug #3** — SLAM RMS chokepoint investigation BEFORE shipping BUG-03 (Phase 2 alone can't fix structural promotion starvation)
-7. **BUG-03 MiDaS Phase 2** — depth observability during prolonged axial walks
-8. **P3 cleanups (F3, F4, Agent-2 H3, BUG-01 SUB-B)** when convenient
+- ~~GPS-bearing init (Option B)~~ — **SUPERSEDED** by the 2026-05-25 gated-compass heading fix
+- ~~BUG-01 multi-descriptor median~~ — **DONE** in `f86c38d` (verified-only descriptor refresh + recompute)
+- ~~Heading~~ — **DONE** in `4a9a212` (gimbal-free + gyro-primary + gated compass)
+
+Latest walk (`rv2_walk_2026_05_25`) counters show the two remaining user-visible systems are both at **zero**:
+
+1. **BUG-01 SUB-A** — widen `kGeomMatchRadiusPx` (15→30-40) + tighten `kGeomDescriptorMaxDistance` (50→35-40). `loop_closure_geom_accepts = 0` → **loops never close → never overlay.** P1, ~10 LOC, derived thresholds, MEDIUM risk. **← top candidate (loops overlay)**
+2. **Hidden Bug #3** — SLAM promotion RMS chokepoint. `slam_promotions_total = 0` → **no orange dots are ever created/anchored.** Needs RMS-distribution dump first. **← top candidate (orange dots)**
+3. **BUG-04 F1+F2 render fixes** — per-frame `is_observed` + widen refresh radius (companion to dots)
+4. **BUG-03 MiDaS Phase 2** — depth observability during axial walks (AFTER Hidden Bug #3)
+5. **Heading confidence indicator** (UX) — optional now the heading is solid
+6. **P3 cleanups (F3, F4, Agent-2 H3, BUG-01 SUB-B)** when convenient
 
 ## Bug count by status (end of 2026-05-21)
 
