@@ -877,6 +877,20 @@ double Tracker::getHeading() const {
     std::lock_guard<std::mutex> lock(pose_mutex_);
     return scalar_heading_;
 }
+int Tracker::getCorrectedTrajectory(float* out_xz, int max_pairs) const {
+    // 2026-05-26 — #2 loop-overlay path redraw. Copies the corrected pose-graph
+    // node polyline (x=East -> VioData x, y=North -> VioData z) snapshotted after
+    // the last optimize() in consumeLoopClosureMatchIfReady. Called from the UI
+    // thread; corrected_traj_xz_ is written under pose_mutex_.
+    if (out_xz == nullptr || max_pairs <= 0) return 0;
+    std::lock_guard<std::mutex> lock(pose_mutex_);
+    const int n = std::min(static_cast<int>(corrected_traj_xz_.size()), max_pairs);
+    for (int i = 0; i < n; ++i) {
+        out_xz[2 * i]     = corrected_traj_xz_[i].x;  // East  -> VioData x
+        out_xz[2 * i + 1] = corrected_traj_xz_[i].y;  // North -> VioData z
+    }
+    return n;
+}
 double Tracker::getLastVisualYawVariance() const {
     std::lock_guard<std::mutex> lock(pose_mutex_);
     return last_visual_yaw_variance_;
@@ -3579,11 +3593,23 @@ VisionOutput Tracker::processFrame(const uint8_t* yuv_data, int width, int heigh
                 }
                 const double rms = std::sqrt(rms2 / static_cast<double>(n_used));
                 if (rms > 1.5) {
-                    navsight::eventCounters().slam_promo_rejected_rms_total
+                    auto& ecr = navsight::eventCounters();
+                    ecr.slam_promo_rejected_rms_total
                         .fetch_add(1, std::memory_order_relaxed);
-                    navsight::eventCounters().slam_promo_rms_milli_p95
-                        .store(static_cast<long long>(std::lround(rms * 1000.0)),
-                               std::memory_order_relaxed);
+                    const long long rms_mi =
+                        static_cast<long long>(std::lround(rms * 1000.0));
+                    ecr.slam_promo_rms_milli_p95
+                        .store(rms_mi, std::memory_order_relaxed);  // legacy: latest sample
+                    // 2026-05-26 Hidden Bug #3 — real distribution: running sum
+                    // (-> mean) + atomic max, to tell "marginal" (mean ~2px) from
+                    // "clone poses inconsistent" (mean ~10px+) before touching the gate.
+                    ecr.slam_promo_rms_sum_milli
+                        .fetch_add(rms_mi, std::memory_order_relaxed);
+                    long long prev_max =
+                        ecr.slam_promo_rms_milli_max.load(std::memory_order_relaxed);
+                    while (rms_mi > prev_max &&
+                           !ecr.slam_promo_rms_milli_max.compare_exchange_weak(
+                               prev_max, rms_mi, std::memory_order_relaxed)) {}
                     continue;
                 }
 
@@ -7058,13 +7084,23 @@ void Tracker::consumeLoopClosureMatchIfReady(IMUPreintegrator& imu) {
                     // protect against numerical pathologies (var_p_total
                     // can be tiny in a clean LC; the floor matches the
                     // PoseGraph's own SIGMA_*_FLOOR_SQ).
-                    const double lc_info_xy  = (var_p > PoseGraph::SIGMA_POS_FLOOR_SQ)
-                                              ? 1.0 / var_p
-                                              : 1.0 / PoseGraph::SIGMA_POS_FLOOR_SQ;
-                    const double lc_info_z   = lc_info_xy;  // var_p is isotropic
-                    const double lc_info_yaw = (sigma_axis_sq_R > PoseGraph::SIGMA_YAW_FLOOR_SQ)
-                                              ? 1.0 / sigma_axis_sq_R
-                                              : 1.0 / PoseGraph::SIGMA_YAW_FLOOR_SQ;
+                    // 2026-05-25 — loop EDGE weight = PnP measurement precision
+                    // (LOOP_CLOSURE_EDGE_SIGMA_*), NOT the drift-inflated var_p /
+                    // sigma_axis_sq_R the chi² gate consumes. See Tracker.h
+                    // derivation: the old var_p-based weight made the loop edge
+                    // ~1600× weaker than odometry so optimize() never closed the
+                    // loop (residual ratio 0.99). The chi² gate above is unchanged
+                    // (still var_p / sigma_axis_sq_R) so acceptance still tolerates
+                    // the large pre-correction gap; only the EDGE WEIGHT changes.
+                    const double edge_var_p   = LOOP_CLOSURE_EDGE_SIGMA_P_M *
+                                                LOOP_CLOSURE_EDGE_SIGMA_P_M;
+                    const double edge_var_yaw = LOOP_CLOSURE_EDGE_SIGMA_YAW_RAD *
+                                                LOOP_CLOSURE_EDGE_SIGMA_YAW_RAD;
+                    const double lc_info_xy  = 1.0 /
+                        std::max(edge_var_p,   PoseGraph::SIGMA_POS_FLOOR_SQ);
+                    const double lc_info_z   = lc_info_xy;  // isotropic
+                    const double lc_info_yaw = 1.0 /
+                        std::max(edge_var_yaw, PoseGraph::SIGMA_YAW_FLOOR_SQ);
                     pose_graph_.addLoopEdge(match_pg, now_pg,
                                              dx_loop, dy_loop,
                                              dz_loop, dyaw_loop,
@@ -7140,6 +7176,24 @@ void Tracker::consumeLoopClosureMatchIfReady(IMUPreintegrator& imu) {
                          max_corr,
                          now_dx, now_dy, now_dz,
                          now_dyaw * 180.0 / M_PI);
+
+                    // 2026-05-26 — #2 loop-overlay path redraw: snapshot the
+                    // CORRECTED node polyline (pn.x=East, pn.y=North; same ground
+                    // frame as VioData x/z) so the UI can rebuild its drifted
+                    // pathHistory. The apply loop above only moved the now-node
+                    // into global_t_; the PAST trajectory is redrawn from here on
+                    // the loop_correction_version_ bump.
+                    {
+                        std::lock_guard<std::mutex> lock(pose_mutex_);
+                        corrected_traj_xz_.clear();
+                        corrected_traj_xz_.reserve(snap.size());
+                        for (const auto& pn : snap) {
+                            corrected_traj_xz_.emplace_back(
+                                static_cast<float>(pn.x),
+                                static_cast<float>(pn.y));
+                        }
+                    }
+                    loop_correction_version_.fetch_add(1, std::memory_order_relaxed);
                 }
             } else {
                 LOGI("LC_TRAJECTORY_GAP_SKIP: reason=no_pg_node "

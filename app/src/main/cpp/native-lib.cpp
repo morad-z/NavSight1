@@ -1043,6 +1043,47 @@ Java_com_example_navsight1_NativeBridge_setMagnetometerHeading(
     }
 }
 
+// 2026-05-26 — #2 loop-overlay path redraw. The UI polls getLoopCorrectionVersion()
+// (cheap atomic) on each VIO update; on a change it calls getCorrectedTrajectory(out)
+// to rebuild its pathHistory from the CORRECTED pose-graph node polyline so the two
+// loops visually overlay (only the now-node delta reaches global_t_). shared_ptr
+// pattern so the engine stays alive if stopVIO races mid-call.
+JNIEXPORT jint JNICALL
+Java_com_example_navsight1_NativeBridge_getLoopCorrectionVersion(
+        JNIEnv*, jobject /* thiz */) {
+    std::shared_ptr<VioEngine> vision;
+    {
+        std::lock_guard<std::mutex> lock(state_mutex);
+        vision = g_vision;
+    }
+    if (!vision) return 0;
+    const Tracker* tracker = vision->getTracker();
+    return tracker ? static_cast<jint>(tracker->getLoopCorrectionVersion()) : 0;
+}
+
+JNIEXPORT jint JNICALL
+Java_com_example_navsight1_NativeBridge_getCorrectedTrajectory(
+        JNIEnv* env, jobject /* thiz */, jfloatArray out_xz) {
+    if (out_xz == nullptr) return 0;
+    std::shared_ptr<VioEngine> vision;
+    {
+        std::lock_guard<std::mutex> lock(state_mutex);
+        vision = g_vision;
+    }
+    if (!vision) return 0;
+    const Tracker* tracker = vision->getTracker();
+    if (!tracker) return 0;
+    const jsize cap = env->GetArrayLength(out_xz);
+    const int max_pairs = static_cast<int>(cap / 2);
+    if (max_pairs <= 0) return 0;
+    std::vector<float> buf(static_cast<size_t>(max_pairs) * 2);
+    const int n = tracker->getCorrectedTrajectory(buf.data(), max_pairs);
+    if (n > 0) {
+        env->SetFloatArrayRegion(out_xz, 0, n * 2, buf.data());
+    }
+    return static_cast<jint>(n);
+}
+
 // ── Camera overlay Phase 2 / 3 (camera_overlay_phase23_plan.md) ──────────────
 //
 // Four read-only accessors for the live camera overlay. None of them mutate

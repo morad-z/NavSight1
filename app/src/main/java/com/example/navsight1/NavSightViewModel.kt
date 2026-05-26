@@ -122,6 +122,12 @@ class NavSightViewModel(application: Application) : AndroidViewModel(application
     var pathHistoryVersion by mutableStateOf(0)
         private set
     val pathHistory: List<PathPoint> get() = _pathHistory
+    // 2026-05-26 — #2 loop-overlay path redraw. On a loop_correction_version bump
+    // (a loop closure re-optimized the pose graph), pathHistory is rebuilt from the
+    // CORRECTED node polyline so the two loops snap onto each other.
+    private var lastLoopCorrectionVersion = 0
+    private val correctedTrajBuf = FloatArray(1000)   // 500 (x,z) pairs = PoseGraph MAX_NODES
+    private val correctedPathSigmaM = 0.5f            // confident sigma for redrawn points (map color)
 
     // Step 6: current 1-sigma horizontal-plane position uncertainty (meters).
     // NaN until the EKF has finished its full init. Backed by a per-frame read
@@ -307,6 +313,34 @@ class NavSightViewModel(application: Application) : AndroidViewModel(application
                 } else Float.NaN
                 positionCovValid = covOk
                 positionSigmaM = sigma
+                // 2026-05-26 — #2 loop-overlay path redraw. When a loop closure
+                // re-optimized the pose graph (version bumped), rebuild the
+                // (drifted) pathHistory from the CORRECTED node polyline so the
+                // two loops snap together; the live per-frame point below then
+                // appends to the corrected history.
+                if (NativeBridge.isLoaded()) {
+                    val lcVer = NativeBridge.getLoopCorrectionVersion()
+                    if (lcVer != lastLoopCorrectionVersion) {
+                        lastLoopCorrectionVersion = lcVer
+                        val nPairs = NativeBridge.getCorrectedTrajectory(correctedTrajBuf)
+                        if (nPairs > 0) {
+                            _pathHistory.clear()
+                            for (i in 0 until nPairs) {
+                                _pathHistory.add(
+                                    PathPoint(
+                                        correctedTrajBuf[2 * i],
+                                        correctedTrajBuf[2 * i + 1],
+                                        correctedPathSigmaM
+                                    )
+                                )
+                            }
+                            android.util.Log.i(
+                                "NavSight-VM",
+                                "PATH_REDRAW: loop_correction_version=$lcVer corrected_nodes=$nPairs"
+                            )
+                        }
+                    }
+                }
                 _pathHistory.add(PathPoint(vio.x.toFloat(), vio.z.toFloat(), sigma))
                 if (_pathHistory.size > 500) _pathHistory.removeAt(0)
                 pathHistoryVersion = _pathHistoryVersion.incrementAndGet()

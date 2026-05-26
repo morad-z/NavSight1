@@ -412,6 +412,17 @@ double PoseGraph::optimize(int max_iterations) {
     ec.pose_graph_residual_norm_post_mm.fetch_add(
         static_cast<long long>(post_res * 1000.0 + 0.5),
         std::memory_order_relaxed);
+
+    // 2026-05-25 falsifier (BUG: loops don't overlay). Per-call info-weighted
+    // residual ratio. Was ~0.99 (loop edge too weak to deform the chain); after
+    // the LOOP_CLOSURE_EDGE_SIGMA_* rebalance it should drop toward <0.5. If it
+    // stays ~1.0, the edge weight wasn't the dominant blocker — look elsewhere
+    // (bad loop-edge measurement, or odom info still dominating).
+    const double conv_ratio = (pre_res > 1e-9) ? (post_res / pre_res) : 0.0;
+    LOGI("POSE_GRAPH_CONVERGE: pre=%.4f post=%.4f ratio=%.3f iters=%d "
+         "odom_edges=%zu loop_edges=%zu max_corr_m=%.3f",
+         pre_res, post_res, conv_ratio, iters_used,
+         odom_edges_.size(), loop_edges_.size(), max_correction_m);
     ec.pose_graph_iters_used_sum.fetch_add(iters_used,
                                             std::memory_order_relaxed);
     ec.pose_graph_max_correction_mm.fetch_add(

@@ -58,6 +58,16 @@ object NativeBridge {
     // IMUPreintegrator::setMagnetometerHeading for gentle gated yaw fusion.
     external fun setMagnetometerHeading(yawRad: Float)
 
+    // 2026-05-26 — #2 loop-overlay path redraw. getLoopCorrectionVersion()
+    // increments each time a loop closure re-optimizes the pose graph; the
+    // ViewModel polls it and, on a change, calls getCorrectedTrajectory(out) to
+    // rebuild pathHistory from the CORRECTED pose-graph node polyline so the two
+    // loops visually overlay (only the now-node delta reaches the live pose).
+    // outXz is filled [x0,z0,x1,z1,...] (x=East, z=North; same frame as VioData);
+    // returns the number of (x,z) pairs written (<= outXz.size/2).
+    external fun getLoopCorrectionVersion(): Int
+    external fun getCorrectedTrajectory(outXz: FloatArray): Int
+
     // Step 5: Calibration & Initialization
     // Returns 0=WAIT_STATIONARY, 1=WAIT_MOTION, 2=READY, 3=TIMEOUT_NEEDS_USER
     external fun getInitStatus(): Int

@@ -173,6 +173,18 @@ public:
     // Thread-safe read-only accessors
     double getSmoothScale() const;
     double getHeading() const;
+    // 2026-05-26 — #2 loop-overlay path redraw. getLoopCorrectionVersion()
+    // increments each time a loop closure re-optimizes the pose graph. The UI
+    // polls it and, on a change, calls getCorrectedTrajectory() to rebuild its
+    // (drifted) pathHistory from the CORRECTED keyframe-node polyline — only the
+    // now-node delta reaches global_t_, so the PAST path must be redrawn here for
+    // the loops to visually overlay. out_xz is filled (x=East, z=North; same
+    // ground frame as VioData x/z), returns the number of (x,z) pairs written
+    // (<= max_pairs). Thread-safe (pose_mutex_).
+    int getLoopCorrectionVersion() const {
+        return loop_correction_version_.load(std::memory_order_relaxed);
+    }
+    int getCorrectedTrajectory(float* out_xz, int max_pairs) const;
     bool isInitialized() const { return initialized_; }
     const EKFState* getEKF() const { return &ekf_; }
     // Step 2.4: variance of the last keyframe-derived visual yaw measurement
@@ -521,6 +533,13 @@ private:
     // loop edge so consumeLoopClosureMatchIfReady can pair the matched
     // keyframe's pg-node with the current end of the chain.
     int last_pg_node_id_{-1};
+    // 2026-05-26 — #2 loop-overlay path redraw. After optimize() corrects the
+    // pose-graph nodes, consumeLoopClosureMatchIfReady snapshots the corrected
+    // node (x=East, y=North) polyline here under pose_mutex_ and bumps
+    // loop_correction_version_; the UI rebuilds its (drifted) pathHistory from it
+    // (only the now-node delta reaches global_t_, so the PAST path needs redraw).
+    std::vector<cv::Point2f> corrected_traj_xz_;       // guarded by pose_mutex_
+    std::atomic<int> loop_correction_version_{0};
 
     // 2026-05-12: VisualMap member + getter reverted. Belongs to Phase 1
     // Step 6 (persistent landmark map) per post_v19_sprint_plan.md, which
@@ -844,6 +863,25 @@ private:
     // heading gate upstream). Source: sim_data_1778100250961 — 40 PnP accepts,
     // 392 chi² rejects, 0 corrections with 3° sigma.
     static constexpr double  LOOP_CLOSURE_BASE_ROT_SIGMA_RAD  = 0.34907;  // 20°
+
+    // ── Pose-graph LOOP-EDGE weights (2026-05-25; BUG: loops don't overlay) ──
+    // The pose-graph loop edge was being weighted with the chi²-GATE budget
+    // var_p (= var_p_pnp 4 m² + drift inflation), giving loop info ≤ 0.25 while
+    // each odometry edge has info ≈ 1/SIGMA_POS_FLOOR_SQ = 400 (5 cm floor).
+    // The loop edge was ~1600× too weak, so PoseGraph::optimize() trusted the
+    // drifted odometry chain and left the loop OPEN (residual ratio 0.99 on
+    // lc2loop_2026_05_25). The drift budget belongs to the chi² ACCEPTANCE gate
+    // (which must tolerate the large pre-correction gap) — NOT to the edge
+    // WEIGHT. A loop closure is an absolute revisit constraint from an
+    // appearance-verified PnP match, so its edge variance must be << the
+    // ACCUMULATED odometry variance over the loop (≈ N·(5 cm)² ≈ 0.2 m² for an
+    // ~80-edge loop) for the optimizer to deform the chain. var=0.01 m² closes
+    // ~95% of the gap (0.2/(0.2+0.01)). Reproj geometry (4 px @ ~5 m depth ≈
+    // 3 cm/inlier) supports sub-decimetre relative precision; 10 cm / 2° are
+    // conservative floors. These weight the EDGE only; var_p and
+    // sigma_axis_sq_R still gate acceptance unchanged.
+    static constexpr double  LOOP_CLOSURE_EDGE_SIGMA_P_M     = 0.10;   // (10 cm)² edge weight
+    static constexpr double  LOOP_CLOSURE_EDGE_SIGMA_YAW_RAD = 0.035;  // 2° edge weight
 
     // 2026-05-24 BUG (LC heading) — heading (world-Z yaw) uncertainty growth
     // per metre walked since the last loop closure. In monocular VIO global yaw

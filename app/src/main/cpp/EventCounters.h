@@ -388,6 +388,17 @@ struct EventCounters {
     // typical values are >> loop_closure_geom_rejects_few_inframe (each
     // candidate has ~50-150 in-frame projections, each is a vote).
     std::atomic<long long> loop_closure_geom_rejects_descriptor{0};
+    // 2026-05-26 — split loop_closure_geom_rejects_descriptor into its two
+    // failure modes (the LC_GEOM log computes them per-attempt but logcat rolls
+    // off; promote to event_summary for durable post-heading-fix diagnosis).
+    // spatial_miss = no current kp within kGeomMatchRadiusPx of the projection
+    // (geometry/pose → widen radius); hamming_miss = kp nearby but min-Hamming >
+    // kGeomDescriptorMaxDistance (appearance/descriptor-staleness → refresh).
+    // hamming_min_{sum,count} → mean min-Hamming-in-radius (~106=random, <50=matchable).
+    std::atomic<long long> loop_closure_geom_spatial_miss{0};
+    std::atomic<long long> loop_closure_geom_hamming_miss{0};
+    std::atomic<long long> loop_closure_geom_hamming_min_sum{0};
+    std::atomic<long long> loop_closure_geom_hamming_min_count{0};
     // total_path_m × 10 (integer decimeters) — verifies the dynamic sigma
     // formula (sigma_p = max(2.0, 0.032 × path_m)) is tracking correctly.
     std::atomic<long long> total_path_dm{0};
@@ -837,6 +848,13 @@ struct EventCounters {
     std::atomic<long long> slam_promo_rejected_rms_total{0};
     std::atomic<long long> slam_promo_rejected_parallax_total{0};
     std::atomic<long long> slam_promo_rms_milli_p95{0};
+    // 2026-05-26 Hidden Bug #3 — REAL distribution of REJECTED two-view RMS (the
+    // *_p95 above is a misnomer: it's the LAST rejected RMS, not a percentile).
+    // mean = slam_promo_rms_sum_milli / (1000 * slam_promo_rejected_rms_total);
+    // max = slam_promo_rms_milli_max. mean ~2px ⇒ marginal (parallax/baseline);
+    // mean ~10px+ ⇒ clone poses inconsistent upstream (do NOT loosen the 1.5px gate).
+    std::atomic<long long> slam_promo_rms_sum_milli{0};
+    std::atomic<long long> slam_promo_rms_milli_max{0};
 
     // 2026-05-17 — translation gated because motion is rotation-only.
     // Catches "user sitting in chair rotating phone" that defeats is_static
@@ -927,6 +945,10 @@ struct EventCounters {
         loop_closure_geom_rejects_few_inframe.store(0, std::memory_order_relaxed);
         loop_closure_geom_rejects_pnp.store(0, std::memory_order_relaxed);
         loop_closure_geom_rejects_descriptor.store(0, std::memory_order_relaxed);
+        loop_closure_geom_spatial_miss.store(0, std::memory_order_relaxed);
+        loop_closure_geom_hamming_miss.store(0, std::memory_order_relaxed);
+        loop_closure_geom_hamming_min_sum.store(0, std::memory_order_relaxed);
+        loop_closure_geom_hamming_min_count.store(0, std::memory_order_relaxed);
         total_path_dm.store(0, std::memory_order_relaxed);
         pose_graph_optimize_calls.store(0, std::memory_order_relaxed);
         pose_graph_iters_used_sum.store(0, std::memory_order_relaxed);
@@ -1004,6 +1026,8 @@ struct EventCounters {
         slam_promo_rejected_rms_total.store(0, std::memory_order_relaxed);
         slam_promo_rejected_parallax_total.store(0, std::memory_order_relaxed);
         slam_promo_rms_milli_p95.store(0, std::memory_order_relaxed);
+        slam_promo_rms_sum_milli.store(0, std::memory_order_relaxed);
+        slam_promo_rms_milli_max.store(0, std::memory_order_relaxed);
         global_t_gated_rotation_dominated_total.store(0, std::memory_order_relaxed);
         translation_heading_projection_total.store(0, std::memory_order_relaxed);
     }
@@ -1099,6 +1123,10 @@ struct EventCounters {
         const long long v_loop_closure_geom_rejects_few_inframe      = loop_closure_geom_rejects_few_inframe.load(std::memory_order_relaxed);
         const long long v_loop_closure_geom_rejects_pnp              = loop_closure_geom_rejects_pnp.load(std::memory_order_relaxed);
         const long long v_loop_closure_geom_rejects_descriptor       = loop_closure_geom_rejects_descriptor.load(std::memory_order_relaxed);
+        const long long v_loop_closure_geom_spatial_miss             = loop_closure_geom_spatial_miss.load(std::memory_order_relaxed);
+        const long long v_loop_closure_geom_hamming_miss             = loop_closure_geom_hamming_miss.load(std::memory_order_relaxed);
+        const long long v_loop_closure_geom_hamming_min_sum          = loop_closure_geom_hamming_min_sum.load(std::memory_order_relaxed);
+        const long long v_loop_closure_geom_hamming_min_count        = loop_closure_geom_hamming_min_count.load(std::memory_order_relaxed);
         const long long v_total_path_dm               = total_path_dm.load(std::memory_order_relaxed);
         const long long v_pose_graph_optimize_calls          = pose_graph_optimize_calls.load(std::memory_order_relaxed);
         const long long v_pose_graph_iters_used_sum          = pose_graph_iters_used_sum.load(std::memory_order_relaxed);
@@ -1177,6 +1205,8 @@ struct EventCounters {
         const long long v_slam_promo_rejected_rms_total       = slam_promo_rejected_rms_total.load(std::memory_order_relaxed);
         const long long v_slam_promo_rejected_parallax_total  = slam_promo_rejected_parallax_total.load(std::memory_order_relaxed);
         const long long v_slam_promo_rms_milli_p95            = slam_promo_rms_milli_p95.load(std::memory_order_relaxed);
+        const long long v_slam_promo_rms_sum_milli            = slam_promo_rms_sum_milli.load(std::memory_order_relaxed);
+        const long long v_slam_promo_rms_milli_max            = slam_promo_rms_milli_max.load(std::memory_order_relaxed);
         const long long v_global_t_gated_rotation_dominated_total = global_t_gated_rotation_dominated_total.load(std::memory_order_relaxed);
         const long long v_translation_heading_projection_total = translation_heading_projection_total.load(std::memory_order_relaxed);
 
@@ -1255,6 +1285,10 @@ struct EventCounters {
         appendKv(out, "loop_closure_geom_rejects_few_inframe",      v_loop_closure_geom_rejects_few_inframe);      out += ',';
         appendKv(out, "loop_closure_geom_rejects_pnp",              v_loop_closure_geom_rejects_pnp);              out += ',';
         appendKv(out, "loop_closure_geom_rejects_descriptor",       v_loop_closure_geom_rejects_descriptor);       out += ',';
+        appendKv(out, "loop_closure_geom_spatial_miss",            v_loop_closure_geom_spatial_miss);            out += ',';
+        appendKv(out, "loop_closure_geom_hamming_miss",            v_loop_closure_geom_hamming_miss);            out += ',';
+        appendKv(out, "loop_closure_geom_hamming_min_sum",         v_loop_closure_geom_hamming_min_sum);         out += ',';
+        appendKv(out, "loop_closure_geom_hamming_min_count",       v_loop_closure_geom_hamming_min_count);       out += ',';
         appendKv(out, "total_path_dm",                  v_total_path_dm);                  out += ',';
         appendKv(out, "pose_graph_optimize_calls",        v_pose_graph_optimize_calls);        out += ',';
         appendKv(out, "pose_graph_iters_used_sum",        v_pose_graph_iters_used_sum);        out += ',';
@@ -1333,6 +1367,8 @@ struct EventCounters {
         appendKv(out, "slam_promo_rejected_rms_total",       v_slam_promo_rejected_rms_total);       out += ',';
         appendKv(out, "slam_promo_rejected_parallax_total",  v_slam_promo_rejected_parallax_total);  out += ',';
         appendKv(out, "slam_promo_rms_milli_p95",            v_slam_promo_rms_milli_p95);            out += ',';
+        appendKv(out, "slam_promo_rms_sum_milli",            v_slam_promo_rms_sum_milli);            out += ',';
+        appendKv(out, "slam_promo_rms_milli_max",            v_slam_promo_rms_milli_max);            out += ',';
         appendKv(out, "global_t_gated_rotation_dominated_total", v_global_t_gated_rotation_dominated_total); out += ',';
         appendKv(out, "translation_heading_projection_total",    v_translation_heading_projection_total);
         out += '}';

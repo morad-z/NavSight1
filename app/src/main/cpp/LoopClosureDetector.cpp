@@ -1063,6 +1063,20 @@ bool LoopClosureDetector::tryDetectLoopGeometric(
         pnp_pts2d.push_back(current_keypoints[best_q_idx].pt);
     }
 
+    // 2026-05-26 — promote the per-attempt spatial/hamming split + min-Hamming
+    // aggregate into event_summary (durable; the LC_GEOM log below rolls off
+    // logcat). Decides the geom-path fix: spatial_miss-dominant → widen radius;
+    // hamming_miss-dominant → descriptor staleness (mean = sum/count: ~106=random,
+    // <50=matchable).
+    eventCounters().loop_closure_geom_spatial_miss.fetch_add(
+        spatial_miss, std::memory_order_relaxed);
+    eventCounters().loop_closure_geom_hamming_miss.fetch_add(
+        hamming_miss, std::memory_order_relaxed);
+    eventCounters().loop_closure_geom_hamming_min_sum.fetch_add(
+        hamming_min_sum_within_radius, std::memory_order_relaxed);
+    eventCounters().loop_closure_geom_hamming_min_count.fetch_add(
+        hamming_min_count_within_radius, std::memory_order_relaxed);
+
     const int mean_h = (hamming_min_count_within_radius > 0)
         ? (hamming_min_sum_within_radius / hamming_min_count_within_radius)
         : -1;
