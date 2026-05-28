@@ -1084,6 +1084,25 @@ Java_com_example_navsight1_NativeBridge_getCorrectedTrajectory(
     return static_cast<jint>(n);
 }
 
+// 2026-05-26 — locomotion-agnostic reported speed (m/s) for ALL motion types
+// (walking, scooter, bike). Depth-weighted metric speed from Tracker::getFusedSpeedMps
+// (recoverPose translation scaled by the tracked points' MiDaS depths) — NOT the
+// pedestrian step model, independent of the EKF v_G_. -1.0 before the first estimate.
+// Same shared_ptr pattern as getLoopCorrectionVersion so the engine stays alive if
+// stopVIO races mid-call.
+JNIEXPORT jfloat JNICALL
+Java_com_example_navsight1_NativeBridge_getFusedSpeedMps(
+        JNIEnv*, jobject /* thiz */) {
+    std::shared_ptr<VioEngine> vision;
+    {
+        std::lock_guard<std::mutex> lock(state_mutex);
+        vision = g_vision;
+    }
+    if (!vision) return -1.0f;
+    const Tracker* tracker = vision->getTracker();
+    return tracker ? static_cast<jfloat>(tracker->getFusedSpeedMps()) : -1.0f;
+}
+
 // ── Camera overlay Phase 2 / 3 (camera_overlay_phase23_plan.md) ──────────────
 //
 // Four read-only accessors for the live camera overlay. None of them mutate

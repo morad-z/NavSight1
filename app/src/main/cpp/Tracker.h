@@ -81,6 +81,7 @@ public:
                               TrackerFrame& frame_out);
 
     void setIntrinsics(double fx, double fy, double cx, double cy);
+    void setCameraHeight(double height_m) { camera_height_m_ = height_m; }
 
     // Step 1 (Visual Production Plan) — push 8-coefficient rational
     // distortion into the owned LensCorrector. Caller is responsible for
@@ -185,6 +186,13 @@ public:
         return loop_correction_version_.load(std::memory_order_relaxed);
     }
     int getCorrectedTrajectory(float* out_xz, int max_pairs) const;
+    // 2026-05-26 — locomotion-agnostic reported speed. Returns the smoothed
+    // depth-weighted metric speed (m/s) computed by updateDepthFlowSpeed from the
+    // tracked feature points' MiDaS depths + the recoverPose translation — NO
+    // stride model, independent of the (diverging) EKF v_G_. Works for walking,
+    // scooter, bike, etc. Returns -1.0 before the first valid estimate (caller
+    // shows 0/"--").
+    double getFusedSpeedMps() const;
     bool isInitialized() const { return initialized_; }
     const EKFState* getEKF() const { return &ekf_; }
     // Step 2.4: variance of the last keyframe-derived visual yaw measurement
@@ -483,6 +491,70 @@ private:
     // Step speed interpolation: maintain last known speed for short gaps
     double last_step_speed_{0.0};
     int64_t last_step_speed_ns_{0};
+
+    // 2026-05-26 — depth-weighted metric speed (Tracker::updateDepthFlowSpeed):
+    // the metric scale of the recoverPose translation, recovered from the tracked
+    // feature points' MiDaS depths → reported speed |v|/dt, EMA-smoothed (τ≈0.5s).
+    // Atomic: written on the camera thread, read by getFusedSpeedMps on the UI
+    // thread. -1.0 = no estimate yet. Independent of the (diverging) EKF v_G_ and
+    // of the global appliedScale.
+    std::atomic<double> depth_flow_speed_mps_{-1.0};
+
+    // 2026-05-27 — expansion-rate metric speed (Tracker::updateExpansionSpeed):
+    // implements "Vz = expansion_rate * Z_rel * K" robustly via Median + WLS.
+    // Atomic: written camera-thread, read by getFusedSpeedMps (UI).
+    std::atomic<double> expansion_speed_mps_{-1.0};
+
+    // Camera-thread helper computing depth_flow_speed_mps_ from the matched KLT
+    // pairs + MiDaS depth + recoverPose (R_vo, t_vo). Called from processFrame.
+    void updateDepthFlowSpeed(const std::vector<cv::Point2f>& prev_ud,
+                              const std::vector<cv::Point2f>& next_ud,
+                              const cv::Mat& R_vo, const cv::Mat& t_vo,
+                              double dt_s);
+
+    // 2026-05-27 expansion-rate (looming / flow-divergence) variant: per-point
+    // Vz = (radial flow / radius / dt) · Z_rel · K. Best-conditioned for forward
+    // motion (where the essential matrix degenerates). Requires the gyro rotation
+    // vector in CAMERA frame (omega_cam · dt) to de-rotate the flow (Heeger-Jepson
+    // 1992) — without it, head turns leak into false speed. The result is FUSED
+    // into depth_flow_speed_mps_ by the forward-motion fraction so the UI shows a
+    // smooth blend (looming-dominant when forward, recoverPose-dominant sideways).
+    void updateExpansionSpeed(const std::vector<cv::Point2f>& prev_ud,
+                              const std::vector<cv::Point2f>& next_ud,
+                              double dt_s,
+                              const cv::Vec3d& gyro_rot_cam);
+
+    // 2026-05-26 — MiDaS relative->metric scale K, calibrated from the accelerometer
+    // during the clean window right after a ZUPT stop. This BREAKS the circular
+    // dependency where MiDaS metric depth inherited the weak VIO scale (the affine
+    // fit calibrated to scale_fuser_). Published basis: VINS-Mono / VI-Depth (Wofk
+    // 2023) / DynaDepth. speed = K * median(flow x relative_depth). -1 until first
+    // calibration. Atomic: written camera-thread, read by getFusedSpeedMps (UI).
+    std::atomic<double> midas_scale_K_{-1.0};
+    // World-frame velocity from accel (g*dt + R_GtoI^T*deltaV, same increment as
+    // EKFState.cpp:295), integrated from a ZUPT stop and re-zeroed at the next stop.
+    // Trustworthy ONLY in the short post-stop window (drift grows after) -> used to
+    // calibrate midas_scale_K_ there. Camera-thread only (no atomic needed).
+    cv::Vec3d accel_vel_w_{0.0, 0.0, 0.0};
+    double secs_since_zupt_{-1.0};  // seconds since last ZUPT stop; -1 until first stop
+    // 2026-05-27 — low-pass of world linear acceleration = the slow gravity-leak +
+    // accel-bias residual that makes the raw integral ramp (12 m/s on a walk). We
+    // subtract it (high-pass) before integrating accel_vel_w_, killing the drift at
+    // its source. Updated every frame (converges to the residual incl. during stops).
+    cv::Vec3d accel_drift_lp_{0.0, 0.0, 0.0};
+    // Stub for the inline setCameraHeight setter at the top of the class (forward-cam
+    // ground-plane scale path, not currently used by speed estimator). Unused until wired.
+    double camera_height_m_{0.0};
+    // 2026-05-27 — post-ZUPT accumulated path lengths for ROBUST scale calibration:
+    // K = accel_dist / visual_rel_dist (ratio of ACCUMULATED distances since the stop).
+    // Far more stable than the per-frame ratio, which swung ~2.4x because MiDaS
+    // renormalises its relative scale every frame (research Rec 3). Reset at each stop.
+    double accel_dist_accum_{0.0};       // metres: integral |accel velocity| dt since stop
+    double visual_rel_dist_accum_{0.0};  // relative units: sum of per-frame relative displacement
+    // Raw MiDaS disparity (relative depth = 1/disparity; high=near) at an image
+    // pixel, BEFORE the metric affine fit. No midas_affine_valid_ gate, so it works
+    // even when the affine fit bails (too few 3D points). false if no depth map yet.
+    bool sampleMidasRawDisparity(float u, float v, double& disparity_out) const;
 
     cv::Ptr<cv::CLAHE> clahe_;
 

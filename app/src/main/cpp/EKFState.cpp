@@ -584,12 +584,33 @@ void EKFState::propagateIMU(const cv::Mat& deltaR, const cv::Mat& deltaV,
     v_G_ = v_new;
     p_G_ = p_new;
 
-    // Clamp velocity to physically reasonable bounds (pedestrian: max 5 m/s)
+    // ── Velocity sanity rail (locomotion-agnostic) ─────────────────────────────
+    // Cause:  the old rail clamped |v_G_| to 5 m/s (18 km/h) — a *pedestrian*
+    //         ceiling. It exists to catch preintegration runaway (50+ m/s), but at
+    //         5 m/s it also truncates every non-walking use case: a scooter/e-bike
+    //         cruising at 20-45 km/h pins against it on essentially every step
+    //         (v29 walk logged 467 clamp events / 622 ticks). With the reported
+    //         speed now sourced from |v_G_| (see Tracker::getFusedSpeedMps), this
+    //         clamp would cap the displayed speed at 18 km/h regardless of true
+    //         motion.
+    // Change: raise the rail to 15 m/s = 54 km/h. Derivation (not a magic number):
+    //         it must clear the fastest realistic personal-mobility speed —
+    //         e-bikes/e-scooters reach ~45 km/h = 12.5 m/s — with margin, while
+    //         still catching the 50+ m/s preintegration divergence the rail was
+    //         created for. This is a divergence guard, NOT a speed limit. Kept
+    //         (don't delete — skill gotcha) and keeps the velocity_clamped counter
+    //         so any runaway is still visible in event_summary.
+    // Falsifier: on any real ride below 54 km/h, velocity_clamped ≈ 0 and the
+    //         reported speed tracks GPS instead of pinning at 18 km/h. If
+    //         velocity_clamped climbs on a slow walk, preintegration is diverging
+    //         upstream — do NOT raise the rail further; find the divergence.
+    constexpr double kMaxPlausibleSpeedMps = 15.0;  // 54 km/h — see derivation above
     double v_norm = cv::norm(v_G_);
-    if (v_norm > 5.0) {
-        LOGW("propagateIMU: velocity clamped from %.2f m/s to 5.0 m/s (preintegration bug?)", v_norm);
+    if (v_norm > kMaxPlausibleSpeedMps) {
+        LOGW("propagateIMU: velocity clamped from %.2f m/s to %.1f m/s (preintegration divergence?)",
+             v_norm, kMaxPlausibleSpeedMps);
         navsight::eventCounters().velocity_clamped.fetch_add(1, std::memory_order_relaxed);
-        v_G_ *= 5.0 / v_norm;
+        v_G_ *= kMaxPlausibleSpeedMps / v_norm;
     }
 }
 

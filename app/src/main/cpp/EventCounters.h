@@ -487,6 +487,42 @@ struct EventCounters {
     // sliding top-right when phone is held still.
     std::atomic<long long> zrup_fired_total{0};
 
+    // 2026-05-26 — else-branch ZUPT (rotate-in-place / no-translation guard) fired.
+    // Replaces the old PDR step-speed translation proxy, which was pedestrian-only
+    // and zeroed v_G_ on every moving non-stepping frame (scooter/bike → reported
+    // speed could never build). New gate: gyro_norm > 0.8 rad/s AND |v_G_| < 0.5 m/s.
+    // Falsifier: ≈ 0 on a real moving ride (cruising); > 0 only on a deliberate
+    // stationary spin test. See Tracker.cpp else-branch ZUPT block.
+    std::atomic<long long> zupt_rotinplace_fired{0};
+
+    // 2026-05-26 — depth-weighted metric speed estimator (Tracker::updateDepthFlowSpeed).
+    //   depth_flow_updates          frames that produced a valid speed estimate
+    //   depth_flow_skipped_few_pts  frames skipped: < 6 points with valid MiDaS depth
+    //   depth_flow_outlier_rejected frames rejected: per-frame speed > 30 m/s
+    std::atomic<long long> depth_flow_updates{0};
+    std::atomic<long long> depth_flow_skipped_few_pts{0};
+    std::atomic<long long> depth_flow_outlier_rejected{0};
+    //   depth_flow_total_mm         Σ per-frame depth-flow displacement (mm) — compare
+    //                               to the real distance walked for a direct scale check
+    //                               (under-counts by the skipped frames above).
+    std::atomic<long long> depth_flow_total_mm{0};
+    //   depth_flow_calib_updates    accel-excitation windows (post-ZUPT) that calibrated
+    //                               the relative->metric scale K (>0 once it's working)
+    std::atomic<long long> depth_flow_calib_updates{0};
+    // 2026-05-27 — calibrated MiDaS relative->metric scale K (x1000): last value +
+    // min/max over the recording, so K STABILITY is visible in event_summary
+    // (logcat rolls off before it can be pulled). A small max/min spread = stable K.
+    std::atomic<long long> midas_scale_k_milli{0};
+    std::atomic<long long> midas_scale_k_min_milli{0};
+    std::atomic<long long> midas_scale_k_max_milli{0};
+    // 2026-05-28 — Looming / flow-divergence speed estimator (updateExpansionSpeed).
+    //   depth_flow_looming_updates   frames the looming Vz estimate fired (≥10 inliers)
+    //   depth_flow_looming_used      frames the FUSED speed was looming-dominant (w_loom>0.5)
+    //   depth_flow_looming_skipped   frames skipped: <10 valid points after de-rotation
+    std::atomic<long long> depth_flow_looming_updates{0};
+    std::atomic<long long> depth_flow_looming_used{0};
+    std::atomic<long long> depth_flow_looming_skipped{0};
+
     // 2026-05-16 — Tracker.cpp:1039 EKF→IMU gyro-bias feedback loop fix.
     // Incremented each time the corrective additive loop fires: EKF's b_g_
     // residual is absorbed into IMU's gyro_bias_, then EKF's b_g_ is reset
@@ -968,6 +1004,18 @@ struct EventCounters {
         rolling_shutter_skew_ns.store(0, std::memory_order_relaxed);
         ekf_init_deferred_madgwick_not_ready.store(0, std::memory_order_relaxed);
         zrup_fired_total.store(0, std::memory_order_relaxed);
+        zupt_rotinplace_fired.store(0, std::memory_order_relaxed);
+        depth_flow_updates.store(0, std::memory_order_relaxed);
+        depth_flow_skipped_few_pts.store(0, std::memory_order_relaxed);
+        depth_flow_outlier_rejected.store(0, std::memory_order_relaxed);
+        depth_flow_total_mm.store(0, std::memory_order_relaxed);
+        depth_flow_calib_updates.store(0, std::memory_order_relaxed);
+        midas_scale_k_milli.store(0, std::memory_order_relaxed);
+        midas_scale_k_min_milli.store(0, std::memory_order_relaxed);
+        midas_scale_k_max_milli.store(0, std::memory_order_relaxed);
+        depth_flow_looming_updates.store(0, std::memory_order_relaxed);
+        depth_flow_looming_used.store(0, std::memory_order_relaxed);
+        depth_flow_looming_skipped.store(0, std::memory_order_relaxed);
         ekf_bg_absorbed_total.store(0, std::memory_order_relaxed);
         gyro_bias_pushed_total.store(0, std::memory_order_relaxed);
         visual_yaw_gated_pure_rotation_total.store(0, std::memory_order_relaxed);
@@ -1146,6 +1194,18 @@ struct EventCounters {
         const long long v_rolling_shutter_skew_ns = rolling_shutter_skew_ns.load(std::memory_order_relaxed);
         const long long v_ekf_init_deferred_madgwick_not_ready = ekf_init_deferred_madgwick_not_ready.load(std::memory_order_relaxed);
         const long long v_zrup_fired_total = zrup_fired_total.load(std::memory_order_relaxed);
+        const long long v_zupt_rotinplace_fired = zupt_rotinplace_fired.load(std::memory_order_relaxed);
+        const long long v_depth_flow_updates = depth_flow_updates.load(std::memory_order_relaxed);
+        const long long v_depth_flow_skipped_few_pts = depth_flow_skipped_few_pts.load(std::memory_order_relaxed);
+        const long long v_depth_flow_outlier_rejected = depth_flow_outlier_rejected.load(std::memory_order_relaxed);
+        const long long v_depth_flow_total_mm = depth_flow_total_mm.load(std::memory_order_relaxed);
+        const long long v_depth_flow_calib_updates = depth_flow_calib_updates.load(std::memory_order_relaxed);
+        const long long v_midas_scale_k_milli = midas_scale_k_milli.load(std::memory_order_relaxed);
+        const long long v_midas_scale_k_min_milli = midas_scale_k_min_milli.load(std::memory_order_relaxed);
+        const long long v_midas_scale_k_max_milli = midas_scale_k_max_milli.load(std::memory_order_relaxed);
+        const long long v_depth_flow_looming_updates = depth_flow_looming_updates.load(std::memory_order_relaxed);
+        const long long v_depth_flow_looming_used = depth_flow_looming_used.load(std::memory_order_relaxed);
+        const long long v_depth_flow_looming_skipped = depth_flow_looming_skipped.load(std::memory_order_relaxed);
         const long long v_ekf_bg_absorbed_total = ekf_bg_absorbed_total.load(std::memory_order_relaxed);
         const long long v_gyro_bias_pushed_total = gyro_bias_pushed_total.load(std::memory_order_relaxed);
         const long long v_visual_yaw_gated_pure_rotation_total = visual_yaw_gated_pure_rotation_total.load(std::memory_order_relaxed);
@@ -1308,6 +1368,18 @@ struct EventCounters {
         appendKv(out, "rolling_shutter_skew_ns",        v_rolling_shutter_skew_ns);        out += ',';
         appendKv(out, "ekf_init_deferred_madgwick_not_ready", v_ekf_init_deferred_madgwick_not_ready); out += ',';
         appendKv(out, "zrup_fired_total", v_zrup_fired_total); out += ',';
+        appendKv(out, "zupt_rotinplace_fired", v_zupt_rotinplace_fired); out += ',';
+        appendKv(out, "depth_flow_updates", v_depth_flow_updates); out += ',';
+        appendKv(out, "depth_flow_skipped_few_pts", v_depth_flow_skipped_few_pts); out += ',';
+        appendKv(out, "depth_flow_outlier_rejected", v_depth_flow_outlier_rejected); out += ',';
+        appendKv(out, "depth_flow_total_mm", v_depth_flow_total_mm); out += ',';
+        appendKv(out, "depth_flow_calib_updates", v_depth_flow_calib_updates); out += ',';
+        appendKv(out, "midas_scale_k_milli", v_midas_scale_k_milli); out += ',';
+        appendKv(out, "midas_scale_k_min_milli", v_midas_scale_k_min_milli); out += ',';
+        appendKv(out, "midas_scale_k_max_milli", v_midas_scale_k_max_milli); out += ',';
+        appendKv(out, "depth_flow_looming_updates", v_depth_flow_looming_updates); out += ',';
+        appendKv(out, "depth_flow_looming_used", v_depth_flow_looming_used); out += ',';
+        appendKv(out, "depth_flow_looming_skipped", v_depth_flow_looming_skipped); out += ',';
         appendKv(out, "ekf_bg_absorbed_total", v_ekf_bg_absorbed_total); out += ',';
         appendKv(out, "gyro_bias_pushed_total", v_gyro_bias_pushed_total); out += ',';
         appendKv(out, "visual_yaw_gated_pure_rotation_total", v_visual_yaw_gated_pure_rotation_total); out += ',';

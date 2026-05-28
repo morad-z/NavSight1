@@ -219,6 +219,10 @@ class NavSightViewModel(application: Application) : AndroidViewModel(application
     val vioInitAzimuth: Float get() = sensorRepository.vioInitAzimuth
 
     private var lastVioForSpeed: VioData? = null
+    // 2026-05-26 — EMA state for the locomotion-agnostic fused-speed display. Smooths
+    // NativeBridge.getFusedSpeedMps() (|v_G_|) into a stable speedometer reading. See
+    // the speed block in the VIO update loop; reset in resetPath()/resetAll().
+    private var speedEmaMps = 0f
     private var lastVioForDist: VioData? = null
     private var lastSpeedTimeMs = 0L
     private var lastSnapTimeMs = 0L
@@ -394,6 +398,34 @@ class NavSightViewModel(application: Application) : AndroidViewModel(application
             }
             lastVioForDist = vio
 
+            // 2026-05-26 — locomotion-agnostic speed. Report the smoothed
+            // depth-weighted metric speed (getFusedSpeedMps: recoverPose translation
+            // scaled by tracked-point MiDaS depths) for ALL motion types instead of
+            // differencing a stride-scaled position. Returns -1.0 before the first
+            // estimate; until then show 0.
+            if (NativeBridge.isLoaded()) {
+                val fusedMps = NativeBridge.getFusedSpeedMps()
+                if (fusedMps >= 0f) {
+                    // EMA low-pass for a stable speedometer. τ ≈ 0.7 s; at the UI
+                    // tick cadence α = dt/(τ+dt). Cited, not magic: 0.7 s trades a
+                    // little display lag for jitter rejection on a moving vehicle
+                    // (Lever D may swap this for a median window later).
+                    val dtS = (nowMs - lastSpeedTimeMs).coerceAtLeast(1L).toDouble() / 1000.0
+                    val tauS = 0.7
+                    val alpha = (dtS / (tauS + dtS)).toFloat()
+                    speedEmaMps += alpha * (fusedMps - speedEmaMps)
+                    currentSpeedKmh = speedEmaMps * 3.6f
+                } else {
+                    speedEmaMps = 0f
+                    currentSpeedKmh = 0f
+                }
+                lastSpeedTimeMs = nowMs
+            }
+            /* SUPERSEDED 2026-05-26 — position-differencing speed. Computed
+               |Δpos|/Δt from vio.x/z (= global_t_), whose scale falls back to the
+               pedestrian stride model → wrong for non-walking motion, and was
+               capped by the old 5 m/s (18 km/h) velocity clamp. Replaced by the
+               fused |v_G_| getter above (locomotion-agnostic, no stride model).
             val prev = lastVioForSpeed
             if (prev != null) {
                 val dtMs = nowMs - lastSpeedTimeMs
@@ -409,6 +441,7 @@ class NavSightViewModel(application: Application) : AndroidViewModel(application
                 lastVioForSpeed = vio
                 lastSpeedTimeMs = nowMs
             }
+            */
 
             if (nowMs - lastSnapTimeMs > 500) {
                 lastSnapTimeMs = nowMs
@@ -564,6 +597,7 @@ class NavSightViewModel(application: Application) : AndroidViewModel(application
         currentSpeedKmh = 0f
         totalDistanceM = 0.0
         lastVioForSpeed = null
+        speedEmaMps = 0f
         lastVioForDist = null
     }
 
@@ -593,6 +627,7 @@ class NavSightViewModel(application: Application) : AndroidViewModel(application
         positionSigmaM = Float.NaN
         positionCovValid = false
         lastVioForSpeed = null
+        speedEmaMps = 0f
         lastVioForDist = null
         snappedPosition = null
         navigationStartMessage = null

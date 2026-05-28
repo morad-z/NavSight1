@@ -68,6 +68,13 @@ object NativeBridge {
     external fun getLoopCorrectionVersion(): Int
     external fun getCorrectedTrajectory(outXz: FloatArray): Int
 
+    // 2026-05-26 — locomotion-agnostic reported speed (m/s) for ALL motion types
+    // (walking, scooter, bike). Depth-weighted metric speed: the recoverPose
+    // translation scaled by the tracked feature points' MiDaS depths — NOT the
+    // pedestrian step model, independent of the EKF velocity. Returns -1.0 before
+    // the first estimate; the ViewModel then shows 0 and smooths the value.
+    external fun getFusedSpeedMps(): Float
+
     // Step 5: Calibration & Initialization
     // Returns 0=WAIT_STATIONARY, 1=WAIT_MOTION, 2=READY, 3=TIMEOUT_NEEDS_USER
     external fun getInitStatus(): Int

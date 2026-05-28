@@ -529,6 +529,44 @@ void Tracker::applyDepthScaleConstraint(
 
 // 2026-05-19 Fix #12 — Per-pixel MiDaS metric depth sampler.
 // See Tracker.h declaration for full cause/change/falsifier writeup.
+bool Tracker::sampleMidasRawDisparity(float u, float v, double& disparity_out) const {
+    // 2026-05-26 — raw MiDaS disparity (relative depth = 1/disparity; high=near),
+    // BEFORE the metric affine fit. Deliberately NO midas_affine_valid_ gate: this
+    // works even when the affine fit bailed (e.g. few_pts3d on the walk), as long as
+    // a depth map has arrived. The metric scale is supplied separately by the accel
+    // calibration in updateDepthFlowSpeed (breaking the circular VIO-scale dependency).
+    std::lock_guard<std::mutex> lock(depth_mutex_);
+    if (depth_map_.empty() || depth_width_ <= 1 || depth_height_ <= 1) {
+        return false;
+    }
+    // Image-pixel -> depth-grid coords (same mapping as sampleMidasMetricDepth).
+    const double img_w = (cx_ > 0.0) ? (2.0 * cx_) : 640.0;
+    const double img_h = (cy_ > 0.0) ? (2.0 * cy_) : 480.0;
+    const double fdx = static_cast<double>(u) / img_w * static_cast<double>(depth_width_);
+    const double fdy = static_cast<double>(v) / img_h * static_cast<double>(depth_height_);
+    if (!std::isfinite(fdx) || !std::isfinite(fdy)) return false;
+    if (fdx < 0.0 || fdx >= static_cast<double>(depth_width_ - 1) ||
+        fdy < 0.0 || fdy >= static_cast<double>(depth_height_ - 1)) {
+        return false;
+    }
+    const int x0 = static_cast<int>(std::floor(fdx));
+    const int y0 = static_cast<int>(std::floor(fdy));
+    const int x1 = x0 + 1;
+    const int y1 = y0 + 1;
+    const double ax = fdx - x0;
+    const double ay = fdy - y0;
+    const float d00 = depth_map_[y0 * depth_width_ + x0];
+    const float d10 = depth_map_[y0 * depth_width_ + x1];
+    const float d01 = depth_map_[y1 * depth_width_ + x0];
+    const float d11 = depth_map_[y1 * depth_width_ + x1];
+    const double disp =
+        (1.0 - ax) * (1.0 - ay) * d00 + ax * (1.0 - ay) * d10 +
+        (1.0 - ax) * ay * d01 + ax * ay * d11;
+    if (!std::isfinite(disp) || disp < 0.01) return false;  // <0.01 = far/unstable
+    disparity_out = disp;
+    return true;
+}
+
 bool Tracker::sampleMidasMetricDepth(float u, float v, double& depth_m_out) const {
     // 1. Read cached affine fit.
     double s_fit, t_fit;
@@ -689,6 +727,14 @@ void Tracker::reset() {
     frame_counter_ = 0;
     global_R_ = cv::Mat::eye(3, 3, CV_64F);
     global_t_ = cv::Mat::zeros(3, 1, CV_64F);
+    // 2026-05-26 — clear depth-flow speed on reset (no estimate until moving again).
+    depth_flow_speed_mps_.store(-1.0, std::memory_order_relaxed);
+    midas_scale_K_.store(-1.0, std::memory_order_relaxed);
+    accel_vel_w_ = cv::Vec3d(0.0, 0.0, 0.0);
+    secs_since_zupt_ = -1.0;
+    accel_dist_accum_ = 0.0;
+    visual_rel_dist_accum_ = 0.0;
+    accel_drift_lp_ = cv::Vec3d(0.0, 0.0, 0.0);
     accel_bias_ = cv::Mat::zeros(3, 1, CV_64F);
     accel_bias_count_ = 0;
     // Lowered from (0.20, 1.0) on 2026-05-04: every walk's vsc trace
@@ -890,6 +936,188 @@ int Tracker::getCorrectedTrajectory(float* out_xz, int max_pairs) const {
         out_xz[2 * i + 1] = corrected_traj_xz_[i].y;  // North -> VioData z
     }
     return n;
+}
+double Tracker::getFusedSpeedMps() const {
+    // 2026-05-26 — return the smoothed depth-weighted metric speed (see
+    // updateDepthFlowSpeed). Atomic single-reader load; -1.0 until first estimate.
+    return depth_flow_speed_mps_.load(std::memory_order_relaxed);
+}
+
+void Tracker::updateDepthFlowSpeed(const std::vector<cv::Point2f>& prev_ud,
+                                   const std::vector<cv::Point2f>& next_ud,
+                                   const cv::Mat& R_vo, const cv::Mat& t_vo,
+                                   double dt_s) {
+    // ── Depth-weighted metric speed from tracked feature points ─────────────────
+    // Cause: recoverPose gives camera rotation R_vo and a UNIT translation
+    //   direction t_vo — the metric magnitude is unobservable from a monocular
+    //   essential matrix alone (classic scale ambiguity). The displayed speed has
+    //   been wrong because it ultimately rode on a single weakly-observable global
+    //   scale (or the pedestrian stride model), and the EKF velocity v_G_ diverges.
+    // Change: recover the one missing scalar s (metric camera displacement this
+    //   frame, |T| = s) by requiring each tracked point — back-projected to its
+    //   MiDaS metric depth — to reproject onto where it is actually observed next
+    //   frame:
+    //       P_prev = Z · [ (u-cx)/fx, (v-cy)/fy, 1 ]   (Z = MiDaS depth, prev cam)
+    //       project( R_vo · P_prev + s · t_vo ) = observed next pixel
+    //   Each point gives a linear equation in s; take the ROBUST MEDIAN of the
+    //   per-point estimates (rejects KLT mismatches + bad-depth outliers). The
+    //   depth prior is what makes scale observable even at constant velocity
+    //   (where IMU/triangulation scale degenerates). Independent of v_G_ and of
+    //   the global appliedScale. speed = |s| / dt, EMA-smoothed.
+    //   Refs: Longuet-Higgins & Prazdny 1980 (motion field); depth-prior scale
+    //   recovery, VI-Depth (Wofk et al. ICRA 2023).
+    // Falsifier: on a ride, depth_flow_updates climbs while moving, the reported
+    //   speed tracks GPS and reads ~0 at true stops. If it reads 0 while clearly
+    //   moving, MiDaS depth is unavailable (depth_flow_skipped_few_pts climbs) —
+    //   look there, do NOT add a fudge factor.
+    if (dt_s <= 1e-4 || R_vo.empty() || t_vo.empty() ||
+        R_vo.rows != 3 || R_vo.cols != 3 || t_vo.rows != 3) {
+        return;
+    }
+    if (fx_ <= 0.0 || fy_ <= 0.0) return;
+    const double tx = t_vo.at<double>(0);
+    const double ty = t_vo.at<double>(1);
+    const double tz = t_vo.at<double>(2);
+
+    const size_t n = std::min(prev_ud.size(), next_ud.size());
+    std::vector<double> s_est, z_est, flow_est;   // parallel: per-point scale, MiDaS depth, pixel flow
+    s_est.reserve(n); z_est.reserve(n); flow_est.reserve(n);
+    int n_no_depth = 0;   // tracked points dropped because MiDaS depth was unavailable/implausible
+    constexpr double kMinCoef = 1e-3;   // ignore equations with ~no sensitivity to s
+    for (size_t i = 0; i < n; ++i) {
+        // 2026-05-26 — RELATIVE depth from raw MiDaS disparity (Z_rel = 1/disp), NOT
+        // the affine-fitted metric depth (which inherited the weak VIO scale and
+        // collapsed to ~0.5 m). The metric scale is applied later via the
+        // accel-calibrated K. Mask the sky strip (upper 18% of image — MiDaS is
+        // unstable there and corrupts the fit; research recommends masking far/sky).
+        const double img_h_mask = (cy_ > 0.0) ? (2.0 * cy_) : 480.0;
+        if (prev_ud[i].y < 0.18 * img_h_mask) { ++n_no_depth; continue; }
+        double disp_raw = 0.0;
+        if (!sampleMidasRawDisparity(prev_ud[i].x, prev_ud[i].y, disp_raw) ||
+            disp_raw < 0.02) {   // <0.02 disparity = far/unstable
+            ++n_no_depth;
+            continue;
+        }
+        const double Z = 1.0 / disp_raw;   // RELATIVE depth (arbitrary units)
+        // Back-project prev pixel using relative depth, rotate to cur frame.
+        const double xn = (prev_ud[i].x - cx_) / fx_;
+        const double yn = (prev_ud[i].y - cy_) / fy_;
+        cv::Mat Pp = (cv::Mat_<double>(3, 1) << Z * xn, Z * yn, Z);
+        cv::Mat A = R_vo * Pp;
+        const double Ax = A.at<double>(0), Ay = A.at<double>(1), Az = A.at<double>(2);
+        const double uo = next_ud[i].x, vo = next_ud[i].y;
+        // Two linear equations in s; use the better-conditioned one per point.
+        //   (uo-cx)*(Az + s*tz) = fx*(Ax + s*tx)  ⇒  s*coef_u = rhs_u
+        const double coef_u = (uo - cx_) * tz - fx_ * tx;
+        const double rhs_u  = fx_ * Ax - (uo - cx_) * Az;
+        const double coef_v = (vo - cy_) * tz - fy_ * ty;
+        const double rhs_v  = fy_ * Ay - (vo - cy_) * Az;
+        double s_i;
+        if (std::abs(coef_u) >= std::abs(coef_v)) {
+            if (std::abs(coef_u) < kMinCoef) continue;
+            s_i = rhs_u / coef_u;
+        } else {
+            if (std::abs(coef_v) < kMinCoef) continue;
+            s_i = rhs_v / coef_v;
+        }
+        if (!std::isfinite(s_i)) continue;
+        const double dfx = next_ud[i].x - prev_ud[i].x;
+        const double dfy = next_ud[i].y - prev_ud[i].y;
+        s_est.push_back(s_i);
+        z_est.push_back(Z);
+        flow_est.push_back(std::sqrt(dfx * dfx + dfy * dfy));
+    }
+
+    constexpr size_t kMinPts = 6;   // quorum for a trustworthy median
+    if (s_est.size() < kMinPts) {
+        navsight::eventCounters().depth_flow_skipped_few_pts.fetch_add(
+            1, std::memory_order_relaxed);
+        return;
+    }
+    std::sort(s_est.begin(), s_est.end());
+    const double s_med  = s_est[s_est.size() / 2];
+    const double disp_rel = std::abs(s_med);   // relative displacement this frame (proportional to metres / K)
+    const double speed_rel = disp_rel / dt_s;   // RELATIVE speed (arbitrary units, proportional to true speed)
+
+    // ── Calibrate the relative->metric scale K from the accelerometer ────────────
+    // K = true_metric_speed / speed_rel. The true speed comes from accel_vel_w_
+    // (integrated world accel) but ONLY in the clean window right after a ZUPT stop,
+    // where short-window accel integration is reliable (drift grows after ~2.5 s,
+    // proven offline). EMA-smoothed (K is a slowly-varying scale). This BREAKS the
+    // circular dependency that collapsed MiDaS metric depth — no VIO/affine scale is
+    // used. Basis: VINS-Mono / VI-Depth (Wofk 2023) velocity-alignment.
+    const double accel_speed = std::hypot(accel_vel_w_[0], accel_vel_w_[1]);  // horizontal m/s
+    visual_rel_dist_accum_ += disp_rel;   // accumulate relative path length since the stop
+    // Robust scale: K = accel_dist / visual_rel_dist — the ratio of ACCUMULATED path
+    // lengths since the ZUPT stop. Far steadier than the per-frame ratio (which swung
+    // 2.4x because MiDaS renormalises its relative scale every frame). Gated to the
+    // clean post-stop window (accel integration trustworthy < ~2.5 s) and once enough
+    // path has accrued (> 0.8 m of accel travel) to be well-conditioned.
+    if (secs_since_zupt_ >= 0.3 && secs_since_zupt_ <= 2.5 &&
+        accel_dist_accum_ > 0.8 && visual_rel_dist_accum_ > 1e-4) {
+        const double k_obs = accel_dist_accum_ / visual_rel_dist_accum_;
+        if (std::isfinite(k_obs) && k_obs > 0.0) {
+            const double cur_k = midas_scale_K_.load(std::memory_order_relaxed);
+            const double new_k = (cur_k <= 0.0) ? k_obs : (0.9 * cur_k + 0.1 * k_obs);
+            midas_scale_K_.store(new_k, std::memory_order_relaxed);
+            navsight::eventCounters().depth_flow_calib_updates.fetch_add(
+                1, std::memory_order_relaxed);
+            // Persist K (x1000) + running min/max so K stability shows in event_summary
+            // (logcat rolls off). Single-writer (camera thread) so relaxed RMW is safe.
+            const long long k_milli = static_cast<long long>(new_k * 1000.0 + 0.5);
+            navsight::eventCounters().midas_scale_k_milli.store(k_milli, std::memory_order_relaxed);
+            const long long kmax = navsight::eventCounters().midas_scale_k_max_milli.load(std::memory_order_relaxed);
+            if (k_milli > kmax) navsight::eventCounters().midas_scale_k_max_milli.store(k_milli, std::memory_order_relaxed);
+            const long long kmin = navsight::eventCounters().midas_scale_k_min_milli.load(std::memory_order_relaxed);
+            if (kmin == 0 || k_milli < kmin) navsight::eventCounters().midas_scale_k_min_milli.store(k_milli, std::memory_order_relaxed);
+        }
+    }
+
+    const double K = midas_scale_K_.load(std::memory_order_relaxed);
+    if (K <= 0.0) {
+        // No metric scale yet: need one accel-excitation window since a stop. Report
+        // nothing (UI shows 0) rather than an unscaled number.
+        if (frame_counter_ % 30 == 0) {
+            LOGI("DEPTH_FLOW_SPEED: K=uncalibrated speed_rel=%.4f/s accel_spd=%.2f "
+                 "tsz=%.2f n=%zu (awaiting accel-excitation window after a stop)",
+                 speed_rel, accel_speed, secs_since_zupt_, s_est.size());
+        }
+        return;
+    }
+    const double speed_metric = K * speed_rel;
+
+    // Trust-boundary sanity: reject a single absurd frame (> 30 m/s = 108 km/h).
+    constexpr double kMaxFrameSpeedMps = 30.0;
+    if (!std::isfinite(speed_metric) || speed_metric > kMaxFrameSpeedMps) {
+        navsight::eventCounters().depth_flow_outlier_rejected.fetch_add(
+            1, std::memory_order_relaxed);
+        return;
+    }
+
+    // EMA low-pass (tau ~ 0.5 s) on the reported metric speed; alpha = dt/(tau+dt).
+    constexpr double kTauS = 0.5;
+    const double alpha = dt_s / (kTauS + dt_s);
+    const double cur = depth_flow_speed_mps_.load(std::memory_order_relaxed);
+    const double next = (cur < 0.0) ? speed_metric : (cur + alpha * (speed_metric - cur));
+    depth_flow_speed_mps_.store(next, std::memory_order_relaxed);
+    navsight::eventCounters().depth_flow_updates.fetch_add(1, std::memory_order_relaxed);
+    navsight::eventCounters().depth_flow_total_mm.fetch_add(
+        static_cast<long long>(K * disp_rel * 1000.0 + 0.5), std::memory_order_relaxed);
+
+    // Diagnostic (2026-05-26): relative units + calibrated K + accel cross-check, so a
+    // walk/run shows whether K converged and the metric speed tracks reality.
+    if (frame_counter_ % 10 == 0) {
+        std::sort(z_est.begin(), z_est.end());
+        std::sort(flow_est.begin(), flow_est.end());
+        const size_t m = s_est.size();
+        LOGI("DEPTH_FLOW_SPEED: n=%zu no_depth=%d Zrel[min/med/max]=%.2f/%.2f/%.2f "
+             "flow[med/max]=%.1f/%.1f speed_rel=%.4f/s K=%.3f accel_spd=%.2f tsz=%.2f "
+             "-> ema=%.2f m/s (%.1f km/h)",
+             m, n_no_depth,
+             z_est.front(), z_est[z_est.size() / 2], z_est.back(),
+             flow_est[flow_est.size() / 2], flow_est.back(),
+             speed_rel, K, accel_speed, secs_since_zupt_, next, next * 3.6);
+    }
 }
 double Tracker::getLastVisualYawVariance() const {
     std::lock_guard<std::mutex> lock(pose_mutex_);
@@ -1992,6 +2220,49 @@ VisionOutput Tracker::processFrame(const uint8_t* yuv_data, int width, int heigh
     // during in-place rotation used to un-freeze translation and produce arcs.
     if (is_static && gyro_norm < 0.8 && imu.getStepInfo().speed_mps > 0.3) is_static = false;
 
+    // 2026-05-26 — accel world-velocity for MiDaS scale calibration (consumed in
+    // updateDepthFlowSpeed). Integrate the SAME per-frame world velocity increment
+    // the EKF uses (g*dt + R_GtoI^T*deltaV, EKFState.cpp:295) from a ZUPT stop, and
+    // re-zero it at the next stop. Trustworthy ONLY in the short post-stop window
+    // (raw accel integration drifts after ~2-3 s — proven offline); there it yields
+    // a clean metric speed that calibrates the relative->metric scale K.
+    if (ekf_.isFullInitialized() && !imu_delta.deltaV.empty() &&
+        imu_delta.dt > 0.0 && imu_delta.dt < 0.5) {
+        cv::Mat R_gi = ekf_.getRotation();   // R_GtoI (world->body)
+        if (!R_gi.empty() && R_gi.rows == 3 && R_gi.cols == 3) {
+            cv::Mat dvw = R_gi.t() * imu_delta.deltaV;   // body->world velocity increment (gravity in)
+            const double dt = imu_delta.dt;
+            // World LINEAR acceleration this frame (~0 when not truly accelerating).
+            const double ax = dvw.at<double>(0) / dt;
+            const double ay = dvw.at<double>(1) / dt;
+            const double az = dvw.at<double>(2) / dt - 9.81;   // remove gravity (Z-down ENU)
+            // Low-pass = the slow residual (gravity-leak + accel bias). tau=2.0 s is
+            // longer than a push-off accel (~0.5-1 s, kept as signal) yet short enough
+            // to track and cancel the slower leak drift (it ramped over 2-7 s in the
+            // data). Updated EVERY frame so it converges to the residual during the
+            // stationary period too.
+            constexpr double kAccelDriftTau = 2.0;
+            const double a_lp = dt / (kAccelDriftTau + dt);
+            accel_drift_lp_[0] += a_lp * (ax - accel_drift_lp_[0]);
+            accel_drift_lp_[1] += a_lp * (ay - accel_drift_lp_[1]);
+            accel_drift_lp_[2] += a_lp * (az - accel_drift_lp_[2]);
+            if (!is_static) {
+                // Integrate the HIGH-PASSED (drift-removed) linear accel.
+                accel_vel_w_[0] += (ax - accel_drift_lp_[0]) * dt;
+                accel_vel_w_[1] += (ay - accel_drift_lp_[1]) * dt;
+                accel_vel_w_[2] += (az - accel_drift_lp_[2]) * dt;
+                if (secs_since_zupt_ >= 0.0) secs_since_zupt_ += dt;
+                accel_dist_accum_ += std::hypot(accel_vel_w_[0], accel_vel_w_[1]) * dt;
+            }
+        }
+    }
+    if (is_static) {
+        accel_vel_w_ = cv::Vec3d(0.0, 0.0, 0.0);
+        secs_since_zupt_ = 0.0;
+        accel_dist_accum_ = 0.0;
+        visual_rel_dist_accum_ = 0.0;
+    }
+
     // 2026-05-18 falsifier: log EKF.b_g_ tagged with is_static so we can see
     // whether walking-phase b_g drifts differently from stationary. v42 walk
     // showed Madgwick yaw drift -0.31°/s during motion (zero stationary).
@@ -2091,6 +2362,9 @@ VisionOutput Tracker::processFrame(const uint8_t* yuv_data, int width, int heigh
     } else {
         consecutive_static_frames_ = 0;
         // 2026-05-09 v16 — "no translation" detector based on PDR step speed.
+        // [SUPERSEDED 2026-05-26: the PDR step-speed proxy was replaced by a
+        //  locomotion-agnostic gyro+velocity gate — see the code block below. The
+        //  rationale here is retained as history for WHY the step proxy was tried.]
         //
         // The previous v13 path gated on `is_pure_rotation` (Rayleigh test
         // on optical flow direction) but that flag stayed FALSE across the
@@ -2116,12 +2390,57 @@ VisionOutput Tracker::processFrame(const uint8_t* yuv_data, int width, int heigh
         // the LP-filtered gravity lags too much to support a bias update.
         // The rotation rate constraint is implicit (gyro feeds R_GtoI via
         // propagateIMU; bounded by LC_GA gravity-alignment).
+        // ── 2026-05-26: locomotion-agnostic rotate-in-place / no-translation guard ──
+        // Cause:  the old gate fired updateZUPT() (which zeros v_G_) whenever the
+        //         PDR step-speed < 0.1 m/s while the camera saw motion. That uses
+        //         walking strides as the "am I translating?" proxy — pedestrian-
+        //         only. A scooter/bike produces NO strides, so step_speed ≈ 0 on
+        //         every cruising frame → this zeroed the fused velocity v_G_ every
+        //         frame → the reported speed (now |v_G_|, see getFusedSpeedMps)
+        //         could never build up for any non-walking motion. This IS the
+        //         "speed calculated from steps is wrong" the user reported.
+        // Change: drop the step proxy. The only failure this branch must still
+        //         guard is the documented "user spins the phone in place → phantom
+        //         translation arc" case (is_static misses it because rotational
+        //         optical flow > 2.5 px forces is_static = false above). That case
+        //         is, by definition, high rotation with no real body velocity. So
+        //         fire ZUPT only when BOTH hold: gyro_norm > 0.8 rad/s (the
+        //         project's established "rotating fast" threshold —
+        //         IMUPreintegrator.cpp:449, Tracker.cpp:1993) AND |v_G_| < 0.5 m/s
+        //         (below the pedestrian gait floor ~1.4 m/s — the filter is not
+        //         meaningfully translating). Never fires for a cruising scooter
+        //         (low gyro, sustained v_G_), nor mid-turn (high gyro BUT high
+        //         v_G_), nor a straight walk (low gyro). Still fires for
+        //         spin-in-hand-while-stopped.
+        // Falsifier: zupt_rotinplace_fired ≈ 0 on a real moving ride; > 0 only on a
+        //         deliberate stationary spin test. If v_G_ collapses to 0 while
+        //         clearly moving, this gate (or the is_static path) is mis-firing —
+        //         read the counter + the ZUPT_ROTINPLACE log line before tuning.
+        constexpr double kRotInPlaceGyroRad = 0.8;   // rad/s — IMUPreintegrator.cpp:449
+        constexpr double kRotInPlaceVelMps  = 0.5;   // m/s — below gait floor (~1.4 m/s)
+        if (ekf_.isFullInitialized()) {
+            double v_g_norm_else = 0.0;
+            cv::Mat v_g_else = ekf_.getVelocity();
+            if (!v_g_else.empty()) v_g_norm_else = cv::norm(v_g_else);
+            if (gyro_norm > kRotInPlaceGyroRad && v_g_norm_else < kRotInPlaceVelMps) {
+                ekf_.updateZUPT();
+                navsight::eventCounters().zupt_rotinplace_fired.fetch_add(
+                    1, std::memory_order_relaxed);
+                LOGI("ZUPT_ROTINPLACE: fired gyro_norm=%.3f rad/s |v_G|=%.3f m/s "
+                     "(rotate-in-place guard; locomotion-agnostic)",
+                     gyro_norm, v_g_norm_else);
+            }
+        }
+        /* SUPERSEDED 2026-05-26 (pedestrian step-speed translation proxy — see the
+           Cause block above; this zeroed v_G_ on every non-stepping moving frame,
+           which broke scooter/bike speed):
         const double step_speed_mps = imu.getStepInfo().speed_mps;
         constexpr double kNoTranslationStepGate = 0.1;  // m/s — well below walking-gait floor
         if (ekf_.isFullInitialized() &&
             step_speed_mps < kNoTranslationStepGate) {
             ekf_.updateZUPT();
         }
+        */
     }
 
     // ── 8. Lens undistortion + Essential matrix + pose ───────────────────────
@@ -2176,6 +2495,35 @@ VisionOutput Tracker::processFrame(const uint8_t* yuv_data, int width, int heigh
         std::vector<uchar> status_verification(prev_ud.size(), 1);
         bool verification_ok = klt_.geometricVerification(prev_ud, next_ud, status_verification,
                                                           K, R_vo, t_vo, inlier_count_out);
+
+        // 2026-05-26 — depth-weighted metric speed (see updateDepthFlowSpeed):
+        // recover the metric scale of the recoverPose translation from the tracked
+        // points' MiDaS depths. Gated on a verified pose so R_vo/t_vo are meaningful.
+        if (verification_ok && inlier_count_out >= static_cast<int>(MIN_INLIERS) &&
+            !R_vo.empty() && !t_vo.empty()) {
+            const double dt_s = (timestamp_ns - current_prev_ts) * 1e-9;
+            // 2026-05-28 — camera-frame gyro rotation vector (omega · dt) for
+            // de-rotating the optical flow before computing looming/divergence.
+            // Without it, head turns produce false forward-speed signals (research
+            // Rec 3: rotational flow corrupts divergence at ~3r/f · |Δω|). Derived
+            // from imu_delta.deltaR (body rotation increment over the frame) via
+            // Rodrigues, then mapped to camera frame with the body→camera extrinsic.
+            cv::Vec3d gyro_rot_cam(0.0, 0.0, 0.0);
+            if (!imu_delta.deltaR.empty() && imu_delta.deltaR.rows == 3 &&
+                imu_delta.deltaR.cols == 3) {
+                cv::Mat rv_body_mat;
+                cv::Rodrigues(imu_delta.deltaR, rv_body_mat);
+                if (rv_body_mat.rows == 3 && rv_body_mat.cols == 1) {
+                    const cv::Matx33d R_bc_ext = ekf_.getExtrinsicsRotation();
+                    const cv::Vec3d rv_body(rv_body_mat.at<double>(0),
+                                            rv_body_mat.at<double>(1),
+                                            rv_body_mat.at<double>(2));
+                    gyro_rot_cam = R_bc_ext * rv_body;
+                }
+            }
+            updateDepthFlowSpeed(prev_ud, next_ud, R_vo, t_vo, dt_s);
+            updateExpansionSpeed(prev_ud, next_ud, dt_s, gyro_rot_cam);
+        }
         // 2026-05-18 falsifier: log inner outcomes when outer gate passed
         if (frame_counter_ % 30 == 0) {
             const double r = tracked > 0 ? (double)inlier_count_out / tracked : 0.0;
@@ -2902,6 +3250,17 @@ VisionOutput Tracker::processFrame(const uint8_t* yuv_data, int width, int heigh
                  quality, (quality >= 0.15) ? 1 : 0, gyro_norm);
         }
         if (is_static || rotation_dominated) {
+            // 2026-05-26 — stopped / rotating-in-place ⇒ no translation ⇒ decay the
+            // reported depth-flow speed toward 0 (EMA τ≈0.5s) so a true stop reads ~0.
+            {
+                const double dt_dec = (timestamp_ns - current_prev_ts) * 1e-9;
+                const double cur_sp = depth_flow_speed_mps_.load(std::memory_order_relaxed);
+                if (cur_sp > 0.0 && dt_dec > 0.0 && dt_dec < 1.0) {
+                    const double a_dec = dt_dec / (0.5 + dt_dec);
+                    depth_flow_speed_mps_.store(cur_sp * (1.0 - a_dec),
+                                                std::memory_order_relaxed);
+                }
+            }
             // Translation frozen — no global_t_ update.
             if (rotation_dominated && !is_static) {
                 navsight::eventCounters().global_t_gated_rotation_dominated_total
@@ -3570,28 +3929,75 @@ VisionOutput Tracker::processFrame(const uint8_t* yuv_data, int width, int heigh
                 cv::Mat p_world =
                     0.5 * ((p_anchor + dAw_n * tA) + (p_far + dBw_n * tB));
 
-                // Reprojection RMSE gate over ALL surviving observations.
-                double rms2 = 0.0;
-                int    n_used = 0;
-                for (const auto& o : *obs) {
-                    cv::Mat R, p;
-                    if (!ekf_.getClonePose(o.clone_state_id, R, p)) continue;
-                    cv::Mat p_C = R * (p_world - p);
-                    const double zC = p_C.at<double>(2, 0);
-                    if (zC < 0.05) { rms2 = 1e9; break; }
-                    const double u = p_C.at<double>(0, 0) / zC;
-                    const double v = p_C.at<double>(1, 0) / zC;
-                    const double du = (u - o.pixel_ud.x) * fx_use;
-                    const double dv = (v - o.pixel_ud.y) * fy_use;
-                    rms2 += du * du + dv * dv;
-                    n_used++;
-                }
+                // Reprojection RMSE over ALL surviving observations. Lambda so we
+                // can RE-SCORE after a MiDaS depth re-seed (Hidden Bug #3). Returns
+                // the 1e9 behind-camera sentinel directly so the stats below can
+                // exclude it (the prior inline path let sqrt(1e9/2)=22360px pollute
+                // the max/mean).
+                auto reprojRms = [&](const cv::Mat& pw, int& n_out) -> double {
+                    double s2 = 0.0; int n = 0;
+                    for (const auto& o : *obs) {
+                        cv::Mat R, p;
+                        if (!ekf_.getClonePose(o.clone_state_id, R, p)) continue;
+                        cv::Mat p_C = R * (pw - p);
+                        const double zC = p_C.at<double>(2, 0);
+                        if (zC < 0.05) { n_out = n; return 1e9; }
+                        const double u = p_C.at<double>(0, 0) / zC;
+                        const double v = p_C.at<double>(1, 0) / zC;
+                        const double du = (u - o.pixel_ud.x) * fx_use;
+                        const double dv = (v - o.pixel_ud.y) * fy_use;
+                        s2 += du * du + dv * dv;
+                        ++n;
+                    }
+                    n_out = n;
+                    return (n >= 1) ? std::sqrt(s2 / static_cast<double>(n)) : 1e9;
+                };
+
+                int n_used = 0;
+                double rms = reprojRms(p_world, n_used);
                 if (n_used < 2) {
                     navsight::eventCounters().slam_promo_rejected_n_used_total
                         .fetch_add(1, std::memory_order_relaxed);
                     continue;
                 }
-                const double rms = std::sqrt(rms2 / static_cast<double>(n_used));
+
+                // 2026-05-26 Hidden Bug #3 — MiDaS depth RESCUE before the RMS gate.
+                // Monocular triangulation is baseline-starved on indoor/axial walks;
+                // the existing MiDaS re-seed (below) ran only AFTER this gate, so a
+                // degenerate point was already rejected. When the two-view solve is
+                // degenerate (rms>1.5), re-seed p_world from baseline-independent
+                // MiDaS metric depth at the anchor pixel and RE-SCORE vs ALL clones.
+                // Promote only if it passes the SAME 1.5px gate (NO loosening — a
+                // wrong MiDaS depth still fails the re-score and is rejected, per the
+                // chi² lesson). Scope: this rescues RMS-rejected (has-baseline-but-
+                // degenerate) candidates; the dominant baseline-gate rejects (~0 cm
+                // translation, line 3469) are a separate riskier follow-up because
+                // reprojection can't validate depth at near-zero baseline.
+                bool midas_rescued = false;
+                if (rms > 1.5) {
+                    const float u_img = static_cast<float>(obs_anchor.x * fx_use + cx_use);
+                    const float v_img = static_cast<float>(obs_anchor.y * fy_use + cy_use);
+                    double z_midas = 0.0;
+                    if (sampleMidasMetricDepth(u_img, v_img, z_midas) &&
+                        std::isfinite(z_midas) && z_midas > 0.05) {
+                        cv::Mat p_cam_midas = (cv::Mat_<double>(3, 1) <<
+                            obs_anchor.x * z_midas, obs_anchor.y * z_midas, z_midas);
+                        cv::Mat p_world_midas = R_anchor.t() * p_cam_midas + p_anchor;
+                        int n_midas = 0;
+                        const double rms_midas = reprojRms(p_world_midas, n_midas);
+                        if (n_midas >= 2 && rms_midas <= 1.5) {
+                            LOGI("SLAM_PROMOTE_MIDAS_RESCUE: fid=%d z_midas=%.2fm "
+                                 "rms_tri=%.1fpx rms_midas=%.2fpx", fid, z_midas,
+                                 rms, rms_midas);
+                            p_world = p_world_midas;
+                            rms = rms_midas;
+                            midas_rescued = true;
+                            navsight::eventCounters().slam_promotions_seeded_with_midas
+                                .fetch_add(1, std::memory_order_relaxed);
+                        }
+                    }
+                }
+
                 if (rms > 1.5) {
                     auto& ecr = navsight::eventCounters();
                     ecr.slam_promo_rejected_rms_total
@@ -3600,16 +4006,18 @@ VisionOutput Tracker::processFrame(const uint8_t* yuv_data, int width, int heigh
                         static_cast<long long>(std::lround(rms * 1000.0));
                     ecr.slam_promo_rms_milli_p95
                         .store(rms_mi, std::memory_order_relaxed);  // legacy: latest sample
-                    // 2026-05-26 Hidden Bug #3 — real distribution: running sum
-                    // (-> mean) + atomic max, to tell "marginal" (mean ~2px) from
-                    // "clone poses inconsistent" (mean ~10px+) before touching the gate.
-                    ecr.slam_promo_rms_sum_milli
-                        .fetch_add(rms_mi, std::memory_order_relaxed);
-                    long long prev_max =
-                        ecr.slam_promo_rms_milli_max.load(std::memory_order_relaxed);
-                    while (rms_mi > prev_max &&
-                           !ecr.slam_promo_rms_milli_max.compare_exchange_weak(
-                               prev_max, rms_mi, std::memory_order_relaxed)) {}
+                    // 2026-05-26 Hidden Bug #3 — distribution sum (-> mean) + max,
+                    // EXCLUDING the 1e9 behind-camera sentinel so the stats reflect
+                    // REAL reprojection error (prior max=22360px was sqrt(1e9/2)).
+                    if (rms < 1e6) {
+                        ecr.slam_promo_rms_sum_milli
+                            .fetch_add(rms_mi, std::memory_order_relaxed);
+                        long long prev_max =
+                            ecr.slam_promo_rms_milli_max.load(std::memory_order_relaxed);
+                        while (rms_mi > prev_max &&
+                               !ecr.slam_promo_rms_milli_max.compare_exchange_weak(
+                                   prev_max, rms_mi, std::memory_order_relaxed)) {}
+                    }
                     continue;
                 }
 
@@ -3639,8 +4047,10 @@ VisionOutput Tracker::processFrame(const uint8_t* yuv_data, int width, int heigh
                 // disagreement is the "geometry suspect, prefer MiDaS"
                 // band). Picked conservatively to avoid replacing healthy
                 // triangulations.
+                // 2026-05-26 — run the MiDaS sanity-REPLACE only when we kept the
+                // triangulated point; if already MiDaS-rescued above, skip it.
                 constexpr double kMidasReplaceRatio = 2.0;
-                {
+                if (!midas_rescued) {
                     cv::Mat p_anchor_cam_mat = R_anchor * (p_world - p_anchor);
                     const double z_tri = p_anchor_cam_mat.at<double>(2, 0);
                     if (std::isfinite(z_tri) && z_tri > 0.05) {
@@ -7241,4 +7651,154 @@ void Tracker::shutdownLoopClosure() {
     // Reset the running flag so a subsequent loadLoopClosureVocabulary
     // can re-launch the worker (e.g. after an in-place reset()).
     loop_closure_thread_running_.store(false, std::memory_order_release);
+}
+
+void Tracker::updateExpansionSpeed(const std::vector<cv::Point2f>& prev_ud,
+                                  const std::vector<cv::Point2f>& next_ud,
+                                  double dt_s,
+                                  const cv::Vec3d& gyro_rot_cam) {
+    // ── Forward speed from optical-flow LOOMING (per-point Vz = (ṙ/r)·Z_rel·K) ─────
+    // Per the research (Koenderink-van Doorn 1987, Nelson-Aloimonos 1989,
+    // Longuet-Higgins-Prazdny 1980, Heeger-Jepson 1992): the radial component of the
+    // DE-ROTATED translational flow gives forward speed / depth directly. Robust for
+    // forward motion exactly where the essential matrix (recoverPose) degenerates.
+    // We DE-ROTATE the flow with the gyro (mandatory — head turns would otherwise
+    // look like forward speed), anchor the FOE to the EKF heading (well-conditioned
+    // even when free-FOE estimation breaks down for pure-forward motion), and FUSE
+    // into depth_flow_speed_mps_ by the forward-motion fraction so the UI sees a
+    // smooth blend (looming-dominant when forward, recoverPose-dominant sideways).
+    if (dt_s <= 1e-4 || fx_ <= 0.0 || fy_ <= 0.0) return;
+
+    // Bail if K hasn't been calibrated yet — without it the looming Vz is in
+    // arbitrary units; falling back to K=1 would lie to the UI.
+    const double K = midas_scale_K_.load(std::memory_order_relaxed);
+    if (K <= 0.0) return;
+
+    // 1. Focus of Expansion (FOE) from the EKF heading projected to image plane.
+    //    Forward motion is assumed along the world-frame heading direction (Z-up ENU).
+    const cv::Matx33d R_GtoI = ekf_.getRotation();
+    const cv::Matx33d R_bc   = ekf_.getExtrinsicsRotation();
+    const cv::Matx33d R_GtoC = R_bc * R_GtoI;
+    const cv::Vec3d fwd_w(std::sin(scalar_heading_), std::cos(scalar_heading_), 0.0);
+    const cv::Vec3d fwd_c = R_GtoC * fwd_w;
+    if (std::abs(fwd_c(2)) < 0.1) return;   // motion ⊥ to viewing axis — no expansion
+    const double u_foe = cx_ + fx_ * (fwd_c(0) / fwd_c(2));
+    const double v_foe = cy_ + fy_ * (fwd_c(1) / fwd_c(2));
+
+    const double wx = gyro_rot_cam[0];
+    const double wy = gyro_rot_cam[1];
+    const double wz = gyro_rot_cam[2];
+
+    // 2. Per-point expansion rate from de-rotated radial flow.
+    const size_t n = std::min(prev_ud.size(), next_ud.size());
+    std::vector<double> vz_estimates;
+    std::vector<double> rho_values;
+    vz_estimates.reserve(n);
+    rho_values.reserve(n);
+    int total_valid = 0;     // points that produced a depth + flow measurement
+    int positive    = 0;     // ... of which, how many were expanding outward (forward)
+    constexpr double kRhoMin  = 0.05;   // mask near-FOE noise blow-up (research)
+    constexpr double kRhoMax  = 0.80;   // mask peripheral lens distortion
+    constexpr double kDispMin = 0.02;   // far-point / sky cutoff (raw MiDaS disparity)
+    for (size_t i = 0; i < n; ++i) {
+        // Distance from FOE in normalized image coords (for radial / r_dot).
+        const double dx = (prev_ud[i].x - u_foe) / fx_;
+        const double dy = (prev_ud[i].y - v_foe) / fy_;
+        const double rho = std::sqrt(dx * dx + dy * dy);
+        if (rho < kRhoMin || rho > kRhoMax) continue;
+
+        // De-rotate the flow using gyro angular displacement in camera frame.
+        // Heeger-Jepson 1992 with focal length absorbed into normalized coords (f=1):
+        //   u_rot = x·y·wx − (1+x²)·wy + y·wz
+        //   v_rot = (1+y²)·wx − x·y·wy − x·wz
+        // x, y are normalized prev coords *from the principal point* (not the FOE —
+        // Heeger-Jepson is derived about the principal point).
+        const double xp = (prev_ud[i].x - cx_) / fx_;
+        const double yp = (prev_ud[i].y - cy_) / fy_;
+        const double u_rot = xp * yp * wx - (1.0 + xp * xp) * wy + yp * wz;
+        const double v_rot = (1.0 + yp * yp) * wx - xp * yp * wy - xp * wz;
+        const double du = (next_ud[i].x - prev_ud[i].x) / fx_ - u_rot;
+        const double dv = (next_ud[i].y - prev_ud[i].y) / fy_ - v_rot;
+
+        // Radial component of the (de-rotated) translational flow.
+        const double drho = (dx * du + dy * dv) / rho;
+        const double tau  = drho / (rho * dt_s);   // expansion rate, 1/s (= Vz/Z)
+
+        double disp_raw = 0.0;
+        if (!sampleMidasRawDisparity(prev_ud[i].x, prev_ud[i].y, disp_raw) ||
+            disp_raw < kDispMin) continue;
+        const double Z_rel = 1.0 / disp_raw;
+        ++total_valid;
+        if (tau > 0.0) ++positive;
+
+        const double vz_i = tau * Z_rel * K;
+        if (std::isfinite(vz_i) && vz_i > 0.0 && vz_i < 30.0) {
+            vz_estimates.push_back(vz_i);
+            rho_values.push_back(rho);
+        }
+    }
+
+    constexpr size_t kMinPts = 10;
+    if (vz_estimates.size() < kMinPts) {
+        navsight::eventCounters().depth_flow_looming_skipped.fetch_add(
+            1, std::memory_order_relaxed);
+        return;
+    }
+
+    // 3. Robust median + ρ²-weighted inlier mean (down-weights near-FOE points).
+    std::sort(vz_estimates.begin(), vz_estimates.end());
+    const double vz_med = vz_estimates[vz_estimates.size() / 2];
+    double sum_num = 0.0, sum_den = 0.0;
+    int n_inliers = 0;
+    const double tol = 0.3 * std::abs(vz_med) + 0.1;
+    for (size_t i = 0; i < vz_estimates.size(); ++i) {
+        if (std::abs(vz_estimates[i] - vz_med) < tol) {
+            const double w = rho_values[i] * rho_values[i];
+            sum_num += w * vz_estimates[i];
+            sum_den += w;
+            ++n_inliers;
+        }
+    }
+    const double vz_fused_raw = (sum_den > 0.0) ? (sum_num / sum_den) : vz_med;
+
+    // EMA on the LOOMING speed itself (kept as an independent diagnostic / output).
+    // 2026-05-28 — tau dropped 0.5 -> 0.2 s: the slow EMA was washing out brief
+    // running-speed bursts (vz_med spikes to ~3.5 m/s only reached ema ~0.6 m/s).
+    constexpr double kTauS = 0.2;
+    const double alpha = dt_s / (kTauS + dt_s);
+    const double cur_loom = expansion_speed_mps_.load(std::memory_order_relaxed);
+    const double next_loom = (cur_loom < 0.0) ? vz_fused_raw
+                                              : (cur_loom + alpha * (vz_fused_raw - cur_loom));
+    expansion_speed_mps_.store(next_loom, std::memory_order_relaxed);
+    navsight::eventCounters().depth_flow_looming_updates.fetch_add(
+        1, std::memory_order_relaxed);
+
+    // 4. FUSE into the displayed speed by forward-motion fraction. Looming is
+    //    best-conditioned for forward motion (its strength) and degenerate for pure
+    //    lateral motion; recoverPose is the opposite. Continuous blend so transitions
+    //    are smooth: w_loom = 0 at fwd_frac=0.5, 1 at fwd_frac=1.0.
+    // 2026-05-28 — when looming is DOMINANT (w_loom > 0.5) use the RAW vz_fused
+    //   (instant) instead of the EMA'd next_loom — the depth_flow EMA on the fused
+    //   result still smooths it, but we get a responsive looming-dominated reading
+    //   instead of one lagging behind the user's bursts.
+    const double forward_fraction = (total_valid > 0)
+        ? (static_cast<double>(positive) / total_valid) : 0.0;
+    const double w_loom = std::clamp((forward_fraction - 0.5) * 2.0, 0.0, 1.0);
+    const double cur_disp = depth_flow_speed_mps_.load(std::memory_order_relaxed);
+    if (cur_disp >= 0.0 && w_loom > 0.0) {
+        const double loom_for_fusion = (w_loom > 0.5) ? vz_fused_raw : next_loom;
+        const double fused = w_loom * loom_for_fusion + (1.0 - w_loom) * cur_disp;
+        depth_flow_speed_mps_.store(fused, std::memory_order_relaxed);
+        if (w_loom > 0.5) {
+            navsight::eventCounters().depth_flow_looming_used.fetch_add(
+                1, std::memory_order_relaxed);
+        }
+    }
+
+    if (frame_counter_ % 30 == 0) {
+        LOGI("EXPANSION_SPEED: n=%zu inliers=%d vz_med=%.2f vz_fused=%.2f ema=%.2f "
+             "fwd_frac=%.2f w_loom=%.2f K=%.3f -> %.1f km/h",
+             vz_estimates.size(), n_inliers, vz_med, vz_fused_raw, next_loom,
+             forward_fraction, w_loom, K, next_loom * 3.6);
+    }
 }
