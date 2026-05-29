@@ -37,6 +37,25 @@ static inline int64_t now_us() {
 // Shared by updateDepthFlowSpeed and updateExpansionSpeed (DRY — avoids split-brain K).
 static constexpr double kAccelKMinDistM = 1.0;
 
+// 2026-05-29 — KNOWN-DISTANCE WALK CALIBRATION (accel-K bias correction).
+// The raw accel integration under-reads true distance on a steady walk because
+// integrating acceleration loses the sustained cruise velocity (the well-known
+// pedestrian-INS limitation — see the offline analyze_accel_speed.py zupt-mode
+// result: it measured ~0.78 m/s on a walk that was faster). Measured on a tape
+// ~13 m walk (v6_a, 2026-05-29): VIO read 7.31 m → correction = 13 / 7.31 ≈ 1.78.
+// 2026-05-29 REVERTED to 1.0 (was 1.78). The 1.78 was applied to accel_dist
+// GLOBALLY in the integrator, so it inflated the RUN's K too (not just walks) —
+// the run read ~27 km/h vs a true ~20 max (user-flagged). The premise that runs
+// would use the unbiased vi_speed (Step B) and bypass this correction FAILED:
+// ScaleEstimatorVI produced garbage (s ~3x too small, relσ 0.35-1.38 mostly
+// rejected — only 1 [vi] calib vs 252 accel-K in v7), so EVERYTHING is on accel-K
+// and the walk-specific 1.78 wrongly scaled runs. The bias is gait-dependent (a
+// single factor cannot fix both walk and run), AND non-portable across phones
+// (user-flagged). So: NO global correction (1.0). The walk under-read returns,
+// to be fixed by a PER-DEVICE, WALK-ONLY runtime calibration (design in progress)
+// — NOT a hardcoded universal constant. Kept as a 1.0 hook for that wiring.
+static constexpr double kAccelKBiasCorrection = 1.0;
+
 // ── Phase 2 Step 4.2.1 (docs/study/phase2_productization_plan.md §4.2.1) ────
 //
 // VI-Depth Stage-1 affine fit between MiDaS disparity and an inverse-depth
@@ -745,7 +764,17 @@ void Tracker::reset() {
     // we measured to vary K by 40-70% between back-to-back recordings of the same
     // motion. Persisting it lets the EMA continue to refine across recordings.
     accel_vel_w_ = cv::Vec3d(0.0, 0.0, 0.0);
-    secs_since_zupt_ = -1.0;
+    // 2026-05-29 (cold-start fix) — open the accel-K calibration window at INIT (0.0),
+    // not -1.0 (closed-until-first-detected-stop). VIO starts after the init flow's
+    // mandatory stationary period (initStatus WAIT_STATIONARY), so the start IS a clean
+    // v=0 reference — treating it as a ZUPT lets K calibrate during the FIRST acceleration
+    // instead of waiting for the first mid-ride stop. Without this, a cold start (no
+    // persisted K) that doesn't stop early reads ~0 speed for the whole first segment
+    // (offline sim: that was the entire ~20% cold-start drift; with the window open at
+    // init it drops to the steady-state ~5%). accel_vel_w_ is zeroed just above, so the
+    // assumed-zero start velocity is correct for the stationary init. Persisted K already
+    // covers subsequent rides; this makes the FIRST-ever ride correct too.
+    secs_since_zupt_ = 0.0;
     accel_dist_accum_ = 0.0;
     visual_rel_dist_accum_ = 0.0;
     visual_rel_dist_loom_ = 0.0;   // 2026-05-29 — looming's separate accumulator
@@ -1135,19 +1164,65 @@ void Tracker::updateDepthFlowSpeed(const std::vector<cv::Point2f>& prev_ud,
     // circular dependency that collapsed MiDaS metric depth — no VIO/affine scale is
     // used. Basis: VINS-Mono / VI-Depth (Wofk 2023) velocity-alignment.
     const double accel_speed = std::hypot(accel_vel_w_[0], accel_vel_w_[1]);  // horizontal m/s
-    // ── DEPTH-FLOW K (midas_scale_K_) — calibrated from THIS path's own relative
-    //    measure (disp_rel = recoverPose translation scale) and consumed below as
-    //    K * speed_rel. Self-consistent (same disp_rel basis in numerator + K's
-    //    denominator) — this is the run-proven path (K=519 read the run correctly).
-    //    Looming keeps a SEPARATE K (expansion_scale_K_) from its own vz_rel basis,
-    //    so there is no cross-basis mismatch and no shared-accumulator double-count.
-    //    (2026-05-29: restored after a single-source experiment that mixed bases.)
-    visual_rel_dist_accum_ += disp_rel;
-    if (secs_since_zupt_ >= 0.3 && secs_since_zupt_ <= 2.5 &&
-        accel_dist_accum_ > kAccelKMinDistM && visual_rel_dist_accum_ > 1e-4) {
-        const double k_obs = accel_dist_accum_ / visual_rel_dist_accum_;
+    // ── Step B (vi_speed → K_df) DISABLED 2026-05-29 — ScaleEstimatorVI is not robust.
+    //    Proven OFFLINE (scripts/test_scale_estimator.py) AND by an independent numpy
+    //    replication (debug workflow): the per-pair Hesch-Martinelli solve suffers
+    //    ERRORS-IN-VARIABLES dilution — the scale column a_col = R*t_vis is built from
+    //    the NOISY recoverPose unit direction, so OLS attenuates s toward zero (1% dir
+    //    noise → s drops 2.5x; 5% → collapse). The frame fix (camera→body, kept above)
+    //    is necessary and correct but NOT sufficient: even with strong scooter-like
+    //    accel/brake excitation and long (sub-sampled) baselines, s/s_true stayed 0.01-0.09
+    //    across all noise levels. Total-Least-Squares over-corrected (s ~6e4). And relσ
+    //    CANNOT gate it out (a confidently-WRONG diluted s passes: relσ 0.07 with s 2.5x
+    //    off). So vi_speed is untrustworthy as a K anchor → do NOT feed it into K.
+    //    The robust scale source is accel-K below (a ratio of ACCUMULATED magnitudes, no
+    //    per-pair regression dilution); its residual gait/mode bias is handled by a
+    //    per-device, per-mode known-distance calibration (the real path forward).
+    //    The frame-fixed solver + OBS_C log are KEPT (diagnostic / future TLS-structured
+    //    estimator), they just no longer drive K. (void the unused freshness members.)
+    (void)vi_metric_speed_mps_; (void)vi_speed_ts_ns_; (void)cur_frame_ts_ns_;
+    const bool vi_calibrated = false;
+    /* LEGACY 2026-05-29 Step B vi->K_df (errors-in-variables diluted, see above):
+    const double vi_speed = vi_metric_speed_mps_.load(std::memory_order_relaxed);
+    const long long vi_ts = vi_speed_ts_ns_.load(std::memory_order_relaxed);
+    const double vi_age_s = (cur_frame_ts_ns_ > 0 && vi_ts > 0)
+        ? (cur_frame_ts_ns_ - vi_ts) * 1e-9 : 1e9;
+    if (vi_speed > 0.0 && vi_age_s >= 0.0 && vi_age_s < 1.5 && speed_rel > 1e-4) {
+        const double k_obs = vi_speed / speed_rel;
         if (std::isfinite(k_obs) && k_obs > 0.0) {
             const double cur_k = midas_scale_K_.load(std::memory_order_relaxed);
+            const double new_k = (cur_k <= 0.0) ? k_obs : (0.95 * cur_k + 0.05 * k_obs);
+            midas_scale_K_.store(new_k, std::memory_order_relaxed);
+            navsight::eventCounters().depth_flow_calib_updates.fetch_add(1, std::memory_order_relaxed);
+            vi_calibrated = true;
+        }
+    }
+    */
+
+    // ── DEPTH-FLOW K (midas_scale_K_) — accel-K fallback when VINS-Mono is stale
+    //    (slow walk / degenerate recoverPose). Calibrated from THIS path's own
+    //    relative measure (disp_rel = recoverPose translation scale) and consumed
+    //    below as K * speed_rel. Self-consistent (same disp_rel basis in numerator +
+    //    K's denominator) — the run-proven path. Looming keeps a SEPARATE K
+    //    (expansion_scale_K_) from its own vz_rel basis (no cross-basis / double-count).
+    //    Skipped when the VINS-Mono anchor already calibrated this frame (preferred).
+    visual_rel_dist_accum_ += disp_rel;
+    if (!vi_calibrated &&
+        secs_since_zupt_ >= 0.3 && secs_since_zupt_ <= 2.5 &&
+        accel_dist_accum_ > kAccelKMinDistM && visual_rel_dist_accum_ > 1e-4) {
+        const double k_obs = accel_dist_accum_ / visual_rel_dist_accum_;
+        // 2026-05-29 — BLOW-UP GUARD: when the visual relative distance goes near-zero
+        // (weak/degenerate flow) while accel_dist accrued, k_obs explodes (v7 looming
+        // hit 22534 vs normal ~1800 → K=10602 → 27 km/h spike). Reject k_obs that is a
+        // >3x outlier vs the current K (same pattern as Observer A's 2.5x reject). The
+        // first calibration (cur_k<=0) is unguarded — seeded by the median bootstrap.
+        const double cur_k = midas_scale_K_.load(std::memory_order_relaxed);
+        const bool k_outlier = (cur_k > 0.0) && (k_obs > 3.0 * cur_k || k_obs < cur_k / 3.0);
+        if (k_outlier && frame_counter_ % 30 == 0) {
+            LOGI("ACCEL_K_CALIB[df]: REJECT outlier k_obs=%.1f vs cur_K=%.1f (vis_rel=%.5f)",
+                 k_obs, cur_k, visual_rel_dist_accum_);
+        }
+        if (std::isfinite(k_obs) && k_obs > 0.0 && !k_outlier) {
             const double new_k = (cur_k <= 0.0) ? k_obs : (0.95 * cur_k + 0.05 * k_obs);
             midas_scale_K_.store(new_k, std::memory_order_relaxed);
             navsight::eventCounters().depth_flow_calib_updates.fetch_add(1, std::memory_order_relaxed);
@@ -1309,6 +1384,10 @@ VisionOutput Tracker::processFrame(const uint8_t* yuv_data, int width, int heigh
                                     TrackerFrame& frame_out) {
     VisionOutput out{};
     frame_out = {};
+
+    // 2026-05-29 (Step B) — current frame timestamp, for vi_speed freshness checks
+    // in updateDepthFlowSpeed (which doesn't receive timestamp_ns directly).
+    cur_frame_ts_ns_ = timestamp_ns;
 
     // Step 9 (ADR-014): set true when this frame commits a keyframe. Declared
     // at function scope so the assembly site at the end of processFrame can
@@ -2380,7 +2459,12 @@ VisionOutput Tracker::processFrame(const uint8_t* yuv_data, int width, int heigh
                 // calibration could mis-read. accel_vel_w_ keeps integrating (it is
                 // re-zeroed at the next stop) — only the DISTANCE accumulator is frozen.
                 if (secs_since_zupt_ >= 0.0 && secs_since_zupt_ <= 2.5) {
-                    accel_dist_accum_ += std::hypot(accel_vel_w_[0], accel_vel_w_[1]) * dt;
+                    // 2026-05-29 — apply the known-distance walk bias correction so
+                    // the accel-K reference matches tape-measured reality (see
+                    // kAccelKBiasCorrection derivation). Scooter/run use vi_speed and
+                    // are unaffected by this accel-K reference in practice.
+                    accel_dist_accum_ += std::hypot(accel_vel_w_[0], accel_vel_w_[1])
+                                         * dt * kAccelKBiasCorrection;
                 }
             }
         }
@@ -2391,6 +2475,35 @@ VisionOutput Tracker::processFrame(const uint8_t* yuv_data, int width, int heigh
         accel_dist_accum_ = 0.0;
         visual_rel_dist_accum_ = 0.0;
         visual_rel_dist_loom_ = 0.0;   // 2026-05-29 — looming's separate accumulator
+        // 2026-05-29 (Step B) — clear the VINS-Mono pair buffer at every stop so each
+        // contiguous MOVING segment solves on a single coherent v0. The buffer only
+        // appends moving pairs; carrying pre-stop pairs across a ZUPT would leave the
+        // gamma (velocity reconstruction) blind to the unbuffered decel→0→reaccel Δv,
+        // corrupting the solve exactly at stop-go (the scooter's dominant pattern).
+        scale_estimator_vi_.reset();
+        observer_c_pair_count_ = 0;
+    }
+
+    // 2026-05-29 (Fix A diagnosis) — consolidated accel-K calibration GATE STATE,
+    // throttled. Behavior-neutral (logging only). The per-path calib logs live
+    // INSIDE updateDepthFlowSpeed (essential-matrix verification_ok-gated) and
+    // updateExpansionSpeed, so on slow-walk frames where verification fails they
+    // never print — leaving us blind to whether the calib window even opens. This
+    // line prints EVERY frame so a single real-walk logcat pins which gate binds:
+    //   window_open = secs_since_zupt_ in [0.3, 2.5]  (only opens after a ZUPT / init reset)
+    //   accel_dist  > kAccelKMinDistM (1.0 m) within that window
+    //   K_df/K_loom = current calibrated scales (-1 = never calibrated)
+    // Read alongside WALK_BG (is_static rate) to see if ZUPT ever fires at stops.
+    if (frame_counter_ % 15 == 0 && ekf_.isFullInitialized()) {
+        const double accel_spd_w = std::hypot(accel_vel_w_[0], accel_vel_w_[1]);
+        const bool window_open = (secs_since_zupt_ >= 0.3 && secs_since_zupt_ <= 2.5);
+        LOGI("ACCEL_K_STATE: is_static=%d tsz=%.2f window_open=%d accel_dist=%.2fm "
+             "accel_spd=%.2f vis_rel_df=%.4f vis_rel_loom=%.4f K_df=%.1f K_loom=%.1f",
+             is_static ? 1 : 0, secs_since_zupt_, window_open ? 1 : 0,
+             accel_dist_accum_, accel_spd_w, visual_rel_dist_accum_,
+             visual_rel_dist_loom_,
+             midas_scale_K_.load(std::memory_order_relaxed),
+             expansion_scale_K_.load(std::memory_order_relaxed));
     }
 
     // 2026-05-18 falsifier: log EKF.b_g_ tagged with is_static so we can see
@@ -3190,13 +3303,37 @@ VisionOutput Tracker::processFrame(const uint8_t* yuv_data, int width, int heigh
                     // Fix B (2026-05-16): use EKF rotation directly (SSOT
                     // post-init). global_R_ was a per-frame mirror — same
                     // value but semantically EKF is authoritative.
-                    kp.R_w_b = ekf_.isFullInitialized()
+                    // 2026-05-29 (Step B) — FRAME FIX: ScaleEstimatorVI needs R_w_b =
+                    // body->world (it rotates body-frame t_vis/Δp/Δv into the WORLD
+                    // frame to match gravity_w_=(0,0,-9.81)). ekf_.getRotation() returns
+                    // R_GtoI = world->body, and global_R_ is also R_GtoI — so BOTH must
+                    // be TRANSPOSED. Passing the un-transposed (world->body) matrix put
+                    // the visual/Δp/Δv terms in the body frame while gravity stayed in
+                    // world → frame-mixed A·x=b → biased s. This pre-existing bug (plus
+                    // the 0.5s buffer) is why Observer C never produced a usable scale.
+                    kp.R_w_b = (ekf_.isFullInitialized()
                                     ? ekf_.getRotation()
-                                    : global_R_.clone();
+                                    : global_R_).t();
                     kp.dt = imu_delta.dt;
-                    kp.t_vis_body = cv::Vec3d(t_vo.at<double>(0),
-                                              t_vo.at<double>(1),
+                    // 2026-05-29 (Step B FRAME FIX #2) — t_vo from cv::recoverPose is in
+                    // the CAMERA frame (TrackKLT.cpp:118 R_cam,t_cam), unit-norm. The
+                    // solver rotates t_vis_body by R_w_b (body->world) to live in the
+                    // SAME world frame as delta_p_body (which IS body-frame). So t_vo
+                    // must first be rotated CAMERA->BODY by R_bc.t() (R_bc =
+                    // getExtrinsicsRotation = body->camera, per EKFState.h:259). Passing
+                    // the raw camera-frame t_vo as body-frame left the visual term
+                    // mis-rotated by the extrinsic (S21 R_bc ~ diag(1,-1,-1), a near-180
+                    // flip) -> visual and inertial displacements in different frames ->
+                    // s came out small/negative & rejected (v7: s=0.03, relsig 0.35).
+                    // PROVEN offline (scripts/test_scale_estimator.py): camera_bug ->
+                    // s rejected; camera_fixed (R_bc.t()*t_vo) -> s ratio 0.99. Root-cause
+                    // frame correction, NOT a tuned factor.
+                    {
+                        const cv::Matx33d R_bc = ekf_.getExtrinsicsRotation();  // body->camera
+                        const cv::Vec3d t_cam(t_vo.at<double>(0), t_vo.at<double>(1),
                                               t_vo.at<double>(2));
+                        kp.t_vis_body = R_bc.t() * t_cam;                       // camera->body
+                    }
                     kp.delta_p_body = cv::Vec3d(imu_delta.deltaP.at<double>(0),
                                                 imu_delta.deltaP.at<double>(1),
                                                 imu_delta.deltaP.at<double>(2));
@@ -3205,6 +3342,10 @@ VisionOutput Tracker::processFrame(const uint8_t* yuv_data, int width, int heigh
                                                 imu_delta.deltaV.at<double>(2));
                     scale_estimator_vi_.addKeyframePair(kp);
                     observer_c_pair_count_++;
+                    // 2026-05-29 (Step B) — running mean of pair dt, to convert the
+                    // solved per-pair metric displacement s into a metric SPEED
+                    // (vi_speed = s / mean_dt). EMA so it tracks the ~uniform frame dt.
+                    vi_pair_dt_mean_ += 0.05 * (kp.dt - vi_pair_dt_mean_);
 
                     // 2026-05-18 falsifier: observer C never fires in v40 walk
                     // (OBS_C log count = 0) despite outer gate looking permissive.
@@ -3221,23 +3362,45 @@ VisionOutput Tracker::processFrame(const uint8_t* yuv_data, int width, int heigh
                     if (observer_c_pair_count_ % OBSERVER_C_SOLVE_INTERVAL == 0
                         && scale_estimator_vi_.size() >= ScaleEstimatorVI::MIN_PAIRS) {
                         double s_obs = 0.0, var_obs = 0.0;
-                        if (scale_estimator_vi_.solve(s_obs, var_obs)
-                            && std::isfinite(s_obs) && std::isfinite(var_obs)
-                            && s_obs > 0.01 && s_obs < 10.0 && var_obs > 0.0) {
+                        const bool solved = scale_estimator_vi_.solve(s_obs, var_obs);
+                        const bool accept = solved && std::isfinite(s_obs) && std::isfinite(var_obs)
+                            && s_obs > 0.01 && s_obs < 10.0 && var_obs > 0.0;
+                        if (accept) {
                             // Inflate variance: per-frame unit-norm visual
                             // translations are noisy and Hesch/Martinelli
                             // assumes consistent scale across pairs. Floor
                             // keeps Observer C from dominating the fuser.
                             double r_var = std::max(var_obs, 0.04);
-                            if (scale_fuser_.update(s_obs, r_var)) {
-                                if (frame_counter_ % 30 == 0) {
-                                    LOGI("OBS_C: s=%.4f var=%.5f -> "
-                                         "fuser_s=%.4f fuser_P=%.5f",
-                                         s_obs, var_obs, scale_fuser_.scale(),
-                                         scale_fuser_.variance());
+                            scale_fuser_.update(s_obs, r_var);
+
+                            // 2026-05-29 (Step B) — publish the VINS-Mono metric SPEED.
+                            // s_obs = recovered metric magnitude of the per-pair visual
+                            // translation; with per-frame pairs that is displacement over
+                            // ~one frame, so speed = s_obs / mean_pair_dt. ACCEPT only a
+                            // CONFIDENT solve (low variance) as the metric anchor —
+                            // var_obs is the scale variance; require its 1σ < 25% of s so
+                            // an unobservable (constant-velocity / degenerate-recoverPose)
+                            // solve does not poison K. Consumed by updateDepthFlowSpeed.
+                            const double rel_sigma = std::sqrt(var_obs) / std::max(1e-6, s_obs);
+                            if (rel_sigma < 0.25 && vi_pair_dt_mean_ > 1e-3) {
+                                const double vi_speed = s_obs / vi_pair_dt_mean_;
+                                if (std::isfinite(vi_speed) && vi_speed > 0.0 && vi_speed < 30.0) {
+                                    vi_metric_speed_mps_.store(vi_speed, std::memory_order_relaxed);
+                                    vi_speed_ts_ns_.store(timestamp_ns, std::memory_order_relaxed);
                                 }
                             }
                         }
+                        // 2026-05-29 — UNGATED log (was %30-gated inside the accept
+                        // branch, so failures + most successes were invisible). Shows
+                        // whether the solve fires and why it is/ isn't accepted.
+                        LOGI("OBS_C: solved=%d s=%.4f var=%.5f relσ=%.2f N=%zu accept=%d "
+                             "-> vi_speed=%.2f m/s (%.1f km/h) fuser_s=%.4f",
+                             solved ? 1 : 0, s_obs, var_obs,
+                             (accept && s_obs > 1e-6) ? std::sqrt(var_obs) / s_obs : -1.0,
+                             scale_estimator_vi_.size(), accept ? 1 : 0,
+                             accept ? s_obs / std::max(1e-3, vi_pair_dt_mean_) : -1.0,
+                             accept ? (s_obs / std::max(1e-3, vi_pair_dt_mean_)) * 3.6 : -1.0,
+                             scale_fuser_.scale());
                     }
                 }
 
@@ -8046,8 +8209,17 @@ void Tracker::updateExpansionSpeed(const std::vector<cv::Point2f>& prev_ud,
         visual_rel_dist_loom_ += vz_rel_fused * dt_s;
         if (accel_dist_accum_ > kAccelKMinDistM && visual_rel_dist_loom_ > 1e-4) {
             const double k_obs = accel_dist_accum_ / visual_rel_dist_loom_;
-            if (std::isfinite(k_obs) && k_obs > 0.0) {
-                const double cur_k = expansion_scale_K_.load(std::memory_order_relaxed);
+            // 2026-05-29 — BLOW-UP GUARD (this is the exact path that hit k_obs=22534 /
+            // K=10602 / 27 km/h on v7 walkrun: vis_rel→0.0002 while accel_dist=4.76m).
+            // Reject k_obs that is a >3x outlier vs the current looming K. First calib
+            // (cur_k<=0) is unguarded. Mirrors the depth-flow guard + Observer A's reject.
+            const double cur_k = expansion_scale_K_.load(std::memory_order_relaxed);
+            const bool k_outlier = (cur_k > 0.0) && (k_obs > 3.0 * cur_k || k_obs < cur_k / 3.0);
+            if (k_outlier && frame_counter_ % 30 == 0) {
+                LOGI("ACCEL_K_CALIB[loom]: REJECT outlier k_obs=%.1f vs cur_K=%.1f (vis_rel=%.5f)",
+                     k_obs, cur_k, visual_rel_dist_loom_);
+            }
+            if (std::isfinite(k_obs) && k_obs > 0.0 && !k_outlier) {
                 const double new_k = (cur_k <= 0.0) ? k_obs
                                                     : (0.95 * cur_k + 0.05 * k_obs);
                 expansion_scale_K_.store(new_k, std::memory_order_relaxed);

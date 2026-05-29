@@ -586,6 +586,19 @@ private:
     // startup (setMidasScaleK) so cold-start walks aren't penalised. Reset at each stop.
     double visual_rel_dist_loom_{0.0};   // relative units (LOOMING vz_rel*dt): for K_loom
     std::atomic<double> expansion_scale_K_{-1.0};  // looming relative->metric scale (K_loom)
+    // 2026-05-29 (Step B) — VINS-Mono (ScaleEstimatorVI / Hesch-Martinelli) metric
+    // SPEED estimate (m/s). On solve success, vi_speed = s / mean_pair_dt, where s is
+    // the recovered metric magnitude of the per-pair visual translation. This is an
+    // unbiased joint IMU+visual+gravity metric reference (unlike the windowed accel-K
+    // which under-reads steady motion) — used to calibrate the depth-flow K when the
+    // recoverPose translation is well-conditioned (fast motion: scooter / run). On
+    // slow walks recoverPose is degenerate so the solve is rejected and this stays
+    // stale; the accel-K path then drives (with its known ~1.5x bias → user does a
+    // one-time known-distance walk calibration). -1 until first valid solve.
+    std::atomic<double>    vi_metric_speed_mps_{-1.0};
+    std::atomic<long long> vi_speed_ts_ns_{0};      // timestamp of last valid vi_speed (freshness)
+    double                 vi_pair_dt_mean_{0.033};  // running mean of pair dt (for s -> speed)
+    int64_t                cur_frame_ts_ns_{0};       // current frame ts, set at processFrame entry
     // Raw MiDaS disparity (relative depth = 1/disparity; high=near) at an image
     // pixel, BEFORE the metric affine fit. No midas_affine_valid_ gate, so it works
     // even when the affine fit bails (too few 3D points). false if no depth map yet.

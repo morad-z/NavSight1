@@ -67,7 +67,16 @@ public:
     // 4 → 12 equations vs 4 unknowns ≈ healthy overdetermination.
     static constexpr size_t MIN_PAIRS = 4;
     // Capacity for the rolling pair buffer.
-    static constexpr size_t MAX_PAIRS = 16;
+    // 2026-05-29 (Step B): 16 -> 90. At ~30 fps per-frame pairs, 16 pairs spanned
+    // only ~0.5 s — too short for scale to be OBSERVABLE: over 0.5 s the body
+    // velocity is ~constant, so the single v0 unknown absorbs all the motion and
+    // the scale column carries no independent variance (solve returns a
+    // degenerate/high-variance s, rejected at the call site → vsc never moved).
+    // 90 pairs ≈ 3 s spans enough velocity variation (accel / decel / turns — which
+    // a scooter has constantly) to separate scale from v0 and make the
+    // Hesch/Martinelli solve well-conditioned. Solve cost is a 4x4 normal-equation
+    // build, O(N) per solve at the ~3 Hz OBSERVER_C_SOLVE_INTERVAL cadence — cheap.
+    static constexpr size_t MAX_PAIRS = 90;
 
 private:
     mutable std::mutex mutex_;
