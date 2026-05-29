@@ -47,6 +47,9 @@ add_library(navsight_core STATIC
     ${VIO_SRC_DIR}/UpdaterMSCKF.cpp
     ${VIO_SRC_DIR}/InertialInitializer.cpp
     ${VIO_SRC_DIR}/VioEngine.cpp
+    # Desktop stub for ViewerServer (Android-only HTTP viewer). VioEngine
+    # holds it as a value member, so the symbols must link.
+    ${CMAKE_CURRENT_SOURCE_DIR}/desktop_stubs/ViewerServer_stub.cpp
     ${VIO_SRC_DIR}/ScaleEstimatorVI.cpp
     ${VIO_SRC_DIR}/ScaleFuser.cpp
     # Plan Step 6 (ADR-012): local windowed bundle adjustment. test_windowed_ba.cpp

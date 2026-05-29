@@ -59,6 +59,7 @@
 
 #include "VioEngine.h"
 #include "EventCounters.h"
+#include "EKFState.h"  // 2026-05-23 yaw-variance probe for the map-anchor noise fix
 
 #include <nlohmann/json.hpp>
 #include <opencv2/core.hpp>
@@ -306,9 +307,12 @@ bool tryLoadFrame(const std::string& frames_dir,
                   const FramesIndex& idx,
                   int64_t ts_ns,
                   int64_t tolerance_ns,
-                  cv::Mat& out) {
+                  cv::Mat& out,
+                  std::filesystem::path& matched_out) {
     auto p = resolveFramePath(frames_dir, idx, ts_ns, tolerance_ns);
     if (p.empty()) return false;
+    matched_out = p;  // 2026-05-29 — expose the matched frame so the caller can
+                      // locate its MiDaS depth raster (<stem>.f32) for --depth-dir.
     cv::Mat raw = cv::imread(p.string(), cv::IMREAD_UNCHANGED);
     if (raw.empty()) {
         std::fprintf(stderr,
@@ -336,6 +340,40 @@ bool tryLoadFrame(const std::string& frames_dir,
     return true;
 }
 
+// 2026-05-29 — Load a MiDaS raw-disparity raster (<frame_stem>.f32, row-major
+// float32, 256x256 per DepthEstimator.kt) produced by scripts/gen_midas_depth.py.
+// The on-device pipeline computes this in Kotlin and pushes it via
+// VioEngine::setDepthMap; the harness historically never fed it, so
+// updateDepthFlowSpeed/updateExpansionSpeed (the depth-flow SPEED path) were
+// dead in replay. Feeding it makes the speed/scale path testable offline.
+// Returns the loaded floats + side length on success.
+bool tryLoadDepthRaster(const std::string& depth_dir,
+                        const std::filesystem::path& frame_path,
+                        std::vector<float>& out, int& side) {
+    namespace fs = std::filesystem;
+    if (depth_dir.empty() || frame_path.empty()) return false;
+    fs::path dp = fs::path(depth_dir) / (frame_path.stem().string() + ".f32");
+    std::error_code ec;
+    auto bytes = fs::file_size(dp, ec);
+    if (ec || bytes == 0 || bytes % sizeof(float) != 0) return false;
+    const size_t n = bytes / sizeof(float);
+    // Expect a square raster (256x256). Reject anything else loudly rather than
+    // silently feeding a mis-shaped map.
+    int s = static_cast<int>(std::lround(std::sqrt(static_cast<double>(n))));
+    if (static_cast<size_t>(s) * s != n) {
+        std::fprintf(stderr, "replay_harness: depth raster %s is not square (n=%zu)\n",
+                     dp.string().c_str(), n);
+        return false;
+    }
+    std::ifstream in(dp, std::ios::binary);
+    if (!in) return false;
+    out.resize(n);
+    in.read(reinterpret_cast<char*>(out.data()), static_cast<std::streamsize>(bytes));
+    if (!in) return false;
+    side = s;
+    return true;
+}
+
 }  // namespace
 
 int main(int argc, char** argv) {
@@ -344,6 +382,8 @@ int main(int argc, char** argv) {
     std::string sim_path;
     std::string csv_path;
     std::string frames_dir_override;
+    std::string depth_dir;  // 2026-05-29 — MiDaS depth rasters (--depth-dir)
+    double seed_k = 0.0;    // 2026-05-29 — warm-start K seed (--seed-k); 0 = cold
     int64_t frame_tolerance_ns = 0;
     {
         std::vector<std::string> positional;
@@ -356,6 +396,27 @@ int main(int argc, char** argv) {
                     return 2;
                 }
                 frames_dir_override = argv[++i];
+            } else if (a == "--depth-dir") {
+                if (i + 1 >= argc) {
+                    std::fprintf(stderr,
+                        "replay_harness: --depth-dir requires a path argument\n");
+                    return 2;
+                }
+                depth_dir = argv[++i];
+            } else if (a == "--seed-k") {
+                // 2026-05-29 — seed midas_scale_K_/expansion_scale_K_ to emulate
+                // the on-device WARM start (K persisted in SharedPreferences).
+                // Lets us test whether the looming speed path carries the dot
+                // when K is pre-calibrated, isolating the cold-start K-deadlock.
+                if (i + 1 >= argc) {
+                    std::fprintf(stderr, "replay_harness: --seed-k requires a value\n");
+                    return 2;
+                }
+                try { seed_k = std::stod(argv[++i]); }
+                catch (const std::exception& e) {
+                    std::fprintf(stderr, "replay_harness: --seed-k parse error: %s\n", e.what());
+                    return 2;
+                }
             } else if (a == "--frame-match-tolerance-ms") {
                 if (i + 1 >= argc) {
                     std::fprintf(stderr,
@@ -409,6 +470,24 @@ int main(int argc, char** argv) {
         "replay_harness: %s mode (%s)\n",
         have_frames ? "recorded-frames" : "IMU-only synthetic",
         have_frames ? frames_dir.c_str() : "no frames/ dir found");
+    // 2026-05-29 — depth-dir validation. Requires frames (depth is keyed by the
+    // matched frame's stem). Fail loudly if the dir is bogus rather than silently
+    // running depth-starved (which is exactly the artifact we are fixing).
+    if (!depth_dir.empty()) {
+        if (!have_frames) {
+            std::fprintf(stderr,
+                "replay_harness: --depth-dir requires --frames-dir / a frames/ dir\n");
+            return 5;
+        }
+        if (!std::filesystem::is_directory(depth_dir)) {
+            std::fprintf(stderr,
+                "replay_harness: --depth-dir %s is not a directory\n",
+                depth_dir.c_str());
+            return 5;
+        }
+        std::fprintf(stdout, "replay_harness: MiDaS depth mode (%s)\n",
+                     depth_dir.c_str());
+    }
     FramesIndex frames_index;
     if (have_frames && frame_tolerance_ns > 0) {
         frames_index = indexFramesDir(frames_dir);
@@ -430,21 +509,339 @@ int main(int argc, char** argv) {
         << "recorded_vx,recorded_vy,recorded_vz,recorded_vyaw_rad,"
         << "glat,glng,gacc_m,"
         << "inlier_count,tracked_count,total_count,mean_flow,"
-        << "pose_flags,vision_valid,frame_loaded,keyframe_stored\n";
+        << "pose_flags,vision_valid,frame_loaded,keyframe_stored,vout_heading_rad,ekf_yaw_var_rad2,bias_yaw_var,cross_yaw,"
+        // 2026-05-29 — the USER-FACING dot trajectory (Tracker::global_t_,
+        // exposed as VisionOutput.t at Tracker.cpp:6231) and the UI speedometer
+        // value (Tracker::getFusedSpeedMps). getPose()/ekf_x..z above is EKF
+        // p_G_ — a DIFFERENT trajectory that the depth-flow speed work does NOT
+        // drive. To score what the user actually sees on the map (and what the
+        // velocity work changes), the scorer must read traj_x/traj_z, not ekf_*.
+        << "traj_x,traj_y,traj_z,fused_speed_mps\n";
 
     VioEngine engine;
     // Synthetic intrinsics (used as defaults when no frames are present).
-    // When recorded frames load, the size of the first loaded frame stays
-    // consistent with what the recording used — the harness does NOT
-    // re-derive intrinsics here; the runtime is expected to have published
-    // calibration via setIntrinsics during recording, which is replayed
-    // implicitly via the EKF's last-known state if you pre-seed via a
-    // companion script. For the first CI fixture (synthetic), this default
-    // matches the synthetic frame dimensions.
     engine.setIntrinsics(static_cast<double>(kSyntheticWidth),
                          static_cast<double>(kSyntheticWidth),
                          kSyntheticWidth * 0.5,
                          kSyntheticHeight * 0.5);
+
+    // 2026-05-20 — Load the ORB DBoW2 vocabulary so the Step 7 loop-closure
+    // detector + all keyframe-time ORB descriptor / landmark / local-map
+    // pipelines that gate on `loop_closure_.isReady()` actually fire.
+    // Without this, Tracker.cpp:3703 skips the entire keyframe ORB block,
+    // landmarks_added_total stays at 0, landmarks_matched_total stays at 0,
+    // loop closure never fires, and Fix #9/#11/#12 have nothing to operate
+    // on.
+    if (!frames_dir.empty()) {
+        const std::filesystem::path vocab_path = std::filesystem::path(
+            __FILE__).parent_path() / "desktop_stubs" / "ORBvoc.txt";
+        if (std::filesystem::exists(vocab_path)) {
+            const bool ok = engine.loadLoopClosureVocabulary(vocab_path.string());
+            std::cerr << "replay_harness: loaded ORBvoc.txt (145 MB), ok="
+                      << (ok ? "true" : "false") << "\n";
+        } else {
+            std::cerr << "replay_harness: ORBvoc.txt not found at "
+                      << vocab_path << " — landmark+LC counters will stay 0\n";
+        }
+    }
+
+    // 2026-05-20 — Critical: shortcut the InertialInitializer's
+    // WAIT_STATIONARY gate via loadStoredCalibration. Without this,
+    // Tracker::processFrame returns early at line 1053 (!initialized_),
+    // so out.valid stays at default false, so EKF never gets visual
+    // updates, so vision_valid=0 / all counters=0 across the replay.
+    //
+    // R_GtoI derived from the first IMU sample's accel direction.
+    // Stationary or near-stationary phone reports specific_force ≈ -g
+    // in body frame. Body-frame "up" direction = a / |a|. That vector
+    // IS column 2 of R_GtoI (world Z expressed in body). Construct
+    // the orthonormal frame via Gram-Schmidt against world X for
+    // columns 0 and 1 (yaw=0 assumption — the magnetometer would set
+    // the real yaw, but we don't have it; the first visual update
+    // will refine).
+    //
+    // This replaces the earlier "identity R_GtoI" stub which left the
+    // EKF thinking the phone was lying flat with screen up, causing
+    // every SLAM promotion's reprojection RMS to fail the 1.5 px gate
+    // because projected SLAM features landed in the wrong half of the
+    // image plane.
+    size_t kMadgwickWarmup = 0;  // Set inside the block below; used by main loop to skip already-fed IMU samples.
+    if (!samples.empty()) {
+        const auto& s0 = samples.front();
+        const double ax = s0.ax, ay = s0.ay, az = s0.az;
+        const double a_norm = std::sqrt(ax * ax + ay * ay + az * az);
+        float R_GtoI[9] = {1, 0, 0,  0, 1, 0,  0, 0, 1};  // identity fallback
+        if (a_norm > 1e-6 && std::isfinite(a_norm)) {
+            // Column 2 = body-frame up (= specific force direction).
+            const double c2x = ax / a_norm;
+            const double c2y = ay / a_norm;
+            const double c2z = az / a_norm;
+            // Gram-Schmidt: pick world X = (1,0,0), project onto plane
+            // perpendicular to col2, normalize → col0.
+            const double dot_x = c2x;  // (1,0,0) · col2 = c2x
+            double c0x = 1.0 - dot_x * c2x;
+            double c0y = -dot_x * c2y;
+            double c0z = -dot_x * c2z;
+            double c0n = std::sqrt(c0x * c0x + c0y * c0y + c0z * c0z);
+            if (c0n < 1e-3) {
+                // World X is nearly parallel to up — use world Y instead.
+                c0x = -c2y * c2x;
+                c0y = 1.0 - c2y * c2y;
+                c0z = -c2y * c2z;
+                c0n = std::sqrt(c0x * c0x + c0y * c0y + c0z * c0z);
+            }
+            c0x /= c0n; c0y /= c0n; c0z /= c0n;
+            // col1 = col2 × col0
+            const double c1x = c2y * c0z - c2z * c0y;
+            const double c1y = c2z * c0x - c2x * c0z;
+            const double c1z = c2x * c0y - c2y * c0x;
+            R_GtoI[0] = static_cast<float>(c0x); R_GtoI[1] = static_cast<float>(c1x); R_GtoI[2] = static_cast<float>(c2x);
+            R_GtoI[3] = static_cast<float>(c0y); R_GtoI[4] = static_cast<float>(c1y); R_GtoI[5] = static_cast<float>(c2y);
+            R_GtoI[6] = static_cast<float>(c0z); R_GtoI[7] = static_cast<float>(c1z); R_GtoI[8] = static_cast<float>(c2z);
+            std::cerr << "replay_harness: R_GtoI derived from first IMU sample, "
+                      << "up_body=(" << c2x << "," << c2y << "," << c2z << ") "
+                      << "|a|=" << a_norm << "\n";
+        } else {
+            std::cerr << "replay_harness: first IMU sample has |a|=0, "
+                      << "falling back to identity R_GtoI\n";
+        }
+        const float zero_bias[3] = {0.0f, 0.0f, 0.0f};
+        // 2026-05-20 — Prefer the saved on-device calibration over the
+        // sample[0]-derived seed. The runtime app saves R_GtoI +
+        // gyro_bias + accel_bias on first-run InertialInitializer
+        // success into shared_prefs/navsight_calibration.xml and
+        // reads it on every subsequent app launch. Without these,
+        // the EKF starts with zero biases → IMU integration drifts
+        // a few °/s per walk → MSCKF chi² rejects ~50% of updates →
+        // EKF state diverges → SLAM promotion's two-view
+        // triangulation produces 60-160 px reprojection error →
+        // all candidates rejected by the 1.5 px RMS gate.
+        //
+        // The XML was pulled from device via:
+        //   adb shell "run-as com.example.navsight1 cat \
+        //     /data/user/0/com.example.navsight1/shared_prefs/navsight_calibration.xml"
+        // saved at tests/cpp/desktop_stubs/navsight_calibration.xml
+        float R_GtoI_use[9] = {
+            R_GtoI[0], R_GtoI[1], R_GtoI[2],
+            R_GtoI[3], R_GtoI[4], R_GtoI[5],
+            R_GtoI[6], R_GtoI[7], R_GtoI[8],
+        };
+        float gyro_bias_use[3] = {0.0f, 0.0f, 0.0f};
+        float accel_bias_use[3] = {0.0f, 0.0f, 0.0f};
+        bool loaded_xml = false;
+        {
+            const std::filesystem::path calib_xml = std::filesystem::path(
+                __FILE__).parent_path() / "desktop_stubs" / "navsight_calibration.xml";
+            std::ifstream xml_in(calib_xml);
+            if (xml_in) {
+                std::string xml((std::istreambuf_iterator<char>(xml_in)),
+                                std::istreambuf_iterator<char>());
+                // Quick-and-dirty XML extraction. Only need three known
+                // <string name="X">comma,sep,values</string> entries.
+                auto extract = [&](const std::string& key,
+                                    std::vector<float>& out) -> bool {
+                    const std::string marker = "name=\"" + key + "\">";
+                    auto p = xml.find(marker);
+                    if (p == std::string::npos) return false;
+                    p += marker.size();
+                    auto end = xml.find("<", p);
+                    if (end == std::string::npos) return false;
+                    std::string vals = xml.substr(p, end - p);
+                    out.clear();
+                    size_t i = 0;
+                    while (i < vals.size()) {
+                        size_t c = vals.find(',', i);
+                        std::string tok = (c == std::string::npos)
+                            ? vals.substr(i) : vals.substr(i, c - i);
+                        try { out.push_back(std::stof(tok)); }
+                        catch (...) { return false; }
+                        if (c == std::string::npos) break;
+                        i = c + 1;
+                    }
+                    return true;
+                };
+                std::vector<float> rot, gb, ab;
+                if (extract("rotation",  rot) && rot.size() == 9 &&
+                    extract("gyro_bias", gb)  && gb.size()  == 3 &&
+                    extract("accel_bias",ab)  && ab.size()  == 3) {
+                    for (int k = 0; k < 9; ++k) R_GtoI_use[k]   = rot[k];
+                    for (int k = 0; k < 3; ++k) gyro_bias_use[k]  = gb[k];
+                    for (int k = 0; k < 3; ++k) accel_bias_use[k] = ab[k];
+                    loaded_xml = true;
+                    std::cerr << "replay_harness: loaded saved calibration "
+                              << "(gyro_bias="
+                              << gb[0] << "," << gb[1] << "," << gb[2]
+                              << " rad/s)\n";
+                }
+            }
+        }
+        engine.loadStoredCalibration(R_GtoI_use, gyro_bias_use, accel_bias_use);
+        if (!loaded_xml) {
+            std::cerr << "replay_harness: navsight_calibration.xml missing; "
+                      << "using sample-derived R_GtoI + zero biases (drift will "
+                      << "dominate)\n";
+        }
+
+        // 2026-05-20 — Bootstrap Madgwick so EKF::initializeFull's
+        // imu.getRotationGtoI() returns non-empty on the first frame.
+        // Order matters:
+        //   1. seedMadgwickYaw FIRST so Madgwick init (triggered by
+        //      the first addAccelData in the warmup loop) consumes
+        //      the right yaw seed. setInitialMadgwickYaw sets
+        //      pending_madgwick_yaw_nav_ which is consumed once at
+        //      tryInitMadgwickLocked. Calling it after the warmup
+        //      is too late — Madgwick already inited with yaw=0.
+        //   2. Warmup 200 IMU samples through Madgwick.
+        //   3. EKF initializeFull will fire on the first processFrame
+        //      with Madgwick's full roll/pitch/yaw.
+        double seed_yaw = 0.0;
+        if (sim_json.contains("points") && sim_json["points"].is_array() &&
+            !sim_json["points"].empty()) {
+            const auto& p0 = sim_json["points"][0];
+            double h = 0.0;
+            if (p0.contains("hdg") && jsonNumber(p0["hdg"], h)) {
+                seed_yaw = h;
+            }
+        }
+        engine.seedMadgwickYaw(seed_yaw);
+        // Warmup: 200 samples ≈ 1 sec of IMU. Enough for Madgwick to
+        // converge on roll/pitch from accel without pre-integrating
+        // too much real walking motion. Skip these in the main loop
+        // to avoid double-feeding. Increasing to 1000 includes
+        // walking motion → Madgwick's quaternion absorbs the wrong
+        // rotation → reprojection RMS skyrockets.
+        kMadgwickWarmup = std::min<size_t>(200, samples.size());
+        for (size_t i = 0; i < kMadgwickWarmup; ++i) {
+            const auto& s = samples[i];
+            engine.addAccelData(s.ts_ns, s.ax, s.ay, s.az);
+            engine.addGyroData (s.ts_ns, s.gx, s.gy, s.gz);
+        }
+        std::cerr << "replay_harness: seeded Madgwick yaw="
+                  << (seed_yaw * 180.0 / 3.14159265) << " deg, then warmed with "
+                  << kMadgwickWarmup << " IMU samples\n";
+    }
+
+    // 2026-05-20 — initialise the runtime-side setters the Android app
+    // calls but the harness historically skipped. Without these, EKF
+    // never reaches full_initialized_=true → vision_valid stays 0 →
+    // every SLAM/landmark/LC counter remains 0 across the entire replay.
+    //
+    // Critical: initial heading comes from the recorded sim's first
+    // `hdg` field (device magnetometer-derived azimuth at the start of
+    // the walk, CW-positive nav convention, radians). Without this,
+    // every replay's EKF "thinks" yaw=0 (arbitrary North) while the
+    // recording's actual scene is rotated by the real heading. The two-
+    // view triangulation then puts world points behind the camera
+    // (chirality fail) or far enough off that reprojection RMS = 160 px
+    // — the 2026-05-20 dominant rejection mode for SLAM promotion.
+    if (!frames_dir.empty()) {
+        // R_bc rear-camera. NOTE: NavSight's default has CHANGED over
+        // time. Pre-2026-05-19 walks (v54_two_loop, etc.) were made
+        // with diag(1, -1, -1) (still visible in EKFState.cpp's
+        // getExtrinsicsAngleDeg R_bc_initial constant). Post-2026-05-19
+        // the EKFState ctor switched to ((0,-1,0),(-1,0,0),(0,0,-1)).
+        // The two differ by 90°. Using the wrong one for an old
+        // recording causes systematic 160-px reprojection RMS, killing
+        // SLAM promotion via the 1.5 px gate.
+        //
+        // Detection: read the recording's startTime. Before 2026-05-19
+        // (epoch ms < ~1779192000000) use diag; after, use the new
+        // matrix. Recordings near the cutover are ambiguous and may
+        // need manual override.
+        // 2026-05-19 12:00 UTC in epoch ms. Walks recorded earlier used
+        // the diag(1,-1,-1) R_bc; later walks use the new convention.
+        constexpr int64_t kRbcCutoverEpochMs = 1779278400000LL;
+        const int64_t start_ms =
+            sim_json.contains("startTime") && sim_json["startTime"].is_number()
+                ? sim_json["startTime"].get<int64_t>() : kRbcCutoverEpochMs;
+        const bool is_old_rbc_era = start_ms < kRbcCutoverEpochMs;
+        float R_bc_flat[9];
+        if (is_old_rbc_era) {
+            // Pre-2026-05-19 — diag(1, -1, -1)
+            R_bc_flat[0] = 1.0f; R_bc_flat[1] = 0.0f; R_bc_flat[2] = 0.0f;
+            R_bc_flat[3] = 0.0f; R_bc_flat[4] = -1.0f; R_bc_flat[5] = 0.0f;
+            R_bc_flat[6] = 0.0f; R_bc_flat[7] = 0.0f; R_bc_flat[8] = -1.0f;
+            std::cerr << "replay_harness: using PRE-2026-05-19 R_bc = diag(1,-1,-1)\n";
+        } else {
+            // Current
+            R_bc_flat[0] = 0.0f; R_bc_flat[1] = -1.0f; R_bc_flat[2] = 0.0f;
+            R_bc_flat[3] = -1.0f; R_bc_flat[4] = 0.0f; R_bc_flat[5] = 0.0f;
+            R_bc_flat[6] = 0.0f; R_bc_flat[7] = 0.0f; R_bc_flat[8] = -1.0f;
+            std::cerr << "replay_harness: using POST-2026-05-19 R_bc = ((0,-1,0),(-1,0,0),(0,0,-1))\n";
+        }
+        engine.setExtrinsicsRotation(R_bc_flat);
+        engine.setUserHeight(1.7f);
+
+        // Pull recorded initial heading from points[0].hdg (radians,
+        // CW-positive nav per project convention). Fall back to 0 if
+        // the field is missing or null (e.g., compass unavailable
+        // during recording).
+        double initial_heading = 0.0;
+        if (sim_json.contains("points") && sim_json["points"].is_array() &&
+            !sim_json["points"].empty()) {
+            const auto& p0 = sim_json["points"][0];
+            double h = 0.0;
+            if (p0.contains("hdg") && jsonNumber(p0["hdg"], h)) {
+                initial_heading = h;
+            }
+        }
+        engine.setInitialHeading(initial_heading);
+        std::cerr << "replay_harness: applied runtime defaults "
+                  << "(R_bc rear-cam, height=1.7m, heading="
+                  << (initial_heading * 180.0 / 3.14159265) << " deg)\n";
+    }
+
+    // 2026-05-20 — when recorded frames are present, load device camera
+    // calibration so EKF intrinsics match the recording. Without this,
+    // synthetic (320×240) intrinsics misalign against real 640×480
+    // frames → vision_valid stays at 0 → EKF never initialises → all
+    // SLAM/landmark/LC counters remain 0 in the replay output.
+    //
+    // The calibration JSON is checked in at
+    // `tests/cpp/desktop_stubs/camera_calib_s21u.json` and was pulled
+    // from the S21 Ultra device's in-app calibration via run-as.
+    // RMS reprojection error 0.106 px — good calibration.
+    if (!frames_dir.empty()) {
+        const std::filesystem::path calib_path = std::filesystem::path(
+            __FILE__).parent_path() / "desktop_stubs" / "camera_calib_s21u.json";
+        std::ifstream calib_in(calib_path);
+        if (calib_in) {
+            try {
+                nlohmann::json cj;
+                calib_in >> cj;
+                const double fx = cj.value("fx", 0.0);
+                const double fy = cj.value("fy", 0.0);
+                const double cx = cj.value("cx", 0.0);
+                const double cy = cj.value("cy", 0.0);
+                if (fx > 0 && fy > 0 && cx > 0 && cy > 0) {
+                    engine.setIntrinsics(fx, fy, cx, cy);
+                    std::cerr << "replay_harness: loaded calibration "
+                              << "fx=" << fx << " fy=" << fy
+                              << " cx=" << cx << " cy=" << cy << "\n";
+                }
+                if (cj.contains("dist")) {
+                    const auto& dj = cj["dist"];
+                    const double k1 = dj.value("k1", 0.0);
+                    const double k2 = dj.value("k2", 0.0);
+                    const double k3 = dj.value("k3", 0.0);
+                    const double k4 = dj.value("k4", 0.0);
+                    const double k5 = dj.value("k5", 0.0);
+                    const double k6 = dj.value("k6", 0.0);
+                    const double p1 = dj.value("p1", 0.0);
+                    const double p2 = dj.value("p2", 0.0);
+                    engine.getTracker()->setDistortion(k1, k2, k3, k4, k5, k6, p1, p2);
+                    std::cerr << "replay_harness: loaded distortion "
+                              << "k1=" << k1 << " k2=" << k2 << "\n";
+                }
+            } catch (const std::exception& e) {
+                std::cerr << "replay_harness: calibration load failed: "
+                          << e.what() << " — falling back to synthetic\n";
+            }
+        } else {
+            std::cerr << "replay_harness: no calibration at "
+                      << calib_path << "; vision_valid may stay 0\n";
+        }
+    }
 
     // Reusable buffer for synthetic frames.
     const std::vector<uint8_t> synthetic_yuv(
@@ -452,8 +849,22 @@ int main(int argc, char** argv) {
         kSyntheticFill);
     // Reusable per-frame NV21 buffer for recorded frames (sized lazily).
     std::vector<uint8_t> recorded_nv21;
+    size_t depth_frames_fed = 0;  // 2026-05-29 — count of MiDaS rasters fed
 
-    for (const auto& s : samples) {
+    // 2026-05-29 — warm-start K seed. On-device, midas_scale_K_/expansion_scale_K_
+    // persist in SharedPreferences across launches; the harness starts cold
+    // (K=-1) so the looming speed path bails until depth-flow calibrates K — but
+    // depth-flow is gated on essential-matrix verification, which fails on slow
+    // walks → deadlock. Seeding K emulates a prior session having calibrated it.
+    if (seed_k > 0.0) {
+        engine.getTracker()->setMidasScaleK(seed_k);
+        std::fprintf(stdout, "replay_harness: seeded warm K = %.1f\n", seed_k);
+    }
+
+    // Skip samples already fed during Madgwick warmup (otherwise they
+    // get integrated twice — double-rotates Madgwick + EKF state).
+    for (size_t s_idx = kMadgwickWarmup; s_idx < samples.size(); ++s_idx) {
+        const auto& s = samples[s_idx];
         // Feed IMU strictly in the recorded order; both calls use the same
         // timestamp so the preintegrator window covers a single sample.
         engine.addAccelData(s.ts_ns, s.ax, s.ay, s.az);
@@ -462,19 +873,43 @@ int main(int argc, char** argv) {
         // Try to load a recorded frame for this timestamp. Falls back to the
         // synthetic mid-grey buffer when there is no PNG on disk.
         cv::Mat grey;
+        std::filesystem::path matched_frame;
         bool frame_loaded = tryLoadFrame(frames_dir, frames_index,
-                                         s.ts_ns, frame_tolerance_ns, grey);
+                                         s.ts_ns, frame_tolerance_ns, grey,
+                                         matched_frame);
+
+        // 2026-05-29 — feed MiDaS depth for this frame BEFORE processFrame, so
+        // the depth-flow speed path (updateDepthFlowSpeed) sees the same depth
+        // the on-device pipeline pushes via setDepthMap. Keyed by the matched
+        // frame's stem (<stem>.f32). Must precede processFrame: the camera-
+        // thread reads depth_map_ during processFrame.
+        if (frame_loaded && !depth_dir.empty()) {
+            std::vector<float> depth;
+            int dside = 0;
+            if (tryLoadDepthRaster(depth_dir, matched_frame, depth, dside)) {
+                engine.setDepthMap(depth.data(), dside, dside);
+                ++depth_frames_fed;
+            }
+        }
 
         VisionOutput vout;
         if (frame_loaded) {
             greyToNv21(grey, recorded_nv21);
             vout = engine.processFrame(recorded_nv21.data(),
                                        grey.cols, grey.rows, s.ts_ns);
-        } else {
+        } else if (frames_dir.empty()) {
+            // IMU-only mode: feed synthetic mid-grey. Visual front-end
+            // will find nothing in a flat frame but won't crash.
             vout = engine.processFrame(synthetic_yuv.data(),
                                        kSyntheticWidth, kSyntheticHeight,
                                        s.ts_ns);
         }
+        // 2026-05-20 — In recorded-frames mode, samples WITHOUT a matching
+        // frame are SKIPPED entirely (do NOT fall back to synthetic).
+        // Mixing real 640×480 frames with synthetic 320×240 mid-grey
+        // crashes KLT at cv::calcOpticalFlowPyrLK (pyramid size mismatch
+        // between consecutive frames). Skipping keeps KLT state intact;
+        // the IMU is already fed above so the EKF still propagates.
 
         double x = std::nan(""), y = std::nan(""), z = std::nan(""), yaw = std::nan("");
         bool init = engine.getPose(x, y, z, yaw);
@@ -499,8 +934,25 @@ int main(int argc, char** argv) {
             << vout.poseFlags << ','
             << (vout.valid ? 1 : 0) << ','
             << (frame_loaded ? 1 : 0) << ','
-            << (vout.keyframe_stored ? 1 : 0)
-            << '\n';
+            << (vout.keyframe_stored ? 1 : 0) << ','
+            << vout.heading << ',';
+        // 2026-05-24 BISECT — yaw-cov columns disabled so the harness compiles
+        // against the COMMITTED baseline too (getYawVariance/getYawCovDiag are
+        // stash-only). Heading bisection only needs vout.heading above.
+        double yawdiag[3] = { std::nan(""), std::nan(""), std::nan("") };
+        csv << std::nan("") << ',' << yawdiag[1] << ',' << yawdiag[2] << ',';
+        // 2026-05-29 — user-facing dot trajectory (global_t_) + UI speed.
+        // vout.t is only populated on frames where the visual front-end ran
+        // (frame_loaded && valid); on skipped/IMU-only ticks it is empty, so
+        // guard and emit NaN to keep the column count stable.
+        double tx = std::nan(""), ty = std::nan(""), tz = std::nan("");
+        if (!vout.t.empty() && vout.t.rows >= 3 && vout.t.type() == CV_64F) {
+            tx = vout.t.at<double>(0, 0);
+            ty = vout.t.at<double>(1, 0);
+            tz = vout.t.at<double>(2, 0);
+        }
+        const double fused_speed = engine.getTracker()->getFusedSpeedMps();
+        csv << tx << ',' << ty << ',' << tz << ',' << fused_speed << '\n';
     }
     csv.flush();
     if (!csv) {
@@ -532,5 +984,9 @@ int main(int argc, char** argv) {
     std::fprintf(stdout,
         "replay_harness: wrote %zu rows -> %s (sidecar: %s)\n",
         samples.size(), csv_path.c_str(), sidecar_path.c_str());
+    if (!depth_dir.empty()) {
+        std::fprintf(stdout, "replay_harness: fed %zu MiDaS depth rasters\n",
+                     depth_frames_fed);
+    }
     return 0;
 }

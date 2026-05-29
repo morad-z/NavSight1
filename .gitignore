@@ -37,3 +37,5 @@ local.properties
 tests/cpp/build*/
 .slack_last_activity
 scripts/da3_benchmark/output/
+
+tests/cpp/desktop_stubs/ORBvoc.txt
