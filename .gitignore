@@ -39,3 +39,21 @@ tests/cpp/build*/
 scripts/da3_benchmark/output/
 
 tests/cpp/desktop_stubs/ORBvoc.txt
+
+# Secrets — keep on disk, NEVER commit
+/.env
+
+# Local recordings / working sim data + analysis plots (kept on disk;
+# committed sim fixtures live in tests/sims/, not the repo root)
+/sim_*.json
+/cand_*.json
+/walk600_*.json
+/*_gps_vio.png
+/logcat_*.txt
+/scripts/output/
+
+# Local agent / vector DBs + generated artifacts
+/agentdb.rvf
+/agentdb.rvf.lock
+/ruvector.db
+/architecture_map.html
