@@ -47,6 +47,35 @@ and replaces them with the free, offline OSM stack this plan already designs.** 
 This was reviewed by a multi-lens + adversarial pass; the corrections below already incorporate the
 adversary's pushback (notably: do NOT use per-candidate free-scale Procrustes — see §0.3 M2).
 
+### 0.0 Branch & merge strategy — READ FIRST if you're on the `osm-migration` worktree
+
+This migration is developed on a **separate branch + worktree** so it never tangles with the in-flight
+speed work. Both branches are on GitHub (`origin`).
+
+| Branch | Folder | Owns |
+|---|---|---|
+| `morad` (trunk) | `C:\Users\morad\AndroidStudioProjects\NavSight1` | the SPEED work (Fix A/B/C) + the VIO **C++ core** |
+| `osm-migration` | `C:\Users\morad\AndroidStudioProjects\NavSight1-mapmatch` (worktree off `morad`) | **THIS migration** (Kotlin / data-layer / build) |
+
+The two touch nearly **disjoint files** — migration = `RoadSnapper.kt`, `NavigationManager.kt`, `SearchBarUi.kt`,
+`build.gradle.kts`, new OSM files; speed = `Tracker.cpp` / `EKFState.cpp`. **Rules for the migration session:**
+
+1. **Do the speed-INDEPENDENT migration half** (§8M Steps A\*/B/C/K-routing/K-search, + L if wanted): replace
+   the 3 paid Google APIs (Roads/Directions/Places) with free OSM. Needs no speed fix.
+2. **Do NOT edit the C++ speed core** (`Tracker.cpp`/`Tracker.h`/`EKFState.cpp`) on this branch — those are
+   changing on `morad` (Fix A/B/C). The ONLY allowed engine touch is the read-only Step B `current_vio_lla()`
+   accessor; keep it minimal + additive so the later merge is conflict-free.
+3. The **scale-dependent matcher** (Step D HMM, K̂ estimator, Step E confidence, Step F EKF feedback) stays
+   **DEFERRED** until the speed (Fix A/B/C) is validated on `morad` and merged — a scale-collapsed dot can't be
+   arc-length-matched (§0.3 M1, §0.5). Build those AFTER the merge, on the correct-scale base.
+4. **Commit/push to `osm-migration` only** — plain `git commit` / `git push` in this folder; never name `morad`.
+5. **Merge order (later, from the `morad` folder):** validate speed on `morad` → `git checkout morad &&
+   git merge osm-migration` → then build the deferred scale-dependent matcher on the merged base →
+   `git worktree remove ../NavSight1-mapmatch`.
+6. **Memory note:** this worktree is a different folder, so it does **not** auto-load the NavSight project
+   memory at `~/.claude/projects/C--Users-morad-AndroidStudioProjects-NavSight1/`. **This plan (§0 + §8M) is the
+   authoritative context — read both before starting.**
+
 ### 0.1 Corrected headline
 
 The plan's bones are sound and still 2026-correct: the Goh online sliding-window HMM (§4.3),
