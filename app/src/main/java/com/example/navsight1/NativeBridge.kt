@@ -75,6 +75,17 @@ object NativeBridge {
     // the first estimate; the ViewModel then shows 0 and smooths the value.
     external fun getFusedSpeedMps(): Float
 
+    // 2026-05-28 — MiDaS scale K (relative-disparity → metric m). Calibrated
+    // inside the C++ depth-flow path from accumulated accel distance vs visual
+    // relative distance. Persisting it across app launches is required because
+    // the first recording after a cold start may not pass essential-matrix
+    // verification (slow walk + close scene → low inlier ratio); without a
+    // seeded K the looming path bails (K<=0) and the UI sits at 0 forever.
+    // ViewModel loads from SharedPreferences on init, pushes here via
+    // setMidasScaleK; periodically reads via getMidasScaleK and writes back.
+    external fun setMidasScaleK(k: Double)
+    external fun getMidasScaleK(): Double
+
     // Step 5: Calibration & Initialization
     // Returns 0=WAIT_STATIONARY, 1=WAIT_MOTION, 2=READY, 3=TIMEOUT_NEEDS_USER
     external fun getInitStatus(): Int

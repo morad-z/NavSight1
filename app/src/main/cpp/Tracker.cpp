@@ -27,6 +27,16 @@ static inline int64_t now_us() {
         std::chrono::steady_clock::now().time_since_epoch()).count();
 }
 
+// 2026-05-29 — minimum accel-integrated distance (m) before the accel-K
+// calibration fires. Derivation (NOT a magic tweak): the calibration window is
+// [0.3, 2.5] s after a ZUPT re-zero (~2.2 s usable). The slowest credible walk
+// is ~0.5 m/s, so the window accrues ~0.5 * 2.2 ≈ 1.1 m of true travel; floor at
+// 1.0 m so a slow walk calibrates while a single push-off frame (~0.1 m) cannot.
+// Was 2.0 m (tuned for the run, which over-accrued) — unreachable on slow walks
+// once the HP-filter velocity-decay was removed (the 2026-05-29 integrator fix).
+// Shared by updateDepthFlowSpeed and updateExpansionSpeed (DRY — avoids split-brain K).
+static constexpr double kAccelKMinDistM = 1.0;
+
 // ── Phase 2 Step 4.2.1 (docs/study/phase2_productization_plan.md §4.2.1) ────
 //
 // VI-Depth Stage-1 affine fit between MiDaS disparity and an inverse-depth
@@ -729,11 +739,18 @@ void Tracker::reset() {
     global_t_ = cv::Mat::zeros(3, 1, CV_64F);
     // 2026-05-26 — clear depth-flow speed on reset (no estimate until moving again).
     depth_flow_speed_mps_.store(-1.0, std::memory_order_relaxed);
-    midas_scale_K_.store(-1.0, std::memory_order_relaxed);
+    // 2026-05-28 — DO NOT reset midas_scale_K_ here: K is a slowly-varying scene
+    // property (MiDaS relative-to-metric ratio), not session-scoped state. Resetting
+    // it on every VIO reset forced a fresh calibration tax on each recording, which
+    // we measured to vary K by 40-70% between back-to-back recordings of the same
+    // motion. Persisting it lets the EMA continue to refine across recordings.
     accel_vel_w_ = cv::Vec3d(0.0, 0.0, 0.0);
     secs_since_zupt_ = -1.0;
     accel_dist_accum_ = 0.0;
     visual_rel_dist_accum_ = 0.0;
+    visual_rel_dist_loom_ = 0.0;   // 2026-05-29 — looming's separate accumulator
+    // NOTE: expansion_scale_K_ (K_loom) is NOT reset here, same as midas_scale_K_:
+    // both are slowly-varying scene scales persisted across resets/recordings.
     accel_drift_lp_ = cv::Vec3d(0.0, 0.0, 0.0);
     accel_bias_ = cv::Mat::zeros(3, 1, CV_64F);
     accel_bias_count_ = 0;
@@ -938,9 +955,45 @@ int Tracker::getCorrectedTrajectory(float* out_xz, int max_pairs) const {
     return n;
 }
 double Tracker::getFusedSpeedMps() const {
-    // 2026-05-26 — return the smoothed depth-weighted metric speed (see
-    // updateDepthFlowSpeed). Atomic single-reader load; -1.0 until first estimate.
-    return depth_flow_speed_mps_.load(std::memory_order_relaxed);
+    // 2026-05-28 — return the TRAJECTORY-applied speed, not the depth-flow estimate.
+    //
+    // Cause of UI bug (2026-05-28 walk): on slow walks with close scenes the
+    //   essential-matrix verification fails (inlier ratio <0.25, trans_degen=1),
+    //   so updateDepthFlowSpeed and updateExpansionSpeed never fire and
+    //   depth_flow_speed_mps_ stays at the -1 warm-up sentinel. Returning that
+    //   to the UI made currentSpeedKmh = 0 while the trajectory was still
+    //   moving via the PDR fallback path — speedometer and dot disagreed.
+    //
+    // Change: the trajectory writes trajectory_speed_mps_ at every accumulation
+    //   site (main camera/depth-flow path, PDR fallback, static/rotation-frozen
+    //   branches). The UI reads THIS atomic so the displayed speed always
+    //   reflects what's actually driving the trajectory the user sees on the map.
+    return trajectory_speed_mps_.load(std::memory_order_relaxed);
+}
+
+void Tracker::setMidasScaleK(double k) {
+    // 2026-05-28 — Kotlin pushes the persisted K here at app start (before any
+    // recording). Only accept positive values so a -1 sentinel from
+    // SharedPreferences "key missing" never clobbers an in-progress calibration.
+    // 2026-05-29 — seed BOTH the depth-flow K (midas_scale_K_) AND the looming K
+    // (expansion_scale_K_) from the one persisted value, so a cold-start walk
+    // (where only looming runs) shows speed from frame 1 instead of waiting for a
+    // fresh calibration. The two K's agree for forward motion (the calibration
+    // regime), so one persisted seed is a valid warm start for both; each then
+    // refines independently from its own relative-distance basis during the session.
+    if (std::isfinite(k) && k > 0.0) {
+        midas_scale_K_.store(k, std::memory_order_relaxed);
+        expansion_scale_K_.store(k, std::memory_order_relaxed);
+    }
+}
+
+double Tracker::getMidasScaleK() const {
+    // 2026-05-29 — return whichever K calibrated. On runs the depth-flow K leads;
+    // on slow walks only the looming K calibrates (depth-flow's recoverPose path
+    // bails). Persisting the calibrated one keeps the next cold start seeded.
+    const double k_df = midas_scale_K_.load(std::memory_order_relaxed);
+    if (k_df > 0.0) return k_df;
+    return expansion_scale_K_.load(std::memory_order_relaxed);
 }
 
 void Tracker::updateDepthFlowSpeed(const std::vector<cv::Point2f>& prev_ud,
@@ -979,17 +1032,43 @@ void Tracker::updateDepthFlowSpeed(const std::vector<cv::Point2f>& prev_ud,
     const double ty = t_vo.at<double>(1);
     const double tz = t_vo.at<double>(2);
 
+    // 2026-05-29 — Step A per-point affine DISABLED on the speed path (it was the
+    // ~5x-undershoot poison). Why: the affine (s,t) from applyDepthScaleConstraint
+    // is fit against target = 1/(z_vio * scale_fuser_.scale()) (Tracker.cpp ~265),
+    // and scale_fuser_ is stuck at the rejected-PDR seed ~0.10. So the affine's
+    // "metric" depth = 1/(s*disp+t) ≈ z_vio*0.10 — in scale_fuser units, ~5x too
+    // small. Treating it as "already metric" (the Step A branch) made walks read
+    // ~1.2 km/h vs ~5. The affine ALSO cannot add scene-invariance here: with only
+    // the noisy VIO triangulation (z_vio in [0,49]) as a per-point metric reference
+    // the fit degenerates to s≈0 (flat depth). The ONLY trustworthy metric anchor
+    // is accel-K (IMU-derived; K=519 read the run correctly). So the speed path now
+    // ALWAYS uses relative MiDaS depth (Z=1/disp_raw) × K. Scene transfer is handled
+    // by K recalibrating per-scene on each stop-go (accel anchor), not a per-frame
+    // affine. The affine/applyDepthScaleConstraint stays for its SLAM consumers.
+    // Snapshot kept commented for an easy revert if a true per-point metric depth
+    // source (not scale_fuser-anchored) is ever wired.
+    /* LEGACY 2026-05-28 Step A affine-on-speed-path (scale_fuser-poisoned):
+    double s_aff = 0.0, t_aff = 0.0;
+    bool aff_valid_now = false;
+    {
+        std::lock_guard<std::mutex> lock(midas_affine_mutex_);
+        s_aff = midas_affine_s_;
+        t_aff = midas_affine_t_;
+        aff_valid_now = midas_affine_valid_;
+    }
+    */
+    constexpr bool aff_valid_now = false;   // affine off the speed path (see above)
+    const double s_aff = 0.0, t_aff = 0.0;  // logged only; unused while aff_valid_now=false
+
     const size_t n = std::min(prev_ud.size(), next_ud.size());
     std::vector<double> s_est, z_est, flow_est;   // parallel: per-point scale, MiDaS depth, pixel flow
     s_est.reserve(n); z_est.reserve(n); flow_est.reserve(n);
     int n_no_depth = 0;   // tracked points dropped because MiDaS depth was unavailable/implausible
     constexpr double kMinCoef = 1e-3;   // ignore equations with ~no sensitivity to s
     for (size_t i = 0; i < n; ++i) {
-        // 2026-05-26 — RELATIVE depth from raw MiDaS disparity (Z_rel = 1/disp), NOT
-        // the affine-fitted metric depth (which inherited the weak VIO scale and
-        // collapsed to ~0.5 m). The metric scale is applied later via the
-        // accel-calibrated K. Mask the sky strip (upper 18% of image — MiDaS is
-        // unstable there and corrupts the fit; research recommends masking far/sky).
+        // 2026-05-26 — depth from MiDaS. RELATIVE if affine fit invalid (K
+        // applied later); METRIC if affine valid (s_med becomes direct meters).
+        // Mask the sky strip (upper 18% of image — MiDaS unstable there).
         const double img_h_mask = (cy_ > 0.0) ? (2.0 * cy_) : 480.0;
         if (prev_ud[i].y < 0.18 * img_h_mask) { ++n_no_depth; continue; }
         double disp_raw = 0.0;
@@ -998,7 +1077,16 @@ void Tracker::updateDepthFlowSpeed(const std::vector<cv::Point2f>& prev_ud,
             ++n_no_depth;
             continue;
         }
-        const double Z = 1.0 / disp_raw;   // RELATIVE depth (arbitrary units)
+        double Z;
+        if (aff_valid_now) {
+            // METRIC depth (scale_fuser units). Scene-invariant per-point.
+            const double inv_m = s_aff * disp_raw + t_aff;
+            if (inv_m <= 1e-4) { ++n_no_depth; continue; }
+            Z = 1.0 / inv_m;
+        } else {
+            // RELATIVE depth. K applied at output.
+            Z = 1.0 / disp_raw;
+        }
         // Back-project prev pixel using relative depth, rotate to cur frame.
         const double xn = (prev_ud[i].x - cx_) / fx_;
         const double yn = (prev_ud[i].y - cy_) / fy_;
@@ -1047,23 +1135,25 @@ void Tracker::updateDepthFlowSpeed(const std::vector<cv::Point2f>& prev_ud,
     // circular dependency that collapsed MiDaS metric depth — no VIO/affine scale is
     // used. Basis: VINS-Mono / VI-Depth (Wofk 2023) velocity-alignment.
     const double accel_speed = std::hypot(accel_vel_w_[0], accel_vel_w_[1]);  // horizontal m/s
-    visual_rel_dist_accum_ += disp_rel;   // accumulate relative path length since the stop
-    // Robust scale: K = accel_dist / visual_rel_dist — the ratio of ACCUMULATED path
-    // lengths since the ZUPT stop. Far steadier than the per-frame ratio (which swung
-    // 2.4x because MiDaS renormalises its relative scale every frame). Gated to the
-    // clean post-stop window (accel integration trustworthy < ~2.5 s) and once enough
-    // path has accrued (> 0.8 m of accel travel) to be well-conditioned.
+    // ── DEPTH-FLOW K (midas_scale_K_) — calibrated from THIS path's own relative
+    //    measure (disp_rel = recoverPose translation scale) and consumed below as
+    //    K * speed_rel. Self-consistent (same disp_rel basis in numerator + K's
+    //    denominator) — this is the run-proven path (K=519 read the run correctly).
+    //    Looming keeps a SEPARATE K (expansion_scale_K_) from its own vz_rel basis,
+    //    so there is no cross-basis mismatch and no shared-accumulator double-count.
+    //    (2026-05-29: restored after a single-source experiment that mixed bases.)
+    visual_rel_dist_accum_ += disp_rel;
     if (secs_since_zupt_ >= 0.3 && secs_since_zupt_ <= 2.5 &&
-        accel_dist_accum_ > 0.8 && visual_rel_dist_accum_ > 1e-4) {
+        accel_dist_accum_ > kAccelKMinDistM && visual_rel_dist_accum_ > 1e-4) {
         const double k_obs = accel_dist_accum_ / visual_rel_dist_accum_;
         if (std::isfinite(k_obs) && k_obs > 0.0) {
             const double cur_k = midas_scale_K_.load(std::memory_order_relaxed);
-            const double new_k = (cur_k <= 0.0) ? k_obs : (0.9 * cur_k + 0.1 * k_obs);
+            const double new_k = (cur_k <= 0.0) ? k_obs : (0.95 * cur_k + 0.05 * k_obs);
             midas_scale_K_.store(new_k, std::memory_order_relaxed);
-            navsight::eventCounters().depth_flow_calib_updates.fetch_add(
-                1, std::memory_order_relaxed);
-            // Persist K (x1000) + running min/max so K stability shows in event_summary
-            // (logcat rolls off). Single-writer (camera thread) so relaxed RMW is safe.
+            navsight::eventCounters().depth_flow_calib_updates.fetch_add(1, std::memory_order_relaxed);
+            LOGI("ACCEL_K_CALIB[df]: k_obs=%.1f accel_dist=%.2fm vis_rel=%.4f tsz=%.2fs "
+                 "cur_K=%.1f -> new_K=%.1f", k_obs, accel_dist_accum_,
+                 visual_rel_dist_accum_, secs_since_zupt_, cur_k, new_k);
             const long long k_milli = static_cast<long long>(new_k * 1000.0 + 0.5);
             navsight::eventCounters().midas_scale_k_milli.store(k_milli, std::memory_order_relaxed);
             const long long kmax = navsight::eventCounters().midas_scale_k_max_milli.load(std::memory_order_relaxed);
@@ -1073,10 +1163,17 @@ void Tracker::updateDepthFlowSpeed(const std::vector<cv::Point2f>& prev_ud,
         }
     }
 
+    // 2026-05-28 (Step A) — when affine is valid, speed_rel is ALREADY metric
+    // (scale_fuser units). Skip the K multiplication. When affine is invalid,
+    // multiply by the global K bootstrap.
+    double speed_metric;
     const double K = midas_scale_K_.load(std::memory_order_relaxed);
-    if (K <= 0.0) {
-        // No metric scale yet: need one accel-excitation window since a stop. Report
-        // nothing (UI shows 0) rather than an unscaled number.
+    if (aff_valid_now) {
+        speed_metric = speed_rel;   // already metric per-point via affine
+    } else if (K > 0.0) {
+        speed_metric = K * speed_rel;
+    } else {
+        // Neither path available — bail.
         if (frame_counter_ % 30 == 0) {
             LOGI("DEPTH_FLOW_SPEED: K=uncalibrated speed_rel=%.4f/s accel_spd=%.2f "
                  "tsz=%.2f n=%zu (awaiting accel-excitation window after a stop)",
@@ -1084,7 +1181,6 @@ void Tracker::updateDepthFlowSpeed(const std::vector<cv::Point2f>& prev_ud,
         }
         return;
     }
-    const double speed_metric = K * speed_rel;
 
     // Trust-boundary sanity: reject a single absurd frame (> 30 m/s = 108 km/h).
     constexpr double kMaxFrameSpeedMps = 30.0;
@@ -1101,8 +1197,11 @@ void Tracker::updateDepthFlowSpeed(const std::vector<cv::Point2f>& prev_ud,
     const double next = (cur < 0.0) ? speed_metric : (cur + alpha * (speed_metric - cur));
     depth_flow_speed_mps_.store(next, std::memory_order_relaxed);
     navsight::eventCounters().depth_flow_updates.fetch_add(1, std::memory_order_relaxed);
+    // 2026-05-28 (Step A) — speed_metric * dt is per-frame metric distance,
+    // valid for both affine (already metric) and K (multiplied above) paths.
     navsight::eventCounters().depth_flow_total_mm.fetch_add(
-        static_cast<long long>(K * disp_rel * 1000.0 + 0.5), std::memory_order_relaxed);
+        static_cast<long long>(speed_metric * dt_s * 1000.0 + 0.5),
+        std::memory_order_relaxed);
 
     // Diagnostic (2026-05-26): relative units + calibrated K + accel cross-check, so a
     // walk/run shows whether K converged and the metric speed tracks reality.
@@ -1110,13 +1209,15 @@ void Tracker::updateDepthFlowSpeed(const std::vector<cv::Point2f>& prev_ud,
         std::sort(z_est.begin(), z_est.end());
         std::sort(flow_est.begin(), flow_est.end());
         const size_t m = s_est.size();
-        LOGI("DEPTH_FLOW_SPEED: n=%zu no_depth=%d Zrel[min/med/max]=%.2f/%.2f/%.2f "
-             "flow[med/max]=%.1f/%.1f speed_rel=%.4f/s K=%.3f accel_spd=%.2f tsz=%.2f "
-             "-> ema=%.2f m/s (%.1f km/h)",
+        LOGI("DEPTH_FLOW_SPEED: src=%s n=%zu no_depth=%d Z[min/med/max]=%.2f/%.2f/%.2f "
+             "flow[med/max]=%.1f/%.1f speed=%.4f/s K=%.3f s=%.4f t=%.4f accel_spd=%.2f "
+             "tsz=%.2f -> ema=%.2f m/s (%.1f km/h)",
+             aff_valid_now ? "affine" : "K",
              m, n_no_depth,
              z_est.front(), z_est[z_est.size() / 2], z_est.back(),
              flow_est[flow_est.size() / 2], flow_est.back(),
-             speed_rel, K, accel_speed, secs_since_zupt_, next, next * 3.6);
+             speed_rel, K, s_aff, t_aff, accel_speed, secs_since_zupt_,
+             next, next * 3.6);
     }
 }
 double Tracker::getLastVisualYawVariance() const {
@@ -2236,23 +2337,51 @@ VisionOutput Tracker::processFrame(const uint8_t* yuv_data, int width, int heigh
             const double ax = dvw.at<double>(0) / dt;
             const double ay = dvw.at<double>(1) / dt;
             const double az = dvw.at<double>(2) / dt - 9.81;   // remove gravity (Z-down ENU)
-            // Low-pass = the slow residual (gravity-leak + accel bias). tau=2.0 s is
-            // longer than a push-off accel (~0.5-1 s, kept as signal) yet short enough
-            // to track and cancel the slower leak drift (it ramped over 2-7 s in the
-            // data). Updated EVERY frame so it converges to the residual during the
-            // stationary period too.
+            // 2026-05-29 — HIGH-PASS DRIFT FILTER REMOVED (was the K=0-on-walks root cause).
+            //
+            // Cause: the HP filter (tau=2.0 s, subtracting accel_drift_lp_) was added
+            //   2026-05-26 to stop raw accel velocity ramping to ~12 m/s. But a STEADY
+            //   walk has near-constant velocity, which the HP filter treats as "drift"
+            //   and cancels — so accel_vel_w_ read 0.08-0.45 m/s while the user walked
+            //   ~1.3 m/s (v5_a logcat: accel_spd=0.08 at tsz=2.5). accel_dist_accum_
+            //   then never reached the 2 m calibration gate => K never calibrated on
+            //   walks (v5_a/v5_c K=0), and depth-flow speed read ~5x low.
+            // Proof: offline analyze_accel_speed.py on the SAME walk:
+            //   [zupt] (raw integrate + ZUPT re-zero, NO HP) -> median 0.78 m/s,
+            //          FINAL drift 0.00 m/s  (CLEAN).
+            //   [hp]   (current on-device) -> median 1.45 but FINAL 3.92 m/s (drifts).
+            //   The ZUPT re-zero (below, is_static branch) alone bounds drift when the
+            //   user stops periodically; the HP filter was both unnecessary AND harmful.
+            // Change: integrate RAW gravity-removed linear accel. Drift is bounded by
+            //   (a) ZUPT re-zero at every is_static, and (b) the K-calibration gate only
+            //   trusting the window <=2.5 s after a stop (raw drift is small that soon
+            //   after a clean v=0). accel_drift_lp_ kept (commented) for easy revert.
+            /* LEGACY 2026-05-26 HP drift filter — decayed steady-walk velocity:
             constexpr double kAccelDriftTau = 2.0;
             const double a_lp = dt / (kAccelDriftTau + dt);
             accel_drift_lp_[0] += a_lp * (ax - accel_drift_lp_[0]);
             accel_drift_lp_[1] += a_lp * (ay - accel_drift_lp_[1]);
             accel_drift_lp_[2] += a_lp * (az - accel_drift_lp_[2]);
+            */
             if (!is_static) {
-                // Integrate the HIGH-PASSED (drift-removed) linear accel.
-                accel_vel_w_[0] += (ax - accel_drift_lp_[0]) * dt;
-                accel_vel_w_[1] += (ay - accel_drift_lp_[1]) * dt;
-                accel_vel_w_[2] += (az - accel_drift_lp_[2]) * dt;
+                // Integrate RAW linear accel (gravity already removed above). ZUPT
+                // re-zero at each stop bounds the drift (data-proven clean).
+                accel_vel_w_[0] += ax * dt;
+                accel_vel_w_[1] += ay * dt;
+                accel_vel_w_[2] += az * dt;
                 if (secs_since_zupt_ >= 0.0) secs_since_zupt_ += dt;
-                accel_dist_accum_ += std::hypot(accel_vel_w_[0], accel_vel_w_[1]) * dt;
+                // 2026-05-29 — only grow accel_dist_accum_ inside the trustworthy
+                // post-ZUPT window (<=2.5 s). Past that, raw integration drift would
+                // inflate the distance with no ZUPT to re-zero (the review's HIGH
+                // finding: a run with few stops could ramp accel_dist and inflate K).
+                // The K-calibration gate already requires secs_since_zupt_<=2.5, so
+                // capping accumulation here changes nothing in-window but stops stale
+                // drift from carrying numbers a later (still <=2.5 after a fresh stop)
+                // calibration could mis-read. accel_vel_w_ keeps integrating (it is
+                // re-zeroed at the next stop) — only the DISTANCE accumulator is frozen.
+                if (secs_since_zupt_ >= 0.0 && secs_since_zupt_ <= 2.5) {
+                    accel_dist_accum_ += std::hypot(accel_vel_w_[0], accel_vel_w_[1]) * dt;
+                }
             }
         }
     }
@@ -2261,6 +2390,7 @@ VisionOutput Tracker::processFrame(const uint8_t* yuv_data, int width, int heigh
         secs_since_zupt_ = 0.0;
         accel_dist_accum_ = 0.0;
         visual_rel_dist_accum_ = 0.0;
+        visual_rel_dist_loom_ = 0.0;   // 2026-05-29 — looming's separate accumulator
     }
 
     // 2026-05-18 falsifier: log EKF.b_g_ tagged with is_static so we can see
@@ -2445,6 +2575,9 @@ VisionOutput Tracker::processFrame(const uint8_t* yuv_data, int width, int heigh
 
     // ── 8. Lens undistortion + Essential matrix + pose ───────────────────────
     bool pose_valid = false;
+    // 2026-05-28 — `used_fallback` now stays false because the PDR fallback was
+    // commented out (user request: legacy). Kept here so the poseFlags bit 8
+    // packing at the bottom of processFrame keeps the same width; reads as 0.
     bool used_fallback = false;
     bool translation_degenerate = false;
     int inlier_count_out = 0;
@@ -2496,33 +2629,47 @@ VisionOutput Tracker::processFrame(const uint8_t* yuv_data, int width, int heigh
         bool verification_ok = klt_.geometricVerification(prev_ud, next_ud, status_verification,
                                                           K, R_vo, t_vo, inlier_count_out);
 
-        // 2026-05-26 — depth-weighted metric speed (see updateDepthFlowSpeed):
-        // recover the metric scale of the recoverPose translation from the tracked
-        // points' MiDaS depths. Gated on a verified pose so R_vo/t_vo are meaningful.
+        // 2026-05-28 — gyro rotation vector in CAMERA frame (omega · dt) for
+        // de-rotating the optical flow before computing looming/divergence.
+        // Computed BEFORE the verification_ok gate because updateExpansionSpeed
+        // (looming) now fires independently of essential-matrix verification —
+        // looming uses only de-rotated flow + FOE from EKF heading, never
+        // R_vo / t_vo from recoverPose. Without de-rotation, head turns
+        // produce false forward-speed (research Rec 3: rotational flow corrupts
+        // divergence at ~3r/f · |Δω|).
+        cv::Vec3d gyro_rot_cam(0.0, 0.0, 0.0);
+        if (!imu_delta.deltaR.empty() && imu_delta.deltaR.rows == 3 &&
+            imu_delta.deltaR.cols == 3) {
+            cv::Mat rv_body_mat;
+            cv::Rodrigues(imu_delta.deltaR, rv_body_mat);
+            if (rv_body_mat.rows == 3 && rv_body_mat.cols == 1) {
+                const cv::Matx33d R_bc_ext = ekf_.getExtrinsicsRotation();
+                const cv::Vec3d rv_body(rv_body_mat.at<double>(0),
+                                        rv_body_mat.at<double>(1),
+                                        rv_body_mat.at<double>(2));
+                gyro_rot_cam = R_bc_ext * rv_body;
+            }
+        }
+        const double dt_s_speed = (timestamp_ns - current_prev_ts) * 1e-9;
+
+        // 2026-05-28 — looming/expansion-rate path. Moved OUT of the
+        // verification_ok gate so it fires on slow walks where the essential
+        // matrix degenerates (today's bug: walk had inlier ratio 0.03-0.19,
+        // verification_ok=false for every frame → depth-flow never fired →
+        // K never calibrated → UI=0). Looming only needs prev_ud/next_ud +
+        // de-rotated flow + FOE-from-EKF-heading + K. It bails internally
+        // if K hasn't been calibrated yet; K persists across app launches
+        // (SharedPreferences) so cold-start walks inherit it from any prior
+        // session that calibrated.
+        updateExpansionSpeed(prev_ud, next_ud, dt_s_speed, gyro_rot_cam);
+
+        // Depth-weighted metric speed (see updateDepthFlowSpeed): recovers the
+        // metric scale of the recoverPose translation from the tracked points'
+        // MiDaS depths. STAYS gated on verification_ok because it consumes
+        // R_vo/t_vo and would produce garbage otherwise.
         if (verification_ok && inlier_count_out >= static_cast<int>(MIN_INLIERS) &&
             !R_vo.empty() && !t_vo.empty()) {
-            const double dt_s = (timestamp_ns - current_prev_ts) * 1e-9;
-            // 2026-05-28 — camera-frame gyro rotation vector (omega · dt) for
-            // de-rotating the optical flow before computing looming/divergence.
-            // Without it, head turns produce false forward-speed signals (research
-            // Rec 3: rotational flow corrupts divergence at ~3r/f · |Δω|). Derived
-            // from imu_delta.deltaR (body rotation increment over the frame) via
-            // Rodrigues, then mapped to camera frame with the body→camera extrinsic.
-            cv::Vec3d gyro_rot_cam(0.0, 0.0, 0.0);
-            if (!imu_delta.deltaR.empty() && imu_delta.deltaR.rows == 3 &&
-                imu_delta.deltaR.cols == 3) {
-                cv::Mat rv_body_mat;
-                cv::Rodrigues(imu_delta.deltaR, rv_body_mat);
-                if (rv_body_mat.rows == 3 && rv_body_mat.cols == 1) {
-                    const cv::Matx33d R_bc_ext = ekf_.getExtrinsicsRotation();
-                    const cv::Vec3d rv_body(rv_body_mat.at<double>(0),
-                                            rv_body_mat.at<double>(1),
-                                            rv_body_mat.at<double>(2));
-                    gyro_rot_cam = R_bc_ext * rv_body;
-                }
-            }
-            updateDepthFlowSpeed(prev_ud, next_ud, R_vo, t_vo, dt_s);
-            updateExpansionSpeed(prev_ud, next_ud, dt_s, gyro_rot_cam);
+            updateDepthFlowSpeed(prev_ud, next_ud, R_vo, t_vo, dt_s_speed);
         }
         // 2026-05-18 falsifier: log inner outcomes when outer gate passed
         if (frame_counter_ % 30 == 0) {
@@ -3261,6 +3408,9 @@ VisionOutput Tracker::processFrame(const uint8_t* yuv_data, int width, int heigh
                                                 std::memory_order_relaxed);
                 }
             }
+            // 2026-05-28 — trajectory frozen ⇒ UI shows 0 km/h instantly. Don't
+            // decay; the user expects "you stopped" to register at once.
+            trajectory_speed_mps_.store(0.0, std::memory_order_relaxed);
             // Translation frozen — no global_t_ update.
             if (rotation_dominated && !is_static) {
                 navsight::eventCounters().global_t_gated_rotation_dominated_total
@@ -3271,15 +3421,60 @@ VisionOutput Tracker::processFrame(const uint8_t* yuv_data, int width, int heigh
                 }
             }
         } else if (pose_valid && !is_pure_rotation && !translation_degenerate && quality >= 0.15) {
-            double disp = appliedScale * cv::norm(t_vo);
-
-            // Sanity cap: max displacement per frame = 2 m/s * dt
-            // Walking is ~1.3 m/s, running ~3 m/s. Anything above 2*dt is noise.
             double dt_frame = (timestamp_ns - current_prev_ts) * 1e-9;
-            double max_disp = 2.0 * std::max(dt_frame, 0.03);
+
+            // 2026-05-28 — Wire depth-flow speed into the trajectory.
+            //
+            // Cause of disconnect: until today, two parallel speed paths ran
+            //   without talking to each other —
+            //   (a) trajectory: disp = scale_fuser_.scale() * |t_vo|, where
+            //       scale_fuser_ is the LEGACY ScaleFuser bootstrapped from
+            //       PDR (stride-based, user-rejected for non-walk gaits) and
+            //       refined by MiDaS affine-fit / Observer-A;
+            //   (b) UI speedometer: getFusedSpeedMps() returns
+            //       depth_flow_speed_mps_ — the new K-calibrated
+            //       depth-weighted recoverPose result plus looming fusion.
+            //   Result: speedometer read 11 km/h on a run while the dot
+            //   crept at ~3 km/h equivalent because the trajectory was
+            //   still on the legacy path.
+            //
+            // Change: when depth-flow speed is valid (>=0; -1 sentinel
+            //   during warm-up before the first updateDepthFlowSpeed),
+            //   override disp = df_speed * dt_frame. Heading/direction
+            //   are unchanged — only the magnitude. Falls back to the
+            //   scale_fuser path on warm-up frames so trajectory drawing
+            //   is never blocked.
+            // Falsifier: dot's per-second motion matches the speedometer
+            //   reading (within EMA lag) on a walk and a run. Legacy
+            //   scale_fuser path still computes (kept for fallback) but
+            //   no longer drives the trajectory once depth-flow is live.
+            double disp = appliedScale * cv::norm(t_vo);
+            const double df_speed = depth_flow_speed_mps_.load(std::memory_order_relaxed);
+            bool used_depth_flow = false;
+            if (df_speed >= 0.0 && dt_frame > 0.0) {
+                disp = df_speed * dt_frame;
+                used_depth_flow = true;
+            }
+
+            // Sanity cap: max displacement per frame.
+            // Pre-2026-05-28 cap was 2.0 m/s (walking), which truncated
+            // running (~3 m/s) and any vehicle locomotion. Raised to 8 m/s
+            // (~28.8 km/h) to cover walk/run/scooter/bike. The depth-flow
+            // path is itself bounded by the looming EMA + recoverPose
+            // robust median, so this cap mostly guards the legacy
+            // scale_fuser branch.
+            double max_disp = 8.0 * std::max(dt_frame, 0.03);
             if (disp > max_disp) {
-                LOGI("DISP_CAP: disp=%.2f capped to %.2f (dt=%.3f)", disp, max_disp, dt_frame);
+                LOGI("DISP_CAP: disp=%.2f capped to %.2f (dt=%.3f) src=%s",
+                     disp, max_disp, dt_frame, used_depth_flow ? "df" : "fuser");
                 disp = max_disp;
+            }
+
+            // 2026-05-28 — publish the speed actually applied to the trajectory
+            // so the UI speedometer (getFusedSpeedMps) reflects what the user
+            // sees on the map. Source = depth-flow when valid, else legacy fuser.
+            if (dt_frame > 0.0) {
+                trajectory_speed_mps_.store(disp / dt_frame, std::memory_order_relaxed);
             }
 
             // Accumulate path length. Pre-2026-05-09 this counter only
@@ -3414,6 +3609,26 @@ VisionOutput Tracker::processFrame(const uint8_t* yuv_data, int width, int heigh
                     static_cast<void>(ekf_.updateRelativePose(t_world_metric, prev_clone_id, var_t));
                 }
             }
+        }
+        /* 2026-05-28 — PDR step-based fallback DISABLED. Reason: it injects a
+           stride-derived translation (≤1 m/s capped) whenever the visual path
+           fails (else-if branch fires when pose_valid=false). On today's walk,
+           essential-matrix verification failed across the whole recording (inlier
+           ratio 0.03-0.19 vs MIN_INLIER_RATIO=0.25 — slow walk + close scene),
+           so PDR was the sole trajectory source, the dot moved, but the
+           speedometer sat at 0 because depth_flow_speed_mps_ stayed at the -1
+           sentinel. User-rejected (2026-05-28): "remove the step based speed,
+           comment it out since its legacy now."
+
+           Going forward: the trajectory advances via the visual / depth-flow
+           path only. When essential-matrix verification fails, looming now
+           still fires (it was moved out of the verification_ok gate above) and
+           contributes via depth_flow_speed_mps_ as long as K is seeded. K is
+           seeded from SharedPreferences on each cold start. If K is still
+           uncalibrated AND essential matrix fails, the trajectory genuinely
+           stops — which is honest and a clear signal to fix depth-flow rather
+           than papering over with PDR.
+
         } else if (!is_static) {
             used_fallback = true;
             auto si = imu.getStepInfo();
@@ -3451,6 +3666,9 @@ VisionOutput Tracker::processFrame(const uint8_t* yuv_data, int width, int heigh
                 navsight::eventCounters().total_path_dm.store(
                     static_cast<long long>(total_path_m_ * 10.0 + 0.5),
                     std::memory_order_relaxed);
+                if (dt_s > 0.0) {
+                    trajectory_speed_mps_.store(d / dt_s, std::memory_order_relaxed);
+                }
                 // Z-up ENU world: project step displacement onto X (East), Y (North).
                 double dx_step = d * std::sin(heading);   // +X = East
                 double dy_step = d * std::cos(heading);   // +Y = North
@@ -3480,6 +3698,7 @@ VisionOutput Tracker::processFrame(const uint8_t* yuv_data, int width, int heigh
                 }
             }
         }
+        */
 
         // ── 9.1 FEJ & MSCKF: Store Camera Clone ──
         // Clone the EKF's IMU-state pose, composing R_bc * R_GtoI so that
@@ -7669,10 +7888,15 @@ void Tracker::updateExpansionSpeed(const std::vector<cv::Point2f>& prev_ud,
     // smooth blend (looming-dominant when forward, recoverPose-dominant sideways).
     if (dt_s <= 1e-4 || fx_ <= 0.0 || fy_ <= 0.0) return;
 
-    // Bail if K hasn't been calibrated yet — without it the looming Vz is in
-    // arbitrary units; falling back to K=1 would lie to the UI.
-    const double K = midas_scale_K_.load(std::memory_order_relaxed);
-    if (K <= 0.0) return;
+    // 2026-05-28 — K bail REMOVED here so the per-point loop can produce a
+    // K-INDEPENDENT relative speed (vz_rel = tau * Z_rel). That value lets us
+    // bootstrap K from accel-distance correlation BELOW, breaking the
+    // chicken-and-egg where K only calibrated inside updateDepthFlowSpeed
+    // (which requires essential-matrix verification to pass — never true on
+    // slow walks). With the bootstrap, K calibrates from any forward-motion
+    // window regardless of essential-matrix success, so cold-start walks
+    // produce metric speed on the first stop→go after the K-calibration
+    // window opens.
 
     // 1. Focus of Expansion (FOE) from the EKF heading projected to image plane.
     //    Forward motion is assumed along the world-frame heading direction (Z-up ENU).
@@ -7689,12 +7913,40 @@ void Tracker::updateExpansionSpeed(const std::vector<cv::Point2f>& prev_ud,
     const double wy = gyro_rot_cam[1];
     const double wz = gyro_rot_cam[2];
 
+    // 2026-05-29 — Step A per-point affine DISABLED on the looming speed path,
+    // same reason as updateDepthFlowSpeed: the affine (s,t) is anchored to
+    // scale_fuser_ (~0.10, the rejected-PDR seed) so its "metric" depth is ~5x
+    // too small, and it degenerates to flat depth (s≈0) on noisy VIO targets.
+    // The accel-K path is the single metric anchor. Looming still computes the
+    // K-independent vz_rel = tau * Z_rel and feeds the shared K bootstrap; the
+    // metric conversion is K * vz_rel (Path B below). Snapshot kept commented
+    // for revert if a non-scale_fuser per-point metric depth is ever wired.
+    /* LEGACY 2026-05-28 Step A affine snapshot (scale_fuser-poisoned):
+    double s_aff = 0.0;
+    double t_aff = 0.0;
+    bool   aff_valid = false;
+    {
+        std::lock_guard<std::mutex> lock(midas_affine_mutex_);
+        s_aff = midas_affine_s_;
+        t_aff = midas_affine_t_;
+        aff_valid = midas_affine_valid_;
+    }
+    */
+    constexpr bool aff_valid = false;       // affine off the speed path (see above)
+    const double s_aff = 0.0, t_aff = 0.0;  // logged only; unused while aff_valid=false
+
     // 2. Per-point expansion rate from de-rotated radial flow.
+    //    K-INDEPENDENT: vz_rel_i = tau * Z_rel; vz_metric_i = vz_rel_i * K.
+    //    AFFINE: vz_metric_i = tau / (s * disp + t) — computed in parallel below.
     const size_t n = std::min(prev_ud.size(), next_ud.size());
-    std::vector<double> vz_estimates;
-    std::vector<double> rho_values;
-    vz_estimates.reserve(n);
+    std::vector<double> vz_rel_estimates;     // K-independent: tau * Z_rel
+    std::vector<double> rho_values;           // aligned with vz_rel_estimates
+    std::vector<double> vz_metric_aff_est;    // affine direct metric: tau / (s*disp+t)
+    std::vector<double> rho_aff_values;       // aligned with vz_metric_aff_est
+    vz_rel_estimates.reserve(n);
     rho_values.reserve(n);
+    vz_metric_aff_est.reserve(n);
+    rho_aff_values.reserve(n);
     int total_valid = 0;     // points that produced a depth + flow measurement
     int positive    = 0;     // ... of which, how many were expanding outward (forward)
     constexpr double kRhoMin  = 0.05;   // mask near-FOE noise blow-up (research)
@@ -7731,35 +7983,147 @@ void Tracker::updateExpansionSpeed(const std::vector<cv::Point2f>& prev_ud,
         ++total_valid;
         if (tau > 0.0) ++positive;
 
-        const double vz_i = tau * Z_rel * K;
-        if (std::isfinite(vz_i) && vz_i > 0.0 && vz_i < 30.0) {
-            vz_estimates.push_back(vz_i);
+        const double vz_rel_i = tau * Z_rel;   // K-independent
+        // Sanity: finite & positive. The metric upper bound (30 m/s) is applied
+        // after multiplying by K below.
+        if (std::isfinite(vz_rel_i) && vz_rel_i > 0.0) {
+            vz_rel_estimates.push_back(vz_rel_i);
             rho_values.push_back(rho);
+        }
+        // 2026-05-28 (Step A) — affine direct metric (per-point, scene-invariant).
+        if (aff_valid) {
+            const double inv_metric = s_aff * disp_raw + t_aff;
+            if (inv_metric > 1e-4) {
+                const double vz_metric_aff_i = tau / inv_metric;
+                if (std::isfinite(vz_metric_aff_i) &&
+                    vz_metric_aff_i > 0.0 && vz_metric_aff_i < 30.0) {
+                    vz_metric_aff_est.push_back(vz_metric_aff_i);
+                    rho_aff_values.push_back(rho);
+                }
+            }
         }
     }
 
     constexpr size_t kMinPts = 10;
-    if (vz_estimates.size() < kMinPts) {
+    if (vz_rel_estimates.size() < kMinPts) {
         navsight::eventCounters().depth_flow_looming_skipped.fetch_add(
             1, std::memory_order_relaxed);
         return;
     }
 
-    // 3. Robust median + ρ²-weighted inlier mean (down-weights near-FOE points).
-    std::sort(vz_estimates.begin(), vz_estimates.end());
-    const double vz_med = vz_estimates[vz_estimates.size() / 2];
+    // 3. Robust median + ρ²-weighted inlier mean of the RELATIVE vz.
+    std::sort(vz_rel_estimates.begin(), vz_rel_estimates.end());
+    const double vz_rel_med = vz_rel_estimates[vz_rel_estimates.size() / 2];
     double sum_num = 0.0, sum_den = 0.0;
     int n_inliers = 0;
-    const double tol = 0.3 * std::abs(vz_med) + 0.1;
-    for (size_t i = 0; i < vz_estimates.size(); ++i) {
-        if (std::abs(vz_estimates[i] - vz_med) < tol) {
+    const double tol_rel = 0.3 * std::abs(vz_rel_med) + 1e-4;
+    for (size_t i = 0; i < vz_rel_estimates.size(); ++i) {
+        if (std::abs(vz_rel_estimates[i] - vz_rel_med) < tol_rel) {
             const double w = rho_values[i] * rho_values[i];
-            sum_num += w * vz_estimates[i];
+            sum_num += w * vz_rel_estimates[i];
             sum_den += w;
             ++n_inliers;
         }
     }
-    const double vz_fused_raw = (sum_den > 0.0) ? (sum_num / sum_den) : vz_med;
+    const double vz_rel_fused = (sum_den > 0.0) ? (sum_num / sum_den) : vz_rel_med;
+    const double forward_fraction_early = (total_valid > 0)
+        ? (static_cast<double>(positive) / total_valid) : 0.0;
+
+    // 4. K BOOTSTRAP from looming — calibrates LOOMING's OWN K (expansion_scale_K_),
+    //    NOT the depth-flow K. Looming fires on ALL locomotion (outside the
+    //    essential-matrix verification gate), so on slow walks (where depth-flow's
+    //    recoverPose path bails) this is the path that calibrates + drives speed.
+    //    Its relative measure is vz_rel = tau*Z_rel — a different basis from
+    //    depth-flow's disp_rel, so it keeps a SEPARATE accumulator
+    //    (visual_rel_dist_loom_) and a SEPARATE K to stay self-consistent (no
+    //    cross-basis mismatch, no shared-accumulator double-count). For pure-forward
+    //    motion both K's reduce to v/(relative speed) so they agree numerically.
+    //    forward_fraction>0.5 gates to the well-conditioned forward regime; the raw
+    //    (HP-removed) accel integrator supplies the ZUPT-re-zeroed metric reference.
+    if (forward_fraction_early > 0.5 &&
+        secs_since_zupt_ >= 0.3 && secs_since_zupt_ <= 2.5 &&
+        vz_rel_fused > 0.0) {
+        visual_rel_dist_loom_ += vz_rel_fused * dt_s;
+        if (accel_dist_accum_ > kAccelKMinDistM && visual_rel_dist_loom_ > 1e-4) {
+            const double k_obs = accel_dist_accum_ / visual_rel_dist_loom_;
+            if (std::isfinite(k_obs) && k_obs > 0.0) {
+                const double cur_k = expansion_scale_K_.load(std::memory_order_relaxed);
+                const double new_k = (cur_k <= 0.0) ? k_obs
+                                                    : (0.95 * cur_k + 0.05 * k_obs);
+                expansion_scale_K_.store(new_k, std::memory_order_relaxed);
+                navsight::eventCounters().depth_flow_calib_updates.fetch_add(
+                    1, std::memory_order_relaxed);
+                // Visible, UNGATED log of every accepted looming-K calibration.
+                LOGI("ACCEL_K_CALIB[loom]: k_obs=%.1f accel_dist=%.2fm vis_rel=%.4f "
+                     "tsz=%.2fs fwd=%.2f cur_K=%.1f -> new_K=%.1f", k_obs, accel_dist_accum_,
+                     visual_rel_dist_loom_, secs_since_zupt_, forward_fraction_early,
+                     cur_k, new_k);
+                // Reuse midas_scale_k_milli min/max gauges for K visibility in
+                // event_summary (looming K shares the same physical scale family).
+                const long long k_milli = static_cast<long long>(new_k * 1000.0 + 0.5);
+                navsight::eventCounters().midas_scale_k_milli.store(
+                    k_milli, std::memory_order_relaxed);
+                const long long kmax = navsight::eventCounters()
+                    .midas_scale_k_max_milli.load(std::memory_order_relaxed);
+                if (k_milli > kmax) navsight::eventCounters()
+                    .midas_scale_k_max_milli.store(k_milli, std::memory_order_relaxed);
+                const long long kmin = navsight::eventCounters()
+                    .midas_scale_k_min_milli.load(std::memory_order_relaxed);
+                if (kmin == 0 || k_milli < kmin) navsight::eventCounters()
+                    .midas_scale_k_min_milli.store(k_milli, std::memory_order_relaxed);
+            }
+        }
+    }
+
+    // 5. Decide metric source: per-point affine (preferred — scene-invariant) or
+    //    global K (fallback).
+    double vz_fused_raw = -1.0;
+    double vz_med       = -1.0;
+    std::vector<double> vz_estimates;  // for log line
+    bool used_affine = false;
+    if (aff_valid && vz_metric_aff_est.size() >= kMinPts) {
+        // Path A: per-point affine direct metric. Robust median + ρ²-WLS in metric
+        // units. No global K multiplication — (s, t) absorbs the scene-dependent
+        // disparity-to-metric mapping per-point.
+        std::sort(vz_metric_aff_est.begin(), vz_metric_aff_est.end());
+        const double vz_aff_med = vz_metric_aff_est[vz_metric_aff_est.size() / 2];
+        double sum_num_a = 0.0, sum_den_a = 0.0;
+        const double tol_aff = 0.3 * std::abs(vz_aff_med) + 0.1;
+        for (size_t i = 0; i < vz_metric_aff_est.size(); ++i) {
+            if (std::abs(vz_metric_aff_est[i] - vz_aff_med) < tol_aff) {
+                const double w = rho_aff_values[i] * rho_aff_values[i];
+                sum_num_a += w * vz_metric_aff_est[i];
+                sum_den_a += w;
+            }
+        }
+        vz_fused_raw = (sum_den_a > 0.0) ? (sum_num_a / sum_den_a) : vz_aff_med;
+        vz_med = vz_aff_med;
+        vz_estimates = vz_metric_aff_est;
+        used_affine = true;
+    } else {
+        // Path B: looming's metric speed = K_loom * vz_rel. Uses LOOMING's own K
+        // (expansion_scale_K_), calibrated above from the same vz_rel basis —
+        // self-consistent, no cross-basis with depth-flow's midas_scale_K_.
+        const double K = expansion_scale_K_.load(std::memory_order_relaxed);
+        if (K <= 0.0) {
+            navsight::eventCounters().depth_flow_looming_skipped.fetch_add(
+                1, std::memory_order_relaxed);
+            return;
+        }
+        vz_fused_raw = vz_rel_fused * K;
+        vz_estimates.reserve(vz_rel_estimates.size());
+        for (double r : vz_rel_estimates) {
+            const double m = r * K;
+            if (std::isfinite(m) && m > 0.0 && m < 30.0) vz_estimates.push_back(m);
+        }
+        vz_med = vz_estimates.empty() ? vz_fused_raw
+                                      : vz_estimates[vz_estimates.size() / 2];
+    }
+    if (!std::isfinite(vz_fused_raw) || vz_fused_raw <= 0.0 || vz_fused_raw > 30.0) {
+        navsight::eventCounters().depth_flow_looming_skipped.fetch_add(
+            1, std::memory_order_relaxed);
+        return;
+    }
 
     // EMA on the LOOMING speed itself (kept as an independent diagnostic / output).
     // 2026-05-28 — tau dropped 0.5 -> 0.2 s: the slow EMA was washing out brief
@@ -7785,9 +8149,17 @@ void Tracker::updateExpansionSpeed(const std::vector<cv::Point2f>& prev_ud,
         ? (static_cast<double>(positive) / total_valid) : 0.0;
     const double w_loom = std::clamp((forward_fraction - 0.5) * 2.0, 0.0, 1.0);
     const double cur_disp = depth_flow_speed_mps_.load(std::memory_order_relaxed);
-    if (cur_disp >= 0.0 && w_loom > 0.0) {
+    // 2026-05-28 — also store when cur_disp<0 (depth-flow never fired this
+    // session, slow-walk scene). Without this, the looming-only case still
+    // left depth_flow_speed_mps_ at -1 → UI sat at 0. Now: when w_loom>0,
+    // looming is reliable enough to be the sole source.
+    if (w_loom > 0.0) {
         const double loom_for_fusion = (w_loom > 0.5) ? vz_fused_raw : next_loom;
-        const double fused = w_loom * loom_for_fusion + (1.0 - w_loom) * cur_disp;
+        double fused = loom_for_fusion;
+        if (cur_disp >= 0.0) {
+            // Both sources available: blend by forward-motion fraction.
+            fused = w_loom * loom_for_fusion + (1.0 - w_loom) * cur_disp;
+        }
         depth_flow_speed_mps_.store(fused, std::memory_order_relaxed);
         if (w_loom > 0.5) {
             navsight::eventCounters().depth_flow_looming_used.fetch_add(
@@ -7796,9 +8168,11 @@ void Tracker::updateExpansionSpeed(const std::vector<cv::Point2f>& prev_ud,
     }
 
     if (frame_counter_ % 30 == 0) {
-        LOGI("EXPANSION_SPEED: n=%zu inliers=%d vz_med=%.2f vz_fused=%.2f ema=%.2f "
-             "fwd_frac=%.2f w_loom=%.2f K=%.3f -> %.1f km/h",
-             vz_estimates.size(), n_inliers, vz_med, vz_fused_raw, next_loom,
-             forward_fraction, w_loom, K, next_loom * 3.6);
+        const double K_log = expansion_scale_K_.load(std::memory_order_relaxed);  // looming's own K
+        LOGI("EXPANSION_SPEED: src=%s n=%zu vz_med=%.2f vz_fused=%.2f ema=%.2f "
+             "fwd_frac=%.2f w_loom=%.2f K_loom=%.3f s=%.4f t=%.4f -> %.1f km/h",
+             used_affine ? "affine" : "K",
+             vz_estimates.size(), vz_med, vz_fused_raw, next_loom,
+             forward_fraction, w_loom, K_log, s_aff, t_aff, next_loom * 3.6);
     }
 }

@@ -193,6 +193,16 @@ public:
     // scooter, bike, etc. Returns -1.0 before the first valid estimate (caller
     // shows 0/"--").
     double getFusedSpeedMps() const;
+    // 2026-05-28 — cross-app-launch persistence of the MiDaS scale K (the
+    // metric-per-relative depth-flow scale calibrated inside updateDepthFlowSpeed).
+    // The Kotlin layer loads K from SharedPreferences on app start and pushes it
+    // here via setMidasScaleK, then periodically reads via getMidasScaleK and
+    // writes back to prefs. Without this, every cold app start re-pays the K
+    // calibration tax — which depends on essential-matrix verification passing,
+    // which fails on slow walks with close scenes → on a cold-start walk K stays
+    // at -1 forever, looming bails (it requires K>0), and the UI shows 0.
+    void setMidasScaleK(double k);
+    double getMidasScaleK() const;
     bool isInitialized() const { return initialized_; }
     const EKFState* getEKF() const { return &ekf_; }
     // Step 2.4: variance of the last keyframe-derived visual yaw measurement
@@ -495,10 +505,24 @@ private:
     // 2026-05-26 — depth-weighted metric speed (Tracker::updateDepthFlowSpeed):
     // the metric scale of the recoverPose translation, recovered from the tracked
     // feature points' MiDaS depths → reported speed |v|/dt, EMA-smoothed (τ≈0.5s).
-    // Atomic: written on the camera thread, read by getFusedSpeedMps on the UI
-    // thread. -1.0 = no estimate yet. Independent of the (diverging) EKF v_G_ and
-    // of the global appliedScale.
+    // Atomic: written on the camera thread, read internally by the depth-flow
+    // K-calibration and the trajectory wire-up. -1.0 = no estimate yet.
+    // Independent of the (diverging) EKF v_G_ and of the global appliedScale.
     std::atomic<double> depth_flow_speed_mps_{-1.0};
+
+    // 2026-05-28 — trajectory-applied speed (m/s). What the trajectory accumulator
+    // is ACTUALLY using to advance global_t_ this frame, regardless of source:
+    //   - depth_flow_speed_mps_ when depth-flow / looming is valid;
+    //   - legacy appliedScale * |t_vo| / dt when essential matrix passed but
+    //     depth-flow hadn't calibrated K yet;
+    //   - PDR step speed when the camera path is degenerate (slow walk +
+    //     close scene → low inlier ratio → verification_ok=false);
+    //   - 0.0 during is_static / rotation_dominated frames.
+    // Read by getFusedSpeedMps for the UI speedometer so the displayed speed
+    // always tracks the actual trajectory motion the user sees on the map. The
+    // depth_flow_speed_mps_ atomic stays as the K-calibrated estimate used by
+    // the depth-flow internals; trajectory_speed_mps_ is the UI-facing view.
+    std::atomic<double> trajectory_speed_mps_{0.0};
 
     // 2026-05-27 — expansion-rate metric speed (Tracker::updateExpansionSpeed):
     // implements "Vz = expansion_rate * Z_rel * K" robustly via Median + WLS.
@@ -550,7 +574,18 @@ private:
     // Far more stable than the per-frame ratio, which swung ~2.4x because MiDaS
     // renormalises its relative scale every frame (research Rec 3). Reset at each stop.
     double accel_dist_accum_{0.0};       // metres: integral |accel velocity| dt since stop
-    double visual_rel_dist_accum_{0.0};  // relative units: sum of per-frame relative displacement
+    double visual_rel_dist_accum_{0.0};  // relative units (DEPTH-FLOW disp_rel): for K_df
+    // 2026-05-29 — SEPARATE looming accumulator + K. The depth-flow path calibrates
+    // midas_scale_K_ from visual_rel_dist_accum_ (recoverPose disp_rel) and consumes it
+    // — self-consistent, run-proven (K=519 read the run right). Looming uses a DIFFERENT
+    // relative measure (vz_rel = tau*Z_rel), so it must calibrate + consume its OWN K to
+    // avoid the cross-basis mismatch a single shared K would create off forward motion.
+    // Both reduce to v/K for pure-forward motion (the calibration regime) so they agree
+    // there; keeping them separate removes all doubt and preserves the run path exactly.
+    // expansion_scale_K_ is seeded from the same persisted value as midas_scale_K_ on
+    // startup (setMidasScaleK) so cold-start walks aren't penalised. Reset at each stop.
+    double visual_rel_dist_loom_{0.0};   // relative units (LOOMING vz_rel*dt): for K_loom
+    std::atomic<double> expansion_scale_K_{-1.0};  // looming relative->metric scale (K_loom)
     // Raw MiDaS disparity (relative depth = 1/disparity; high=near) at an image
     // pixel, BEFORE the metric affine fit. No midas_affine_valid_ gate, so it works
     // even when the affine fit bails (too few 3D points). false if no depth map yet.

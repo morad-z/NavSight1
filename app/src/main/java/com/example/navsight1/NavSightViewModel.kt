@@ -45,6 +45,16 @@ class NavSightViewModel(application: Application) : AndroidViewModel(application
         private const val PREFS_NAME = "navsight_prefs"
         private const val PREF_SCALE_CALIBRATION_FACTOR = "scale_calibration_factor"
         private const val PREF_USER_HEIGHT = "user_height_m"
+        // 2026-05-28 — persisted MiDaS scale K across app launches. See NativeBridge
+        // setMidasScaleK comment for why this is necessary (first-launch walks fail
+        // to calibrate K because essential-matrix verification fails → looming
+        // bails → UI sits at 0). Float because SharedPreferences has no Double.
+        private const val PREF_MIDAS_SCALE_K = "midas_scale_k"
+        // Save K to prefs every N milliseconds while VIO is running. Dropped
+        // from 10 s to 3 s on 2026-05-28: short recordings (10 s run) finished
+        // before the 10 s persist tick ever fired, so K=1499 from the run was
+        // lost on the next startVIO. 3 s gives ~3 persists per 10 s recording.
+        private const val MIDAS_K_PERSIST_INTERVAL_MS = 3_000L
     }
 
     private val sensorRepository = SensorRepository(application)
@@ -250,9 +260,21 @@ class NavSightViewModel(application: Application) : AndroidViewModel(application
         NativeBridge.setUserHeight(h)
     }
 
+    private var lastMidasKPersistMs = 0L
+
     init {
         NativeBridge.setScale(scaleCalibrationFactor)
         NativeBridge.setUserHeight(userHeight)
+        // 2026-05-28 — push persisted MiDaS scale K to native at startup.
+        // -1 = never calibrated; native ignores non-positive values so this is a
+        // safe no-op on first launch. Once any session calibrates K (run, walk+run,
+        // or a fast-enough walk that passes essential-matrix verification), the
+        // value persists and future cold-start walks inherit it immediately so
+        // the looming path (which gates on K>0) fires from frame 1.
+        val persistedK = prefs.getFloat(PREF_MIDAS_SCALE_K, -1f).toDouble()
+        if (persistedK > 0.0) {
+            NativeBridge.setMidasScaleK(persistedK)
+        }
 
         viewModelScope.launch {
             sensorRepository.orientationState.sample(200L).collect { orientationState = it }
@@ -420,6 +442,17 @@ class NavSightViewModel(application: Application) : AndroidViewModel(application
                     currentSpeedKmh = 0f
                 }
                 lastSpeedTimeMs = nowMs
+
+                // 2026-05-28 — every 10 s, persist the calibrated MiDaS scale K
+                // to SharedPreferences so the next cold start inherits it. Only
+                // writes positive values (native returns -1 before first calib).
+                if (nowMs - lastMidasKPersistMs >= MIDAS_K_PERSIST_INTERVAL_MS) {
+                    lastMidasKPersistMs = nowMs
+                    val k = NativeBridge.getMidasScaleK()
+                    if (k > 0.0) {
+                        prefs.edit().putFloat(PREF_MIDAS_SCALE_K, k.toFloat()).apply()
+                    }
+                }
             }
             /* SUPERSEDED 2026-05-26 — position-differencing speed. Computed
                |Δpos|/Δt from vio.x/z (= global_t_), whose scale falls back to the
@@ -565,10 +598,36 @@ class NavSightViewModel(application: Application) : AndroidViewModel(application
     fun onResume() {
         sensorRepositoryActive = true   // ← mark BEFORE starting sensors
         sensorRepository.startSensors()
+        // 2026-05-28 — re-seed the MiDaS scale K AFTER startSensors(). startSensors
+        // calls NativeBridge.startVIO() which destroys and recreates the VioEngine
+        // (native-lib.cpp:199-202), wiping the in-native midas_scale_K_ atomic
+        // back to its -1.0 init value. Without this re-push, switching apps and
+        // coming back would force a fresh K calibration on the next recording —
+        // exactly the regression we saw between today's run (K=1499) and the
+        // subsequent walk+run (K=0). Doing it here in onResume covers every
+        // lifecycle path: app open, return-from-background, configuration change.
+        if (NativeBridge.isLoaded()) {
+            val persistedK = prefs.getFloat(PREF_MIDAS_SCALE_K, -1f).toDouble()
+            if (persistedK > 0.0) {
+                NativeBridge.setMidasScaleK(persistedK)
+            }
+        }
     }
 
     fun onPause() {
         sensorRepositoryActive = false  // ← mark BEFORE stopping sensors so in-flight frames are dropped
+        // 2026-05-28 — persist the latest K BEFORE stopSensors. stopSensors does
+        // not directly recreate the Tracker, but the next onResume->startVIO
+        // will. If we let onResume's re-seed run with a stale prefs value
+        // (from before this session's calibration), all of this session's
+        // calibration is lost. Save what's in native NOW so the next onResume
+        // pushes the latest value back.
+        if (NativeBridge.isLoaded()) {
+            val k = NativeBridge.getMidasScaleK()
+            if (k > 0.0) {
+                prefs.edit().putFloat(PREF_MIDAS_SCALE_K, k.toFloat()).apply()
+            }
+        }
         if (isRecordingSimulation) sensorRepository.stopGpsUpdates()
         sensorRepository.stopSensors()
     }

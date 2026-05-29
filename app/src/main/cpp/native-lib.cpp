@@ -1103,6 +1103,39 @@ Java_com_example_navsight1_NativeBridge_getFusedSpeedMps(
     return tracker ? static_cast<jfloat>(tracker->getFusedSpeedMps()) : -1.0f;
 }
 
+// 2026-05-28 — cross-app-launch persistence of the MiDaS scale K.
+// Without this, every cold start re-pays the K calibration tax; on the
+// first recording of a session if essential-matrix verification fails
+// (slow walk + close scene), K never calibrates → looming bails → UI
+// speed sits at 0 forever. Kotlin (NavSightViewModel) loads K from
+// SharedPreferences on init and pushes it here; periodically pulls
+// the latest K back to write to prefs.
+extern "C" JNIEXPORT void JNICALL
+Java_com_example_navsight1_NativeBridge_setMidasScaleK(
+        JNIEnv*, jobject /* thiz */, jdouble k) {
+    std::shared_ptr<VioEngine> vision;
+    {
+        std::lock_guard<std::mutex> lock(state_mutex);
+        vision = g_vision;
+    }
+    if (!vision) return;
+    Tracker* tracker = vision->getTracker();
+    if (tracker) tracker->setMidasScaleK(static_cast<double>(k));
+}
+
+extern "C" JNIEXPORT jdouble JNICALL
+Java_com_example_navsight1_NativeBridge_getMidasScaleK(
+        JNIEnv*, jobject /* thiz */) {
+    std::shared_ptr<VioEngine> vision;
+    {
+        std::lock_guard<std::mutex> lock(state_mutex);
+        vision = g_vision;
+    }
+    if (!vision) return -1.0;
+    const Tracker* tracker = vision->getTracker();
+    return tracker ? static_cast<jdouble>(tracker->getMidasScaleK()) : -1.0;
+}
+
 // ── Camera overlay Phase 2 / 3 (camera_overlay_phase23_plan.md) ──────────────
 //
 // Four read-only accessors for the live camera overlay. None of them mutate
