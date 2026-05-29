@@ -1,6 +1,6 @@
 # NavSight Map Matching Plan
 
-**Status**: draft
+**Status**: draft — **REVISED 2026-05-29** (scale-first refocus + Google→free migration; see §0)
 **Owner**: Morad
 **Scope**: add an OSM-backed map-matching layer that consumes
 **VIO-tracked position** (never raw GPS) and (a) eliminates visible
@@ -34,6 +34,185 @@ intersection-anchored heading, off-road silent-disable, mount-mode
 awareness, OSM tag analysis, library landscape). The **math** is rebuilt
 from scratch around a windowed shape-similarity emission probability
 that is robust to VIO's correlated-drift noise model.
+
+---
+
+## 0. Revision 2026-05-29 — scale-first refocus + Google→free migration
+
+This revision does two things: **(A)** refocuses the plan from *heading drift* (the problem when
+the plan was drafted — now fixed, commit `4a9a212`) to the *metric-scale collapse* that now
+dominates; and **(B)** reframes the plan as the **migration that rips out the paid Google APIs
+and replaces them with the free, offline OSM stack this plan already designs.** §1–§12 below stand
+**except where corrected here** — read §0 first; it overrides the body on every point it touches.
+This was reviewed by a multi-lens + adversarial pass; the corrections below already incorporate the
+adversary's pushback (notably: do NOT use per-candidate free-scale Procrustes — see §0.3 M2).
+
+### 0.1 Corrected headline
+
+The plan's bones are sound and still 2026-correct: the Goh online sliding-window HMM (§4.3),
+offset-invariant emission to survive correlated VIO drift (§8.D.1), display-only-before-EKF-feedback
+phasing (§11 Q3), off-road silent-disable (Principle 11), covariance-mandatory soft observation (§8.F).
+**Keep all of it.** But the live failure is no longer heading — it is **metric scale**: the user-facing
+dot (`Tracker::global_t_`, advanced by `disp = K·speed_rel`) reads **~0.12× cold / ~0.30× warm-K** of
+true distance (3–8× under-read). **Honesty caveat (the user's own steer):** that magnitude is from the
+offline replay harness only (grayscale frames, ~18.7 fps, harness skips `reset()`/`WAIT_STATIONARY`, cold
+K=−1) and is **not yet on-device-confirmed** — the *direction* (scale under-reads) is well-supported by
+months of walk data; the *magnitude* awaits an on-device logcat. Turn **angles/shape are correct**
+(heading ~2–3°); only metric scale is broken.
+
+### 0.2 Google → free migration (NEW — this is the cost driver)
+
+Found in the current code. Google **Maps SDK map loads are free on Android**; the money is **Roads API +
+Directions API + Places API**. We migrate ALL of it for $0 + offline + jamming-immunity (no key, no network).
+
+| Google component | File(s) | Google API | Cost | Free replacement | Maps to |
+|---|---|---|---|---|---|
+| Map display | `MapScreenUi.kt` (`GoogleMap`, `CameraPosition`) | Maps SDK | free* but online + key-coupled | **MapLibre Native** (vector, offline MBTiles/PMTiles) or **osmdroid** (raster, simplest) | NEW **Step L** |
+| Road snapping | `RoadSnapper.kt` (`RoadsApi.snapToRoads`, ~2 Hz @ `NavSightViewModel:487`) | Roads API | **$$ / req** | the **OSM HMM matcher** — `RoadSnapper.snapToRoad()` body becomes the local snap; delete the `GeoApiContext`/Roads call | **Steps C/D** |
+| Routing | `NavigationManager.kt` (`DirectionsApi`) | Directions API | **$$ / req** (now disabled → straight-line fallback @ `:216`) | offline router: **BRouter** (FOSS, purpose-built offline-Android) or **Valhalla-mobile** | **Step K** |
+| Dest. search | `SearchBarUi.kt` + `places-client` | Places API | **$$ / req** | offline **Nominatim-style index** over OSM `name`/`addr:*` | **Step K.1** |
+| `LatLng` data type | 7 files (MapScreenUi, NavigationManager, NavSightUtils, NavSightViewModel, RoadSnapper, SearchBarUi, SensorRepository) | `gms.maps.model.LatLng` | coupling | neutral `data class GeoPoint(lat, lng)` (or typealias) | **Step 0.x / L** |
+
+**Recommended v1 = HYBRID: keep the Google display, swap only the 3 PAID APIs.** The display is free and
+decoupled, so keeping `GoogleMap` (and the `gms LatLng` type) is the leanest path — it avoids both the display
+rewrite **and** the `GeoPoint` refactor across 7 files, and removes the entire bill (Roads + Directions +
+Places are the only paid surfaces). Caveats of keeping the Google display: (1) still needs a Maps key with a
+billing account attached (loads are free, but the account must exist); (2) the **basemap tiles need network** —
+in a jammed/offline area the background goes blank/stale while the VIO dot + OSM snap + offline router keep
+working on embedded data; (3) cosmetic: the OSM-snapped dot may sit ~1–2 m off Google's rendered road (different
+surveys). **Therefore Step L (display → MapLibre/osmdroid) is OPTIONAL / deferred** — do it only when a fully
+offline, no-key, jam-proof basemap is wanted. v1 keeps Google display + free OSM matcher/router/search.
+
+**"Make routing work again"** = NavigationManager currently falls back to a straight line because the
+Directions key is blank (`:57` "routing will be disabled", `:216` `calculateFallbackRoute`). The fix is
+**not** to restore the paid key — it is to wire an **offline router** (BRouter/Valhalla) so routing works
+with **$0, offline, and jam-proof**. Remove `places-client`, `google-maps-services`, and the
+`com.google.android.geo.API_KEY` manifest placeholder once L/C/D/K land. Keep `play-services-location`
+only if the **one** bootstrap GPS fix (SessionAnchor, §8.B) still uses it (see SU8 — add a no-fix fallback).
+
+### 0.3 MUST-FIX corrections to the body (these override §1–§12)
+
+- **M1 — §10 risk "VIO scale bias": LOW–MEDIUM → HIGH / precondition.** The text "scale fuser bounds to
+  ±10–20%; β=2.0 accommodates" is false: the affine/scale-fuser path is forced **off** the speed path
+  (the "5× poison"), and the error is multiples, not ±20%. At collapsed scale the transition term is
+  ~10σ-rejected and the emission loses its discriminative *margin*. (Magnitude replay-only — confirm
+  on-device before fixing β.) **It is a precondition, not a tolerated nuisance.**
+- **M2/M3 — §8.D.1/§8.D.2 scale handling.** Make the matcher scale-robust with a **single, bounded,
+  shared `K̂`** applied uniformly to all candidates, via a **log-ratio transition kernel**
+  `exp(−|log(d_route /(K̂·d_vio))| / β_log)`. **Do NOT** use per-candidate free-scale Procrustes/Umeyama —
+  it discards the arc-length prior and *amplifies* confidently-wrong snaps (a curvy side-street rescales
+  itself to fit). Keep the existing mean-offset subtraction (it's correct; compose it under the shared K̂).
+- **M4 — §1 dependencies.** Heading-fix dep = **MET** (commit `4a9a212`: gimbal-free RV + gyro-primary
+  gated compass — not the cited `EKFState.cpp:1052/1097/1217`). Step-7 loop-closure dep = **PARTIAL**
+  (`loop_closure_corrections_applied>0` but `loop_closure_geom_accepts=0`, `slam_promotions_total=0`).
+  **ADD** a dependency: *"dot metric scale validated within ~±20% of truth on a real walk (Fix A/B landed)."*
+- **M5 — §10 "confidently-wrong" mitigation** must not lean on loop closure as the independent corrector
+  (geom closures = 0 today). Lean on χ² gating + hysteresis + Step-G cross-check instead.
+- **M6/M7 — §2 motivation + the primary fixture.** Rewrite §2 around scale; the fixture
+  `simulation_data_1778147132092.json` is the **pre-fix 75° walk** and its acceptance criteria (notably
+  Step B's "~75° reduction", §9 baselines) are dead. Re-record the primary fixture on the post-`4a9a212`
+  engine; the `1779643969824` 134 m loop is a candidate.
+- **M8 — §8.I** the replay harness **already exists** (`tests/cpp/replay_harness.cpp`, mingw+Ninja
+  `build_mingw/`; extended with traj/speed CSV cols + `--depth-dir` + `--seed-k`). "Add the flag," not
+  "build it" — and note its fidelity caveats so map-match acceptance isn't over-trusted vs replay.
+- **M9 — §5.1 GraphHopper offline-Android is DEPRECATED** (Android demo removed v2.0; offline routing
+  deprecated; F-Droid app is now online-only). For routing prefer **BRouter** or **Valhalla-mobile**
+  (Step K); for the matcher data layer, a **hand-rolled R-tree over a Haifa OSM extract** is the lean v1.
+- **M10 — drop the PEDESTRIAN/SCOOTER mount-mode split** (§7, §8.D.4, §8.H) — contradicts the
+  locomotion-agnostic product decision. Single v1 profile (foot ∪ cycleway ∪ road).
+
+### 0.4 NEW opportunity — Step D.5: matcher-as-scale-estimator (`K̂_map`)
+
+The single highest-leverage upgrade. Over a matched window the matcher yields `d_route` (matched road
+arc-length) and `d_vio` (VIO arc-length); their ratio **`K̂_map = d_route / d_vio` is a direct, GPS-free,
+ZUPT-free observation of the VIO scale K** — exactly the anchor accel-K fails to produce
+(`depth_flow_calib_updates=0`) and that ScaleEstimatorVI was abandoned for. Emit `K̂_map` (log-EMA,
+gated on top-state prob > 0.5 + not-OFF_ROAD + > 10 m motion + **hard road-identity confidence**), feed it
+into `Tracker::updateDepthFlowSpeed` above accel-K with the existing >3× blow-up guard; counters
+`map_scale_k_milli`, `map_scale_calib_updates`. **Caveats (load-bearing):** (i) it is **downstream of
+Fix B** — `d_vio` is corrupted by the same verification-gating bug (only ~28% of frames advance), so the
+ratio mixes scale error with sampling error until Fix B lands; (ii) a mis-identified parallel road poisons
+K and **diverges** (the ADR-004 loop) → identity-confidence gating is mandatory, not optional; (iii) it is
+most reliable on **turn-rich** windows and weakest on long straights (where the transition term most needs
+it). So: a strong *opportunistic* anchor, complementary to Fix A (fuse in log space) and orthogonal to
+Fix B — **not** a closed-loop guarantee or a substitute for fixing scale in the engine.
+
+### 0.5 Resequenced lean v1 ("a dot that stays on the road at roughly-right distance")
+
+```
+PREREQ  Fix A (accel-K self-calibration) + Fix B (per-frame dot advance)  — NOT in this plan; the real blocker.
+        Gate: a real walk shows dot metric scale within ~±20% of truth.  (Confirm via on-device logcat.)
+        Fix C (TURNS, see §0.7) — narrow the `rotation_dominated` freeze (Tracker.cpp:3562) to gate on a real
+        translation signal, not PDR step_speed. Required before any turn (roundabout/U-turn) renders as an arc.
+ 0   Re-baseline this doc (M1/M4/M5/M6/M7 edits).
+ B   Tracker::current_vio_lla  (read-only, ~50 LOC).  Acceptance rewritten (drop the 75° claim).
+     (v1 keeps the Google display + gms LatLng — no GeoPoint refactor needed for the hybrid.)
+ A*  LEAN data layer — Haifa-only OSM extract + hand-rolled R-tree over ways.  Defer GraphHopper/Valhalla/BRouter
+     decision and the region manager until Step K actually needs routing.
+ C   Snap-to-nearest, display-only — REPLACES RoadSnapper.kt's Google Roads call.   ← v1 user-visible payload.
+ E*  LITE confidence + off-road silent-disable (snap-distance + VIO-variance + LC-recency; keep silent-disable).
+ I*  PARTIAL — extend the EXISTING harness; labelling tool; 1–2 fixtures (not the 5-corpus).
+        ── v1 ships here: free display + free road-snapping, $0, offline. ──
+ D + D.5   Windowed shape HMM with shared-K̂ scale handling (M2) + the K̂_map scale estimator (§0.4).
+           Only after scale is fixed AND if Step C mis-snaps on parallel roads in practice.  Distance-based 50 m window.
+ F   Soft EKF position observation — only after on-device replay shows no self-reinforcing lock-in; default-OFF.
+ K   ROUTING + SEARCH MIGRATION — offline router (BRouter/Valhalla) replaces Directions API ("routing works again");
+     offline Nominatim-style index replaces Places API.   [the other half of the Google→free migration]
+ L*  OPTIONAL/DEFERRED — DISPLAY swap GoogleMap → MapLibre/osmdroid + neutral GeoPoint. Only for a fully-offline,
+     no-key, jam-proof basemap. v1 KEEPS the Google display (free; the bill was Roads/Directions/Places, now gone).
+ —   CUT from v1: Step G (intersection-yaw) — heading is fixed; cutting on PRIORITY grounds (not "heading solved
+     forever": 2.5° over 1 km ≈ 44 m cross-track, but the matcher absorbs it). Keep G named as the heading-re-drift
+     backstop, since the geometric LC that would otherwise catch re-drift is currently dead (geom_accepts=0).
+ —   SPLIT OUT: the rest of Step K's turn-by-turn navigation → docs/NAVIGATION_PLAN.md once a matched dot ships.
+```
+
+### 0.6 Updated answers to §11 open questions
+
+1. **GraphHopper authority** — moot for v1 (defer routing to Step K); GraphHopper offline-Android is
+   deprecated (M9) — choose BRouter/Valhalla when routing is actually on the table.
+2. **Default region** — **Haifa-only** for v1 (smaller/faster; it's the test+deploy city).
+3. **EKF feedback default on/off** — **display-only (A–E), Step F OFF** — reinforced by scale collapse
+   (don't feed a scale-inconsistent snap into the EKF).
+4. **Step G** — **CUT from v1** on priority grounds; keep as the heading-re-drift backstop.
+5. **Window length** — deferred with Step D; prefer the **distance-based 50 m** window (arc-length is what
+   scale distorts, so a distance window is more robust to residual scale error).
+6. **Off-road fixtures** — **2 for v1** (1 clean outdoor loop + 1 indoor/plaza), grow later.
+7. **Mount-mode auto-switch** — moot (locomotion-agnostic; no mount mode in v1).
+8. **Step K sequencing** — turn-by-turn navigation splits into `docs/NAVIGATION_PLAN.md`; but the
+   **offline routing + search engines** (the Google Directions/Places replacement) stay here as Step K
+   because the user wants routing working again as part of this migration.
+
+### 0.7 Turn handling — roundabouts & mid-road U-turns (code-verified 2026-05-29)
+
+Split **DETECTION** (did the user turn / which way) from **RENDERING** (the shape drawn on the map):
+
+- **DETECTION works for both.** Gyro-primary heading (`Tracker.cpp:3491`) tracks a 270–360° roundabout sweep and
+  a 180° U-turn flip. *Caveat:* gyro **scale-factor** error (~1–3% of swept angle ≈ 4–11° on a full roundabout)
+  is now **un-anchored** since Step G (intersection-yaw) is cut — bias drift over the sweep is fine, scale-factor
+  is the small residual heading risk; the matcher absorbs it on entry/exit.
+- **RENDERING is NOT correct yet** for either maneuver — gated on **three** fixes, in order:
+  1. **Fix C — the `rotation_dominated` translation freeze (the binding bug, code-verified).**
+     `rotation_dominated = gyro_norm > 0.2 rad/s && PDR step_speed < 0.1 m/s` (`Tracker.cpp:3549-3550`);
+     `if (is_static || rotation_dominated)` (`:3562`) skips the **sole** per-frame advance site (`:3737-3739`).
+     A turn sweeps at 30–90°/s and PDR `step_speed` is structurally ~0 for **non-pedestrian/scooter** motion →
+     the gate is true for the **whole** maneuver → the dot **freezes position, pivots in place, then teleports to
+     the exit**. The matcher then sees *two clusters + a teleport, not an arc* — so Fix A/B and Step D cannot
+     render the turn until this is fixed. The gate exists for a real reason (phone-in-chair "looking around" =
+     50 m phantom, 2026-05-17), so fix the **root cause**: re-gate on a real translation signal (accel speed /
+     looming forward-fraction), NOT PDR `step_speed`. Do **not** remove it.
+  2. **Fix A/B** (scale + advance every frame) — else the roundabout radius / U-turn legs are ~⅓ size.
+  3. **Step D, not Step C** — snap-to-nearest **corner-cuts** a roundabout to the chord (and is CW/CCW
+     ambiguous); the HMM + routing-distance transition follows the ring, but only once scale + Fix C give it a
+     real arc to match.
+- **ROUNDABOUT: NO today → YES after {Fix C + Fix A/B + Step D}.** Step C alone never renders it. Even with Step D
+  the entry/exit transition is numerically twitchy on the multi-short-arc one-way ring (CW/CCW flip risk).
+- **MID-ROAD U-TURN: the genuine blind spot.** Detection = VIO/gyro (yes). The matcher does **not** detect the
+  reversal — it inherits whatever VIO drew, and can make it **worse**: Step C flickers the dot between the two
+  lane/segment directions (bearing-blind, per-sample); Step D can **node-snap the reversal to the nearest
+  junction** (fabricating a detour to an intersection and back). v1 has no reverse-candidate / heading-aware
+  emission to localize the reversal. So for U-turns: **trust VIO**; the matcher's best case is "keep it on the
+  road," worst case it relocates the turnaround. (Step G being cut has no effect — a mid-block U-turn has no
+  intersection node anyway.)
 
 ---
 
@@ -85,6 +264,13 @@ against a re-walked daytime sim.
 ---
 
 ## 2. Why this plan exists
+
+> ⚠ **REVISED 2026-05-29 (see §0.1):** this section's heading-drift motivation is **obsolete** — the
+> heading sign bug below was fixed and committed (`4a9a212`); real-walk heading drift is now ~2–3°. The
+> live reason this plan exists today is **metric-scale collapse** (the dot reads ~0.12–0.30× of true
+> distance) plus replacing the paid Google Roads/Directions/Places APIs with a free offline OSM stack.
+> The `…1778147132092` walk below is the *pre-fix* 75° recording — keep it only as a heading-regression
+> archive, not as the acceptance fixture.
 
 A real daytime walk recorded as
 `tests/sims/simulation_data_1778147132092.json` accumulated **75°
@@ -290,6 +476,13 @@ https://www.mdpi.com/2079-9292/13/9/1685
 ## 5. Library options ranked (on-device feasibility)
 
 ### 5.1 GraphHopper (Java, Apache 2.0) — recommended baseline, with caveat
+
+> ⚠ **REVISED 2026-05-29 (see §0.3 M9):** GraphHopper's **offline-Android path is deprecated** — the
+> Android demo was removed in v2.0 and offline routing is no longer officially supported; the F-Droid
+> `com.graphhopper.maps` app is now an **online** planner. Do **not** assume the "F-Droid ships an Android
+> binary so the path is proven" claim below. For **routing** (Step K) prefer **BRouter** (FOSS, offline-
+> Android) or **Valhalla-mobile**; for the **matcher data layer** (lean v1) use a hand-rolled R-tree over a
+> Haifa OSM extract (§0.5 Step A*). Re-spike before committing to GraphHopper.
 
 Routing engine with a built-in map-matching module that wraps the same
 `hmm-lib` used by Newson & Krumm. Officially supports Android (F-Droid
@@ -1201,7 +1394,7 @@ Step K (navigation) acceptance is independent and listed under §8.K.
 | **Intersection-bearing observer (Step G) is novel framing** | MEDIUM | Step I's labelled multi-intersection sims are the regression. ADR-019 review must explicitly walk through "what if a 4-way intersection has bearings 0°/89°/180°/271°?" — small bearing perturbations should not flip which pair gets matched. |
 | **Privacy: which OSM regions the user downloads is sensitive (reveals travel)** | LOW | Step A: no telemetry of region downloads. Local-only. ADR-020 documents the rule. |
 | **Scooter on a sidewalk + scooter profile** → matcher silent-disables for the entire ride | LOW | `mount_mode_disagreement` event logged; user can switch profile. Auto-switch on sustained disagreement is future work (open question 7). |
-| **VIO scale bias** moves the entire VIO stream uniformly slow/fast → window arc-length disagrees with route arc-length → transition probability collapses | LOW–MEDIUM | The scale fuser (inertial Step 3) bounds scale to ±10–20%. Step D's transition `beta = 2.0 m` accommodates that range. Larger biases trip the confidence gate (`transition_consistency` low) → silent-disable. |
+| **VIO metric-scale collapse** — the dot reads ~0.12–0.30× of true distance (3–8× under-read; replay-measured, on-device magnitude unconfirmed). The window is the right *shape/angles* at ~⅓ size. **REVISED 2026-05-29** (was rated LOW–MEDIUM "±10–20%, β=2.0 accommodates" — both false: the affine/scale-fuser path is OFF the speed path, so even ±20% no longer holds). | **HIGH / precondition** | This is **not** a tolerated nuisance — at collapsed scale the offset-only Fréchet emission loses its discriminative *margin* (→ confidently-wrong snaps on parallel roads, the §10 row-1 CRITICAL failure) and the `β=2.0 m` transition term is ~10σ-rejected. **Fix:** (1) gate the arc-length-dependent parts (transition, straight-road disambiguation) on **Fix A/B** restoring scale to ~±20%; (2) make the matcher scale-robust with a single shared bounded `K̂` via a log-ratio transition kernel (§0.3 M2 — NOT per-candidate free Procrustes); (3) turn-topology *identity* is scale-free, so display-only snapping (Step C) can run before scale is fixed. Bonus: `K̂_map = d_route/d_vio` becomes a scale *estimator* (§0.4). |
 
 ---
 
@@ -1286,3 +1479,784 @@ Before this plan kicks off, please answer:
   erode that rule).
 - **Multi-session map / crowdsourced geometry refinement** (privacy +
   scope, defer).
+
+---
+
+## 8M — Migration step bodies (execution-ready 2026-05-29)
+
+> These step bodies are the **execution-ready** rewrite of the migration half of §8 (the
+> Google→free OSM swap). They **supersede the original §8 A / C / K where they differ** — the
+> original §8 is left intact above as the historical superset (it assumed GraphHopper + per-mode
+> mount profiles + EKF feedback, all of which §0 corrected). When the two conflict, **8M wins**.
+> Scope of 8M = the **speed-independent, cost-saving** half only: replace the 3 PAID Google APIs
+> (Roads, Directions, Places) + build the OSM data layer they need. It does **NOT** include the
+> scale-dependent matcher (Step D HMM, K̂ estimator, Step E confidence, Step F EKF feedback) — those
+> stay in the original §8, DEFERRED behind the speed fixes (Fix A/B/C, §0.7) and out of scope here.
+> Fixed decisions (do not re-litigate): HYBRID v1 keeps the Google display + the `gms LatLng` type
+> (no `GeoPoint` refactor, no display rewrite); Step L is OPTIONAL/DEFERRED; GraphHopper offline-Android
+> is OUT (M9); region is **Haifa-only**; snap-to-nearest (Step C) is a like-for-like free replacement of
+> the current Google Roads snapper (per-point, corner-cutting accepted for v1).
+
+### Step A* — OSM data layer (lean, Haifa-only)
+
+**Goal**: produce, from a Haifa-only OSM extract, the three in-memory structures the migration
+consumes — (1) a **road-segment R-tree** for snapping (Step C), (2) a **routing graph** for Step
+K-routing, (3) a **name/addr geocode index** for Step K-search — built by a **dev-machine
+preprocessing pipeline** whose compact output ships as an **APK asset** and loads into RAM on first
+launch. **No GraphHopper** (M9); a **hand-rolled PBF→structures preprocessor** plus a **hand-rolled
+R-tree + adjacency graph** for snap/geocode, with **BRouter** (`brouter-core`, MIT) as the embedded
+offline router fed its own `rd5` segment file. End state: Haifa data is embedded, the three
+structures are live, and first-launch load is bounded and measured. **This step is purely additive
+and read-only on the EKF** — it produces data and a query API; it does not touch `Tracker`/`EKFState`.
+
+#### A*.0 Decisions locked for v1 (no re-deciding downstream)
+
+- **Extract source**: **Geofabrik `israel-and-palestine-latest.osm.pbf`** (~115 MB, daily) is the
+  upstream; there is **no Haifa sub-region on Geofabrik**, so the dev pipeline **clips to a Haifa
+  bbox locally**. Clip via **`osmium extract`** with a polygon/bbox (preferred — reproducible, scriptable)
+  or **BBBike** (`extract.bbbike.org`, custom rectangle/polygon) as the manual fallback. Haifa bbox v1:
+  `lon 34.94…35.10, lat 32.74…32.86` (Haifa municipality + Carmel + downtown + the test loops; widen later
+  if a walk leaves it). Record the exact bbox + the upstream PBF date in the asset manifest (A*.4).
+- **PBF parse (dev machine, NOT on device)**: **`osmpbf`** (Java, `org.openstreetmap.pbf:osmpbf`,
+  low-level protobuf block reader) wrapped by our own way/node walker — OR **OSMonaut** (Java, returns
+  complete entities, low-memory mode) if we want complete-entity convenience. **Pick `osmpbf`** for v1:
+  the clipped Haifa PBF is small (≈3–6 MB), we only need a single forward pass emitting our own compact
+  binary, and `osmpbf` has the smallest dependency surface. OSMonaut is the documented fallback if
+  two-pass node-resolution becomes annoying. **Neither library ships in the APK** — they are
+  build-time only (the preprocessor is a desktop Gradle/`:tools` task), so they add **0 bytes** to the APK.
+- **R-tree (on device + at preprocess)**: **hand-rolled**, ~250 LOC. A static, **bulk-loaded
+  packed Hilbert R-tree** (STR / sort-tile-recursive packing) over way-segment AABBs — read-only after
+  build, no insert/delete needed, so packing beats a dynamic R-tree on both build time and query speed.
+  Rationale for hand-rolling vs vendoring (e.g. JTS `STRtree`): JTS is a ~1.5 MB jar dragging in a full
+  geometry suite we do not need, and we want the leaf payload to be our `segment_id` + precomputed segment
+  endpoints (for the perpendicular-distance projection in Step C) rather than generic `Geometry`. Hand-roll.
+- **Routing engine**: **BRouter `brouter-core`** (MIT, Java, offline-Android-native, embeddable
+  in-process — modules `brouter-core` / `brouter-codec` / `brouter-mapaccess` / `brouter-expressions`
+  are separable from the Android-Service app). **Chosen over** (a) **Valhalla-mobile** — C++/NDK build of
+  a large third-party project, tile data 100 MB+ even for a city, real engineering cost (§5.2); and
+  (b) **hand-rolled A*/Dijkstra over our own adjacency graph** — viable and ~150 LOC but re-implements
+  turn restrictions, one-way handling, foot/bike access rules, and weighting that BRouter's `.brf`
+  profiles already encode and that we'd otherwise hand-maintain. **BRouter wins**: $0, offline, MIT,
+  proven on Android, profile-driven (one `foot`-∪-`bike`-∪-`road` profile per M10, no mount split), and
+  its `rd5` data is produced from the **same** clipped Haifa PBF by **`brouter-map-creator`** on the dev
+  machine. **Cost note**: `brouter-core` + `brouter-codec` + `brouter-mapaccess` + `brouter-expressions`
+  jars ≈ **2–4 MB** added to the APK (measure in A*.1 gate); the Haifa `rd5` segment slice ≈ **2–8 MB**
+  (BRouter ships 5×5° world tiles at tens of MB each, but a Haifa-clipped single-tile slice produced by
+  `brouter-map-creator` from our bbox is small). If the jar+data gate (A*.1) is blown, **fall back to the
+  hand-rolled A\*/Dijkstra over the routing graph** (structure (2) already exists for that purpose) and
+  drop BRouter — an ADR records the choice.
+- **Geocode index**: **hand-rolled** inverted index (token → list of `place_id`) over OSM
+  `name` / `addr:street` / `addr:housenumber` / `addr:city` tags on nodes + way centroids, plus a flat
+  `place_id → (lat, lng, display_name)` table. No Lucene (multi-MB jar, overkill for one city). Substring +
+  prefix match with simple ranking (exact-name > prefix > token-contains, ties broken by closer-to-anchor).
+- **Asset shipping**: **dev-machine preprocess → embed compact binary as APK asset** (NOT on-device
+  PBF parse). On-device parsing of even a clipped PBF means shipping a parser, holding the protobuf
+  blocks + the full node coordinate map in RAM during a cold start, and a multi-second first-launch
+  stall — all avoidable. The dev pipeline emits **mmap-friendly little-endian binary blobs**; first
+  launch memory-maps / streams them straight into the three structures. **No `.osm.pbf` is shipped in
+  the APK.**
+
+#### A*.1 Dev-machine preprocessing pipeline (`:tools` desktop module + `scripts/`)
+
+A new Gradle desktop module `tools/osm-preprocess/` (JVM `application`, NOT shipped) plus a thin shell
+wrapper `scripts/build_haifa_assets.sh`. Stages, each idempotent and logged:
+
+1. **Acquire + clip** — `scripts/build_haifa_assets.sh`:
+   - `curl` the Geofabrik `israel-and-palestine-latest.osm.pbf` (cache locally; record SHA + date).
+   - `osmium extract --bbox 34.94,32.74,35.10,32.86 israel-and-palestine-latest.osm.pbf -o haifa.osm.pbf`
+     (fallback: BBBike polygon export). Assert `haifa.osm.pbf` size in `[1 MB, 12 MB]` (sanity bound).
+2. **Parse + build R-tree blob** — `OsmPreprocessor.kt` in `:tools` (uses `osmpbf`):
+   - **Pass 1**: collect every node `id → (lat, lng)` into a primitive `LongObjectMap` (Haifa ≈ a few
+     hundred k nodes → fits in dev-machine RAM easily).
+   - **Pass 2**: for each `way` whose `highway ∈ {footway, path, pedestrian, steps, living_street,
+     residential, unclassified, tertiary, secondary, primary, service, cycleway, track}` AND
+     `access != private/no` (single locomotion-agnostic profile, M10): materialise its node coordinates,
+     split into consecutive **segments** `(a→b)`, assign a stable `segment_id` (monotonic), record
+     `way_id`, `highway` class, the segment endpoints, and the parent way's `name` (for cue text).
+   - Bulk-load all segment AABBs into the **STR-packed R-tree**; serialise to `haifa_segments.rtree`
+     (header: count, node fanout, bbox; then packed node array + leaf payload array).
+3. **Build routing graph blob** — same Pass-2 walk:
+   - Emit an **adjacency graph**: dedup endpoints into graph vertices (snap-to-grid at ~1e-7 deg to merge
+     shared endpoints), edges = segments with length (haversine) + `highway` class + `oneway` flag.
+     Serialise to `haifa_graph.bin` (vertex table `id→lat,lng`; edge table `from,to,len_m,class,oneway`).
+   - This is structure (2) and is the **fallback router's** input; BRouter uses its own `rd5` (stage 5).
+4. **Build geocode index blob**:
+   - For every node/way with `name` or `addr:*`, emit a `place` record `(place_id, lat, lng, display_name,
+     normalised_tokens)`; build the inverted index `token → [place_id]`.
+   - Serialise `haifa_geocode.bin` (places table + token postings). Lowercase/strip-diacritics tokens;
+     keep Hebrew + Latin (Haifa names are bilingual) — store raw display, index normalised.
+5. **Build BRouter `rd5` slice** — invoke `brouter-map-creator` on `haifa.osm.pbf` to produce the Haifa
+   `rd5` segment file(s); copy into assets. (Profiles `.brf` are tiny text — ship the chosen
+   foot∪bike∪road profile alongside.)
+6. **Emit asset manifest** — `haifa_assets.json`: `{ schema_version, bbox, upstream_pbf_date,
+   upstream_pbf_sha, built_at, segment_count, vertex_count, edge_count, place_count, blob_sizes{...},
+   brouter_rd5_name, profile_name }`. This is what the region manager (deferred) and the
+   `osm_data_age_days` confidence factor (Step E, deferred) read.
+7. **APK-size gate (binding)**: build a debug APK with the assets + the BRouter jars and **measure the
+   delta**. **Gate: total APK delta ≤ 12 MB compressed** (BRouter jars ~2–4 MB + `rd5` ~2–8 MB +
+   our three blobs ~1–3 MB for Haifa). If blown, drop BRouter for the hand-rolled A* router (removes the
+   jars + `rd5`, leaving only our blobs ≈ ≤ 4 MB) and re-measure. ADR records the outcome.
+
+Output assets, committed under `app/src/main/assets/osm/haifa/`:
+`haifa_segments.rtree`, `haifa_graph.bin`, `haifa_geocode.bin`, `haifa_assets.json`,
+`haifa.rd5` (+ `*.brf` profile). **No `.pbf`.** Add `noCompress` for `.rd5`/`.rtree`/`.bin`
+in `app/build.gradle.kts` `androidResources` (alongside the existing `tflite`) so they memory-map.
+
+#### A*.2 On-device data layer (`OsmDataLayer.kt`, new — the runtime API)
+
+A single Kotlin object/class `OsmDataLayer` constructed once at app start (off the UI thread,
+`Dispatchers.Default`), holding the three loaded structures. It is the **only** thing Steps C / K-routing /
+K-search talk to — they never see the asset format. Public API (typed, immutable returns):
+
+- `suspend fun load(context: Context): Result<Unit>` — copies/opens the four blobs from assets,
+  mmaps `.rtree`/`.bin`, hands `.rd5` path to BRouter; populates structures; logs load time + counts.
+  Idempotent; safe to call on every `onCreate`. Returns `Result.failure` (not throw) on a corrupt/missing
+  blob so the app degrades to "no snap, straight-line route" rather than crashing.
+- `data class RoadSegment(val segmentId: Long, val wayId: Long, val highwayClass: String,
+   val aLat: Double, val aLng: Double, val bLat: Double, val bLng: Double, val name: String?)`
+- `fun nearestSegments(lat: Double, lng: Double, radiusM: Double, maxResults: Int): List<RoadSegment>`
+  — R-tree window query (expand the AABB by `radiusM` converted to deg) returning candidates **sorted by
+  true perpendicular distance** to the `(a→b)` segment. This is exactly what Step C's hand-rolled
+  `RoadSnapper.snapToRoad` body calls.
+- `data class GeoHit(val placeId: Long, val lat: Double, val lng: Double, val displayName: String)`
+- `fun geocode(query: String, anchorLat: Double, anchorLng: Double, limit: Int): List<GeoHit>`
+  — token-normalise the query, intersect postings, rank, return top-`limit`. Step K-search calls this.
+- `fun manifest(): OsmAssetManifest` — exposes bbox + ages for the (deferred) region manager / Step E.
+- The **routing graph** is held internally; routing is exposed through a separate `OsmRouter`
+  (A*.3) so the data layer stays a pure data/query surface.
+
+All queries are pure, allocation-light, and main-thread-safe for the read path (mmap + binary search /
+tree descent — no I/O after `load`).
+
+#### A*.3 Router seam (`OsmRouter.kt`, new — feeds Step K-routing only)
+
+Thin interface so Step K-routing is decoupled from BRouter-vs-fallback:
+`interface OsmRouter { suspend fun route(start: GeoPt, dest: GeoPt): List<GeoPt> /* polyline, empty = no route */ }`.
+Default impl `BRouterRouter` wraps `brouter-core` in-process against the loaded `rd5` + profile;
+fallback impl `DijkstraRouter` runs A* over `haifa_graph.bin`. Step K-routing's `NavigationManager`
+builds its `NavigationRoute` from the returned polyline (the existing straight-line `calculateFallbackRoute`
+stays as the **no-route** fallback when the polyline is empty / out-of-bbox). `GeoPt` here is an internal
+`(lat,lng)` pair; the public `NavigationRoute`/`RouteStep`/`ManeuverType` contract is unchanged (Step K body).
+
+#### A*.4 First-launch load + budgets (Haifa-only)
+
+- **APK delta budget**: **≤ 12 MB compressed** (A*.1 gate). For comparison the original §8 budget was
+  ≤ 30 MB for the whole country with GraphHopper; Haifa-only + BRouter is far under.
+- **Per-region writable storage**: **≤ 25 MB** (Haifa blobs + `rd5` copied to internal storage if
+  BRouter needs a writable dir; the `.rtree`/`.bin` blobs are mmapped read-only from assets where the
+  platform allows, else copied once).
+- **First-launch load time**: **≤ 300 ms** to mmap the three blobs + hand BRouter the `rd5`
+  (no parsing on device — the cost the original §8's ≤ 60 s "index time" paid is moved to the dev machine).
+  Cold-start impact ≤ 200 ms on the warm path (Step 9 plan-wide budget); load runs off the UI thread so it
+  never blocks first frame.
+- **No network, no key, no Geofabrik call on device** — Haifa data is fully embedded (jamming-immune,
+  per §0.2). On-demand extra regions + the region manager are **DEFERRED** (original §8 Step A.2/A.3);
+  v1 is Haifa-only and the user is intentionally "trapped" in-city (§0.6 Q2 — accepted for v1).
+
+#### A*.5 Instrumentation (mandatory per navsight-implementor)
+
+`OsmDataLayer.load` logs (LOGI) + records counters: `osm_load_ms`, `osm_segment_count`,
+`osm_vertex_count`, `osm_edge_count`, `osm_place_count`, `osm_load_failed` (1 on corrupt blob),
+`osm_rtree_bytes`, `osm_rd5_present` (0/1). `nearestSegments` increments `osm_snap_query_count` and
+records `osm_snap_query_p95_us`; `geocode` increments `osm_geocode_query_count`. These are the
+falsifiers the Step C / K bodies assert against.
+
+#### Full implementation plan
+
+1. **Asset pipeline** — create `tools/osm-preprocess/` (`:tools` desktop JVM module, not in the app
+   classpath) with `OsmPreprocessor.kt` (osmpbf parse → R-tree blob + graph blob + geocode blob +
+   manifest) and `scripts/build_haifa_assets.sh` (acquire/clip via `osmium`, invoke the preprocessor,
+   invoke `brouter-map-creator`, drop assets into `app/src/main/assets/osm/haifa/`). Commit the
+   generated assets (they are reproducible from the manifest's recorded bbox + PBF date).
+2. **Build config** — add `noCompress` for `.rd5`/`.rtree`/`.bin` in `app/build.gradle.kts`; add the
+   BRouter jars (`brouter-core`, `brouter-codec`, `brouter-mapaccess`, `brouter-expressions`) to
+   `libs.versions.toml` + `app/build.gradle.kts` (the Google `google-maps-services` + `places-client`
+   removals happen in the Step C / K bodies, not here — keep `play-services-maps` + the Maps key for the
+   hybrid display).
+3. **Runtime data layer** — implement `OsmDataLayer.kt` (load + `nearestSegments` + `geocode` +
+   `manifest`) and the binary readers (`SegmentRTreeReader`, `RoutingGraphReader`, `GeocodeIndexReader`)
+   as small focused files (< 300 LOC each per coding-style). Hand-roll the **STR-packed R-tree** reader
+   + perpendicular-projection helper.
+4. **Router seam** — implement `OsmRouter` + `BRouterRouter` (in-process `brouter-core`) and the
+   `DijkstraRouter` fallback over `haifa_graph.bin`.
+5. **Wire load** — call `OsmDataLayer.load(context)` once during app init (e.g. in
+   `NavSightViewModel` init or `Application.onCreate`), off the main thread, before Step C's snapper or
+   Step K's search/route are first invoked. Degrade gracefully on `Result.failure`.
+6. **Instrumentation** — emit the A*.5 counters + LOGI lines.
+7. **Offline preprocess verification** — a `:tools` unit test asserts the round-trip: a tiny synthetic
+   PBF (CI construct only — §3 Principle 6: no synthetic OSM in *production*; test-only is fine)
+   produces blobs whose `nearestSegments`/`geocode` return the planted segment/place. This is the
+   "replay before re-flash" guard (§3 Principle 4) for the data layer.
+
+#### Acceptance criteria
+
+- The dev pipeline (`scripts/build_haifa_assets.sh`) runs end-to-end from the Geofabrik
+  `israel-and-palestine` PBF to `app/src/main/assets/osm/haifa/{haifa_segments.rtree, haifa_graph.bin,
+  haifa_geocode.bin, haifa_assets.json, haifa.rd5, *.brf}`, deterministically (same PBF date + bbox →
+  byte-identical blobs), and writes a manifest recording the upstream PBF date, SHA, and exact bbox.
+- **APK size delta ≤ 12 MB compressed** with the BRouter jars + Haifa assets (the A*.1 gate); if the
+  gate is blown, the build switches to the `DijkstraRouter` fallback (drops BRouter jars + `rd5`) and an
+  ADR records it.
+- `OsmDataLayer.load(context)` completes in **≤ 300 ms** on the target S21 Ultra, off the UI thread,
+  with no network access (airplane mode), logging `osm_load_ms` + the four `*_count` counters > 0 for Haifa.
+- `nearestSegments(lat, lng, radiusM=30, maxResults=8)` for a point on a known Haifa road returns that
+  road's segment first (sorted by true perpendicular distance), with `osm_snap_query_p95_us` ≤ 1000 µs.
+- `geocode("…known Haifa place…", anchor, limit=5)` resolves to a lat/lng inside the Haifa bbox; an
+  out-of-corpus query returns an empty list (no crash, no false hit).
+- `OsmRouter.route(start, dest)` for two in-bbox Haifa points returns a non-empty polyline that stays on
+  mapped ways; an out-of-bbox destination returns empty (caller falls back to straight line).
+- **Read-only on the EKF**: trajectory output is bit-identical with and without `OsmDataLayer` loaded
+  (this step adds data + queries only; it does not call `Tracker`/`EKFState`).
+- The `:tools` synthetic-PBF round-trip test passes in CI (no on-device, no production synthetic-OSM branch).
+
+---
+
+### Step B* — Read-only VIO→lat/lng accessor (`Tracker::current_vio_lla`)
+
+**Goal**: expose the EKF's current position as `(lat, lng)` for the Kotlin map-matching layer, derived
+from `(SessionAnchor + EKF position) → inverse-haversine`. **Read-only on the engine — the only C++ touch
+in the whole migration.** One bootstrap GPS fix sets the anchor (allowed by ADR-004); if no fix is ever
+obtained, the accessor reports "unanchored" and the matcher silent-disables. **No raw GPS sample feeds
+the EKF; no GPS feeds the matcher — only VIO-derived position.** (Supersedes original §8 Step B where it
+assumes a matcher consumer; v1 the only consumer is the read path the harness records.)
+
+#### Full implementation plan
+
+1. **`SessionAnchor` struct in `Tracker.h`** (new, private member `session_anchor_`):
+   - Fields: `double anchor_lat_rad`, `double anchor_lng_rad`, `int64_t anchor_t_ns`, `bool valid`.
+   - Default-constructed `valid = false`. Set exactly once, never mutated after.
+2. **`Tracker::setSessionAnchor(double lat_deg, double lng_deg, int64_t t_ns)`** (new public method):
+   - Called from Kotlin via a new `NativeBridge` JNI entry the **first** time a valid GPS fix arrives during
+     bootstrap (mirrors the existing `memory/reference_gps_usage_model.md` one-fix contract).
+   - Stores `anchor_lat_rad = lat_deg·π/180`, `anchor_lng_rad = lng_deg·π/180`, `anchor_t_ns = t_ns`,
+     `valid = true`. Idempotent: if `session_anchor_.valid` is already true, log
+     `LOGI("[VIO_LLA] anchor already set, ignoring re-anchor")` and return — never re-anchor mid-session
+     (would teleport the whole track).
+   - `EventCounters`: increment `vio_lla_anchor_set` on first set; `vio_lla_anchor_reanchor_ignored` on any
+     later call.
+3. **`Tracker::current_vio_lla()`** (new public method), returns a small POD:
+   ```cpp
+   struct VioLla {
+       double lat_rad;     // VIO-projected latitude
+       double lng_rad;     // VIO-projected longitude
+       int64_t t_ns;       // EKF state timestamp
+       double var_xy_m2;   // EKF position-covariance trace (xy), published uncertainty
+       bool   valid;       // false => no anchor yet; matcher must silent-disable
+   };
+   ```
+   - If `!session_anchor_.valid`: return `VioLla{0,0,last_state_t_ns,0,false}` and (rate-limited, once per
+     ~5 s) `LOGI("[VIO_LLA] no SessionAnchor — matcher disabled")`; increment `vio_lla_unanchored_reads`.
+   - Else read `EKFState::getPosition()` → local-frame metres `(p_x, p_y)` in the **same world convention the
+     engine already uses** (Z-up world per `project_z_up_fix_2026_05_08`; XY are the horizontal components —
+     assert/log the convention at the boundary per the implementor contract).
+   - Inverse-haversine (small-angle, equirectangular — adequate at city scale, the inverse of Step K-search's
+     forward projection so they round-trip):
+     ```
+     lat_rad = anchor_lat_rad + p_y / EARTH_RADIUS_M
+     lng_rad = anchor_lng_rad + p_x / (EARTH_RADIUS_M · cos(anchor_lat_rad))
+     ```
+     `EARTH_RADIUS_M = 6371000.0` (matches `SnappedLatLng.distanceTo` in `RoadSnapper.kt:238`, so distance
+     math is consistent across the JNI boundary — no magic-number drift).
+   - `var_xy_m2` = trace of the EKF position covariance block (`P[0,0] + P[1,1]`), already available where
+     loop-closure variance is read.
+   - **No write to EKF state.** This method only reads.
+4. **`NativeBridge.kt` JNI**: add `external fun nativeSetSessionAnchor(latDeg, lngDeg, tNs)` and
+   `external fun nativeCurrentVioLla(): DoubleArray?` (returns `[latDeg, lngDeg, tNs, varXyM2]` or `null` when
+   `valid == false`). Convert `lat_rad/lng_rad` → degrees on the C++ side so Kotlin gets a gms-compatible
+   `LatLng(latDeg, lngDeg)` directly. Keep the bridge thin (no logic).
+5. **No-fix fallback (ADR-004 compliance)**: `nativeCurrentVioLla()` returns `null` until an anchor exists.
+   The Kotlin caller treats `null` as "matcher unavailable" and falls through to the raw-VIO display path —
+   exactly the `isSnapped = false` behavior `RoadSnapper` already has. GPS jamming in Haifa means a fix may
+   never arrive; the app must remain fully functional (VIO dot only, no snap) in that case.
+6. **Sim recording**: `SimulationFrameRecorder` gains a per-frame `vio_lla` field (`[latDeg, lngDeg,
+   varXyM2]`) alongside the existing `glat/glng/gacc`, so the replay harness (§8.I / `tests/cpp/
+   replay_harness.cpp`) and `scripts/analyze_replay_csv.py` can compare VIO-projected position vs recorded
+   GPS offline.
+
+#### Acceptance criteria
+
+- With a SessionAnchor set, `current_vio_lla()` round-trips: feeding its `(lat,lng)` back through Step
+  K-search's forward `(lat,lng)→local-metres` projection reproduces `EKFState::getPosition().xy` to < 0.5 m
+  at Haifa latitude (proves the inverse-haversine pair is consistent).
+- On a stationary sim (phone on a table) the `vio_lla` stream stays within the EKF's own reported position σ
+  (`sqrt(var_xy_m2)`) of the recorded GPS lat/lng — the projection adds no bias beyond the EKF's stated
+  uncertainty. (No "75° reduction" claim — that was the dead pre-`4a9a212` fixture, §0 M6/M7.)
+- With **no** GPS fix for the entire session, `nativeCurrentVioLla()` returns `null` for every call, the app
+  shows the raw VIO dot, no crash, and `vio_lla_unanchored_reads > 0`.
+- EKF behaviour is bit-identical with and without this accessor wired (read-only proof): the same sim produces
+  an identical `traj_x/z` CSV from the replay harness.
+- `vio_lla_anchor_set == 1` and `vio_lla_anchor_reanchor_ignored == 0` on a normal single-anchor walk.
+
+---
+
+### Step C* — SNAP: replace `RoadSnapper.kt`'s Google Roads call with a local OSM R-tree snap
+
+**Goal**: make `RoadSnapper.snapToRoad()` snap against the local Haifa OSM road segments (Step A*'s
+`OsmDataLayer.nearestSegments` R-tree) instead of `RoadsApi.snapToRoads`, while keeping the class name, the
+`snapToRoad(vioPosition: LatLng, recentPath: List<LatLng>): SnappedLatLng` signature, the `SnappedLatLng`
+shape, the LRU cache, the >15 m soft-snap "trust raw VIO", and the throttle **byte-identical at the call
+sites** — so `NavSightViewModel:63` (construction), `:487` (call), and `:825` (`shutdown()`) are untouched.
+This is a like-for-like $0/offline replacement of the *current* per-point Google Roads snapper; its
+snap-to-nearest corner-cut limitation is **accepted for v1** and fixed later by the deferred Step D HMM (it
+is not a regression — the current Google snapper also snaps per-point). (Supersedes original §8 Step C; the
+R-tree it queries is the one built in Step A*, not a separate `RoadGraph`.)
+
+#### Full implementation plan
+
+1. **Source = Step A*'s `OsmDataLayer`, not a new graph.** Step A* already builds the STR-packed segment
+   R-tree and exposes `fun nearestSegments(lat, lng, radiusM, maxResults): List<RoadSegment>` (sorted by true
+   perpendicular distance) and `RoadSegment(segmentId, wayId, highwayClass, aLat, aLng, bLat, bLng, name)`.
+   Step C consumes that seam; it does **not** define its own R-tree. `RoadSnapper` reaches the loaded
+   `OsmDataLayer` through a process-wide holder set by Step A* on first launch (see step 4) — it never loads
+   OSM data itself.
+2. **Per-point snap math** — a top-level `internal` function `projectPointOntoSegment(...)` (in a new small
+   file `app/src/main/java/com/example/navsight1/RoadSnapMath.kt`, unit-testable, no Android deps). For the
+   single nearest `RoadSegment` returned by `nearestSegments`, recompute the foot-of-perpendicular + metric
+   distance (the R-tree already sorted by it, but Step C needs the projected *point*, not just the distance):
+   - Work in a **local east-north metric tangent plane** anchored at the query point:
+     `mPerDegLat = 111_320.0`, `mPerDegLng = 111_320.0 * cos(toRadians(pLat))`.
+     Convert A, B, P to metres relative to P: `ax = (aLng - pLng) * mPerDegLng; ay = (aLat - pLat) * mPerDegLat`
+     (B likewise; P is the origin).
+   - Project origin onto A→B: `dx = bx - ax; dy = by - ay; len2 = dx*dx + dy*dy`.
+     `t = if (len2 < 1e-9) 0.0 else clamp(-(ax*dx + ay*dy) / len2, 0.0, 1.0)` (clamp keeps the snap on the
+     finite segment — this is what makes it snap to nearest *road*, and is exactly the corner-cutting source
+     that Step D later removes).
+     `fx = ax + t*dx; fy = ay + t*dy` → foot in local metres; distance `= hypot(fx, fy)`.
+   - Convert the foot back to lat/lng: `snappedLat = pLat + fy / mPerDegLat; snappedLng = pLng + fx /
+     mPerDegLng`. The returned `distanceM` is reused directly (already metric, do **not** re-run haversine for
+     the gate; keep `SnappedLatLng.distanceTo` only for the existing >15 m soft-snap comparison so that path
+     stays byte-identical).
+3. **Rip out Google inside `RoadSnapper.kt`, keep the control flow**:
+   - **Remove** imports `com.google.maps.GeoApiContext`, `com.google.maps.RoadsApi`,
+     `com.google.maps.model.SnappedPoint`. **Keep** `com.google.android.gms.maps.model.LatLng` (display still
+     uses gms LatLng — no GeoPoint refactor in v1).
+   - **Comment-out** (not delete, per the project's comment-out rule) the `geoApiContext` lazy property and the
+     `RoadsApi.snapToRoads(...).await()` call in a `/* LEGACY (Google Roads API, removed in OSM migration
+     2026-05-29) ... */` brace so the diff shows what was replaced.
+   - **Preserve verbatim**: the `withContext(Dispatchers.IO)` wrapper; the cache-first check
+     (`snapCache.get(cacheKey)`); the `getCacheKey` 6-decimal key; the LRU `CACHE_SIZE = 50`; the `>15.0`
+     soft-snap branch (`distToRoad > 15.0 → return rawSnapped`); the `try/catch` with `consecutiveFailures`
+     log-throttling (now wraps the local query — a missing/empty index falls into the same graceful "return
+     unsnapped" path); and the `recentPath` parameter (stays in the signature; v1 snap-to-nearest only needs
+     the last point, so `recentPath` is accepted-but-unused — documented inline, used again by Step D).
+     Keeping it unused preserves the `:487` call byte-for-byte.
+   - **`shutdown()` stays a method** with the same name: replace the body with a no-op log
+     (`Log.d(TAG, "RoadSnapper shutdown")`) since there is no longer a `GeoApiContext` to close. `:825` is
+     untouched.
+4. **Constructor — keep `:63` byte-identical via a provider, not a ctor-arg change.** The current ctor is
+   `RoadSnapper(private val apiKey: String)` and `NavSightViewModel:63` constructs it. Since `:63` must stay
+   byte-identical and `RoadSnapper` must reach the data layer, keep `RoadSnapper(private val apiKey: String)`
+   **unchanged** and have `RoadSnapper` pull the already-loaded `OsmDataLayer` from the process-wide holder
+   Step A* populates (`OsmDataLayer` singleton / a `@Volatile` provider). The construction line at `:63` is
+   **literally unchanged**; `apiKey` becomes a benign ignored field (comment `// MIGRATION: apiKey ignored —
+   OSM snap needs no key`). If the data layer is `null` (not yet loaded), `snapToRoad` returns the unsnapped
+   `SnappedLatLng(isSnapped=false)` — same shape as today's "API disabled" path, so the dot trusts raw VIO
+   until the layer is ready. **Decision (no re-deciding downstream): ship the provider route** — the
+   ignored `apiKey` field costs nothing and the provider is the only zero-touch way to inject the layer.
+5. **Local confidence + graceful field mapping** (replace Google's `placeId`/`originalIndex`):
+   - Keep the `SnappedLatLng(latitude, longitude, placeId: String?, originalIndex: Int?, isSnapped: Boolean)`
+     data class **unchanged** (read elsewhere via `toLatLng()`/`distanceTo` and possibly by recordings — do
+     not alter its shape).
+   - On a successful snap: `placeId = "osm:way:$wayId"` (the OSM way id, namespaced so any consumer that only
+     checks non-null still works and a human can tell it's OSM). `originalIndex = null` (Google's batch index
+     has no analogue in a single-point snap; nothing downstream depends on its value).
+   - **Confidence is computed locally** so Step D can later reuse it: the current `snapToRoad` signature has
+     **no** variance argument and the task forbids changing it, so v1 uses a constant floor: `sigma = 5.0`
+     (OSM way-geometry accuracy, https://wiki.openstreetmap.org/wiki/Accuracy), `confidence = exp(-distanceM /
+     sigma)`. (When Step F/D add a variance-carrying overload, the `max(5, sqrt(var))` form drops in.) The
+     result is **not** stored on `SnappedLatLng` (no field exists and the task forbids adding one) — it is
+     logged (`Log.d(TAG, "OSM snap %.1fm conf %.2f way %d".format(distanceM, confidence, wayId))`) and used
+     internally only.
+   - **Off-road / no-snap**: call `OsmDataLayer.nearestSegments(lat, lng, radiusM = 5.0 * sigma /*=25 m*/,
+     maxResults = 1)`. If it returns empty (no segment within 25 m), return the unsnapped
+     `SnappedLatLng(vioLat, vioLng, placeId=null, originalIndex=null, isSnapped=false)` — identical to today's
+     empty-result and API-disabled paths, so the existing "trust raw VIO when not snapped" display is unchanged.
+6. **Throttle**: the original code's "throttled to 2 Hz" is enforced at the **call site**
+   (`NavSightViewModel:487`, ~2 Hz cadence), not inside `RoadSnapper`. Do **not** add a throttle (keeps `:487`
+   byte-identical); the local R-tree query is O(log N) and cheap enough at the existing cadence. Note this in
+   a comment so the doc-claim/behavior gap is intentional.
+7. **gradle / keys** (cross-reference the Build-changes body; do not duplicate the edit): once C lands,
+   `google-maps-services` is no longer referenced by `RoadSnapper`. Its removal happens in the Build-changes
+   pass (it may still be transitively referenced until Directions/Places are migrated). Keep
+   `play-services-maps` and the Maps display key (display still needs them — hybrid v1).
+8. **Tests** (`tests/` — never root): JVM unit tests on the pure-Kotlin math, no Android runtime.
+   - `projectPointOntoSegment`: point beside a horizontal segment → foot at perpendicular, distance == offset;
+     beyond endpoint A → clamps to A (`t==0`); beyond B → clamps to B (`t==1`); degenerate zero-length segment
+     → distance to the single node, no NaN.
+   - `RoadSnapper.snapToRoad`: with a fake `OsmDataLayer` returning a 3 m snap → `isSnapped=true`,
+     `placeId=="osm:way:<id>"`, lat/lng == projected; with a 40 m snap (>15 m soft-snap) → returns raw VIO
+     unchanged (`isSnapped=false`); with the data-layer provider `null` → returns raw VIO unsnapped; cache-hit
+     on a repeated 6-decimal key returns the cached snap without re-querying.
+
+#### Acceptance criteria
+
+- `NavSightViewModel.kt` lines **63 (construction), 487 (call), 825 (`shutdown()`)** are **byte-identical**
+  before and after — verified by `git diff -- app/src/main/java/com/example/navsight1/NavSightViewModel.kt`
+  showing **no change** at those lines.
+- The public surface of `RoadSnapper` is preserved: class name `RoadSnapper`, method
+  `suspend fun snapToRoad(vioPosition: LatLng, recentPath: List<LatLng>): SnappedLatLng`, method
+  `fun shutdown()`, and the `SnappedLatLng(latitude, longitude, placeId, originalIndex, isSnapped)` shape are
+  all unchanged (compile-checked by the untouched call sites).
+- No `com.google.maps.*` (Roads API) import remains in `RoadSnapper.kt`; `com.google.android.gms.maps.model.
+  LatLng` is retained. The old Google block is commented-out, not deleted.
+- On a replayed Haifa walk (the post-`4a9a212` fixture, e.g. the `1779643969824` 134 m loop), the snapped dot
+  follows the OSM road for ≥ 80% of sustained-motion samples (`speed > 1.0 m/s`) and returns raw-VIO unsnapped
+  when the user is > 25 m from any road (building/plaza), matching the original Step C off-road behavior — and
+  **never** produces a snap further than the >15 m soft-snap allows.
+- The snap runs fully **offline with no Maps/Roads key and no network** (jamming-immune); with the data layer
+  not yet loaded the dot trusts raw VIO and never crashes.
+- JVM unit tests pass; build is green (`./gradlew :app:assembleDebug`).
+- Documented limitation: snap-to-nearest **corner-cuts** and is **bearing-blind** — **accepted for v1**, fixed
+  by the deferred Step D HMM (per §0.7). Like-for-like replacement of the current per-point Google snapper,
+  **not a regression**.
+
+---
+
+### Step K-routing* — offline router (replaces Google Directions API)
+
+**Goal**: "make routing work again" with **$0, offline, and jamming-immune**: replace the `DirectionsApi`
+call inside `NavigationManager.calculateRoute(start, destination)` with the embedded offline router
+(**BRouter `brouter-core`**, MIT, pure-Java) chosen in Step A* / exposed via the `OsmRouter` seam, while
+**keeping the `NavigationRoute` / `RouteStep` / `ManeuverType` public types and the `calculateFallbackRoute`
+straight-line fallback unchanged** so `NavigationManager`'s callers and the navigation UI are untouched.
+Turn-by-turn maneuvers and street names come from OSM way data (BRouter voice hints + way `name` tags)
+instead of Google's HTML instruction strings. (Supersedes original §8 Step K routing portion §8.K.1 items
+3/5/6 where they assumed GraphHopper/Directions.)
+
+#### Library decision (justified, binding for v1): BRouter, not Valhalla-mobile, not hand-rolled A*
+
+| Option | Verdict | Reason |
+|---|---|---|
+| **BRouter `brouter-core`** (MIT, pure-Java + Android) | **CHOSEN** | No NDK — drops into `app/build.gradle.kts` as a JVM dependency/vendored module, same slot as the removed `google-maps-services`. Purpose-built for **offline Android**. **Its own `.rd5` data** (a single Haifa-clipped 5×5° segment slice, a few hundred KB–low MB), built by `brouter-map-creator` from the same clipped PBF as Step A*. Emits **voice hints with turn types** (left / slight-left / sharp-left / right / … / roundabout-exit / u-turn / continue) that map 1:1 onto the existing `ManeuverType` enum; street names from OSM way `name` tags — so the UI's instruction/maneuver/icon path is preserved. One locomotion-agnostic profile (`.brf`, foot∪cycleway∪road) per M10, no mount split. |
+| **Valhalla-mobile** (MIT, C++/NDK) | Rejected v1 | Real NDK build of a large C++ project (the cost flagged in §5.2); tiles heavier than a single `.rd5`; community mobile wrapper exposes only `route` via JNI. Documented bailout only if BRouter fails the spike. |
+| **Hand-rolled A*/Dijkstra over the Step A* graph** | Rejected v1 (kept as fallback) | Reuses the Step A* `haifa_graph.bin` (zero new data, the `DijkstraRouter` seam already exists), but the entire turn-instruction generator (junction detection, turn-angle → `ManeuverType`, street-name attribution, voice-hint distances) would be net-new code that BRouter already ships and field-tests. Named fallback if BRouter's APK-delta or routing-latency gate (A*.1) is blown. |
+
+#### Full implementation plan
+
+1. **Dependencies** — handled in the Build-changes body: remove `google-maps-services` + `places-client`;
+   keep `play-services-maps` + the Maps display key; add the BRouter jars. Not duplicated here.
+2. **Embed Haifa routing data + profiles** — handled in Step A* (stage 5): `app/src/main/assets/osm/haifa/
+   haifa.rd5` + the chosen `.brf` profile; copied to a writable `segmentDir` on first launch by the Step A*
+   asset-copy pass.
+3. **Router class = Step A*'s seam.** `OfflineRouter` is the `OsmRouter`/`BRouterRouter` from A*.3, wrapping
+   `brouter-core` **in-process** (no `Bundle`/AIDL service — we link the jar). It runs on `Dispatchers.IO`:
+   ```
+   val rc = RoutingContext().apply {
+       localFunction = profilePath.absolutePath   // .brf profile
+       turnInstructionMode = 2                     // locus-style hints (street names + turn cmds)
+   }
+   val waypoints = listOf(
+       OsmNodeNamed().apply { name = "from"; ilon = toIlon(start.lng);  ilat = toIlat(start.lat) },
+       OsmNodeNamed().apply { name = "to";   ilon = toIlon(destination.lng); ilat = toIlat(destination.lat) }
+   )
+   val engine = RoutingEngine(null, null, segmentDir.absolutePath, waypoints, rc, /*engineMode=*/0)
+   engine.doRun(MAX_RUNNING_TIME_MS)               // bounded value, not 0
+   val track: OsmTrack? = engine.foundTrack        // null + engine.errorMessage on failure
+   ```
+   (`ilon = (lon + 180) * 1e6`, `ilat = (lat + 90) * 1e6` — BRouter's fixed-point integer coords.) Returns
+   `null` (point off-graph / `.rd5` missing) so the caller falls back to the straight line.
+4. **Rewrite `NavigationManager.calculateRoute(start, destination)` body — signature/return type unchanged.**
+   - **Comment-out** the `geoApiContext` field, the `GeoApiContext` import, the
+     `DirectionsApi`/`PolylineEncoding`/`TravelMode` usage. Keep `apiKey` as an ignored constructor param so
+     the construction site is untouched (pass it nowhere).
+   - New body:
+     1. If `OsmRouter` is unavailable (assets not yet copied / no `.rd5`), `Log.w` and
+        `return calculateFallbackRoute(start, destination)` — the straight line stays as the no-route fallback.
+     2. `val polyline = osmRouter.route(start, destination); if (polyline.size < 2) return
+        calculateFallbackRoute(start, destination)`.
+     3. Map `OsmTrack` → `NavigationRoute`:
+        - `polyline`: `track.nodes` → `List<LatLng>` (each `OsmPathElement`'s `ilon/ilat` → `LatLng`).
+        - `totalDistanceMeters`: `track.distance.toDouble()`.
+        - `estimatedTimeSeconds`: prefer a profile-derived time if exposed; else the existing
+          `distance / averageSpeed` (10 m/s) estimate `calculateFallbackRoute` uses — documented v1
+          approximation (turn-by-turn timing split to `NAVIGATION_PLAN.md`).
+        - `steps`: build `List<RouteStep>` from BRouter's **voice hints** (`track.getVoiceHints()` when
+          `turnInstructionMode != 0`). Per hint: `startLocation`/`endLocation` = hint track position + next
+          hint position; `maneuver` = `toManeuverType(hint.cmd)` (step 5); `streetName` = OSM way `name` at/
+          after the junction ("Unknown road" when untagged — matches today's `extractStreetName` default);
+          `instruction` = synthesized (`"Turn left onto <streetName>"`) — **no HTML parsing**
+          (`parseManeuver`/`extractStreetName`'s `htmlInstructions` regex is now dead — comment out, don't
+          delete); `distance` = arc-length between consecutive hints.
+        - Zero hints (short straight route) → a single `STRAIGHT` `RouteStep` spanning start→destination (same
+          shape as `calculateFallbackRoute`).
+   - Keep the whole `withContext(Dispatchers.IO) { … }` + `try/catch` shape; on any exception, `Log.e` and
+     `calculateFallbackRoute`.
+5. **`ManeuverType` mapping** (replaces `parseManeuver` HTML matching). Add
+   `OsmRouter.toManeuverType(cmd: Int): ManeuverType` keyed on BRouter `VoiceHint` command codes:
+   left/right families → `TURN_LEFT/RIGHT`, `TURN_SLIGHT_*`, `TURN_SHARP_*`; u-turn → `UTURN_LEFT`/`UTURN_RIGHT`;
+   roundabout-exit → `ROUNDABOUT_LEFT`/`ROUNDABOUT_RIGHT` (by exit-turn sign); keep-left/right → `FORK_LEFT`/
+   `FORK_RIGHT`; continue / no-hint → `STRAIGHT`. `MERGE`/`RAMP_*` (no foot/cycleway analogue) fold to
+   `STRAIGHT`/`FORK_*`; left in the enum (used by `getManeuverIcon`), no UI change. Pure code→enum table —
+   **no magic thresholds** (BRouter already classified the turn angle).
+6. **No EKF coupling, no display rewrite.** Routing output is display + cue only (matches original §8.K.2):
+   `polyline` renders on the Google `GoogleMap` as a route overlay; the matched/snapped dot still comes from
+   Step C* (`RoadSnapper`). `updateVioPosition(snappedPosition: LatLng)` and the rest of `NavigationManager`
+   are untouched.
+7. **Re-route + search are out of this body.** Off-route re-routing, route-adherence thresholds, voice
+   playback, and the destination-search migration (Step K-search*) belong to the broader split (§0.5, §0.6
+   Q8). This body only restores `calculateRoute` to working offline.
+8. **ADR (Step J)**: BRouter chosen over Valhalla-mobile (no NDK) and hand-rolled A* (reuses shipped
+   turn-instruction code), MIT license, `.rd5` data lifecycle (single Haifa segment, update cadence shared
+   with §6 / ADR-020 region story), and the hand-rolled-A* bailout trigger (spike fails APK-delta or routing-
+   latency gate).
+
+#### Acceptance criteria
+
+- **Works offline, $0, no Google key for routing.** With data disabled and `com.google.maps:*` deps removed,
+  `calculateRoute(start, destination)` returns a `NavigationRoute` with `polyline.size > 2` and
+  `steps.isNotEmpty()` for a Haifa start→destination pair on the embedded `.rd5` — no `GeoApiContext`, no
+  `DirectionsApi`, no billing.
+- **Public contract unchanged**: `NavigationRoute`, `RouteStep`, `ManeuverType`,
+  `NavigationManager.calculateRoute` signature, `updateVioPosition(LatLng)`, and `calculateFallbackRoute` all
+  compile and run **without any change to `NavSightViewModel` or the navigation UI** (no `.kt` outside
+  `NavigationManager.kt` + the new `OsmRouter`/`OfflineRouter.kt` is edited).
+- **Maneuvers + street names come from OSM**: a planned Haifa route produces `RouteStep`s whose `maneuver`
+  matches the real turns (left/right/roundabout) and whose `streetName` matches the OSM way `name` for ≥ 80%
+  of named ways along the route — with **zero HTML parsing** in the code path.
+- **Fallback preserved**: when the router cannot produce a track (point off-graph, `.rd5` not yet copied, or
+  exception), `calculateRoute` returns the straight-line `calculateFallbackRoute` (single `STRAIGHT` step) —
+  no crash, no empty route.
+- **Latency gate (spike)**: route computation for a typical Haifa origin→destination ≤ 2 s p95 on a Samsung
+  Galaxy S21 Ultra; if exceeded, profile-simplify or fall back to the hand-rolled A* per the ADR.
+- **APK/data gate (spike)**: `brouter-core` jar + Haifa `.rd5` + `.brf` delta is measured against the §6.2 /
+  A*.1 storage budget; if blown, the hand-rolled-A*-over-Step-A*-graph (`DijkstraRouter`) bailout is taken.
+- **ADR lands with the code** documenting BRouter-vs-Valhalla-vs-hand-rolled and the `.rd5` lifecycle.
+
+---
+
+### Step K-search* — offline destination geocoder (replaces Places API)
+
+**Goal**: replace the paid Google **Places API** autocomplete in `SearchBarUi.kt` with the on-device
+geocoder built in Step A* (`OsmDataLayer.geocode`) over the Haifa OSM `name`/`addr:*` index. Destination
+search works fully offline, **$0**, jamming-immune. The search UX (the `WazeSearchBar` look, the predictions
+dropdown, the route-preview card) is preserved unchanged — only the prediction/resolve source swaps.
+
+#### Library decision (WebSearch'd)
+
+There is **no battle-tested truly-offline embedded geocoder for Android.** The closest hits — OSMBonusPack
+`GeocoderNominatim` and `hdk24/nominatim-osm` — are **online** wrappers around the public Nominatim HTTP
+service (network + rate-limited + not jam-proof), failing the offline mandate; a full local Nominatim is a
+Postgres/PostGIS server, not embeddable. **Decision: the hand-rolled inverted index from Step A*** (token →
+`place_id` postings + a flat `place_id → (lat,lng,display_name)` table). Small (~150 LOC, already built in
+A*.1 stage 4), reuses Step A*'s parsed POI list, needs no extra dependency or APK weight, and is the only
+option satisfying offline + no-key + jam-proof.
+
+#### Full implementation plan
+
+1. **Index = Step A* output.** The geocode blob `haifa_geocode.bin` and the runtime
+   `OsmDataLayer.geocode(query, anchorLat, anchorLng, limit): List<GeoHit>` (with
+   `GeoHit(placeId, lat, lng, displayName)`) already exist from Step A*. Step K-search consumes them; it does
+   not parse OSM itself. `name`/`name:en`/`name:he` are all indexed (Hebrew + Latin both hit), `addr:street` +
+   `addr:housenumber` populate `displayName`.
+2. **Thin adapter `OfflineGeocoder`** (new, `app/src/main/java/com/example/navsight1/OfflineGeocoder.kt`)
+   — wraps `OsmDataLayer.geocode` to **mirror the existing free-function signatures** in `SearchBarUi.kt` so
+   the composable wiring is untouched:
+   ```kotlin
+   suspend fun predictions(query: String, anchor: LatLng?, limit: Int = 6): List<PlacePrediction>
+   suspend fun resolve(placeId: String): LatLng?     // placeId == GeoHit.placeId encoded as String
+   ```
+   - `predictions` = `OsmDataLayer.geocode(query, anchor?.latitude ?: bboxCenterLat, anchor?.longitude ?:
+     bboxCenterLng, limit).map { PlacePrediction(placeId = it.placeId.toString(), primaryText =
+     it.displayName.substringBefore(','), secondaryText = it.displayName.substringAfter(',', "")) }` — the
+     **existing** `PlacePrediction` data class (`SearchBarUi.kt:32`), so the dropdown renders identically.
+     A*'s `geocode` already ranks exact-name > prefix > token-contains, ties broken by closer-to-anchor.
+   - `resolve` re-queries by id (or caches the last `predictions` list) and returns the gms
+     `LatLng(lat, lng)` — the **existing** `onResult: (LatLng?) -> Unit` contract.
+3. **Swap in `SearchBarUi.kt`** (preserve the composable, change only the source):
+   - Replace the `placesClient: PlacesClient` parameter on `SearchBarCard`/`WazeSearchBar`/
+     `fetchPlacePredictions`/`fetchPlaceLatLng` with `geocoder: OfflineGeocoder`. The composable body, the
+     `predictions` state, the `isSearching` flag, the dropdown `Surface`, and the route-preview card are
+     unchanged.
+   - `fetchPlacePredictions(query, …)` → `scope.launch { predictions = geocoder.predictions(q, anchor) }`
+     (drop the `AutocompleteSessionToken` — no billing session).
+   - `fetchPlaceLatLng(placeId, …)` → `geocoder.resolve(placeId)`.
+   - Keep the `q.length >= 2` debounce gate (`SearchBarUi.kt:72`) and the `try/catch → Log.e`.
+   - `fetchDirectionsRoute(...)` (the Google Directions call at `SearchBarUi.kt:213`) is **out of this body** —
+     replaced by the offline router in Step K-routing*. Until that lands, wire the call site to the `OsmRouter`
+     interface; do not restore the Google key.
+4. **Construction**: build `OfflineGeocoder` once (lazy singleton or in the ViewModel, alongside the existing
+   `RoadSnapper` construction at `NavSightViewModel:63`) and pass it down; **comment-out** the `PlacesClient`
+   creation and the `Places.initialize(...)` call.
+5. **No network, no key**: `OfflineGeocoder`/`OsmDataLayer.geocode` make zero HTTP calls. Works in airplane
+   mode / jammed Haifa.
+
+#### Acceptance criteria
+
+- A name query (e.g. "Technion", typed as "tech") returns a Haifa POI prediction list within 100 ms p95 on an
+  S21 Ultra, fully offline (airplane mode on).
+- Selecting a prediction resolves to a `LatLng` within ~20 m of the OSM POI node, and the existing
+  route-preview card opens with that destination — UX visually identical to the Places path.
+- Hebrew (`name:he`) and English (`name:en`) queries both resolve the same landmark.
+- Removing the device's network connection causes **no** change in search behavior (proves no hidden online
+  dependency).
+- `SearchBarUi.kt` no longer imports `com.google.android.libraries.places.*`; a build with `places-client`
+  removed from gradle compiles.
+- Empty/blank handling matches the old path: no predictions for queries < 2 chars; graceful empty list (no
+  crash) when the index has no match.
+
+---
+
+### Build changes (8M) — gradle edits
+
+**Goal**: remove the two paid Google client libraries (Roads via `google-maps-services`, Places via
+`places-client`); **keep** `play-services-maps` (the Google display stays in HYBRID v1) and **keep** the Maps
+key (display still needs a key + billing account, even though loads are free); add the chosen free libs for
+the OSM data layer/router. No display rewrite.
+
+#### Full implementation plan
+
+1. **`gradle/libs.versions.toml`** — remove the two paid entries and their version refs:
+   - Delete library `google-maps-services` (line 39) and version `googleMapsServices` (line 17). (Roads API.)
+   - Delete library `places-client` (line 42) and version `places` (line 18). (Places API.)
+   - Optionally delete `slf4j-simple` (line 43) + `slf4j` (line 19) — exists only for `google-maps-services`
+     logging (`build.gradle.kts:117–118 "SLF4J for Roads API logging"`); confirm no other consumer first.
+   - **Keep**: `maps-services-client` = `play-services-maps` (line 41 — note the misnomer: this alias is the
+     *display* SDK, not Roads), `maps-compose` (line 40), `google-location-services` (line 44 — still used for
+     the one bootstrap GPS fix feeding `setSessionAnchor`; keep with a no-fix fallback per Step B*),
+     `google-tasks` (line 45).
+   - **Add** the BRouter router jars (`brouter-core`, `brouter-codec`, `brouter-mapaccess`,
+     `brouter-expressions`) per Step A* / K-routing* (vendored `libs/*.jar` or a Gradle subproject — BRouter is
+     not on Maven Central). The matcher data layer (Step A*) hand-rolled R-tree + the dev-machine PBF parser
+     need **no runtime dependency** (parsing is build-time in `:tools`/`scripts`; the asset ships).
+2. **`app/build.gradle.kts`** dependencies block:
+   - Remove `implementation(libs.google.maps.services)` (line 106, Roads).
+   - Remove `implementation(libs.places.client)` (line 115, Places).
+   - Remove `implementation(libs.slf4j.simple)` (line 118) if its version ref was removed.
+   - **Keep** `implementation(libs.maps.services.client)` (line 112 — display SDK),
+     `implementation(libs.maps.compose)` (line 109), `implementation(libs.google.location.services)`
+     (line 121), `implementation(libs.google.tasks)` (line 122).
+   - **Keep** the Maps key plumbing unchanged (`build.gradle.kts:25–28`):
+     `manifestPlaceholders["GOOGLE_MAPS_API_KEY"]` + `buildConfigField("String","GOOGLE_MAPS_API_KEY",…)` stay
+     — the `GoogleMap` compose display needs the key + an attached billing account (loads free; the account
+     must exist). Note `BuildConfig.GOOGLE_MAPS_API_KEY` is also read at `SearchBarUi.kt:58` for the Directions
+     call — once Step K-routing* lands and `fetchDirectionsRoute` is gone, that read disappears, but the key
+     itself stays for display.
+   - Add the BRouter jars `implementation(libs.brouter.core)` etc. Ship the Haifa OSM assets under
+     `app/src/main/assets/osm/haifa/` (Step A* output); `noCompress` for `.rd5`/`.rtree`/`.bin` is added in
+     the Step A* build-config pass (mirrors the existing `noCompress += "tflite"` at `build.gradle.kts:42`).
+3. **Manifest**: keep `com.google.android.geo.API_KEY` (display). Comment-out any
+   `com.google.android.libraries.places` meta-data / `Places.initialize` (Places gone). Confirm no leftover
+   Roads/Places permissions.
+4. **ProGuard**: no new keep rules for removals; add keep rules only if BRouter uses reflection.
+
+#### Acceptance criteria
+
+- A clean build succeeds with `google-maps-services` and `places-client` fully removed from both
+  `libs.versions.toml` and `build.gradle.kts`.
+- The app still renders the Google `GoogleMap` display (HYBRID v1) — `play-services-maps` + `maps-compose` +
+  the Maps key are intact.
+- No source file references `com.google.maps.*` (Roads) or `com.google.android.libraries.places.*` (Places)
+  after the swap (grep clean; commented-out legacy blocks excepted).
+- APK has no Roads/Places client code; the size delta is a reduction net of the added BRouter lib + Haifa
+  asset (which are budgeted in Step A*.1's ≤ 12 MB gate).
+- The bootstrap GPS fix still reaches `setSessionAnchor` via `play-services-location`, and the app is fully
+  functional with location denied/jammed (no-fix fallback, Step B*).
+
+---
+
+### Step L (8M) — OSM basemap display swap — **OPTIONAL / DEFERRED**
+
+**Goal (deferred)**: replace the Google `GoogleMap` compose display (`MapScreenUi.kt`) with a fully-offline
+OSM renderer so the basemap works with **no key, no billing account, and no network** — closing the last
+Google coupling. **Not in v1.** HYBRID v1 deliberately keeps the Google display because it is free, decoupled,
+and avoids both the display rewrite and the `GeoPoint` refactor across 7 files. Do Step L only when a jam-proof
+offline basemap is explicitly wanted (the v1 caveat: in jammed/offline Haifa the Google basemap tiles go
+blank/stale while the VIO dot + OSM snap + offline router keep working on embedded data).
+
+#### Short plan (when undeferred)
+
+1. Pick renderer: **osmdroid** (raster tiles, simplest drop-in `MapView`, smallest change) vs **MapLibre
+   Native** (vector, MBTiles/PMTiles, nicer offline basemap, heavier integration). Recommendation: osmdroid
+   for the first cut.
+2. Introduce a neutral `data class GeoPoint(lat, lng)` (or a typealias) and migrate the gms `LatLng` usages
+   across the 7 coupled files (MapScreenUi, NavigationManager, NavSightUtils, NavSightViewModel, RoadSnapper,
+   SearchBarUi, SensorRepository). This is the refactor v1 intentionally skips.
+3. Ship offline MBTiles/raster tiles for Haifa as an asset; remove the Maps key, the manifest
+   `com.google.android.geo.API_KEY`, and `play-services-maps` + `maps-compose`.
+
+#### Acceptance criteria (when undeferred)
+
+- The basemap renders fully offline (airplane mode, no Maps key in `local.properties`) over the Haifa tile
+  asset.
+- The VIO dot, OSM-snapped dot, and route polyline render on the new map with the same UX as the Google
+  display.
+- No source references `com.google.android.gms.maps.*`; the Maps key and `play-services-maps` are removed.
+
+---
+
+## 8M.adv — Adversarial feasibility check (top risks + mitigations)
+
+> Skeptic pass over the 8M bodies. Where they will fail in practice, with a mitigation each so the plan is
+> not over-optimistic. Numbers are estimates to be confirmed by the A*.1 APK gate spike, not promises.
+
+1. **APK/asset size for Haifa (R-tree + routing graph + geocode + BRouter jars + `.rd5`).** Realistic v1
+   estimate: our three hand-rolled blobs ≈ **1–3 MB** (Haifa is one city: tens of k road segments, a few k
+   POIs); BRouter jars ≈ **2–4 MB**; the Haifa-clipped `.rd5` ≈ **2–8 MB** (BRouter's stock world tiles are
+   tens of MB each, but a single-bbox slice from `brouter-map-creator` is much smaller). **Total ≈ 5–15 MB**
+   — the A*.1 **≤ 12 MB** gate is *plausible but not guaranteed*; the `.rd5` slice is the swing factor.
+   **Mitigation**: the A*.1 gate is binding and measured before any commit; if blown, drop BRouter for the
+   `DijkstraRouter` over `haifa_graph.bin` (removes jars + `.rd5`, leaving ≈ ≤ 4 MB) and take the hand-rolled
+   turn-instruction cost. ADR records the outcome. Tighten the bbox if even the blobs run large.
+
+2. **The router needs its OWN data format, doubling data + preprocessing (the biggest hidden cost).** TRUE —
+   BRouter does **not** read our R-tree or `haifa_graph.bin`; it needs its own `.rd5`, built by a *separate*
+   `brouter-map-creator` pass over the same PBF. So v1 carries **two** routing-capable structures (the R-tree/
+   graph for snap + the `.rd5` for routing) and **two** preprocess stages. The hand-rolled A*/Dijkstra is the
+   only option that reuses `haifa_graph.bin` (one structure, one preprocess) — but it costs the entire
+   turn-instruction generator BRouter ships for free. **Net "less work" verdict**: BRouter is less *code* (no
+   turn-instruction engine to write/test) at the price of more *data + a second preprocess stage*; hand-rolled
+   A* is less *data* at the price of significant net-new code. **Mitigation**: BRouter for v1 (code risk >
+   data risk when the data is one city and the gate has headroom); `DijkstraRouter` is the pre-built fallback
+   if the A*.1 size gate fails — and `haifa_graph.bin` is built regardless (Step A* stage 3), so the fallback
+   is always available with zero extra preprocessing.
+
+3. **Google display + OSM snap = visible dot-vs-road offset, and a possible licensing issue.** Two real
+   risks. (a) **Geometric offset**: Google's basemap tiles and OSM road geometry are independently surveyed
+   and can disagree by **5–15 m** in places; the OSM-snapped dot will sit *beside* the Google-drawn road where
+   they diverge, looking wrong even when the snap is correct. **Mitigation**: accept for v1 (the dot is
+   VIO-truth snapped to OSM, not to Google's raster — documented); Step L (offline OSM basemap) removes the
+   mismatch by drawing the same OSM geometry the snap uses. (b) **Licensing**: Google Maps Platform ToS
+   restrict using Google Maps *content* alongside non-Google maps/derived data in the same view. Rendering the
+   Google basemap while overlaying an OSM-derived polyline/dot is a **gray area** — overlaying your own data on
+   a Google map is normal, but mixing OSM-*derived* routing geometry on a Google basemap may trip the
+   no-other-maps clause. **Mitigation**: flag for a ToS read before shipping HYBRID v1 publicly; the clean exit
+   is Step L (all-OSM display). For internal Haifa testing this is moot.
+
+4. **Hand-rolled OSM PBF parse + R-tree on-device — weekend or a month?** Note: 8M moved the **parse off the
+   device** (dev-machine `:tools` preprocess → shipped blob), which removes the hardest part (protobuf block
+   decoding + the full node-coordinate map in RAM during cold start). What remains on-device is the **blob
+   reader + STR-packed R-tree query + perpendicular projection** ≈ a few hundred LOC, realistically a
+   **few days**, not a month. The dev-side `osmpbf` two-pass walk (node map → way segmentation) is the larger
+   chunk, ~**1 week** with edge cases (relations ignored for v1, multipolygon ways, `oneway` parsing).
+   **Mitigation**: scope to ways-only (skip relations/turn-restrictions in v1 — the deferred Step D/G handle
+   those); OSMonaut is the documented fallback if the two-pass node resolution gets fiddly; the `:tools`
+   synthetic-PBF round-trip test (A* step 7) catches reader/writer drift early.
+
+5. **Turn-by-turn maneuvers + street names from raw OSM (no Google HTML) — harder than it looks?** Moderate
+   risk, **mostly mitigated by choosing BRouter** (which already emits classified turn commands + carries the
+   way `name`). The residual hard parts: (a) **roundabout exit numbering** and (b) **lane/exit guidance** are
+   weaker in BRouter than Google; (c) **`name` coverage** — many Haifa service roads/footways are untagged, so
+   `streetName` falls back to "Unknown road" more often than Google's. **Mitigation**: v1 maps BRouter's
+   already-classified `VoiceHint.cmd` straight to `ManeuverType` (a pure table, no angle math); accept
+   "Unknown road" for untagged ways (matches the existing default); the ≥ 80%-named-ways acceptance criterion
+   *measures* coverage rather than assuming it. If hand-rolled A* is taken instead (gate failure), the
+   turn-angle → maneuver classifier becomes net-new and **this risk jumps** — another reason BRouter is the v1
+   pick.
+
+6. **The one bootstrap GPS fix under jamming — what if it never arrives?** Very likely in jammed Haifa: the
+   `SessionAnchor` may never be set. Then `current_vio_lla()` returns `valid=false` / `null` forever, so
+   **map-matching, snap, and any lat/lng-anchored display are silent-disabled for the whole session** — the
+   app runs on raw VIO local-frame only. **Mitigation (already in Step B* step 5)**: this is the explicit
+   no-fix fallback — the app stays fully functional (VIO dot, no snap, no absolute geo), never crashes, and
+   `vio_lla_unanchored_reads` proves the path was taken. Secondary mitigation for later: a **manual "I am
+   here" anchor** (long-press the map to set `SessionAnchor` from a user tap) gives the matcher an anchor
+   without GPS — *deferred*, noted here as the escape hatch if jamming makes the no-anchor session the common
+   case rather than the exception.
+
+7. **(bonus) Haifa-bbox trap + stale OSM data.** Two smaller risks. (a) A walk/route that **leaves the
+   `34.94,32.74,35.10,32.86` bbox** gets no snap and no route (off-graph) — the user is "trapped" in-city.
+   **Mitigation**: accepted for v1 (§0.6 Q2); the bbox is widened in the manifest if a test walk leaves it;
+   the region manager (on-demand extra regions) is the deferred general fix. (b) **Stale embedded OSM** — a new
+   road or a renamed street won't appear until the asset is rebuilt. **Mitigation**: the manifest records
+   `upstream_pbf_date`; the (deferred) `osm_data_age_days` confidence factor + a rebuild cadence (ADR-020)
+   handle freshness; for v1 a manual asset rebuild from a fresh Geofabrik PBF is the update path.
