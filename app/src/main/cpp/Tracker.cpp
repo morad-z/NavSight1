@@ -1025,10 +1025,92 @@ double Tracker::getMidasScaleK() const {
     return expansion_scale_K_.load(std::memory_order_relaxed);
 }
 
+// ── Scale fix Step 2 — gait classifier (camera thread) ──────────────────────────
+// docs/SCALE_FIX_DESIGN_2026_05_30.md §3 Step 2. Thresholds are physics-derived,
+// NOT tuned magic numbers:
+//   • VEHICLE: no step for >3 s while still moving (accel_speed>0.5 m/s) ⇒ riding,
+//     not walking. The 0.5 m/s floor = kAccelKMinDistM(1.0 m) / the ~2.2 s usable
+//     calibration window — below it the accel-K window cannot accrue a metre.
+//   • RUN: step cadence > 2.7 Hz. Running cadence is 2.7-4 Hz (textbook); 2.7 sits
+//     0.2 Hz above the 2.5 Hz top of normal walking (1.5-2.5 Hz), giving a
+//     hysteresis gap. The step detector caps cadence at 4 Hz (MIN_STEP_PERIOD_S).
+//   • WALK: cadence ≥ 0.6 Hz (a slow walk; MAX_STEP_PERIOD_S=1.5 s ≈ 0.67 Hz).
+//   • else: hold the current mode (cold start / ambiguous — no spurious switch).
+// A candidate must persist kModeHoldFrames (~0.5 s @ 30 Hz) before the slot swaps.
+Tracker::GaitMode Tracker::classifyGait(const IMUPreintegrator& imu, double accel_speed) {
+    const auto si = imu.getStepInfo();
+    GaitMode cand;
+    if (si.time_since_last_step_s > 3.0 && accel_speed > 0.5) cand = GaitMode::VEHICLE;
+    else if (si.step_freq_hz > 2.7)                           cand = GaitMode::RUN;
+    else if (si.step_freq_hz >= 0.6)                          cand = GaitMode::WALK;
+    else                                                      cand = active_mode_;  // hold on cold/ambiguous
+
+    // Hysteresis: only switch after kModeHoldFrames consecutive candidate frames.
+    if (cand == active_mode_) { mode_hold_frames_ = 0; last_gait_frame_ = frame_counter_; return active_mode_; }
+    // Advance the hold counter at most ONCE per processFrame (classifyGait is called
+    // from both speed paths in the same frame). Without this, kModeHoldFrames would
+    // count speed-path invocations, not frames, and halve the ~0.5 s debounce on
+    // frames where both paths fire.
+    if (last_gait_frame_ == frame_counter_) return active_mode_;
+    last_gait_frame_ = frame_counter_;
+    if (++mode_hold_frames_ >= kModeHoldFrames) {
+        const GaitMode old_mode = active_mode_;
+        active_mode_ = cand;
+        mode_hold_frames_ = 0;
+        onModeSwitch(old_mode, cand);  // save old slot, load/seed new slot (Step 3)
+    }
+    return active_mode_;
+}
+
+// ── Scale fix Step 3 — mode-switch slot swap + fast-converge EMA ─────────────────
+// docs/SCALE_FIX_DESIGN_2026_05_30.md §3 Step 3. The run-overshoot root cause was a
+// stale K inherited across the EMA on a walk→run transition. On every switch:
+//   1) SAVE the active mode's live K into the OLD slot (so a calibrated WALK K is
+//      captured the first time we leave WALK — k_slots_[WALK] is otherwise unset).
+//   2) LOAD the NEW slot into the live K. A virgin slot (df<0) is seeded
+//      conservatively from the WALK slot (RUN = walk*0.62 measured ratio; VEHICLE =
+//      walk as a coarse start) — NEVER inheriting the prior mode's raw K.
+//   3) Arm the fast-converge EMA (kFastConvergeFrames).
+// We touch ONLY the K state + mode counters here. The physical accumulators
+// (accel_dist_accum_ / visual_rel_dist_*) keep running — only a ZUPT resets those —
+// so the new mode calibrates as soon as it accrues distance (TRAP CHECKLIST #4).
+void Tracker::onModeSwitch(GaitMode old_mode, GaitMode new_mode) {
+    KSlot& old_s = k_slots_[static_cast<int>(old_mode)];
+    KSlot& new_s = k_slots_[static_cast<int>(new_mode)];
+
+    // (1) Save the currently-active K into the old slot.
+    old_s.df   = midas_scale_K_.load(std::memory_order_relaxed);
+    old_s.loom = expansion_scale_K_.load(std::memory_order_relaxed);
+
+    // (2) Load (or seed) the new slot into the live, atomic active K.
+    if (new_s.df > 0.0) {
+        midas_scale_K_.store(new_s.df, std::memory_order_relaxed);
+        expansion_scale_K_.store(new_s.loom, std::memory_order_relaxed);
+    } else {
+        // Virgin slot — seed from the WALK estimate (use the current live K as the
+        // walk estimate when the WALK slot itself is still empty), never raw-inherit.
+        double w = k_slots_[static_cast<int>(GaitMode::WALK)].df;
+        if (w <= 0.0) w = midas_scale_K_.load(std::memory_order_relaxed);
+        if (w > 0.0) {
+            const double seed = (new_mode == GaitMode::RUN) ? (w * kRunWalkSeedRatio) : w;
+            midas_scale_K_.store(seed, std::memory_order_relaxed);
+            expansion_scale_K_.store(seed, std::memory_order_relaxed);
+            new_s.df = seed;     // leave the seed in BOTH the live K and the slot
+            new_s.loom = seed;
+        }
+    }
+
+    mode_switch_fast_alpha_frames_ = kFastConvergeFrames;
+    LOGI("GAIT_MODE_SWITCH: old=%d new=%d K=%.1f",
+         static_cast<int>(old_mode), static_cast<int>(new_mode),
+         midas_scale_K_.load(std::memory_order_relaxed));
+}
+
 void Tracker::updateDepthFlowSpeed(const std::vector<cv::Point2f>& prev_ud,
                                    const std::vector<cv::Point2f>& next_ud,
                                    const cv::Mat& R_vo, const cv::Mat& t_vo,
-                                   double dt_s) {
+                                   double dt_s,
+                                   const IMUPreintegrator& imu, double gyro_norm) {
     // ── Depth-weighted metric speed from tracked feature points ─────────────────
     // Cause: recoverPose gives camera rotation R_vo and a UNIT translation
     //   direction t_vo — the metric magnitude is unobservable from a monocular
@@ -1164,6 +1246,10 @@ void Tracker::updateDepthFlowSpeed(const std::vector<cv::Point2f>& prev_ud,
     // circular dependency that collapsed MiDaS metric depth — no VIO/affine scale is
     // used. Basis: VINS-Mono / VI-Depth (Wofk 2023) velocity-alignment.
     const double accel_speed = std::hypot(accel_vel_w_[0], accel_vel_w_[1]);  // horizontal m/s
+    // ── Scale fix Step 2 — classify gait BEFORE loading/using cur_k, so the calib
+    //    below reads/writes THIS gait's slot (midas_scale_K_ == active mode's K).
+    //    classifyGait may onModeSwitch() here (load/seed the new slot + arm fast EMA).
+    active_mode_ = classifyGait(imu, accel_speed);
     // ── Step B (vi_speed → K_df) DISABLED 2026-05-29 — ScaleEstimatorVI is not robust.
     //    Proven OFFLINE (scripts/test_scale_estimator.py) AND by an independent numpy
     //    replication (debug workflow): the per-pair Hesch-Martinelli solve suffers
@@ -1207,9 +1293,18 @@ void Tracker::updateDepthFlowSpeed(const std::vector<cv::Point2f>& prev_ud,
     //    (expansion_scale_K_) from its own vz_rel basis (no cross-basis / double-count).
     //    Skipped when the VINS-Mono anchor already calibrated this frame (preferred).
     visual_rel_dist_accum_ += disp_rel;
+    // 2026-05-30 (Scale fix Step 5) — TURN SUPPRESSION. Turning lowers the forward
+    // vis_rel (recoverPose translation scale) while accel_dist keeps accruing, so
+    // k_obs inflates toward the measured UTURN≈1652 and would drag K_walk up. Skip
+    // the calibration while |gyro| ≥ 0.5 rad/s (≈29°/s) — milder than the existing
+    // kGyroGateRadS=1.2 ZUPT gate, but well above straight-walk yaw RMS (~0.17 rad/s
+    // ≈10°/s), so straight-line calibration is unchanged.
+    constexpr double kTurnSuppressGyroRadS = 0.5;  // rad/s; physics: above walk-yaw RMS, below in-place turn
+    const bool turning = (gyro_norm >= kTurnSuppressGyroRadS);
     if (!vi_calibrated &&
         secs_since_zupt_ >= 0.3 && secs_since_zupt_ <= 2.5 &&
-        accel_dist_accum_ > kAccelKMinDistM && visual_rel_dist_accum_ > 1e-4) {
+        accel_dist_accum_ > kAccelKMinDistM && visual_rel_dist_accum_ > 1e-4 &&
+        !turning) {
         const double k_obs = accel_dist_accum_ / visual_rel_dist_accum_;
         // 2026-05-29 — BLOW-UP GUARD: when the visual relative distance goes near-zero
         // (weak/degenerate flow) while accel_dist accrued, k_obs explodes (v7 looming
@@ -1219,16 +1314,30 @@ void Tracker::updateDepthFlowSpeed(const std::vector<cv::Point2f>& prev_ud,
         const double cur_k = midas_scale_K_.load(std::memory_order_relaxed);
         const bool k_outlier = (cur_k > 0.0) && (k_obs > 3.0 * cur_k || k_obs < cur_k / 3.0);
         if (k_outlier && frame_counter_ % 30 == 0) {
-            LOGI("ACCEL_K_CALIB[df]: REJECT outlier k_obs=%.1f vs cur_K=%.1f (vis_rel=%.5f)",
-                 k_obs, cur_k, visual_rel_dist_accum_);
+            LOGI("ACCEL_K_CALIB[df]: REJECT outlier k_obs=%.1f vs cur_K=%.1f (vis_rel=%.5f) gait=%d",
+                 k_obs, cur_k, visual_rel_dist_accum_, static_cast<int>(active_mode_));
         }
         if (std::isfinite(k_obs) && k_obs > 0.0 && !k_outlier) {
-            const double new_k = (cur_k <= 0.0) ? k_obs : (0.95 * cur_k + 0.05 * k_obs);
+            // 2026-05-30 (Scale fix Step 3) — fast-converge EMA for the first
+            // kFastConvergeFrames after a mode switch (so the new slot leaves its
+            // seed quickly); otherwise the steady-state α (== legacy 0.05). On a
+            // pure walk (no switch) fast frames are 0 → α=0.05 exactly as before.
+            double alpha = (mode_switch_fast_alpha_frames_ > 0) ? kFastAlpha : kNormalAlpha;
+            // Decrement at most once per frame: df + loom both calibrate on a
+            // verification_ok frame, and a naive decrement in each would halve the
+            // intended kFastConvergeFrames window. Mirror the last_gait_frame_ guard.
+            if (mode_switch_fast_alpha_frames_ > 0 &&
+                last_fast_alpha_frame_ != frame_counter_) {
+                --mode_switch_fast_alpha_frames_;
+                last_fast_alpha_frame_ = frame_counter_;
+            }
+            const double new_k = (cur_k <= 0.0) ? k_obs : ((1.0 - alpha) * cur_k + alpha * k_obs);
             midas_scale_K_.store(new_k, std::memory_order_relaxed);
             navsight::eventCounters().depth_flow_calib_updates.fetch_add(1, std::memory_order_relaxed);
             LOGI("ACCEL_K_CALIB[df]: k_obs=%.1f accel_dist=%.2fm vis_rel=%.4f tsz=%.2fs "
-                 "cur_K=%.1f -> new_K=%.1f", k_obs, accel_dist_accum_,
-                 visual_rel_dist_accum_, secs_since_zupt_, cur_k, new_k);
+                 "cur_K=%.1f -> new_K=%.1f gait=%d", k_obs, accel_dist_accum_,
+                 visual_rel_dist_accum_, secs_since_zupt_, cur_k, new_k,
+                 static_cast<int>(active_mode_));
             const long long k_milli = static_cast<long long>(new_k * 1000.0 + 0.5);
             navsight::eventCounters().midas_scale_k_milli.store(k_milli, std::memory_order_relaxed);
             const long long kmax = navsight::eventCounters().midas_scale_k_max_milli.load(std::memory_order_relaxed);
@@ -1236,6 +1345,13 @@ void Tracker::updateDepthFlowSpeed(const std::vector<cv::Point2f>& prev_ud,
             const long long kmin = navsight::eventCounters().midas_scale_k_min_milli.load(std::memory_order_relaxed);
             if (kmin == 0 || k_milli < kmin) navsight::eventCounters().midas_scale_k_min_milli.store(k_milli, std::memory_order_relaxed);
         }
+    } else if (turning && !vi_calibrated &&
+               secs_since_zupt_ >= 0.3 && secs_since_zupt_ <= 2.5 &&
+               accel_dist_accum_ > kAccelKMinDistM && visual_rel_dist_accum_ > 1e-4 &&
+               frame_counter_ % 30 == 0) {
+        // Scale fix Step 5 — would have calibrated, but suppressed by the turn gate.
+        LOGI("ACCEL_K_CALIB[df]: SKIP turn gyro_norm=%.3f>=0.5 accel_dist=%.2fm vis_rel=%.4f gait=%d",
+             gyro_norm, accel_dist_accum_, visual_rel_dist_accum_, static_cast<int>(active_mode_));
     }
 
     // 2026-05-28 (Step A) — when affine is valid, speed_rel is ALREADY metric
@@ -1286,13 +1402,13 @@ void Tracker::updateDepthFlowSpeed(const std::vector<cv::Point2f>& prev_ud,
         const size_t m = s_est.size();
         LOGI("DEPTH_FLOW_SPEED: src=%s n=%zu no_depth=%d Z[min/med/max]=%.2f/%.2f/%.2f "
              "flow[med/max]=%.1f/%.1f speed=%.4f/s K=%.3f s=%.4f t=%.4f accel_spd=%.2f "
-             "tsz=%.2f -> ema=%.2f m/s (%.1f km/h)",
+             "tsz=%.2f gait=%d -> ema=%.2f m/s (%.1f km/h)",
              aff_valid_now ? "affine" : "K",
              m, n_no_depth,
              z_est.front(), z_est[z_est.size() / 2], z_est.back(),
              flow_est[flow_est.size() / 2], flow_est.back(),
              speed_rel, K, s_aff, t_aff, accel_speed, secs_since_zupt_,
-             next, next * 3.6);
+             static_cast<int>(active_mode_), next, next * 3.6);
     }
 }
 double Tracker::getLastVisualYawVariance() const {
@@ -2498,12 +2614,13 @@ VisionOutput Tracker::processFrame(const uint8_t* yuv_data, int width, int heigh
         const double accel_spd_w = std::hypot(accel_vel_w_[0], accel_vel_w_[1]);
         const bool window_open = (secs_since_zupt_ >= 0.3 && secs_since_zupt_ <= 2.5);
         LOGI("ACCEL_K_STATE: is_static=%d tsz=%.2f window_open=%d accel_dist=%.2fm "
-             "accel_spd=%.2f vis_rel_df=%.4f vis_rel_loom=%.4f K_df=%.1f K_loom=%.1f",
+             "accel_spd=%.2f vis_rel_df=%.4f vis_rel_loom=%.4f K_df=%.1f K_loom=%.1f gait=%d",
              is_static ? 1 : 0, secs_since_zupt_, window_open ? 1 : 0,
              accel_dist_accum_, accel_spd_w, visual_rel_dist_accum_,
              visual_rel_dist_loom_,
              midas_scale_K_.load(std::memory_order_relaxed),
-             expansion_scale_K_.load(std::memory_order_relaxed));
+             expansion_scale_K_.load(std::memory_order_relaxed),
+             static_cast<int>(active_mode_));
     }
 
     // 2026-05-18 falsifier: log EKF.b_g_ tagged with is_static so we can see
@@ -2774,7 +2891,10 @@ VisionOutput Tracker::processFrame(const uint8_t* yuv_data, int width, int heigh
         // if K hasn't been calibrated yet; K persists across app launches
         // (SharedPreferences) so cold-start walks inherit it from any prior
         // session that calibrated.
-        updateExpansionSpeed(prev_ud, next_ud, dt_s_speed, gyro_rot_cam);
+        // 2026-05-30 (Scale fix Steps 2/5): pass imu (gait classify) + gyro_norm
+        // (turn-suppression). gyro_norm is the function-scope value computed at the
+        // top of processFrame (rad/s); imu is in scope here.
+        updateExpansionSpeed(prev_ud, next_ud, dt_s_speed, gyro_rot_cam, imu, gyro_norm);
 
         // Depth-weighted metric speed (see updateDepthFlowSpeed): recovers the
         // metric scale of the recoverPose translation from the tracked points'
@@ -2782,7 +2902,7 @@ VisionOutput Tracker::processFrame(const uint8_t* yuv_data, int width, int heigh
         // R_vo/t_vo and would produce garbage otherwise.
         if (verification_ok && inlier_count_out >= static_cast<int>(MIN_INLIERS) &&
             !R_vo.empty() && !t_vo.empty()) {
-            updateDepthFlowSpeed(prev_ud, next_ud, R_vo, t_vo, dt_s_speed);
+            updateDepthFlowSpeed(prev_ud, next_ud, R_vo, t_vo, dt_s_speed, imu, gyro_norm);
         }
         // 2026-05-18 falsifier: log inner outcomes when outer gate passed
         if (frame_counter_ % 30 == 0) {
@@ -3548,6 +3668,29 @@ VisionOutput Tracker::processFrame(const uint8_t* yuv_data, int width, int heigh
         // the casual "look around" case that strict gates miss.
         const bool rotation_dominated =
             (gyro_norm > 0.2 && imu.getStepInfo().speed_mps < 0.1);
+        // 2026-05-30 Fix B — decouple the user-facing dot advance from the
+        // essential-matrix pose_valid flag. ROOT CAUSE: forward locomotion moves
+        // the camera along its optical axis (focus-of-expansion in-image, ~0
+        // central parallax, recoverPose inlier ratio 0.03-0.19), so pose_valid is
+        // false on ~74% of walk frames and the dot froze 93% of the time. The
+        // forward-speed signal IS observable via looming (depth_flow_speed_mps_,
+        // set by updateExpansionSpeed independently of recoverPose); the dot's
+        // translation needs only (heading, forward-speed), neither of which needs
+        // the essential matrix. So advance whenever a trusted visual pose OR a
+        // valid looming speed exists. is_static/rotation_dominated above still
+        // freeze true stops and in-place rotation (anti-phantom-drift preserved);
+        // the EKF relative-pose fusion and the t_vo-based vertical stay gated on
+        // the real pose (pose_path_ok) since they consume recoverPose's t_vo.
+        const double df_speed_gate =
+            depth_flow_speed_mps_.load(std::memory_order_relaxed);
+        const bool pose_path_ok = pose_valid && !is_pure_rotation
+                               && !translation_degenerate && quality >= 0.15;
+        // 1 cm/s floor (sub-noise): the freeze branch decays depth_flow_speed_mps_
+        // toward 0 (never < 0) at a stop, and warm-up holds the -1 sentinel; a bare
+        // ">= 0" would fire the fallback on those decay/sentinel artifacts with
+        // disp~0. Below 1 cm/s there is no real locomotion, so require a genuinely
+        // positive looming speed before advancing the dot without a visual pose.
+        const bool looming_speed_ok = (df_speed_gate > 0.01);
         // 2026-05-18 falsifier: per-gate skip counters so we can attribute
         // the 58m PDR-vs-VIO gap. The accumulator at the else-if branch only
         // fires when ALL gates pass; each gate that fires here is "lost"
@@ -3583,7 +3726,7 @@ VisionOutput Tracker::processFrame(const uint8_t* yuv_data, int width, int heigh
                          gyro_norm, imu.getStepInfo().speed_mps);
                 }
             }
-        } else if (pose_valid && !is_pure_rotation && !translation_degenerate && quality >= 0.15) {
+        } else if (pose_path_ok || looming_speed_ok) {
             double dt_frame = (timestamp_ns - current_prev_ts) * 1e-9;
 
             // 2026-05-28 — Wire depth-flow speed into the trajectory.
@@ -3611,12 +3754,24 @@ VisionOutput Tracker::processFrame(const uint8_t* yuv_data, int width, int heigh
             //   reading (within EMA lag) on a walk and a run. Legacy
             //   scale_fuser path still computes (kept for fallback) but
             //   no longer drives the trajectory once depth-flow is live.
-            double disp = appliedScale * cv::norm(t_vo);
-            const double df_speed = depth_flow_speed_mps_.load(std::memory_order_relaxed);
+            double disp = (t_vo.empty() ? 0.0 : appliedScale * cv::norm(t_vo));
+            const double df_speed = df_speed_gate;  // same atomic, same frame (loaded above)
             bool used_depth_flow = false;
             if (df_speed >= 0.0 && dt_frame > 0.0) {
                 disp = df_speed * dt_frame;
                 used_depth_flow = true;
+            }
+            // 2026-05-30 Fix B falsifier: count frames where the dot advanced on
+            // the looming speed WITHOUT a trusted essential-matrix pose — the
+            // forward-motion-degenerate frames this fix rescues from freezing.
+            if (used_depth_flow && !pose_path_ok) {
+                navsight::eventCounters().global_t_advanced_via_depthflow_fallback_total
+                    .fetch_add(1, std::memory_order_relaxed);
+                if (frame_counter_ % 30 == 0) {
+                    LOGI("TRANS_FALLBACK: dot advanced on looming df_speed=%.2f "
+                         "dt=%.3f disp=%.3f pose_valid=%d (essential-matrix degenerate)",
+                         df_speed, dt_frame, disp, pose_valid ? 1 : 0);
+                }
             }
 
             // Sanity cap: max displacement per frame.
@@ -3689,7 +3844,10 @@ VisionOutput Tracker::processFrame(const uint8_t* yuv_data, int width, int heigh
             // (camera Y points DOWN). World Z is UP. Negate camera-Y to
             // recover world-Z. For flat-ground walking dz ≈ 0.
             double dz_world = 0.0;
-            if (!t_vo.empty())
+            // 2026-05-30 Fix B — only trust t_vo for the vertical component when we
+            // have a real visual pose; on the looming-only path t_vo may be empty
+            // or stale (failed verification), so leave dz=0 (flat-ground walking).
+            if (pose_path_ok && !t_vo.empty())
                 dz_world = -appliedScale * t_vo.at<double>(1);
 
             navsight::eventCounters().translation_heading_projection_total
@@ -3755,7 +3913,11 @@ VisionOutput Tracker::processFrame(const uint8_t* yuv_data, int width, int heigh
             //   1. Visual reprojection: ~5% of displacement (RANSAC inliers)
             //   2. Scale uncertainty: scale_fuser_.var() scales with disp²
             //   3. Floor: 1cm to prevent over-tight fusion when disp~0
-            if (ekf_.isFullInitialized()) {
+            // 2026-05-30 Fix B — feed the visual relative-pose to the EKF only on
+            // the trusted-pose path; the looming-only fallback has no t_vo, so its
+            // σ_scale (∝ ‖t_vo‖) would be ill-defined. The dot still advances above;
+            // ekf_.setPosition(global_t_) keeps the EKF in sync regardless.
+            if (pose_path_ok && ekf_.isFullInitialized()) {
                 int prev_clone_id = ekf_.getLatestCloneId();
                 if (prev_clone_id >= 0) {
                     cv::Mat t_world_metric = (cv::Mat_<double>(3, 1)
@@ -7893,6 +8055,67 @@ void Tracker::consumeLoopClosureMatchIfReady(IMUPreintegrator& imu) {
                     const double lc_info_z   = lc_info_xy;  // isotropic
                     const double lc_info_yaw = 1.0 /
                         std::max(edge_var_yaw, PoseGraph::SIGMA_YAW_FLOOR_SQ);
+
+                    // 2026-05-30 — POSE-GRAPH INCOHERENCE GUARD. ROOT CAUSE: the
+                    // auto-odom edges are built from ABSOLUTE node-position diffs
+                    // (PoseGraph.cpp:47 `dx = x - prev.x`), so every EKF loop-
+                    // closure teleport (`global_t_ += delta_p`, updateAbsolutePose
+                    // above, + the pose-graph now-correction below) gets BAKED into
+                    // the chain as fake physical motion. The frozen-node chain then
+                    // disagrees with the PnP loop measurement by FAR more than real
+                    // drift, and optimize() smears a physically-wrong warp across
+                    // every node which the UI redraws as the whole trajectory.
+                    // House-loop 2026-05-30: 47.9 m loop-edge residual on a 100 m
+                    // loop -> 4.7 m + 12.3deg warp (pose_graph_max_correction_mm=4691).
+                    // A TRUE closure's residual ~= accumulated drift
+                    // (LOOP_CLOSURE_DRIFT_RATE x path); 5x that is the outlier
+                    // boundary (~16% of path — beyond it the constraint is frame
+                    // incoherence or a false match, not drift). On reject we SKIP
+                    // optimize+apply+redraw; the EKF direct correction already moved
+                    // the dot, so the trajectory stays on the clean EKF-corrected
+                    // path (the v54 behaviour where the pose-graph was inert and
+                    // loops still overlaid). HEADING-SAFE: scalar_heading_/Madgwick
+                    // is untouched. The deeper root fix (teleport-free odom edges)
+                    // is tracked separately; this guard makes the warp impossible
+                    // regardless.
+                    double pg_mx, pg_my, pg_mz, pg_myaw;
+                    double pg_nx, pg_ny, pg_nz, pg_nyaw;
+                    const bool pg_got =
+                        pose_graph_.getNode(match_pg, pg_mx, pg_my, pg_mz, pg_myaw) &&
+                        pose_graph_.getNode(now_pg,   pg_nx, pg_ny, pg_nz, pg_nyaw);
+                    double pg_lc_resid = 0.0;
+                    if (pg_got) {
+                        const double ddx = pg_nx - pg_mx;
+                        const double ddy = pg_ny - pg_my;
+                        const double ddz = pg_nz - pg_mz;
+                        const double cmp = std::cos(pg_myaw);
+                        const double smp = std::sin(pg_myaw);
+                        const double pred_dx =  cmp * ddx + smp * ddy;
+                        const double pred_dy = -smp * ddx + cmp * ddy;
+                        pg_lc_resid = std::sqrt(
+                            (pred_dx - dx_loop) * (pred_dx - dx_loop) +
+                            (pred_dy - dy_loop) * (pred_dy - dy_loop) +
+                            (ddz     - dz_loop) * (ddz     - dz_loop));
+                    }
+                    const double pg_expected_drift =
+                        std::max(LOOP_CLOSURE_DRIFT_RATE * total_path_m_,
+                                 LOOP_CLOSURE_PNP_SIGMA_FLOOR_M);
+                    constexpr double kPgIncoherenceFactor = 5.0;  // outlier boundary
+                    const bool pg_coherent =
+                        pg_got &&
+                        (pg_lc_resid <= kPgIncoherenceFactor * pg_expected_drift);
+                    if (!pg_coherent) {
+                        navsight::eventCounters().pose_graph_rejected_incoherent
+                            .fetch_add(1, std::memory_order_relaxed);
+                        LOGI("POSE_GRAPH_REJECT_INCOHERENT: lc_resid=%.2fm "
+                             "expected_drift=%.2fm thresh=%.2fm path=%.1fm "
+                             "match_pg=%d now_pg=%d got=%d "
+                             "(frozen-node frame incoherence / false match -> "
+                             "skip optimize+redraw; EKF direct correction stands)",
+                             pg_lc_resid, pg_expected_drift,
+                             kPgIncoherenceFactor * pg_expected_drift,
+                             total_path_m_, match_pg, now_pg, pg_got ? 1 : 0);
+                    } else {
                     pose_graph_.addLoopEdge(match_pg, now_pg,
                                              dx_loop, dy_loop,
                                              dz_loop, dyaw_loop,
@@ -7986,6 +8209,7 @@ void Tracker::consumeLoopClosureMatchIfReady(IMUPreintegrator& imu) {
                         }
                     }
                     loop_correction_version_.fetch_add(1, std::memory_order_relaxed);
+                    }  // end else (pg_coherent) — 2026-05-30 incoherence guard
                 }
             } else {
                 LOGI("LC_TRAJECTORY_GAP_SKIP: reason=no_pg_node "
@@ -8038,7 +8262,8 @@ void Tracker::shutdownLoopClosure() {
 void Tracker::updateExpansionSpeed(const std::vector<cv::Point2f>& prev_ud,
                                   const std::vector<cv::Point2f>& next_ud,
                                   double dt_s,
-                                  const cv::Vec3d& gyro_rot_cam) {
+                                  const cv::Vec3d& gyro_rot_cam,
+                                  const IMUPreintegrator& imu, double gyro_norm) {
     // ── Forward speed from optical-flow LOOMING (per-point Vz = (ṙ/r)·Z_rel·K) ─────
     // Per the research (Koenderink-van Doorn 1987, Nelson-Aloimonos 1989,
     // Longuet-Higgins-Prazdny 1980, Heeger-Jepson 1992): the radial component of the
@@ -8050,6 +8275,13 @@ void Tracker::updateExpansionSpeed(const std::vector<cv::Point2f>& prev_ud,
     // into depth_flow_speed_mps_ by the forward-motion fraction so the UI sees a
     // smooth blend (looming-dominant when forward, recoverPose-dominant sideways).
     if (dt_s <= 1e-4 || fx_ <= 0.0 || fy_ <= 0.0) return;
+
+    // ── Scale fix Step 2 — classify gait BEFORE loading/using cur_k below, so the
+    //    looming K calib reads/writes THIS gait's slot (expansion_scale_K_ == active
+    //    mode's loom K). accel_speed = horizontal world-frame accel velocity (same
+    //    quantity used in updateDepthFlowSpeed / ACCEL_K_STATE). May onModeSwitch().
+    const double accel_speed = std::hypot(accel_vel_w_[0], accel_vel_w_[1]);  // m/s
+    active_mode_ = classifyGait(imu, accel_speed);
 
     // 2026-05-28 — K bail REMOVED here so the per-point loop can produce a
     // K-INDEPENDENT relative speed (vz_rel = tau * Z_rel). That value lets us
@@ -8203,11 +8435,19 @@ void Tracker::updateExpansionSpeed(const std::vector<cv::Point2f>& prev_ud,
     //    motion both K's reduce to v/(relative speed) so they agree numerically.
     //    forward_fraction>0.5 gates to the well-conditioned forward regime; the raw
     //    (HP-removed) accel integrator supplies the ZUPT-re-zeroed metric reference.
+    // 2026-05-30 (Scale fix Step 5) — TURN SUPPRESSION (mirrors the depth-flow path):
+    // turning lowers forward looming vz_rel while accel_dist accrues, inflating k_obs
+    // toward the measured UTURN≈1652 and dragging K up. Skip the calib while
+    // |gyro| ≥ 0.5 rad/s — above straight-walk yaw RMS (~0.17 rad/s), below in-place
+    // turns. The accumulator keeps running (same as depth-flow) so the ratio spans the
+    // same physical interval once calibration resumes (TRAP CHECKLIST #4).
+    constexpr double kTurnSuppressGyroRadS = 0.5;  // rad/s
+    const bool turning = (gyro_norm >= kTurnSuppressGyroRadS);
     if (forward_fraction_early > 0.5 &&
         secs_since_zupt_ >= 0.3 && secs_since_zupt_ <= 2.5 &&
         vz_rel_fused > 0.0) {
         visual_rel_dist_loom_ += vz_rel_fused * dt_s;
-        if (accel_dist_accum_ > kAccelKMinDistM && visual_rel_dist_loom_ > 1e-4) {
+        if (!turning && accel_dist_accum_ > kAccelKMinDistM && visual_rel_dist_loom_ > 1e-4) {
             const double k_obs = accel_dist_accum_ / visual_rel_dist_loom_;
             // 2026-05-29 — BLOW-UP GUARD (this is the exact path that hit k_obs=22534 /
             // K=10602 / 27 km/h on v7 walkrun: vis_rel→0.0002 while accel_dist=4.76m).
@@ -8216,20 +8456,31 @@ void Tracker::updateExpansionSpeed(const std::vector<cv::Point2f>& prev_ud,
             const double cur_k = expansion_scale_K_.load(std::memory_order_relaxed);
             const bool k_outlier = (cur_k > 0.0) && (k_obs > 3.0 * cur_k || k_obs < cur_k / 3.0);
             if (k_outlier && frame_counter_ % 30 == 0) {
-                LOGI("ACCEL_K_CALIB[loom]: REJECT outlier k_obs=%.1f vs cur_K=%.1f (vis_rel=%.5f)",
-                     k_obs, cur_k, visual_rel_dist_loom_);
+                LOGI("ACCEL_K_CALIB[loom]: REJECT outlier k_obs=%.1f vs cur_K=%.1f (vis_rel=%.5f) gait=%d",
+                     k_obs, cur_k, visual_rel_dist_loom_, static_cast<int>(active_mode_));
             }
             if (std::isfinite(k_obs) && k_obs > 0.0 && !k_outlier) {
+                // 2026-05-30 (Scale fix Step 3) — fast-converge EMA after a mode
+                // switch; else steady-state α (== legacy 0.05). Pure walk: 0 fast
+                // frames → α=0.05 exactly as before.
+                double alpha = (mode_switch_fast_alpha_frames_ > 0) ? kFastAlpha : kNormalAlpha;
+                // Decrement at most once per frame (see updateDepthFlowSpeed note —
+                // shared counter with the depth-flow path).
+                if (mode_switch_fast_alpha_frames_ > 0 &&
+                    last_fast_alpha_frame_ != frame_counter_) {
+                    --mode_switch_fast_alpha_frames_;
+                    last_fast_alpha_frame_ = frame_counter_;
+                }
                 const double new_k = (cur_k <= 0.0) ? k_obs
-                                                    : (0.95 * cur_k + 0.05 * k_obs);
+                                                    : ((1.0 - alpha) * cur_k + alpha * k_obs);
                 expansion_scale_K_.store(new_k, std::memory_order_relaxed);
                 navsight::eventCounters().depth_flow_calib_updates.fetch_add(
                     1, std::memory_order_relaxed);
                 // Visible, UNGATED log of every accepted looming-K calibration.
                 LOGI("ACCEL_K_CALIB[loom]: k_obs=%.1f accel_dist=%.2fm vis_rel=%.4f "
-                     "tsz=%.2fs fwd=%.2f cur_K=%.1f -> new_K=%.1f", k_obs, accel_dist_accum_,
+                     "tsz=%.2fs fwd=%.2f cur_K=%.1f -> new_K=%.1f gait=%d", k_obs, accel_dist_accum_,
                      visual_rel_dist_loom_, secs_since_zupt_, forward_fraction_early,
-                     cur_k, new_k);
+                     cur_k, new_k, static_cast<int>(active_mode_));
                 // Reuse midas_scale_k_milli min/max gauges for K visibility in
                 // event_summary (looming K shares the same physical scale family).
                 const long long k_milli = static_cast<long long>(new_k * 1000.0 + 0.5);
@@ -8244,6 +8495,11 @@ void Tracker::updateExpansionSpeed(const std::vector<cv::Point2f>& prev_ud,
                 if (kmin == 0 || k_milli < kmin) navsight::eventCounters()
                     .midas_scale_k_min_milli.store(k_milli, std::memory_order_relaxed);
             }
+        } else if (turning && accel_dist_accum_ > kAccelKMinDistM &&
+                   visual_rel_dist_loom_ > 1e-4 && frame_counter_ % 30 == 0) {
+            // Scale fix Step 5 — would have calibrated, but suppressed by the turn gate.
+            LOGI("ACCEL_K_CALIB[loom]: SKIP turn gyro_norm=%.3f>=0.5 accel_dist=%.2fm vis_rel=%.4f gait=%d",
+                 gyro_norm, accel_dist_accum_, visual_rel_dist_loom_, static_cast<int>(active_mode_));
         }
     }
 

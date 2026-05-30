@@ -431,6 +431,10 @@ struct EventCounters {
     std::atomic<long long> pose_graph_max_correction_mm{0};
     std::atomic<long long> pose_graph_max_correction_mrad{0};
     std::atomic<long long> pose_graph_rejected_singular{0};
+    // 2026-05-30 — loop constraint rejected as incoherent (loop-edge residual
+    // >> expected drift): frozen-node frame incoherence or false match. The
+    // guard that stops the whole-trajectory warp; EKF direct correction stands.
+    std::atomic<long long> pose_graph_rejected_incoherent{0};
     std::atomic<long long> pose_graph_loop_edges_added{0};
     std::atomic<long long> pose_graph_apply_calls{0};
 
@@ -903,6 +907,12 @@ struct EventCounters {
     // high count + plausible total_path_dm → working as v22 did.
     std::atomic<long long> translation_heading_projection_total{0};
 
+    // 2026-05-30 Fix B — frames where the user-facing dot advanced on the
+    // looming/depth-flow speed WITHOUT a trusted essential-matrix pose (the
+    // forward-motion-degenerate frames that previously froze the dot). High
+    // count + a re-walk path that grows toward truth ⇒ the freeze was this gate.
+    std::atomic<long long> global_t_advanced_via_depthflow_fallback_total{0};
+
     // Reset every counter to 0. Called on simulator-recording start so
     // each sim begins with a clean slate. Cheap atomic stores; safe to
     // call concurrently with hot-path increments (we accept that a few
@@ -993,6 +1003,7 @@ struct EventCounters {
         pose_graph_max_correction_mm.store(0, std::memory_order_relaxed);
         pose_graph_max_correction_mrad.store(0, std::memory_order_relaxed);
         pose_graph_rejected_singular.store(0, std::memory_order_relaxed);
+        pose_graph_rejected_incoherent.store(0, std::memory_order_relaxed);
         pose_graph_loop_edges_added.store(0, std::memory_order_relaxed);
         pose_graph_apply_calls.store(0, std::memory_order_relaxed);
         extrinsics_rotation_angle_mdeg.store(0, std::memory_order_relaxed);
@@ -1078,6 +1089,7 @@ struct EventCounters {
         slam_promo_rms_milli_max.store(0, std::memory_order_relaxed);
         global_t_gated_rotation_dominated_total.store(0, std::memory_order_relaxed);
         translation_heading_projection_total.store(0, std::memory_order_relaxed);
+        global_t_advanced_via_depthflow_fallback_total.store(0, std::memory_order_relaxed);
     }
 
     // Monotonic max-update for ba_solve_us_max. Lock-free CAS loop.
@@ -1183,6 +1195,7 @@ struct EventCounters {
         const long long v_pose_graph_max_correction_mm       = pose_graph_max_correction_mm.load(std::memory_order_relaxed);
         const long long v_pose_graph_max_correction_mrad     = pose_graph_max_correction_mrad.load(std::memory_order_relaxed);
         const long long v_pose_graph_rejected_singular       = pose_graph_rejected_singular.load(std::memory_order_relaxed);
+        const long long v_pose_graph_rejected_incoherent     = pose_graph_rejected_incoherent.load(std::memory_order_relaxed);
         const long long v_pose_graph_loop_edges_added        = pose_graph_loop_edges_added.load(std::memory_order_relaxed);
         const long long v_pose_graph_apply_calls             = pose_graph_apply_calls.load(std::memory_order_relaxed);
         const long long v_extrinsics_rotation_angle_mdeg = extrinsics_rotation_angle_mdeg.load(std::memory_order_relaxed);
@@ -1269,6 +1282,7 @@ struct EventCounters {
         const long long v_slam_promo_rms_milli_max            = slam_promo_rms_milli_max.load(std::memory_order_relaxed);
         const long long v_global_t_gated_rotation_dominated_total = global_t_gated_rotation_dominated_total.load(std::memory_order_relaxed);
         const long long v_translation_heading_projection_total = translation_heading_projection_total.load(std::memory_order_relaxed);
+        const long long v_global_t_advanced_via_depthflow_fallback_total = global_t_advanced_via_depthflow_fallback_total.load(std::memory_order_relaxed);
 
         std::string out;
         out.reserve(2200);  // expanded for 18 new silent-failure counters (2026-05-16)
@@ -1357,6 +1371,7 @@ struct EventCounters {
         appendKv(out, "pose_graph_max_correction_mm",     v_pose_graph_max_correction_mm);     out += ',';
         appendKv(out, "pose_graph_max_correction_mrad",   v_pose_graph_max_correction_mrad);   out += ',';
         appendKv(out, "pose_graph_rejected_singular",     v_pose_graph_rejected_singular);     out += ',';
+        appendKv(out, "pose_graph_rejected_incoherent",   v_pose_graph_rejected_incoherent);   out += ',';
         appendKv(out, "pose_graph_loop_edges_added",      v_pose_graph_loop_edges_added);      out += ',';
         appendKv(out, "pose_graph_apply_calls",           v_pose_graph_apply_calls);           out += ',';
         appendKv(out, "extrinsics_rotation_angle_mdeg", v_extrinsics_rotation_angle_mdeg); out += ',';
@@ -1442,7 +1457,8 @@ struct EventCounters {
         appendKv(out, "slam_promo_rms_sum_milli",            v_slam_promo_rms_sum_milli);            out += ',';
         appendKv(out, "slam_promo_rms_milli_max",            v_slam_promo_rms_milli_max);            out += ',';
         appendKv(out, "global_t_gated_rotation_dominated_total", v_global_t_gated_rotation_dominated_total); out += ',';
-        appendKv(out, "translation_heading_projection_total",    v_translation_heading_projection_total);
+        appendKv(out, "translation_heading_projection_total",    v_translation_heading_projection_total); out += ',';
+        appendKv(out, "global_t_advanced_via_depthflow_fallback_total", v_global_t_advanced_via_depthflow_fallback_total);
         out += '}';
         return out;
     }

@@ -531,10 +531,14 @@ private:
 
     // Camera-thread helper computing depth_flow_speed_mps_ from the matched KLT
     // pairs + MiDaS depth + recoverPose (R_vo, t_vo). Called from processFrame.
+    // 2026-05-30 (Scale fix Steps 2/5): imu drives classifyGait at the top;
+    // gyro_norm (rad/s, from the call site) drives the turn-suppression gate on
+    // the K calibration so turns don't inflate K_walk toward the UTURN k_obs.
     void updateDepthFlowSpeed(const std::vector<cv::Point2f>& prev_ud,
                               const std::vector<cv::Point2f>& next_ud,
                               const cv::Mat& R_vo, const cv::Mat& t_vo,
-                              double dt_s);
+                              double dt_s,
+                              const IMUPreintegrator& imu, double gyro_norm);
 
     // 2026-05-27 expansion-rate (looming / flow-divergence) variant: per-point
     // Vz = (radial flow / radius / dt) · Z_rel · K. Best-conditioned for forward
@@ -543,10 +547,55 @@ private:
     // 1992) — without it, head turns leak into false speed. The result is FUSED
     // into depth_flow_speed_mps_ by the forward-motion fraction so the UI shows a
     // smooth blend (looming-dominant when forward, recoverPose-dominant sideways).
+    // 2026-05-30 (Scale fix Steps 2/5): imu drives classifyGait at the top;
+    // gyro_norm (rad/s) drives the turn-suppression gate on the looming K calib.
     void updateExpansionSpeed(const std::vector<cv::Point2f>& prev_ud,
                               const std::vector<cv::Point2f>& next_ud,
                               double dt_s,
-                              const cv::Vec3d& gyro_rot_cam);
+                              const cv::Vec3d& gyro_rot_cam,
+                              const IMUPreintegrator& imu, double gyro_norm);
+
+    // 2026-05-30 (Scale fix Steps 1-3, docs/SCALE_FIX_DESIGN_2026_05_30.md) —
+    // PER-GAIT K. A single shared K cannot serve walk/run/vehicle: the measured
+    // accel-K observations are WALK k_obs≈1340, RUN≈831 (ratio 0.62), UTURN≈1652.
+    // A walk-stop accel spike pushed the shared K up (~2400) and then over-scaled
+    // the following run. Fix: keep midas_scale_K_/expansion_scale_K_ as the ACTIVE
+    // mode's K (used everywhere exactly as before — no rename) and store a per-mode
+    // copy in k_slots_. classifyGait() picks the mode each frame; onModeSwitch()
+    // SAVES the active K into the old slot and LOADS the new slot (seeding a virgin
+    // RUN slot at walk*0.62, VEHICLE at the current K). All of this runs on the
+    // camera thread (single writer/reader), so active_mode_/mode_*_frames_/k_slots_
+    // need no atomics; only midas_scale_K_/expansion_scale_K_ stay atomic (UI reads).
+    enum class GaitMode { WALK = 0, RUN = 1, VEHICLE = 2 };
+    struct KSlot { double df{-1.0}; double loom{-1.0}; };  // camera-thread only
+    KSlot k_slots_[3];
+    GaitMode active_mode_{GaitMode::WALK};
+    int mode_hold_frames_{0};               // consecutive frames a NEW candidate held
+    int mode_switch_fast_alpha_frames_{0};  // remaining frames of fast-converge EMA
+    // classifyGait runs in BOTH updateExpansionSpeed and updateDepthFlowSpeed within
+    // the same processFrame; this guards the hysteresis counter so it advances at
+    // most once per frame (keeps kModeHoldFrames a true ~0.5 s regardless of how many
+    // speed paths fired). -1 = never classified.
+    long long last_gait_frame_{-1};
+    // Same once-per-frame guard for the fast-converge EMA counter: both calib paths
+    // (depth-flow + looming) decrement mode_switch_fast_alpha_frames_ on a
+    // verification_ok frame; without this they halve the kFastConvergeFrames window
+    // on frames where both fire. -1 = unset.
+    long long last_fast_alpha_frame_{-1};
+    // 15 frames @ 30 Hz ≈ 0.5 s hysteresis before any mode switch (debounces a
+    // misclassified frame from swapping K slots).
+    static constexpr int    kModeHoldFrames     = 15;
+    // After a switch, run the EMA fast for this many frames so the new slot
+    // converges from its seed instead of lagging at α=0.05 over a whole leg.
+    static constexpr int    kFastConvergeFrames = 10;
+    static constexpr double kFastAlpha          = 0.3;   // fast post-switch EMA
+    static constexpr double kNormalAlpha        = 0.05;  // steady-state EMA (== legacy 0.05)
+    // RUN seed = WALK*0.62 from the measured k_obs ratio (RUN 831 / WALK 1340).
+    static constexpr double kRunWalkSeedRatio   = 0.62;
+
+    // Camera-thread gait classification + slot swap (Scale fix Steps 2-3).
+    GaitMode classifyGait(const IMUPreintegrator& imu, double accel_speed);
+    void onModeSwitch(GaitMode old_mode, GaitMode new_mode);
 
     // 2026-05-26 — MiDaS relative->metric scale K, calibrated from the accelerometer
     // during the clean window right after a ZUPT stop. This BREAKS the circular
@@ -554,6 +603,7 @@ private:
     // fit calibrated to scale_fuser_). Published basis: VINS-Mono / VI-Depth (Wofk
     // 2023) / DynaDepth. speed = K * median(flow x relative_depth). -1 until first
     // calibration. Atomic: written camera-thread, read by getFusedSpeedMps (UI).
+    // 2026-05-30: now holds the ACTIVE GaitMode's depth-flow K (see k_slots_).
     std::atomic<double> midas_scale_K_{-1.0};
     // World-frame velocity from accel (g*dt + R_GtoI^T*deltaV, same increment as
     // EKFState.cpp:295), integrated from a ZUPT stop and re-zeroed at the next stop.

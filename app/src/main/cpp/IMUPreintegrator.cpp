@@ -560,6 +560,10 @@ IMUPreintegrator::StepInfo IMUPreintegrator::getStepInfo() const {
     info.accel_variance = static_cast<double>(accel_variance_est_);
     info.time_since_last_step_s = -1.0;
     info.stride_calibrated = (user_stride_m_ > 0.0);
+    // 2026-05-30 (Scale fix Step 0) — step cadence for gait classification.
+    // step_period_s_ is the interval between the last two detected steps (s),
+    // set in detectStep(); 0 when no recent step → report 0 Hz.
+    info.step_freq_hz = (step_period_s_ > 0.0) ? (1.0 / step_period_s_) : 0.0;
 
     // Step 3 Observer A: time-since-last-step. Used by Tracker to fade PDR
     // confidence smoothly as a step ages, instead of a hard cutoff.

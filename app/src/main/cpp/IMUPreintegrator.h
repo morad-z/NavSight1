@@ -99,6 +99,13 @@ public:
         double accel_variance;           // running variance of |accel| (m²/s⁴)
         double time_since_last_step_s;   // seconds since last detected step
         bool   stride_calibrated;        // true if a per-user stride was set
+
+        // 2026-05-30 (Scale fix Step 0) — step cadence exposed for the gait
+        // classifier (Tracker::classifyGait, WALK/RUN/VEHICLE per-mode K).
+        // = 1/step_period_s_; 0 when no recent step. Cadence biomechanics:
+        // walk 1.5-2.5 Hz, run 2.7-4 Hz; the step detector's MIN_STEP_PERIOD_S
+        // =0.25 s caps it at 4 Hz. No JNI/ABI break (StepInfo returned by value).
+        double step_freq_hz{0.0};
     };
 
     StepInfo getStepInfo() const;
