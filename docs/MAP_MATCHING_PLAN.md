@@ -243,6 +243,23 @@ Split **DETECTION** (did the user turn / which way) from **RENDERING** (the shap
   road," worst case it relocates the turnaround. (Step G being cut has no effect — a mid-block U-turn has no
   intersection node anyway.)
 
+### 0.8 Acceptance goal + map-matched trajectory in recordings/analysis (2026-05-30)
+
+**Primary acceptance goal (user, 2026-05-30):** a **500 m forward + back ride (~1 km total) with ≤5% drift
+(≤50 m).** Cleanest metric for an out-and-back = **endpoint-return** (how far the end dot lands from the start,
+as % of the ~1 km ridden) plus path-length within ±5% of ~1 km. This is the bar the matcher + speed path must
+hit on a real scooter ride. (NOTE: an out-and-back is a **mid-road U-turn** route — the §0.7 hard case — so
+hitting this also exercises the U-turn handling.)
+
+**Record + plot the map-matched trajectory** (so it's comparable to GPS + VIO like `compare_gps_vio.py` does):
+- **Recorder (osm-migration / Step F):** log the map-matched position per sample in the sim JSON as
+  **`mm_lat` / `mm_lng`** (geographic, same frame as `glat`/`glng`), alongside VIO (`vx`/`vz`) + GPS
+  (`glat`/`glng`). Null when the matcher produces nothing that sample. Also a per-sample `mm_conf` is welcome.
+- **Analyzer (DONE 2026-05-30 — `scripts/compare_gps_vio.py`):** already extended to plot the map-matched track
+  (magenta) next to GPS (green) + VIO (blue) when `mm_lat`/`mm_lng` are present, report its path length, and
+  run the out-and-back ≤5% endpoint-return assessment for all three tracks. No-op on recordings lacking the field.
+- **Both branches:** this requirement is synced to `morad` and `osm-migration`.
+
 ---
 
 ## 1. Status / scope / dependencies

@@ -168,7 +168,37 @@ def main():
     if gps_path > 0:
         print(f"  VIO/GPS      : {vio_path / gps_path:.3f}x   "
               f"({'VIO undershoots' if vio_path < gps_path else 'VIO overshoots'})")
+
+    # Map-matched track (§8M Step F output, logged per sample as mm_lat/mm_lng once map matching is
+    # implemented). It's already in the same geographic frame as GPS, so NO yaw-alignment is needed —
+    # convert straight to ENU. Optional: only reported/plotted when the field is present.
+    mm_en = [lla_to_enu(p["mm_lat"], p["mm_lng"], lat0, lon0)
+             for p in pts if p.get("mm_lat") is not None and p.get("mm_lng") is not None]
+    mm_path = sum(math.hypot(mm_en[i][0] - mm_en[i - 1][0], mm_en[i][1] - mm_en[i - 1][1])
+                  for i in range(1, len(mm_en)))
+    if mm_en:
+        print(f"  map-matched  : {mm_path:.1f} m   ({len(mm_en)} pts)"
+              + (f"   {mm_path / gps_path:.3f}x" if gps_path > 0 else ""))
     print()
+
+    # OUT-AND-BACK / 1 km GOAL: 500 m forward + back = ~1 km, target ≤5% drift. On an out-and-back the
+    # cleanest drift metric is "endpoint return" — how far the end point lands from the start (ideally 0).
+    # 5% of a 1 km ride = 50 m. Denominator = GPS path (the measured truth).
+    def _endpoint_return(track):
+        return None if len(track) < 2 else math.hypot(track[-1][0] - track[0][0],
+                                                       track[-1][1] - track[0][1])
+    if gps_path > 0:
+        print("OUT-AND-BACK / 1 km GOAL (target ≤5% drift = ≤50 m endpoint return on a 1 km ride):")
+        for name, track in (("GPS", gps_en), ("VIO", vio_aligned), ("map-matched", mm_en)):
+            er = _endpoint_return(track)
+            if er is None:
+                continue
+            pct = 100 * er / gps_path
+            flag = "PASS" if pct <= 5.0 else "OVER"
+            print(f"  {name:<12}: end returns {er:6.1f} m from start  "
+                  f"({pct:4.1f}% of {gps_path:.0f} m)  [{flag} vs 5%]")
+        print()
+
     print("DIVERGENCE (VIO-aligned vs GPS, at each paired sample):")
     print(f"  mean dist    : {sum(dists) / len(dists):.2f} m")
     print(f"  max dist     : {max_dist:.2f} m   at t = {t_max:.1f} s")
@@ -224,6 +254,10 @@ def main():
         axes[0].plot(0, 0, "go", markersize=10, label="start")
         axes[0].plot(end_gps[0], end_gps[1], "g^", markersize=12, label="GPS end")
         axes[0].plot(end_vio[0], end_vio[1], "b^", markersize=12, label="VIO end")
+        if mm_en:
+            axes[0].plot([p[0] for p in mm_en], [p[1] for p in mm_en],
+                         "-m", linewidth=1.5, label=f"map-matched ({mm_path:.0f} m)")
+            axes[0].plot(mm_en[-1][0], mm_en[-1][1], "m^", markersize=12, label="map-matched end")
         axes[0].set_aspect("equal")
         axes[0].set_xlabel("East (m)")
         axes[0].set_ylabel("North (m)")
