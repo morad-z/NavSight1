@@ -37,7 +37,11 @@ android {
         }
     }
 
-    // Don't compress TFLite models — they need memory-mapping for performance
+    // Don't compress TFLite models — they need memory-mapping for performance.
+    // NOTE: the Haifa OSM blobs (assets/osm/haifa/*.bin) are intentionally LEFT
+    // COMPRESSED — OsmDataLayer reads them fully into memory via assets.open()
+    // (transparent inflate, a few ms at startup), so AAPT deflate saves ~6 MB of
+    // APK with no runtime cost. (Add "bin" to noCompress only if we switch to mmap.)
     androidResources {
         noCompress += "tflite"
     }
@@ -49,6 +53,18 @@ android {
                 getDefaultProguardFile("proguard-android-optimize.txt"),
                 "proguard-rules.pro"
             )
+        }
+        debug {
+            // OSM-migration coexistence: install this branch's debug build ALONGSIDE
+            // the speed-branch app (com.example.navsight1) instead of overwriting it.
+            // The suffix gives this build its own package (com.example.navsight1.osm),
+            // its own data/prefs, and its own launcher entry. The debug source set
+            // (app/src/debug/res) renames it to "NavSight OSM" so the two are
+            // distinguishable in the launcher. Remove this block before merging to
+            // the speed branch (it's debug-only and harmless, but the merged trunk
+            // should ship a single applicationId).
+            applicationIdSuffix = ".osm"
+            versionNameSuffix = "-osm"
         }
     }
     
@@ -102,22 +118,18 @@ dependencies {
     implementation(libs.androidx.compose.ui.tooling.preview)
     implementation(libs.androidx.compose.material3)
 
-    // Google Maps
-    implementation(libs.google.maps.services)
+    // OSM migration 2026-05-30 (§8M Build changes): removed paid Google client
+    // libs — google-maps-services (Roads), places-client (Places), slf4j-simple
+    // (Roads logging). Routing/snapping/search now run offline against the local
+    // Haifa OSM data layer. The Google DISPLAY SDK is KEPT (hybrid v1).
 
-    // Maps Compose
+    // Maps Compose (display)
     implementation(libs.maps.compose)
 
-    // Roads API client library
+    // Google Maps display SDK (play-services-maps) — the GoogleMap composable
     implementation(libs.maps.services.client)
 
-    // Places API for destination search autocomplete
-    implementation(libs.places.client)
-
-    // SLF4J for Roads API logging
-    implementation(libs.slf4j.simple)
-
-    // Location services
+    // Location services (one bootstrap GPS fix → setSessionAnchor, ADR-004)
     implementation(libs.google.location.services)
     implementation(libs.google.tasks)
 
@@ -139,6 +151,9 @@ dependencies {
 
     // Testing
     testImplementation(libs.junit)
+    // Real org.json for JVM unit tests (Android's android.jar ships only stubs that
+    // throw "not mocked"). Lets DynamicRoadsParseTest exercise RoadsJsonParser.
+    testImplementation("org.json:json:20240303")
     androidTestImplementation(libs.androidx.junit)
     androidTestImplementation(libs.androidx.espresso.core)
     androidTestImplementation(platform(libs.androidx.compose.bom))

@@ -129,6 +129,16 @@ object NativeBridge {
     external fun nativeGetEventCountersJson(): String
     external fun nativeResetEventCounters()
 
+    // Map-matching Step B* (MAP_MATCHING_PLAN.md §8M) — VIO→lat/lng bridge.
+    // nativeSetSessionAnchor: push the ONE bootstrap GPS fix that anchors the
+    // VIO local frame to geographic coordinates (ADR-004 — never feeds the EKF).
+    // Idempotent on the native side; a second call is logged + ignored.
+    external fun nativeSetSessionAnchor(latDeg: Double, lngDeg: Double, tNs: Long)
+    // Returns [latDeg, lngDeg, tNs, varXyM2] for the current user-facing dot
+    // (global_t_), or null when no SessionAnchor exists yet (matcher disabled /
+    // GPS jammed). Read-only on the engine.
+    external fun nativeCurrentVioLla(): DoubleArray?
+
     // Step 8b (Visual Production Plan): seed the EKF body→camera extrinsics
     // rotation R_bc from Android CameraCharacteristics.SENSOR_ORIENTATION.
     // R_bc_flat: 9 floats in row-major order.  Called once after camera open,

@@ -55,6 +55,18 @@ class NavSightViewModel(application: Application) : AndroidViewModel(application
         // before the 10 s persist tick ever fired, so K=1499 from the run was
         // lost on the next startVIO. 3 s gives ~3 persists per 10 s recording.
         private const val MIDAS_K_PERSIST_INTERVAL_MS = 3_000L
+
+        // Tier-1 #4 — minimum OSRM /match HMM confidence to trust the matched dot.
+        // Below this (or on a broken/split trace) we fall back to the per-point snapper.
+        private const val MIN_MATCH_CONFIDENCE = 0.30
+        // Tier-1 #2 — read-only K̂_map scale-observation gates. Higher confidence bar
+        // than the dot (scale is sensitive), enough VIO baseline to be meaningful, and
+        // a sane ratio band so a wrong match never logs a garbage scale.
+        private const val SCALE_OBS_MIN_CONFIDENCE = 0.60
+        private const val SCALE_OBS_MIN_VIO_M = 15.0
+        private const val SCALE_OBS_MIN_RATIO = 0.2
+        private const val SCALE_OBS_MAX_RATIO = 5.0
+        private const val SCALE_OBS_LOG_INTERVAL_MS = 3_000L
     }
 
     private val sensorRepository = SensorRepository(application)
@@ -152,6 +164,9 @@ class NavSightViewModel(application: Application) : AndroidViewModel(application
 
     var startLocation by mutableStateOf<LatLng?>(null)
         private set
+    // When the user long-presses the map to relocate the start pin, GPS fixes must not
+    // clobber the chosen anchor (the set-once GPS normally wins).
+    private var startLocationOverridden = false
 
     var navigationState by mutableStateOf<NavigationState>(NavigationState.Idle)
         private set
@@ -222,7 +237,19 @@ class NavSightViewModel(application: Application) : AndroidViewModel(application
         val gpsLat: Double?, val gpsLng: Double?, val gpsAlt: Double?, val gpsAcc: Float?,
         val meanFlow: Double, val inlierCount: Int,
         val stepCount: Int, val stepFreq: Double, val strideLength: Double,
-        val poseFlags: Int, val heading: Double
+        val poseFlags: Int, val heading: Double,
+        // Map-matching Step B* (§8M) — VIO position projected to geographic
+        // (lat,lng) via the SessionAnchor, with the EKF's xy-covariance trace.
+        // null until a SessionAnchor exists (no GPS fix / jammed).
+        val vioLat: Double?, val vioLng: Double?, val vioVarXy: Double?,
+        // §0.8 — the map-matched (OSM-snapped) track, same geographic frame as
+        // glat/glng. null on samples where the matcher produced nothing.
+        val mmLat: Double?, val mmLng: Double?, val mmConf: Double?,
+        // Matcher diagnostics persisted for offline analysis (logcat is ephemeral):
+        //   mmSrc    — "osrm:match" | "snap" | "raw" | null (which matcher produced the dot)
+        //   kMap     — per-sample K̂_map = d_route/d_vio (scale observation; null when unmatched)
+        //   maneuver — ManeuverState ("FREE_ROAD" | "ON_ROUNDABOUT" | "MID_ROAD_UTURN")
+        val mmSrc: String?, val kMap: Double?, val maneuver: String?
     )
     // ──────────────────────────────────────────────────────────────────────────
 
@@ -236,12 +263,52 @@ class NavSightViewModel(application: Application) : AndroidViewModel(application
     private var lastVioForDist: VioData? = null
     private var lastSpeedTimeMs = 0L
     private var lastSnapTimeMs = 0L
+    // Heading-aware map-matcher (§0.7): detects roundabout traversal/exit + U-turns
+    // from the VIO heading. Session-scoped; reset in resetAll(). maneuverState is
+    // exposed for the UI (e.g. a roundabout indicator).
+    private val maneuverStateMachine = ManeuverStateMachine()
+    var maneuverState by mutableStateOf(ManeuverState.FREE_ROAD)
+        private set
+
+    // Step D — live trajectory map-matcher (OSRM /match HMM). Primary dot source:
+    // matches the recent VIO PATH to the road so the dot follows curves/roundabout
+    // rings instead of "letting go" past the per-point soft-snap cap. Falls back to
+    // [roadSnapper] (per-point) when offline / no match. Source logged on transition.
+    private val liveMatcher = LiveMatcher()
+    @Volatile private var lastSnapSource = ""
+    // Guards against overlapping snap coroutines while a /match HTTP call is in flight
+    // (set/cleared on the Main collector thread + the IO finally).
+    @Volatile private var snapInFlight = false
+    // Tier-1 #3: the matched ROAD polyline for the current window (on-road geometry the
+    // dot sits on). Empty when on the per-point fallback / unmatched. Rendered by the map.
+    var matchedRoadPath by mutableStateOf<List<LatLng>>(emptyList())
+        private set
+    // Tier-1 #2: throttle for the read-only K̂_map scale observation log (ms).
+    @Volatile private var lastScaleObsMs = 0L
+    // Latest per-sample matcher diagnostics, stashed by the snap coroutine and recorded
+    // into the sim JSON (logcat is ephemeral; these must survive in the recording).
+    @Volatile private var lastKMap: Double? = null
+
+    // §0.8 / Step C*: the latest MAP-MATCHED position (the OSM-snapped dot), set
+    // only when the snap actually landed on a road (isSnapped). null otherwise.
+    // Recorded per sample as mm_lat/mm_lng for the analyzer's magenta track.
+    @Volatile private var lastMapMatched: LatLng? = null
+    // §0.8 — per-sample map-match confidence = exp(-snapDistanceM / 5.0), mirroring
+    // RoadSnapper's SNAP_SIGMA_M=5 m. null when not snapped (no map-matched point).
+    @Volatile private var lastMapMatchedConf: Double? = null
     private var lastUiUpdateTimeMs = 0L
     private val UI_UPDATE_THROTTLE_MS = 200L
 
     private var latestVioState: VioData = VioData()
     private var hasLocationPermission = false
 
+    // MIGRATION 2026-05-30 (MAP_MATCHING_PLAN.md §8M Step K-search*): offline OSM
+    // destination search replaces the Google Places API. Reaches the loaded
+    // OsmDataLayer through its process-wide holder; $0, no key, fully offline.
+    val offlineGeocoder = OfflineGeocoder()
+
+    /* LEGACY (Google Places API, removed in OSM migration 2026-05-30). Commented
+       out per the comment-out rule.
     val placesClient by lazy {
         if (apiKey.isNotBlank() && !com.google.android.libraries.places.api.Places.isInitialized()) {
             com.google.android.libraries.places.api.Places.initialize(getApplication(), apiKey)
@@ -252,6 +319,12 @@ class NavSightViewModel(application: Application) : AndroidViewModel(application
             throw IllegalStateException("Places API not initialized. Check your GOOGLE_MAPS_API_KEY.")
         }
     }
+    */
+
+    // Map-matching Step B* (§8M): true once the bootstrap GPS fix has set the
+    // native SessionAnchor. Guards against re-anchoring (native is also idempotent).
+    @Volatile
+    private var sessionAnchorSet = false
 
     fun updateUserHeight(height: Float) {
         val h = height.coerceIn(1.0f, 2.5f)
@@ -274,6 +347,15 @@ class NavSightViewModel(application: Application) : AndroidViewModel(application
         val persistedK = prefs.getFloat(PREF_MIDAS_SCALE_K, -1f).toDouble()
         if (persistedK > 0.0) {
             NativeBridge.setMidasScaleK(persistedK)
+        }
+
+        // Map-matching §8M: load the embedded Israel-wide SEARCH index off the main
+        // thread, and init the dynamic ROAD-region manager (roads are fetched on
+        // demand around the user's location — RoadRegionManager). Both degrade
+        // gracefully (raw-VIO display, empty search) if assets/network are absent.
+        viewModelScope.launch(Dispatchers.Default) {
+            OsmDataLayer.load(getApplication())
+            RoadRegionManager.init(getApplication())
         }
 
         viewModelScope.launch {
@@ -299,7 +381,24 @@ class NavSightViewModel(application: Application) : AndroidViewModel(application
             }
         }
         viewModelScope.launch {
-            sensorRepository.startLocation.collect { startLocation = it }
+            sensorRepository.startLocation.collect {
+                // Respect a user long-press override; GPS otherwise sets the anchor once.
+                if (!startLocationOverridden) startLocation = it
+                // Dynamic roads: begin loading the road region around the user the
+                // instant the first GPS fix lands (before VIO produces a position).
+                if (it != null) RoadRegionManager.ensureRegion(it.latitude, it.longitude)
+                // Map-matching Step B* (§8M): the FIRST bootstrap GPS fix anchors the
+                // VIO local frame to geographic coordinates (ADR-004 — one fix, never
+                // feeds the EKF). Idempotent on the native side; guarded here too.
+                if (!sessionAnchorSet && it != null) {
+                    sessionAnchorSet = true
+                    runCatching {
+                        NativeBridge.nativeSetSessionAnchor(
+                            it.latitude, it.longitude, System.currentTimeMillis() * 1_000_000L
+                        )
+                    }.onFailure { e -> Log.w("NavSightVM", "setSessionAnchor failed: ${e.message}") }
+                }
+            }
         }
         viewModelScope.launch {
             sensorRepository.showCameraBlocked.collect { showCameraBlocked = it }
@@ -395,6 +494,14 @@ class NavSightViewModel(application: Application) : AndroidViewModel(application
 
             if (isRecordingSimulation) {
                 val gps = currentGpsLocation
+                // Step B* (§8M): VIO position projected to geographic (lat,lng) — the
+                // user-facing dot (global_t_) via the SessionAnchor. null when no anchor.
+                val vioLla = runCatching { NativeBridge.nativeCurrentVioLla() }.getOrNull()
+                val mm = lastMapMatched   // §0.8 — latest OSM-snapped position (or null)
+                val mmC = lastMapMatchedConf   // §0.8 — its confidence (or null)
+                val mmS = lastSnapSource.ifEmpty { null }   // matcher source (osrm:match/snap/raw)
+                val kM = lastKMap   // per-sample scale observation (null when unmatched)
+                val mvr = maneuverState.name   // current maneuver state (Main thread read)
                 synchronized(simulationDataPoints) {
                     simulationDataPoints.add(SimulationPoint(
                         timestamp = System.currentTimeMillis(),
@@ -407,7 +514,11 @@ class NavSightViewModel(application: Application) : AndroidViewModel(application
                         gpsAlt = gps?.altitude, gpsAcc = gps?.accuracy,
                         meanFlow = vio.meanFlow, inlierCount = vio.inlierCount,
                         stepCount = vio.stepCount, stepFreq = vio.stepFreq,
-                        strideLength = vio.strideLength, poseFlags = vio.poseFlags, heading = vio.heading
+                        strideLength = vio.strideLength, poseFlags = vio.poseFlags, heading = vio.heading,
+                        vioLat = vioLla?.getOrNull(0), vioLng = vioLla?.getOrNull(1),
+                        vioVarXy = vioLla?.getOrNull(3),
+                        mmLat = mm?.latitude, mmLng = mm?.longitude, mmConf = mmC,
+                        mmSrc = mmS, kMap = kM, maneuver = mvr
                     ))
                 }
             }
@@ -476,24 +587,164 @@ class NavSightViewModel(application: Application) : AndroidViewModel(application
             }
             */
 
+            // The ManeuverStateMachine is STATEFUL (per-tick heading sweep + tick-based U-turn
+            // window), so it MUST tick every ~500 ms on the (Main, serial) collector — even
+            // while a /match HTTP call is still in flight. Only the network snap is gated by
+            // snapInFlight. The timer is consumed only once we actually have an anchor.
             if (nowMs - lastSnapTimeMs > 500) {
-                lastSnapTimeMs = nowMs
-                viewModelScope.launch(Dispatchers.IO) {
-                    val start = startLocation ?: return@launch
+                val start = startLocation
+                if (start != null) {
+                    lastSnapTimeMs = nowMs
                     val currentLatLng = NavSightUtils.metersToLatLng(start, vio.x, vio.z)
-                    val recentPath = pathHistory.takeLast(10).map { p ->
-                        NavSightUtils.metersToLatLng(start, p.x.toDouble(), p.z.toDouble())
+                    // Dynamic roads: ensure the region around the user's CURRENT position
+                    // is loaded (re-fetches when they move into a new tile). Non-blocking.
+                    RoadRegionManager.ensureRegion(currentLatLng.latitude, currentLatLng.longitude)
+                    val region = RoadRegionManager.regionFor(currentLatLng.latitude, currentLatLng.longitude)
+                    // Heading-aware matcher (§0.7): detect roundabout traversal/exit + U-turns
+                    // from the VIO heading (radians → degrees; MapScreenUi convention).
+                    val headingDeg = Math.toDegrees(vio.heading)
+                    val maneuver = maneuverStateMachine.tick(
+                        currentLatLng.latitude, currentLatLng.longitude, headingDeg, region?.roundabouts
+                    )
+                    maneuver.event?.let { ev ->
+                        Log.i("ManeuverSM", "MANEUVER event=$ev state=${maneuver.state} " +
+                            "sweep=${"%.0f".format(maneuver.accumulatedSweepDeg)} " +
+                            "exitBearing=${maneuver.suggestedExit?.bearingDeg?.let { "%.0f".format(it) } ?: "-"} " +
+                            "dir=${maneuver.travelDirection}")
                     }
-                    val snapped = roadSnapper.snapToRoad(currentLatLng, recentPath)
-                    withContext(Dispatchers.Main) {
-                        snappedPosition = snapped.toLatLng()
-                        if (navigationState is NavigationState.Active) {
-                            navigationManager.updateVioPosition(snapped.toLatLng())
-                        }
-                    }
+                    maneuverState = maneuver.state  // Compose state; collector is on Main
+                    // Gate ONLY the network snap so /match coroutines never stack; the SM has
+                    // already advanced this cycle regardless.
+                    if (!snapInFlight) launchNetworkSnap(start, currentLatLng, maneuver, nowMs)
                 }
             }
         }
+    }
+
+    /**
+     * Launch the gated network snap: OSRM /match on a subsampled trajectory window, with the
+     * per-point [roadSnapper] as the offline/low-confidence fallback. Holds [snapInFlight] for
+     * its lifetime (cleared in finally). [maneuver] is the latest SM result (ring-pin for the
+     * fallback); [nowMs] stamps the read-only K̂_map observation.
+     */
+    private fun launchNetworkSnap(start: LatLng, currentLatLng: LatLng, maneuver: ManeuverResult, nowMs: Long) {
+        val recentPath = pathHistory.takeLast(10).map { p ->
+            NavSightUtils.metersToLatLng(start, p.x.toDouble(), p.z.toDouble())
+        }
+        // Step D — primary: OSRM /match on a subsampled trajectory window (the last ~150 frames
+        // ≈ 6 s of path). It snaps the PATH (not the point) to the road, so the dot follows
+        // curves/roundabouts and does not "let go" the way per-point snap does past SOFT_SNAP_MAX_M.
+        // HARD CAP at ≤9 points: the public OSRM demo /match rejects >10 trace coordinates with
+        // HTTP 400 "Too many trace coordinates" (measured 2026-05-31: N=10 OK, N=12 TooBig), which
+        // was making EVERY /match fail → permanent per-point fallback → off-road drift.
+        val recent = pathHistory.takeLast(150)
+        val stride = maxOf(1, recent.size / 8)
+        val matchWindow = recent.filterIndexed { i, _ -> i % stride == 0 }.takeLast(8)
+            .map { p -> NavSightUtils.metersToLatLng(start, p.x.toDouble(), p.z.toDouble()) } + currentLatLng
+        snapInFlight = true
+        viewModelScope.launch(Dispatchers.IO) {
+            try {
+                // Primary: trajectory map-match (geometry + confidence).
+                val matched = liveMatcher.match(matchWindow)
+                // #4 — confidence gating + break detection: only trust /match when it is
+                // confident and the trace was not split. Otherwise fall back to per-point snap.
+                val accept = matched != null &&
+                    matched.confidence >= MIN_MATCH_CONFIDENCE && !matched.broken
+                val snapped: SnappedLatLng
+                val matchedPath: List<LatLng>
+                if (accept && matched != null) {
+                    snapped = SnappedLatLng(matched.matched.latitude, matched.matched.longitude, "osrm:match", null, true)
+                    matchedPath = matched.matchedPath        // #3 — on-road geometry
+                } else {
+                    snapped = roadSnapper.snapToRoad(currentLatLng, recentPath, maneuver)
+                    // #10 — keep the last matched road on a TRANSIENT /match miss (no green-line
+                    // flicker); only drop it when we are truly off any road.
+                    matchedPath = if (snapped.isSnapped) matchedRoadPath else emptyList()
+                }
+                val srcLabel = if (accept) "osrm:match" else if (snapped.isSnapped) "snap" else "raw"
+                if (srcLabel != lastSnapSource) {
+                    lastSnapSource = srcLabel
+                    Log.i("LiveMatcher", "SNAP_SOURCE source=$srcLabel " +
+                        "conf=${matched?.confidence?.let { "%.2f".format(it) } ?: "-"} " +
+                        "broken=${matched?.broken ?: "-"} windowPts=${matchWindow.size}")
+                }
+                // #2 — READ-ONLY scale observation K̂_map (logged + recorded only; NOT fed to scale).
+                if (accept && matched != null) recordScaleObservation(matched, matchWindow, nowMs)
+                else lastKMap = null
+                // §0.8 — record the map-matched position only when snapped to a road.
+                if (snapped.isSnapped) {
+                    lastMapMatched = snapped.toLatLng()
+                    lastMapMatchedConf = if (accept && matched != null) matched.confidence else {
+                        val rawSL = SnappedLatLng(currentLatLng.latitude, currentLatLng.longitude, null, null, false)
+                        exp(-snapped.distanceTo(rawSL) / 5.0)   // σ=5 m (RoadSnapper.SNAP_SIGMA_M)
+                    }
+                } else {
+                    lastMapMatched = null
+                    lastMapMatchedConf = null
+                }
+                // #8 — when navigating, project onto the planned route (route-pinned) + detect
+                // off-route → reroute. Returns the display position (pinned within the corridor).
+                val displayPos = if (navigationState is NavigationState.Active) {
+                    navigationManager.updateVioPosition(snapped.toLatLng())
+                } else {
+                    snapped.toLatLng()
+                }
+                withContext(Dispatchers.Main) {
+                    snappedPosition = displayPos
+                    matchedRoadPath = matchedPath
+                }
+            } finally {
+                snapInFlight = false
+            }
+        }
+    }
+
+    /**
+     * Tier-1 #2 — READ-ONLY map-derived scale observation. d_route = the matched road
+     * length over the window (treated as truth); d_vio = the raw VIO path length over the
+     * SAME (subsampled) window; K̂_map = d_route / d_vio is how much our VIO under/over-reads
+     * distance. Two outputs: (a) STASH the raw per-sample value in [lastKMap] for the sim
+     * recording (recorded un-gated/un-throttled; the analyzer filters it with mm_conf);
+     * (b) LOG a hard-gated, throttled MAP_SCALE_OBS line for live debugging. READ-ONLY —
+     * deliberately NOT applied to the dot's scale/speed: that path is protected (morad
+     * branch, gated on Fix A/B). The subsampled d_vio slightly under-reads on tight curves.
+     */
+    private fun recordScaleObservation(matched: LiveMatcher.MatchResult, window: List<LatLng>, nowMs: Long) {
+        if (matched.routeDistanceM <= 0.0) { lastKMap = null; return }
+        var dVio = 0.0
+        for (i in 1 until window.size) {
+            dVio += RoadSnapMath.haversineM(
+                window[i - 1].latitude, window[i - 1].longitude,
+                window[i].latitude, window[i].longitude
+            )
+        }
+        if (dVio < 1.0) { lastKMap = null; return }   // avoid div-by-~0 on a stationary window
+        val kMap = matched.routeDistanceM / dVio
+        lastKMap = kMap   // (a) raw per-sample → recording
+
+        // (b) hard-gated + throttled live log
+        if (matched.confidence < SCALE_OBS_MIN_CONFIDENCE) return
+        if (dVio < SCALE_OBS_MIN_VIO_M) return
+        if (kMap < SCALE_OBS_MIN_RATIO || kMap > SCALE_OBS_MAX_RATIO) return
+        if (nowMs - lastScaleObsMs < SCALE_OBS_LOG_INTERVAL_MS) return
+        lastScaleObsMs = nowMs
+        Log.i("LiveMatcher", "MAP_SCALE_OBS k_map=%.3f d_route=%.1f d_vio=%.1f conf=%.2f".format(
+            kMap, matched.routeDistanceM, dVio, matched.confidence))
+    }
+
+    /**
+     * User override (long-press on the map): relocate the start/origin pin to [latLng].
+     * The VIO origin (vio 0,0) is re-anchored here, so the dot + path + matcher all
+     * reproject from this point (NavSightUtils.metersToLatLng uses startLocation as the
+     * origin). Pre-loads the road region around it. The C++ SessionAnchor (vlat/vlng in
+     * recordings) is intentionally left on the original GPS fix — this is a display/match
+     * anchor override, not a re-anchor of the EKF.
+     */
+    fun overrideStartLocation(latLng: LatLng) {
+        startLocationOverridden = true
+        startLocation = latLng
+        RoadRegionManager.ensureRegion(latLng.latitude, latLng.longitude)
+        Log.i("NavSightVM", "START_OVERRIDE lat=${latLng.latitude} lng=${latLng.longitude}")
     }
 
     fun toggleSimulationRecording(getExternalFilesDir: (String?) -> java.io.File?, filesDir: java.io.File) {
@@ -573,6 +824,12 @@ class NavSightViewModel(application: Application) : AndroidViewModel(application
                 sb.append("\"gx\":${p.gyroX},\"gy\":${p.gyroY},\"gz\":${p.gyroZ},")
                 sb.append("\"glat\":${p.gpsLat ?: "null"},\"glng\":${p.gpsLng ?: "null"},")
                 sb.append("\"galt\":${p.gpsAlt ?: "null"},\"gacc\":${p.gpsAcc ?: "null"},")
+                // Step B* / §0.8 — VIO-projected (lat,lng) + map-matched track.
+                sb.append("\"vlat\":${p.vioLat ?: "null"},\"vlng\":${p.vioLng ?: "null"},\"vvar\":${p.vioVarXy ?: "null"},")
+                sb.append("\"mm_lat\":${p.mmLat ?: "null"},\"mm_lng\":${p.mmLng ?: "null"},\"mm_conf\":${p.mmConf ?: "null"},")
+                // Matcher diagnostics (logcat-equivalent, persisted): source, K̂_map, maneuver state.
+                sb.append("\"mm_src\":${p.mmSrc?.let { "\"$it\"" } ?: "null"},\"k_map\":${p.kMap ?: "null"},")
+                sb.append("\"maneuver\":${p.maneuver?.let { "\"$it\"" } ?: "null"},")
                 sb.append("\"mflow\":${p.meanFlow},\"inl\":${p.inlierCount},")
                 sb.append("\"steps\":${p.stepCount},\"sfreq\":${p.stepFreq},")
                 sb.append("\"stride\":${p.strideLength},\"pflags\":${p.poseFlags},")
@@ -687,6 +944,17 @@ class NavSightViewModel(application: Application) : AndroidViewModel(application
         positionCovValid = false
         lastVioForSpeed = null
         speedEmaMps = 0f
+        // Heading-aware matcher: drop any in-progress roundabout/U-turn state.
+        maneuverStateMachine.reset()
+        maneuverState = ManeuverState.FREE_ROAD
+        lastSnapSource = ""
+        snapInFlight = false
+        matchedRoadPath = emptyList()
+        lastScaleObsMs = 0L
+        lastKMap = null
+        startLocationOverridden = false   // a fresh session re-acquires the GPS anchor
+        lastMapMatched = null
+        lastMapMatchedConf = null
         lastVioForDist = null
         snappedPosition = null
         navigationStartMessage = null

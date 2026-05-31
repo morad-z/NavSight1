@@ -21,11 +21,10 @@ import androidx.compose.ui.text.style.TextOverflow
 import androidx.compose.ui.unit.dp
 import androidx.compose.ui.unit.sp
 import com.google.android.gms.maps.model.LatLng
-import com.google.android.libraries.places.api.net.PlacesClient
-import kotlinx.coroutines.Dispatchers
+// MIGRATION 2026-05-30 (MAP_MATCHING_PLAN.md §8M Step K-search*): Places API
+// removed; destination search now runs offline against the local Haifa OSM
+// geocode index (OfflineGeocoder). gms LatLng retained (hybrid v1).
 import kotlinx.coroutines.launch
-import kotlinx.coroutines.withContext
-import org.json.JSONObject
 
 private const val TAG = "NavSight"
 
@@ -38,24 +37,22 @@ data class RoutePreview(
 )
 
 @Composable
-fun SearchBarCard(pal: NavPalette, startLocation: LatLng?, placesClient: PlacesClient, onDestinationSelected: (LatLng) -> Unit) {
-    WazeSearchBar(pal, startLocation, placesClient, onDestinationSelected)
+fun SearchBarCard(pal: NavPalette, startLocation: LatLng?, geocoder: OfflineGeocoder, onDestinationSelected: (LatLng) -> Unit) {
+    WazeSearchBar(pal, startLocation, geocoder, onDestinationSelected)
 }
 
 @Composable
 fun WazeSearchBar(
     pal: NavPalette,
     startLocation: LatLng?,
-    placesClient: PlacesClient,
+    geocoder: OfflineGeocoder,
     onDestinationSelected: (LatLng) -> Unit
 ) {
     var searchText   by remember { mutableStateOf("") }
     var predictions  by remember { mutableStateOf<List<PlacePrediction>>(emptyList()) }
     var isSearching  by remember { mutableStateOf(false) }
     var routePreview by remember { mutableStateOf<RoutePreview?>(null) }
-    val sessionToken = remember { com.google.android.libraries.places.api.model.AutocompleteSessionToken.newInstance() }
     val scope        = rememberCoroutineScope()
-    val apiKey       = remember { BuildConfig.GOOGLE_MAPS_API_KEY }
 
     Column(Modifier.fillMaxWidth()) {
         Surface(color = pal.card, shape = RoundedCornerShape(18.dp),
@@ -70,8 +67,8 @@ fun WazeSearchBar(
                         searchText   = q
                         routePreview = null
                         if (q.length >= 2) scope.launch {
-                            try { fetchPlacePredictions(q, sessionToken, placesClient) { predictions = it } }
-                            catch (e: Exception) { Log.e(TAG, "Places crashed", e) }
+                            try { predictions = geocoder.predictions(q, startLocation) }
+                            catch (e: Exception) { Log.e(TAG, "Offline geocode crashed", e) }
                         } else predictions = emptyList()
                     },
                     modifier   = Modifier.weight(1f),
@@ -100,16 +97,15 @@ fun WazeSearchBar(
                         Surface(onClick = {
                             isSearching = true
                             predictions = emptyList()
-                            fetchPlaceLatLng(pred.placeId, placesClient) { ll ->
+                            scope.launch {
+                                val ll = geocoder.resolve(pred.placeId)
                                 if (ll != null) {
                                     searchText = pred.primaryText
                                     val origin = startLocation
                                     if (origin != null) {
-                                        scope.launch {
-                                            val polyline = fetchDirectionsRoute(origin, ll, apiKey)
-                                            isSearching  = false
-                                            routePreview = RoutePreview(ll, pred.primaryText, polyline)
-                                        }
+                                        val polyline = fetchOfflineRoute(origin, ll)
+                                        isSearching  = false
+                                        routePreview = RoutePreview(ll, pred.primaryText, polyline)
                                     } else {
                                         isSearching = false
                                         onDestinationSelected(ll)
@@ -184,69 +180,22 @@ fun WazeSearchBar(
     }
 }
 
-fun fetchPlacePredictions(
-    query: String,
-    sessionToken: com.google.android.libraries.places.api.model.AutocompleteSessionToken,
-    placesClient: PlacesClient,
-    onResult: (List<PlacePrediction>) -> Unit
-) {
-    val req = com.google.android.libraries.places.api.net.FindAutocompletePredictionsRequest
-        .builder().setSessionToken(sessionToken).setQuery(query).build()
-    placesClient.findAutocompletePredictions(req)
-        .addOnSuccessListener { r ->
-            onResult(r.autocompletePredictions.map {
-                PlacePrediction(it.placeId, it.getPrimaryText(null).toString(), it.getSecondaryText(null).toString())
-            })
-        }
-        .addOnFailureListener { e -> Log.e(TAG, "Autocomplete failed", e); onResult(emptyList()) }
-}
+/**
+ * Route polyline (preview) via the OSM router. OnlineRouter routes to ANY
+ * destination (free no-key OSRM), falling back to the local dynamic region when
+ * offline. Empty → the route-preview card just shows "Route ready".
+ */
+suspend fun fetchOfflineRoute(origin: LatLng, destination: LatLng): List<LatLng> =
+    OnlineRouter().route(origin, destination)
 
-fun fetchPlaceLatLng(placeId: String, placesClient: PlacesClient, onResult: (LatLng?) -> Unit) {
-    val fields = listOf(com.google.android.libraries.places.api.model.Place.Field.LAT_LNG)
-    placesClient.fetchPlace(
-        com.google.android.libraries.places.api.net.FetchPlaceRequest.newInstance(placeId, fields)
-    )
-        .addOnSuccessListener { onResult(it.place.latLng) }
-        .addOnFailureListener { e -> Log.e(TAG, "Place fetch failed", e); onResult(null) }
-}
+/* LEGACY (Google Places + Directions API, removed in OSM migration 2026-05-30,
+   §8M Step K-search* / K-routing*). Replaced by OfflineGeocoder (predictions/
+   resolve) + fetchOfflineRoute above. Commented out per the project's
+   comment-out-don't-delete rule.
 
-suspend fun fetchDirectionsRoute(origin: LatLng, destination: LatLng, apiKey: String): List<LatLng> =
-    withContext(Dispatchers.IO) {
-        try {
-            val url  = "https://maps.googleapis.com/maps/api/directions/json" +
-                "?origin=${origin.latitude},${origin.longitude}" +
-                "&destination=${destination.latitude},${destination.longitude}" +
-                "&mode=walking&key=$apiKey"
-            val conn = java.net.URL(url).openConnection() as java.net.HttpURLConnection
-            conn.connectTimeout = 8000; conn.readTimeout = 8000
-            val json = conn.inputStream.bufferedReader().readText()
-            conn.disconnect()
-            decodeDirectionsJson(json)
-        } catch (e: Exception) {
-            Log.e(TAG, "Directions API error: ${e.message}", e)
-            emptyList()
-        }
-    }
-
-private fun decodeDirectionsJson(json: String): List<LatLng> = try {
-    val obj    = JSONObject(json)
-    val routes = obj.getJSONArray("routes")
-    if (routes.length() == 0) emptyList()
-    else decodePolyline(routes.getJSONObject(0).getJSONObject("overview_polyline").getString("points"))
-} catch (e: Exception) { Log.e(TAG, "Directions JSON parse error", e); emptyList() }
-
-fun decodePolyline(encoded: String): List<LatLng> {
-    val poly  = mutableListOf<LatLng>()
-    var index = 0; val len = encoded.length
-    var lat = 0; var lng = 0
-    while (index < len) {
-        var b: Int; var shift = 0; var result = 0
-        do { b = encoded[index++].code - 63; result = result or ((b and 0x1f) shl shift); shift += 5 } while (b >= 0x20)
-        val dLat = if (result and 1 != 0) (result shr 1).inv() else result shr 1; lat += dLat
-        shift = 0; result = 0
-        do { b = encoded[index++].code - 63; result = result or ((b and 0x1f) shl shift); shift += 5 } while (b >= 0x20)
-        val dLng = if (result and 1 != 0) (result shr 1).inv() else result shr 1; lng += dLng
-        poly.add(LatLng(lat / 1E5, lng / 1E5))
-    }
-    return poly
-}
+fun fetchPlacePredictions(query, sessionToken, placesClient, onResult) { ... PlacesClient.findAutocompletePredictions ... }
+fun fetchPlaceLatLng(placeId, placesClient, onResult) { ... placesClient.fetchPlace ... }
+suspend fun fetchDirectionsRoute(origin, destination, apiKey) { ... maps.googleapis.com/maps/api/directions ... }
+private fun decodeDirectionsJson(json) { ... overview_polyline ... }
+fun decodePolyline(encoded) { ... Google encoded-polyline decode ... }
+*/

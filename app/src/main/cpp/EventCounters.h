@@ -903,6 +903,16 @@ struct EventCounters {
     // high count + plausible total_path_dm → working as v22 did.
     std::atomic<long long> translation_heading_projection_total{0};
 
+    // 2026-05-30 Map-matching Step B* (MAP_MATCHING_PLAN.md §8M) — VIO→lat/lng
+    // accessor instrumentation. The accessor is read-only on the EKF; these
+    // counters are the falsifiers the Step B* acceptance criteria assert against.
+    //   vio_lla_anchor_set               first setSessionAnchor() (expect == 1 on a normal walk)
+    //   vio_lla_anchor_reanchor_ignored  later setSessionAnchor() calls ignored (expect 0; never re-anchor mid-session)
+    //   vio_lla_unanchored_reads         current_vio_lla() reads while no anchor (matcher disabled / GPS jammed)
+    std::atomic<long long> vio_lla_anchor_set{0};
+    std::atomic<long long> vio_lla_anchor_reanchor_ignored{0};
+    std::atomic<long long> vio_lla_unanchored_reads{0};
+
     // Reset every counter to 0. Called on simulator-recording start so
     // each sim begins with a clean slate. Cheap atomic stores; safe to
     // call concurrently with hot-path increments (we accept that a few
@@ -1078,6 +1088,9 @@ struct EventCounters {
         slam_promo_rms_milli_max.store(0, std::memory_order_relaxed);
         global_t_gated_rotation_dominated_total.store(0, std::memory_order_relaxed);
         translation_heading_projection_total.store(0, std::memory_order_relaxed);
+        vio_lla_anchor_set.store(0, std::memory_order_relaxed);
+        vio_lla_anchor_reanchor_ignored.store(0, std::memory_order_relaxed);
+        vio_lla_unanchored_reads.store(0, std::memory_order_relaxed);
     }
 
     // Monotonic max-update for ba_solve_us_max. Lock-free CAS loop.
@@ -1269,6 +1282,9 @@ struct EventCounters {
         const long long v_slam_promo_rms_milli_max            = slam_promo_rms_milli_max.load(std::memory_order_relaxed);
         const long long v_global_t_gated_rotation_dominated_total = global_t_gated_rotation_dominated_total.load(std::memory_order_relaxed);
         const long long v_translation_heading_projection_total = translation_heading_projection_total.load(std::memory_order_relaxed);
+        const long long v_vio_lla_anchor_set              = vio_lla_anchor_set.load(std::memory_order_relaxed);
+        const long long v_vio_lla_anchor_reanchor_ignored = vio_lla_anchor_reanchor_ignored.load(std::memory_order_relaxed);
+        const long long v_vio_lla_unanchored_reads        = vio_lla_unanchored_reads.load(std::memory_order_relaxed);
 
         std::string out;
         out.reserve(2200);  // expanded for 18 new silent-failure counters (2026-05-16)
@@ -1442,7 +1458,10 @@ struct EventCounters {
         appendKv(out, "slam_promo_rms_sum_milli",            v_slam_promo_rms_sum_milli);            out += ',';
         appendKv(out, "slam_promo_rms_milli_max",            v_slam_promo_rms_milli_max);            out += ',';
         appendKv(out, "global_t_gated_rotation_dominated_total", v_global_t_gated_rotation_dominated_total); out += ',';
-        appendKv(out, "translation_heading_projection_total",    v_translation_heading_projection_total);
+        appendKv(out, "translation_heading_projection_total",    v_translation_heading_projection_total);    out += ',';
+        appendKv(out, "vio_lla_anchor_set",              v_vio_lla_anchor_set);              out += ',';
+        appendKv(out, "vio_lla_anchor_reanchor_ignored", v_vio_lla_anchor_reanchor_ignored); out += ',';
+        appendKv(out, "vio_lla_unanchored_reads",        v_vio_lla_unanchored_reads);
         out += '}';
         return out;
     }

@@ -995,6 +995,59 @@ Java_com_example_navsight1_NativeBridge_nativeResetEventCounters(
     LOGI("EventCounters reset");
 }
 
+// ── Map-matching Step B* (MAP_MATCHING_PLAN.md §8M) — VIO→lat/lng bridge ─────
+// Read-only on the engine. nativeSetSessionAnchor: one bootstrap GPS fix sets
+// the anchor (ADR-004). nativeCurrentVioLla: returns the user-facing dot
+// (global_t_) projected to geographic degrees, or null when no anchor exists
+// (matcher silent-disable / GPS jammed). Thin shims — all logic lives in Tracker.
+
+JNIEXPORT void JNICALL
+Java_com_example_navsight1_NativeBridge_nativeSetSessionAnchor(
+        JNIEnv*, jobject, jdouble lat_deg, jdouble lng_deg, jlong t_ns) {
+    std::shared_ptr<VioEngine> vision;
+    {
+        std::lock_guard<std::mutex> lock(state_mutex);
+        vision = g_vision;
+    }
+    if (!vision) {
+        LOGI("nativeSetSessionAnchor: VIO engine not started, ignoring anchor");
+        return;
+    }
+    Tracker* tracker = vision->getTracker();
+    if (!tracker) return;
+    tracker->setSessionAnchor(lat_deg, lng_deg, static_cast<int64_t>(t_ns));
+}
+
+// Returns a double[4] = {latDeg, lngDeg, tNsAsDouble, varXyM2}, or null when
+// the matcher has no anchor (valid == false). Degrees on the C++ side so Kotlin
+// gets a gms-compatible LatLng(latDeg, lngDeg) directly.
+JNIEXPORT jdoubleArray JNICALL
+Java_com_example_navsight1_NativeBridge_nativeCurrentVioLla(
+        JNIEnv* env, jobject) {
+    std::shared_ptr<VioEngine> vision;
+    {
+        std::lock_guard<std::mutex> lock(state_mutex);
+        vision = g_vision;
+    }
+    if (!vision) return nullptr;
+    const Tracker* tracker = vision->getTracker();
+    if (!tracker) return nullptr;
+
+    Tracker::VioLla lla = tracker->current_vio_lla();
+    if (!lla.valid) return nullptr;
+
+    jdoubleArray out = env->NewDoubleArray(4);
+    if (!out) return nullptr;
+    const double buf[4] = {
+        lla.lat_rad * 180.0 / M_PI,
+        lla.lng_rad * 180.0 / M_PI,
+        static_cast<double>(lla.t_ns),
+        lla.var_xy_m2
+    };
+    env->SetDoubleArrayRegion(out, 0, 4, buf);
+    return out;
+}
+
 // ── Step 8b: seed body→camera extrinsics rotation ────────────────────────────
 // Called once from Kotlin after camera open, using the rotation matrix derived
 // from CameraCharacteristics.SENSOR_ORIENTATION (degrees) converted by the
