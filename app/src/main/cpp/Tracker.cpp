@@ -1484,6 +1484,83 @@ bool Tracker::getPositionCovarianceXZ(double out[3]) const {
     return true;
 }
 
+// ── Map-matching Step B* (MAP_MATCHING_PLAN.md §8M) — VIO→lat/lng ────────────
+// Read-only on the EKF. See Tracker.h VioLla/SessionAnchor for the contract.
+
+void Tracker::setSessionAnchor(double lat_deg, double lng_deg, int64_t t_ns) {
+    std::lock_guard<std::mutex> lock(pose_mutex_);
+    if (session_anchor_.valid) {
+        // Never re-anchor mid-session: a second anchor would teleport the whole
+        // track. Log + count, then return (idempotent).
+        navsight::eventCounters().vio_lla_anchor_reanchor_ignored.fetch_add(
+            1, std::memory_order_relaxed);
+        LOGI("VIO_LLA: anchor already set (%.7f,%.7f), ignoring re-anchor (%.7f,%.7f)",
+             session_anchor_.anchor_lat_rad * 180.0 / M_PI,
+             session_anchor_.anchor_lng_rad * 180.0 / M_PI,
+             lat_deg, lng_deg);
+        return;
+    }
+    session_anchor_.anchor_lat_rad = lat_deg * M_PI / 180.0;
+    session_anchor_.anchor_lng_rad = lng_deg * M_PI / 180.0;
+    session_anchor_.anchor_t_ns    = t_ns;
+    session_anchor_.valid          = true;
+    navsight::eventCounters().vio_lla_anchor_set.fetch_add(1, std::memory_order_relaxed);
+    LOGI("VIO_LLA: SessionAnchor set lat=%.7f lng=%.7f t_ns=%lld",
+         lat_deg, lng_deg, static_cast<long long>(t_ns));
+}
+
+Tracker::VioLla Tracker::current_vio_lla() const {
+    // EARTH_RADIUS_M matches SnappedLatLng.distanceTo (RoadSnapper.kt:238) and
+    // Step K-search's forward projection, so the inverse/forward pair round-trips
+    // and distance math is consistent across the JNI boundary (no magic-number drift).
+    constexpr double EARTH_RADIUS_M = 6371000.0;
+
+    std::lock_guard<std::mutex> lock(pose_mutex_);
+    VioLla result;
+    result.t_ns = cur_frame_ts_ns_;
+
+    if (!session_anchor_.valid) {
+        const long long n = navsight::eventCounters().vio_lla_unanchored_reads.fetch_add(
+            1, std::memory_order_relaxed) + 1;
+        // Rate-limited falsifier: first read + every 64th thereafter (the read
+        // cadence is set by the Kotlin caller; no wall-clock dependency here).
+        if (n == 1 || (n % 64) == 0) {
+            LOGI("VIO_LLA: no SessionAnchor — matcher disabled (unanchored_reads=%lld)", n);
+        }
+        result.valid = false;
+        return result;
+    }
+
+    // Z-up ENU world: global_t_(0)=East, global_t_(1)=North, global_t_(2)=Up
+    // (verified Tracker.cpp:3682-3739). The matcher consumes the USER-FACING
+    // dot global_t_, NOT ekf_.getPosition()/p_G_ (project_visual_audit_2026_05_30).
+    double p_east_m  = 0.0;
+    double p_north_m = 0.0;
+    if (!global_t_.empty() && global_t_.rows >= 3 && global_t_.type() == CV_64F) {
+        p_east_m  = global_t_.at<double>(0);
+        p_north_m = global_t_.at<double>(1);
+    }
+
+    const double anchor_lat_rad = session_anchor_.anchor_lat_rad;
+    // Equirectangular inverse projection (city-scale adequate; exact inverse of
+    // Step K-search's forward (lat,lng)->local-metres). p_north -> lat, p_east -> lng.
+    result.lat_rad = anchor_lat_rad + p_north_m / EARTH_RADIUS_M;
+    result.lng_rad = session_anchor_.anchor_lng_rad +
+                     p_east_m / (EARTH_RADIUS_M * std::cos(anchor_lat_rad));
+    result.valid = true;
+
+    // var_xy_m2 = trace of the horizontal EKF position-covariance block
+    // (East var + North var), 0 before full init. Inlined (cannot call
+    // getPositionCovarianceXZ — it would re-lock the non-recursive pose_mutex_).
+    if (ekf_.isFullInitialized()) {
+        cv::Mat P = ekf_.getCovariance();
+        if (!P.empty() && P.rows >= 15 && P.cols >= 15 && P.type() == CV_64F) {
+            result.var_xy_m2 = P.at<double>(12, 12) + P.at<double>(13, 13);
+        }
+    }
+    return result;
+}
+
 void Tracker::addImuData(int64_t ts, float ax, float ay, float az, float gx, float gy, float gz) {
     if (!initialized_) {
         initializer_.addImuData(ts, ax, ay, az, gx, gy, gz);

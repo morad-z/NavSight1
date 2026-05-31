@@ -229,6 +229,37 @@ public:
     // yet fully initialized; out-array is then filled with zeros.
     bool getPositionCovarianceXZ(double out[3]) const;
 
+    // ── Map-matching Step B* (MAP_MATCHING_PLAN.md §8M) — VIO→lat/lng ─────────
+    //
+    // Read-only projection of the user-facing position dot to geographic
+    // (lat,lng) for the Kotlin map-matching layer. Two methods, both additive
+    // and read-only on the EKF (the ONLY engine touch the osm-migration branch
+    // makes; §0.0 rule 2). One bootstrap GPS fix sets the SessionAnchor
+    // (allowed by ADR-004); thereafter every position is derived purely from
+    // VIO — no raw GPS sample ever feeds the EKF or the matcher.
+    //
+    // SOURCE DECISION (binding): the projection reads the user-facing
+    // `global_t_` (the dot the user sees), NOT `ekf_.getPosition()` / p_G_.
+    // The plan body text said getPosition(), but project_visual_audit_2026_05_30
+    // established the displayed dot IS global_t_ and that p_G_ over-reads
+    // ~1.4–2× — so the matcher must consume global_t_ to snap what's on screen.
+    struct VioLla {
+        double  lat_rad{0.0};    // VIO-projected latitude  (radians)
+        double  lng_rad{0.0};    // VIO-projected longitude (radians)
+        int64_t t_ns{0};         // EKF/Tracker state timestamp
+        double  var_xy_m2{0.0};  // EKF horizontal position-covariance trace (East+North), m²
+        bool    valid{false};    // false => no SessionAnchor yet; matcher must silent-disable
+    };
+
+    // Set the one-shot session anchor from the first valid bootstrap GPS fix.
+    // Idempotent: a second call is logged + ignored (re-anchoring mid-session
+    // would teleport the whole track). Thread: called from the JNI/Kotlin side.
+    void setSessionAnchor(double lat_deg, double lng_deg, int64_t t_ns);
+
+    // Project the current user-facing position to (lat,lng). Returns valid=false
+    // (and increments vio_lla_unanchored_reads) until a SessionAnchor exists.
+    VioLla current_vio_lla() const;
+
     // ── Plan Step 7 (ADR-013): same-session loop closure (DBoW2) ──────────────
     //
     // Push the absolute on-device path of the ORB DBoW2 vocabulary into the
@@ -368,6 +399,17 @@ private:
                          // authoritative for position. global_t_ is now a
                          // read mirror refreshed by §11.9 in processFrame.
                          // (2026-05-16 Fix A)
+
+    // Map-matching Step B* (MAP_MATCHING_PLAN.md §8M) — one-shot session anchor.
+    // Set exactly once from a bootstrap GPS fix (ADR-004), never mutated after.
+    // Read-only consumer of global_t_; does not affect any VIO state.
+    struct SessionAnchor {
+        double  anchor_lat_rad{0.0};
+        double  anchor_lng_rad{0.0};
+        int64_t anchor_t_ns{0};
+        bool    valid{false};
+    };
+    SessionAnchor session_anchor_;
 
     double fx_{0.}, fy_{0.}, cx_{0.}, cy_{0.};
     // Step 8c: row read-out time skew from Camera2 SENSOR_ROLLING_SHUTTER_SKEW.

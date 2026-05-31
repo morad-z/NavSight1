@@ -47,7 +47,7 @@ fun NavigationInstructionBanner(
             Spacer(Modifier.width(12.dp))
             Column(Modifier.weight(1f)) {
                 Text(
-                    instruction.streetName ?: "Continue", color = pal.textPrimary,
+                    instruction.title(), color = pal.textPrimary,
                     fontWeight = FontWeight.Bold, fontSize = 17.sp,
                     maxLines = 1, overflow = TextOverflow.Ellipsis
                 )

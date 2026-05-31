@@ -64,7 +64,7 @@ fun DebugPanel(
 
             HorizontalDivider(color = pal.teal.copy(0.1f), thickness = 0.5.dp)
             DebugRow("Dist",    "${"%.2f".format(totalDistanceM)} m", pal.teal, pal)
-            DebugRow("Speed",   "${"%.2f".format(speedMs)} m/s",       pal.teal, pal)
+            DebugRow("Speed",   "${"%.1f".format(speedMs * 3.6f)} km/h", pal.teal, pal)
             DebugRow("Quality", "${"%.0f".format(qualityPct)}%",
                 when { qualityPct > 70f -> pal.teal; qualityPct > 30f -> pal.orange; else -> Color(0xFFEF5350) }, pal)
             DebugRow("Mode",    fusionMode,

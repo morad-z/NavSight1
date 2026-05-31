@@ -1,0 +1,28 @@
+{
+  "schema_version": 1,
+  "bbox": [
+    34.94,
+    32.74,
+    35.1,
+    32.86
+  ],
+  "search_bbox": [
+    34.2,
+    29.45,
+    35.95,
+    33.45
+  ],
+  "upstream_pbf_date": "2026-05-30",
+  "upstream_pbf_sha": "b79032dc9a383abb",
+  "source": "overpass-api",
+  "built_at": "2026-05-30T17:58:43Z",
+  "segment_count": 101174,
+  "vertex_count": 92653,
+  "edge_count": 101174,
+  "place_count": 254790,
+  "blob_sizes": {
+    "segments": 5697390,
+    "graph": 3607118,
+    "geocode": 16647785
+  }
+}

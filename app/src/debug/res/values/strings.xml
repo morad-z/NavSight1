@@ -1,0 +1,9 @@
+<?xml version="1.0" encoding="utf-8"?>
+<!-- Debug-only override (OSM-migration branch). Overrides app_name for the debug
+     build so this branch's app ("NavSight OSM", package com.example.navsight1.osm)
+     is distinguishable in the launcher from the speed-branch app ("NavSight1",
+     package com.example.navsight1). Build-type source-set resources override the
+     main source set without a duplicate-resource error. -->
+<resources>
+    <string name="app_name">NavSight OSM</string>
+</resources>

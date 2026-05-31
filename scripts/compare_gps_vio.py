@@ -181,6 +181,36 @@ def main():
               + (f"   {mm_path / gps_path:.3f}x" if gps_path > 0 else ""))
     print()
 
+    # MAP-MATCHER DIAGNOSTICS (recorded per sample so they survive offline — §0.9):
+    # k_map = d_route/d_vio (scale observation, read-only), mm_src (which matcher made the
+    # dot), maneuver (FREE_ROAD / ON_ROUNDABOUT / MID_ROAD_UTURN). All optional fields.
+    from collections import Counter
+    kmaps = [p["k_map"] for p in pts if p.get("k_map") is not None]
+    srcs = [p["mm_src"] for p in pts if p.get("mm_src")]
+    mvrs = [p["maneuver"] for p in pts if p.get("maneuver")]
+    if kmaps or srcs or mvrs:
+        print("MAP-MATCHER DIAGNOSTICS (recorded per sample — survives offline):")
+        if kmaps:
+            ks = sorted(kmaps)
+            med = ks[len(ks) // 2]
+            mean = sum(ks) / len(ks)
+            print(f"  K_map = d_route/d_vio : n={len(ks)}  mean={mean:.3f}  median={med:.3f}"
+                  f"  min={ks[0]:.3f}  max={ks[-1]:.3f}")
+            if med > 0:
+                pct = abs(1 - 1 / med) * 100
+                sense = "under" if med > 1 else "over"
+                print(f"     -> VIO reads ~{1/med:.2f}x of road truth ({sense}-reads ~{pct:.0f}%)"
+                      f"   [map-derived scale; read-only, not fed to the engine]")
+        if srcs:
+            tot = len(srcs)
+            cov = "  ".join(f"{k}={v} ({100*v/tot:.0f}%)" for k, v in Counter(srcs).most_common())
+            print(f"  dot source            : {cov}")
+        if mvrs:
+            states = "  ".join(f"{k}={v}" for k, v in Counter(mvrs).items())
+            events = sum(1 for i in range(1, len(mvrs)) if mvrs[i] != mvrs[i - 1])
+            print(f"  maneuver states       : {states}   (transitions/events={events})")
+        print()
+
     # OUT-AND-BACK / 1 km GOAL: 500 m forward + back = ~1 km, target ≤5% drift. On an out-and-back the
     # cleanest drift metric is "endpoint return" — how far the end point lands from the start (ideally 0).
     # 5% of a 1 km ride = 50 m. Denominator = GPS path (the measured truth).

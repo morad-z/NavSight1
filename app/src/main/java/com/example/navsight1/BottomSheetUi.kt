@@ -28,27 +28,16 @@ fun BottomSheet(
     navState: NavigationState,
     isNight: Boolean,
     cameraVisible: Boolean,
-    isRecordingGpx: Boolean,
-    debugVisible: Boolean,
-    speedKmh: Float,
     totalM: Double,
-    compassLabel: String,
     isMoving: Boolean,
-    fusionMode: String,
-    vioInitialized: Boolean,
-    incidents: List<IncidentCardModel>,
-    expanded: Boolean,
-    onCameraClick: () -> Unit,
-    onGpxClick: () -> Unit,
-    onDebugClick: () -> Unit,
+    onMapClick: () -> Unit,
     onResetClick: () -> Unit,
     onStopNavClick: () -> Unit,
-    onNightToggle: () -> Unit,
-    onToggleExpanded: () -> Unit
+    onNightToggle: () -> Unit
 ) {
     Column(modifier.fillMaxWidth().navigationBarsPadding()) {
 
-        // ETA banner — slides up when navigating
+        // ETA banner — slides up when navigating (kept; the "End" action lives here).
         AnimatedVisibility(
             navState is NavigationState.Active,
             enter = slideInVertically { it } + fadeIn(tween(220)),
@@ -84,93 +73,56 @@ fun BottomSheet(
             }
         }
 
-        // Expandable panel
-        AnimatedVisibility(
-            visible = expanded,
-            enter = slideInVertically(tween(90)) { it / 3 } + fadeIn(tween(90)),
-            exit  = slideOutVertically(tween(70)) { it / 3 } + fadeOut(tween(70))
-        ) {
-                Surface(
-                    modifier        = Modifier.fillMaxWidth().padding(horizontal = 10.dp, vertical = 6.dp),
-                    color           = Color.White,
-                    shape           = RoundedCornerShape(30.dp),
-                    shadowElevation = 20.dp
-                ) {
-                    Column(Modifier.fillMaxWidth().padding(horizontal = 14.dp, vertical = 12.dp)) {
-                        SheetHandleRow(expanded, speedKmh, compassLabel, onToggleExpanded)
-                        Spacer(Modifier.height(10.dp))
-                        Text("Nearest incidents", color = LightText, fontSize = 18.sp, fontWeight = FontWeight.Bold)
-                        Spacer(Modifier.height(12.dp))
-                        incidents.forEachIndexed { idx, incident ->
-                            IncidentCard(incident)
-                            if (idx != incidents.lastIndex) Spacer(Modifier.height(10.dp))
-                        }
-                        Spacer(Modifier.height(12.dp))
-                        Surface(color = SoftSurface, shape = RoundedCornerShape(20.dp), border = BorderStroke(1.dp, SoftBorder)) {
-                            Column(Modifier.padding(horizontal = 12.dp, vertical = 10.dp)) {
-                                Row(Modifier.fillMaxWidth(), Arrangement.SpaceBetween, Alignment.CenterVertically) {
-                                    StatPill("${"%.0f".format(speedKmh)}", "km/h", HeroPurple)
-                                    StatPill("${"%.0f".format(totalM)}", "meters", pal.orange)
-                                    StatPill(compassLabel, "heading", Color(0xFF4B7BEC))
-                                    StatPill(
-                                        if (vioInitialized) fusionMode else "INIT",
-                                        if (isMoving) "tracking" else "standby",
-                                        if (vioInitialized) pal.teal else Color(0xFF9E9E9E)
-                                    )
-                                }
-                                Spacer(Modifier.height(8.dp))
-                                Row(Modifier.fillMaxWidth(), horizontalArrangement = Arrangement.spacedBy(6.dp)) {
-                                    TabBtn(
-                                        icon = Icons.Default.PhotoCamera,
-                                        label = if (cameraVisible) "Map" else "Camera",
-                                        tint = Color.White, bgColor = HeroPurple, isPrimary = true,
-                                        modifier = Modifier.weight(1f), onClick = onCameraClick
-                                    )
-                                    TabBtn(
-                                        icon  = if (isNight) Icons.Default.LightMode else Icons.Default.DarkMode,
-                                        label = if (isNight) "Day" else "Night",
-                                        tint  = if (isNight) Orange400 else pal.textSecondary,
-                                        modifier = Modifier.weight(1f), onClick = onNightToggle
-                                    )
-                                    TabBtn(
-                                        icon = Icons.Default.Tune, label = "Debug",
-                                        tint = if (debugVisible) pal.teal else pal.textSecondary,
-                                        isActive = debugVisible, modifier = Modifier.weight(1f), onClick = onDebugClick
-                                    )
-                                    if (navState is NavigationState.Active) {
-                                        TabBtn(icon = Icons.Default.Close, label = "End",
-                                            tint = Color.White, bgColor = Color(0xFFEF5350),
-                                            modifier = Modifier.weight(1f), onClick = onStopNavClick)
-                                    } else {
-                                        TabBtn(
-                                            icon  = if (vioInitialized) Icons.Default.Sensors else Icons.Default.HourglassEmpty,
-                                            label = if (vioInitialized) "Live" else "Waiting",
-                                            tint  = if (vioInitialized) pal.teal else pal.textSecondary,
-                                            modifier = Modifier.weight(1f), onClick = onDebugClick
-                                        )
-                                    }
-                                }
-                            }
-                        }
-                    }
-                }
-        }
-        // Bottom nav bar
+        // Slim action bar. Everything redundant was removed: speed/heading/mode live in the
+        // hero header, camera/debug/calibrate live in the side action stack. This bar keeps
+        // only what is unique + useful: the live distance tracked, and the Reset / Night / (Map)
+        // actions. (GPX recording + the fake "incidents" panel were dropped as unused.)
         Surface(color = Color.White, shadowElevation = 14.dp) {
             Row(
-                Modifier.fillMaxWidth().padding(horizontal = 6.dp, vertical = 6.dp),
-                horizontalArrangement = Arrangement.SpaceAround,
+                Modifier.fillMaxWidth().padding(horizontal = 18.dp, vertical = 9.dp),
+                horizontalArrangement = Arrangement.SpaceBetween,
                 verticalAlignment     = Alignment.CenterVertically
             ) {
-                BottomNavItem(Icons.Default.Map, "Map", !expanded) {
-                    if (expanded) onToggleExpanded()
-                    if (cameraVisible) onCameraClick()
+                // LEFT — the one live stat not shown elsewhere: distance tracked.
+                Row(verticalAlignment = Alignment.CenterVertically, horizontalArrangement = Arrangement.spacedBy(9.dp)) {
+                    Box(Modifier.size(8.dp).clip(CircleShape)
+                        .background(if (isMoving) pal.teal else Color(0xFFB7B7C2)))
+                    Column {
+                        Text("${"%.0f".format(totalM)} m", color = LightText,
+                            fontSize = 18.sp, fontWeight = FontWeight.ExtraBold, lineHeight = 19.sp)
+                        Text(if (isMoving) "tracking live" else "distance tracked",
+                            color = Color(0xFF9E9EAC), fontSize = 9.sp)
+                    }
                 }
-                BottomNavItem(Icons.Default.Warning, "Warnings", expanded, onToggleExpanded)
-                BottomNavItem(Icons.Default.Refresh, "Rides", false, onResetClick)
-                BottomNavItem(Icons.Default.FiberManualRecord, "Records", isRecordingGpx, onGpxClick)
+                // RIGHT — the genuinely useful actions.
+                Row(horizontalArrangement = Arrangement.spacedBy(10.dp), verticalAlignment = Alignment.CenterVertically) {
+                    if (cameraVisible) FooterAction(Icons.Default.Map, "Map", pal.teal, onMapClick)
+                    FooterAction(Icons.Default.Refresh, "Reset", HeroPurple, onResetClick)
+                    FooterAction(
+                        if (isNight) Icons.Default.LightMode else Icons.Default.DarkMode,
+                        if (isNight) "Day" else "Night",
+                        if (isNight) Orange400 else Color(0xFF6B6B7B), onNightToggle
+                    )
+                }
             }
         }
+    }
+}
+
+/** A clean footer action: stacked icon + label, tappable, tinted by intent. */
+@Composable
+fun FooterAction(
+    icon: androidx.compose.ui.graphics.vector.ImageVector,
+    label: String, accent: Color, onClick: () -> Unit
+) {
+    Column(
+        Modifier.clip(RoundedCornerShape(14.dp)).clickable { onClick() }
+            .padding(horizontal = 12.dp, vertical = 3.dp),
+        horizontalAlignment = Alignment.CenterHorizontally
+    ) {
+        Icon(icon, label, tint = accent, modifier = Modifier.size(22.dp))
+        Spacer(Modifier.height(1.dp))
+        Text(label, color = accent, fontSize = 9.sp, fontWeight = FontWeight.SemiBold)
     }
 }
 

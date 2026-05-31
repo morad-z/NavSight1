@@ -3,6 +3,8 @@ package com.example.navsight1
 import androidx.compose.animation.*
 import androidx.compose.animation.core.tween
 import androidx.compose.foundation.BorderStroke
+import androidx.compose.foundation.border
+import androidx.compose.ui.draw.clip
 import androidx.compose.foundation.Canvas
 import androidx.compose.foundation.background
 import androidx.compose.foundation.layout.*
@@ -28,8 +30,10 @@ import com.google.android.gms.maps.model.BitmapDescriptorFactory
 import com.google.android.gms.maps.model.CameraPosition
 import com.google.android.gms.maps.model.LatLng
 import com.google.maps.android.compose.*
+import kotlinx.coroutines.CancellationException
 import kotlinx.coroutines.Dispatchers
 import kotlinx.coroutines.delay
+import kotlinx.coroutines.isActive
 import kotlinx.coroutines.launch
 import kotlin.math.*
 
@@ -48,18 +52,17 @@ fun MainScreen(viewModel: NavSightViewModel, pal: NavPalette, isNight: Boolean, 
     val isMoving        = vio.isInitialized && vio.meanFlow > 1.0
 
     var cameraVisible       by remember { mutableStateOf(false) }
-    var isRecordingGpx      by remember { mutableStateOf(false) }
-    var gpxPoints           by remember { mutableStateOf<List<Pair<Double, Double>>>(emptyList()) }
-    var gpxMessage          by remember { mutableStateOf<String?>(null) }
     var debugVisible        by remember { mutableStateOf(false) }
     var calibrationVisible  by remember { mutableStateOf(false) }
     // 2026-05-17 — Allan-variance IMU recorder overlay. Standalone, does not
     // run VIO/camera/GPS. Long-running (1-2 hours) for noise characterization.
     var imuCalibrationVisible by remember { mutableStateOf(false) }
-    var bottomSheetExpanded by rememberSaveable { mutableStateOf(false) }
-    val scope               = rememberCoroutineScope()
+    // Camera-follow state, hoisted out of NavigationMapWrapper so the recenter button can
+    // live in the top overlay layer (it was inside the map layer, hidden under the sheet).
+    var isFollowing         by remember { mutableStateOf(true) }
     val context             = LocalContext.current
-    val lowerOverlayPadding = if (bottomSheetExpanded) 260.dp else 88.dp
+    // Slim footer (no expandable panel) → constant padding for the side overlays.
+    val lowerOverlayPadding = 88.dp
 
     val compassLabel = when {
         fusedHeading < 22.5f || fusedHeading >= 337.5f -> "N"
@@ -76,12 +79,6 @@ fun MainScreen(viewModel: NavSightViewModel, pal: NavPalette, isNight: Boolean, 
         vio.trackingQuality < 0.3 -> "IMU"
         vio.trackingQuality > 0.7 -> "CAMERA"
         else                      -> "HYBRID"
-    }
-    val qualityLevel = when { vio.trackingQuality < 0.3 -> 0; vio.trackingQuality < 0.7 -> 1; else -> 2 }
-    val speedBucket  = (viewModel.currentSpeedKmh / 5f).toInt()
-    val incidentItems = remember(navState, vio.isInitialized, qualityLevel, isMoving, speedBucket) {
-        buildIncidentCards(navState, isMoving, viewModel.currentSpeedKmh,
-            viewModel.totalDistanceM, vio.trackingQuality.toFloat(), vio.isInitialized)
     }
 
     Box(Modifier.fillMaxSize().background(pal.bg)) {
@@ -135,6 +132,7 @@ fun MainScreen(viewModel: NavSightViewModel, pal: NavPalette, isNight: Boolean, 
             } else {
                 NavigationMapWrapper(
                     mapStart, fusedHeading, historySnapshot, pal, viewModel,
+                    isFollowing, { isFollowing = it },
                     Modifier.fillMaxSize()
                 )
             }
@@ -210,7 +208,7 @@ fun MainScreen(viewModel: NavSightViewModel, pal: NavPalette, isNight: Boolean, 
                     }
                 }
                 AnimatedVisibility(navState is NavigationState.Idle, enter = fadeIn(), exit = fadeOut()) {
-                    SearchBarCard(pal, viewModel.startLocation, viewModel.placesClient) { dest -> viewModel.startNavigation(dest) }
+                    SearchBarCard(pal, viewModel.startLocation, viewModel.offlineGeocoder) { dest -> viewModel.startNavigation(dest) }
                 }
                 viewModel.navigationStartMessage?.let { msg ->
                     Spacer(Modifier.height(8.dp))
@@ -230,29 +228,8 @@ fun MainScreen(viewModel: NavSightViewModel, pal: NavPalette, isNight: Boolean, 
                 MapActionStack(pal,
                     onCameraClick  = { cameraVisible = true },
                     onDebugClick   = { debugVisible = !debugVisible },
-                    onExpandSheet  = { bottomSheetExpanded = !bottomSheetExpanded },
                     onCalibrateClick = { calibrationVisible = true }
                 )
-            }
-
-            SpeedLimitBadge(
-                modifier = Modifier.align(Alignment.BottomStart)
-                    .padding(start = 10.dp, bottom = lowerOverlayPadding + 42.dp),
-                speedKmh = viewModel.currentSpeedKmh, pal = pal
-            )
-
-            if (isRecordingGpx) {
-                Box(Modifier.align(Alignment.TopCenter).statusBarsPadding().padding(top = 80.dp)) { RecordingPill(pal) }
-                val displayPos = viewModel.snappedPosition
-                    ?: mapStart?.let { NavSightUtils.metersToLatLng(it, viewModel.virtualX, viewModel.virtualZ) }
-                displayPos?.let { pos ->
-                    LaunchedEffect(pos) { gpxPoints = gpxPoints + Pair(pos.latitude, pos.longitude) }
-                }
-            }
-
-            gpxMessage?.let { msg ->
-                LaunchedEffect(msg) { delay(3000); gpxMessage = null }
-                Box(Modifier.align(Alignment.TopCenter).statusBarsPadding().padding(top = 80.dp)) { WazeToast(msg, pal) }
             }
 
             AnimatedVisibility(debugVisible,
@@ -265,32 +242,31 @@ fun MainScreen(viewModel: NavSightViewModel, pal: NavPalette, isNight: Boolean, 
         }
 
         BottomSheet(
-            modifier        = Modifier.align(Alignment.BottomCenter),
-            pal             = pal,
-            navState        = navState,
-            isNight         = isNight,
-            cameraVisible   = cameraVisible,
-            isRecordingGpx  = isRecordingGpx,
-            debugVisible    = debugVisible,
-            speedKmh        = viewModel.currentSpeedKmh,
-            totalM          = viewModel.totalDistanceM,
-            compassLabel    = compassLabel,
-            isMoving        = isMoving,
-            fusionMode      = fusionMode,
-            vioInitialized  = vio.isInitialized,
-            incidents       = incidentItems,
-            expanded        = bottomSheetExpanded,
-            onCameraClick   = { cameraVisible = !cameraVisible },
-            onGpxClick      = {
-                if (!isRecordingGpx) { isRecordingGpx = true; gpxPoints = emptyList(); gpxMessage = "Recording…" }
-                else { isRecordingGpx = false; scope.launch(Dispatchers.IO) { gpxMessage = saveGpxFile(context, gpxPoints) } }
-            },
-            onDebugClick    = { debugVisible = !debugVisible },
-            onResetClick    = { viewModel.resetAll() },
-            onStopNavClick  = { viewModel.stopNavigation() },
-            onNightToggle   = onToggleNight,
-            onToggleExpanded = { bottomSheetExpanded = !bottomSheetExpanded }
+            modifier       = Modifier.align(Alignment.BottomCenter),
+            pal            = pal,
+            navState       = navState,
+            isNight        = isNight,
+            cameraVisible  = cameraVisible,
+            totalM         = viewModel.totalDistanceM,
+            isMoving       = isMoving,
+            onMapClick     = { if (cameraVisible) cameraVisible = false },
+            onResetClick   = { viewModel.resetAll() },
+            onStopNavClick = { viewModel.stopNavigation() },
+            onNightToggle  = onToggleNight
         )
+
+        // Recenter button — drawn AFTER the bottom sheet (so it's on top, not hidden under
+        // it) and positioned just above the sheet. Only shown when the map view is active
+        // and the user has panned away (camera not following). Tapping re-engages follow.
+        if (!cameraVisible && !isFollowing) {
+            FloatingActionButton(
+                onClick        = { isFollowing = true },
+                modifier       = Modifier.align(Alignment.BottomEnd)
+                    .padding(end = 14.dp, bottom = lowerOverlayPadding + 12.dp).size(52.dp),
+                containerColor = pal.card, contentColor = pal.teal,
+                elevation      = FloatingActionButtonDefaults.elevation(8.dp)
+            ) { Icon(Icons.Default.MyLocation, "Recenter", modifier = Modifier.size(26.dp)) }
+        }
 
         // Step 1 (Visual plan): full-screen camera calibration overlay.
         AnimatedVisibility(
@@ -354,7 +330,9 @@ fun MainScreen(viewModel: NavSightViewModel, pal: NavPalette, isNight: Boolean, 
 fun NavigationMapWrapper(
     start: LatLng, azimuth: Float,
     history: List<PathPoint>, pal: NavPalette,
-    viewModel: NavSightViewModel, modifier: Modifier = Modifier
+    viewModel: NavSightViewModel,
+    isFollowing: Boolean, onFollowingChange: (Boolean) -> Unit,
+    modifier: Modifier = Modifier
 ) {
     val navState   = viewModel.navigationState
     val displayPos = viewModel.snappedPosition
@@ -366,7 +344,9 @@ fun NavigationMapWrapper(
     val cameraState = rememberCameraPositionState {
         position = CameraPosition.Builder().target(displayPos).zoom(targetZoom).bearing(azimuth).tilt(targetTilt).build()
     }
-    var isFollowing by remember { mutableStateOf(true) }
+    // isFollowing is hoisted (the recenter button lives in the parent overlay). Read it
+    // through rememberUpdatedState so the long-lived follow loop below sees live updates.
+    val followingState by rememberUpdatedState(isFollowing)
     val curPos  by rememberUpdatedState(displayPos)
     val curAzi  by rememberUpdatedState(azimuth)
     val curZoom by rememberUpdatedState(targetZoom)
@@ -375,31 +355,39 @@ fun NavigationMapWrapper(
     LaunchedEffect(cameraState.isMoving) {
         if (cameraState.isMoving &&
             cameraState.cameraMoveStartedReason == CameraMoveStartedReason.GESTURE)
-            isFollowing = false
+            onFollowingChange(false)
     }
     LaunchedEffect(Unit) {
         var lastBearing = azimuth
         while (true) {
             val bearingChanged = kotlin.math.abs(((curAzi - lastBearing + 540f) % 360f) - 180f) > 1.5f
-            if (isFollowing) {
-                cameraState.animate(com.google.android.gms.maps.CameraUpdateFactory.newCameraPosition(
-                    CameraPosition.Builder().target(curPos).zoom(curZoom).bearing(curAzi).tilt(curTilt).build()), 350)
-                lastBearing = curAzi; delay(400L)
-            } else {
-                if (bearingChanged) {
+            try {
+                if (followingState) {
+                    cameraState.animate(com.google.android.gms.maps.CameraUpdateFactory.newCameraPosition(
+                        CameraPosition.Builder().target(curPos).zoom(curZoom).bearing(curAzi).tilt(curTilt).build()), 350)
+                    lastBearing = curAzi
+                } else if (bearingChanged) {
                     cameraState.animate(com.google.android.gms.maps.CameraUpdateFactory.newCameraPosition(
                         CameraPosition.Builder().target(cameraState.position.target)
                             .zoom(cameraState.position.zoom).bearing(curAzi).tilt(cameraState.position.tilt).build()), 180)
                     lastBearing = curAzi
                 }
-                delay(160L)
+            } catch (e: CancellationException) {
+                // A user touch/gesture interrupts the in-flight camera animation (maps-compose
+                // throws CancellationException here). That must NOT kill the follow loop —
+                // otherwise the map permanently stops following/rotating and recenter can't
+                // revive it. Re-throw ONLY on a real scope cancellation (effect leaving).
+                if (!isActive) throw e
             }
+            delay(if (followingState) 400L else 160L)
         }
     }
 
     var mapPos      by remember { mutableStateOf(displayPos) }
     var mapAzi      by remember { mutableStateOf(azimuth) }
     var mapPath     by remember { mutableStateOf<List<LatLng>>(emptyList()) }
+    // Tier-1 #3: the OSRM-matched ROAD polyline (on-road geometry the dot sits on).
+    var mapMatched  by remember { mutableStateOf<List<LatLng>>(emptyList()) }
     var lastOverlay by remember { mutableStateOf(0L) }
 
     LaunchedEffect(displayPos, azimuth, history.size) {
@@ -408,6 +396,7 @@ fun NavigationMapWrapper(
         if (now - lastOverlay >= interval || navState is NavigationState.Routing) {
             lastOverlay = now; mapPos = displayPos; mapAzi = azimuth
             mapPath = history.map { NavSightUtils.metersToLatLng(start, it.x.toDouble(), it.z.toDouble()) }
+            mapMatched = viewModel.matchedRoadPath
         }
     }
 
@@ -418,7 +407,10 @@ fun NavigationMapWrapper(
             properties          = MapProperties(mapType = MapType.NORMAL, isMyLocationEnabled = false),
             uiSettings          = MapUiSettings(zoomControlsEnabled = false, compassEnabled = false,
                 myLocationButtonEnabled = false, zoomGesturesEnabled = true, scrollGesturesEnabled = true,
-                tiltGesturesEnabled = true, rotationGesturesEnabled = true)
+                tiltGesturesEnabled = true, rotationGesturesEnabled = true),
+            // Long-press to relocate the start/origin pin — the dot + path + matcher
+            // reproject from the chosen point (NavSightViewModel.setStartLocation).
+            onMapLongClick      = { latLng -> viewModel.overrideStartLocation(latLng) }
         ) {
             val arrowIcon = remember { NavSightUtils.vectorToBitmap(context, R.drawable.navigation_arrow) }
             val startIcon = remember { BitmapDescriptorFactory.defaultMarker(BitmapDescriptorFactory.HUE_AZURE) }
@@ -427,6 +419,9 @@ fun NavigationMapWrapper(
                 Marker(state = MarkerState(navState.route.destination), title = "Destination")
             }
             if (mapPath.isNotEmpty()) Polyline(points = mapPath, color = pal.orange.copy(0.8f), width = 7f, zIndex = 5f)
+            // Tier-1 #3: the matched ROAD polyline (green, on top of the raw orange trail)
+            // — the road the matcher placed the dot on. Empty when on the per-point fallback.
+            if (mapMatched.size >= 2) Polyline(points = mapMatched, color = Color(0xFF2ECC71), width = 9f, zIndex = 6f)
             // Step 6 (Task #29): 1σ horizontal-plane uncertainty ring around the user.
             // Radius is the sigma reported by the EKF, clamped to [0.5 m, 25 m] so the
             // overlay stays visible without dominating the screen during a degraded run.
@@ -447,16 +442,10 @@ fun NavigationMapWrapper(
                 )
             }
             Marker(state = MarkerState(mapPos), rotation = mapAzi, flat = true, anchor = Offset(0.5f, 0.5f), icon = arrowIcon)
-            Marker(state = MarkerState(start), title = "Start", icon = startIcon)
+            Marker(state = MarkerState(start), title = "Start", icon = startIcon,
+                snippet = "Long-press the map to move me")
         }
-        if (!isFollowing) {
-            FloatingActionButton(
-                onClick        = { isFollowing = true },
-                modifier       = Modifier.align(Alignment.BottomEnd).padding(end = 14.dp, bottom = 105.dp).size(52.dp),
-                containerColor = pal.card, contentColor = pal.teal,
-                elevation      = FloatingActionButtonDefaults.elevation(6.dp)
-            ) { Icon(Icons.Default.Place, "Recenter", modifier = Modifier.size(26.dp)) }
-        }
+        // (Recenter FAB hoisted to the parent overlay so it isn't hidden under the sheet.)
     }
 }
 
@@ -544,24 +533,62 @@ fun SensorRadarWaze(history: List<PathPoint>, currentAzimuth: Float, pal: NavPal
 
 @Composable
 fun HeroHeader(speedKmh: Float, compassLabel: String, fusionMode: String, qualityPct: Float, pal: NavPalette) {
-    Surface(color = Color.Transparent, shape = RoundedCornerShape(18.dp)) {
-        Box(
-            Modifier.fillMaxWidth()
-                .background(Brush.verticalGradient(listOf(HeroPurple, HeroPurpleDark)), RoundedCornerShape(18.dp))
-                .padding(horizontal = 10.dp, vertical = 5.dp)
-        ) {
-            Row(Modifier.fillMaxWidth(), Arrangement.SpaceBetween, Alignment.CenterVertically) {
-                HeroMiniBadge(Icons.Default.Speed, "${qualityPct.toInt()}%", Color.White.copy(0.14f))
-                Row(verticalAlignment = Alignment.CenterVertically, horizontalArrangement = Arrangement.spacedBy(6.dp)) {
-                    SpeedLimitCore(speedKmh)
-                    Column(horizontalAlignment = Alignment.CenterHorizontally) {
-                        Text("Live drive", color = Color.White.copy(0.72f), fontSize = 7.sp)
-                        Text("${"%.0f".format(speedKmh)}", color = Color.White, fontSize = 18.sp,
-                            fontWeight = FontWeight.ExtraBold, lineHeight = 18.sp)
-                        Text("km/h", color = Color.White.copy(0.92f), fontSize = 7.sp)
-                    }
+    // Health colors: fusion mode + tracking quality drive the two accent dots so a glance
+    // reads "where am I heading / how fast / is tracking healthy" without parsing text.
+    val modeColor = when (fusionMode) {
+        "CAMERA" -> Teal500
+        "HYBRID" -> Orange400
+        "IMU", "INIT" -> Color(0xFFEF5350)
+        else     -> Color.White.copy(0.55f)
+    }
+    val qColor = when { qualityPct > 70f -> Teal500; qualityPct > 30f -> Orange400; else -> Color(0xFFEF5350) }
+    Box(
+        Modifier.fillMaxWidth()
+            .clip(RoundedCornerShape(22.dp))
+            .background(Brush.verticalGradient(listOf(HeroPurple, HeroPurpleDark)))
+            // Top highlight → soft bottom: a 1px gradient edge gives the bar real depth.
+            .border(
+                BorderStroke(1.dp, Brush.verticalGradient(
+                    listOf(Color.White.copy(0.22f), Color.White.copy(0.04f)))),
+                RoundedCornerShape(22.dp)
+            )
+            .padding(horizontal = 18.dp, vertical = 9.dp)
+    ) {
+        Row(Modifier.fillMaxWidth(), Arrangement.SpaceBetween, Alignment.CenterVertically) {
+            // LEFT — heading (the big glyph) + fusion mode dot
+            Column(horizontalAlignment = Alignment.Start) {
+                Text(compassLabel, color = Color.White, fontSize = 24.sp,
+                    fontWeight = FontWeight.Black, lineHeight = 24.sp)
+                Row(verticalAlignment = Alignment.CenterVertically,
+                    horizontalArrangement = Arrangement.spacedBy(4.dp),
+                    modifier = Modifier.padding(top = 3.dp)) {
+                    Box(Modifier.size(6.dp).clip(CircleShape).background(modeColor))
+                    Text(fusionMode, color = Color.White.copy(0.78f), fontSize = 9.sp,
+                        fontWeight = FontWeight.SemiBold, letterSpacing = 0.8.sp)
                 }
-                HeroMiniBadge(Icons.Default.Explore, "$compassLabel • $fusionMode", Color.White.copy(0.14f))
+            }
+            // CENTER — the hero: live speed paired with the speed-limit sign
+            Row(verticalAlignment = Alignment.CenterVertically,
+                horizontalArrangement = Arrangement.spacedBy(10.dp)) {
+                SpeedLimitCore(speedKmh)
+                Column(horizontalAlignment = Alignment.CenterHorizontally) {
+                    Text("${"%.0f".format(speedKmh)}", color = Color.White, fontSize = 38.sp,
+                        fontWeight = FontWeight.Black, lineHeight = 34.sp)
+                    Text("KM/H", color = Color.White.copy(0.6f), fontSize = 9.sp,
+                        letterSpacing = 3.sp, fontWeight = FontWeight.Bold)
+                }
+            }
+            // RIGHT — tracking-quality readout with a health dot
+            Column(horizontalAlignment = Alignment.End) {
+                Row(verticalAlignment = Alignment.CenterVertically,
+                    horizontalArrangement = Arrangement.spacedBy(4.dp)) {
+                    Box(Modifier.size(6.dp).clip(CircleShape).background(qColor))
+                    Text("${qualityPct.toInt()}%", color = Color.White, fontSize = 17.sp,
+                        fontWeight = FontWeight.ExtraBold, lineHeight = 17.sp)
+                }
+                Text("TRACK", color = Color.White.copy(0.5f), fontSize = 8.sp,
+                    letterSpacing = 1.5.sp, fontWeight = FontWeight.Bold,
+                    modifier = Modifier.padding(top = 1.dp))
             }
         }
     }
@@ -646,12 +673,10 @@ fun MapActionStack(
     pal: NavPalette,
     onCameraClick: () -> Unit,
     onDebugClick: () -> Unit,
-    onExpandSheet: () -> Unit,
     onCalibrateClick: () -> Unit = {},
 ) {
     Column(verticalArrangement = Arrangement.spacedBy(8.dp), horizontalAlignment = Alignment.CenterHorizontally) {
         FloatingMapButton(Icons.Default.PhotoCamera, onCameraClick)
-        FloatingMapButton(Icons.Default.Layers, onExpandSheet)
         FloatingMapButton(Icons.Default.CenterFocusStrong, onCalibrateClick)
         FloatingMapButton(Icons.Default.Tune, onDebugClick, Color.Black, Color.White)
     }
