@@ -274,7 +274,11 @@ class NavSightViewModel(application: Application) : AndroidViewModel(application
     // matches the recent VIO PATH to the road so the dot follows curves/roundabout
     // rings instead of "letting go" past the per-point soft-snap cap. Falls back to
     // [roadSnapper] (per-point) when offline / no match. Source logged on transition.
-    private val liveMatcher = LiveMatcher()
+    // Local on-device Viterbi map-matcher (the offline replacement for the OSRM /match URL —
+    // no network/rate-limits/coordinate-cap). LiveMatcher (OSRM) is kept for reference but no
+    // longer the dot source.
+    private val localMatcher = LocalMatcher()
+    @Suppress("unused") private val liveMatcher = LiveMatcher()
     @Volatile private var lastSnapSource = ""
     // Guards against overlapping snap coroutines while a /match HTTP call is in flight
     // (set/cleared on the Main collector thread + the IO finally).
@@ -615,7 +619,7 @@ class NavSightViewModel(application: Application) : AndroidViewModel(application
                     maneuverState = maneuver.state  // Compose state; collector is on Main
                     // Gate ONLY the network snap so /match coroutines never stack; the SM has
                     // already advanced this cycle regardless.
-                    if (!snapInFlight) launchNetworkSnap(start, currentLatLng, maneuver, nowMs)
+                    if (!snapInFlight) launchNetworkSnap(start, currentLatLng, region, maneuver, nowMs)
                 }
             }
         }
@@ -627,25 +631,23 @@ class NavSightViewModel(application: Application) : AndroidViewModel(application
      * its lifetime (cleared in finally). [maneuver] is the latest SM result (ring-pin for the
      * fallback); [nowMs] stamps the read-only K̂_map observation.
      */
-    private fun launchNetworkSnap(start: LatLng, currentLatLng: LatLng, maneuver: ManeuverResult, nowMs: Long) {
+    private fun launchNetworkSnap(start: LatLng, currentLatLng: LatLng, region: DynamicRoadRegion?, maneuver: ManeuverResult, nowMs: Long) {
         val recentPath = pathHistory.takeLast(10).map { p ->
             NavSightUtils.metersToLatLng(start, p.x.toDouble(), p.z.toDouble())
         }
-        // Step D — primary: OSRM /match on a subsampled trajectory window (the last ~150 frames
-        // ≈ 6 s of path). It snaps the PATH (not the point) to the road, so the dot follows
-        // curves/roundabouts and does not "let go" the way per-point snap does past SOFT_SNAP_MAX_M.
-        // HARD CAP at ≤9 points: the public OSRM demo /match rejects >10 trace coordinates with
-        // HTTP 400 "Too many trace coordinates" (measured 2026-05-31: N=10 OK, N=12 TooBig), which
-        // was making EVERY /match fail → permanent per-point fallback → off-road drift.
+        // Step D — primary: the LOCAL Viterbi matcher on a subsampled trajectory window (last
+        // ~150 frames ≈ 6 s of path). It map-matches the PATH (not the point) to the road, so
+        // the dot follows curves/roundabouts and does not "let go" the way per-point snap does.
+        // ~15 points (the on-device matcher has no coordinate cap — that was an OSRM-URL limit).
         val recent = pathHistory.takeLast(150)
-        val stride = maxOf(1, recent.size / 8)
-        val matchWindow = recent.filterIndexed { i, _ -> i % stride == 0 }.takeLast(8)
+        val stride = maxOf(1, recent.size / 14)
+        val matchWindow = recent.filterIndexed { i, _ -> i % stride == 0 }.takeLast(15)
             .map { p -> NavSightUtils.metersToLatLng(start, p.x.toDouble(), p.z.toDouble()) } + currentLatLng
         snapInFlight = true
         viewModelScope.launch(Dispatchers.IO) {
             try {
-                // Primary: trajectory map-match (geometry + confidence).
-                val matched = liveMatcher.match(matchWindow)
+                // Primary: on-device Viterbi map-match (geometry + confidence). No network.
+                val matched = localMatcher.match(matchWindow, region)
                 // #4 — confidence gating + break detection: only trust /match when it is
                 // confident and the trace was not split. Otherwise fall back to per-point snap.
                 val accept = matched != null &&
@@ -653,7 +655,7 @@ class NavSightViewModel(application: Application) : AndroidViewModel(application
                 val snapped: SnappedLatLng
                 val matchedPath: List<LatLng>
                 if (accept && matched != null) {
-                    snapped = SnappedLatLng(matched.matched.latitude, matched.matched.longitude, "osrm:match", null, true)
+                    snapped = SnappedLatLng(matched.matched.latitude, matched.matched.longitude, "local:match", null, true)
                     matchedPath = matched.matchedPath        // #3 — on-road geometry
                 } else {
                     snapped = roadSnapper.snapToRoad(currentLatLng, recentPath, maneuver)
@@ -661,7 +663,7 @@ class NavSightViewModel(application: Application) : AndroidViewModel(application
                     // flicker); only drop it when we are truly off any road.
                     matchedPath = if (snapped.isSnapped) matchedRoadPath else emptyList()
                 }
-                val srcLabel = if (accept) "osrm:match" else if (snapped.isSnapped) "snap" else "raw"
+                val srcLabel = if (accept) "local:match" else if (snapped.isSnapped) "snap" else "raw"
                 if (srcLabel != lastSnapSource) {
                     lastSnapSource = srcLabel
                     Log.i("LiveMatcher", "SNAP_SOURCE source=$srcLabel " +
