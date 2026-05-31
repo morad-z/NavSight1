@@ -778,6 +778,11 @@ void Tracker::reset() {
     accel_dist_accum_ = 0.0;
     visual_rel_dist_accum_ = 0.0;
     visual_rel_dist_loom_ = 0.0;   // 2026-05-29 — looming's separate accumulator
+    // 2026-05-31 — re-arm cold fast-converge each session. K itself is NOT reset (it
+    // persists across recordings, see note below), so the first accepted calib of a new
+    // session treats the persisted seed as uncalibrated and fast-converges to the live
+    // k_obs instead of crawling at α=0.05 (fixes the 0.68x cold-walk under-read).
+    cold_fast_converge_armed_ = false;
     // NOTE: expansion_scale_K_ (K_loom) is NOT reset here, same as midas_scale_K_:
     // both are slowly-varying scene scales persisted across resets/recordings.
     accel_drift_lp_ = cv::Vec3d(0.0, 0.0, 0.0);
@@ -1040,10 +1045,26 @@ double Tracker::getMidasScaleK() const {
 Tracker::GaitMode Tracker::classifyGait(const IMUPreintegrator& imu, double accel_speed) {
     const auto si = imu.getStepInfo();
     GaitMode cand;
-    if (si.time_since_last_step_s > 3.0 && accel_speed > 0.5) cand = GaitMode::VEHICLE;
-    else if (si.step_freq_hz > 2.7)                           cand = GaitMode::RUN;
-    else if (si.step_freq_hz >= 0.6)                          cand = GaitMode::WALK;
-    else                                                      cand = active_mode_;  // hold on cold/ambiguous
+    // 2026-05-31 (FIX B Part 2) — VEHICLE veto: also require ABSENCE of recent cadence
+    // (step_freq_hz < 0.6). A walk pause/turn freezes last_step_ns_ (detectStep gyro-gates
+    // step detection), so time_since_last_step_s climbs past 3 s while accel drift keeps
+    // accel_speed > 0.5 → walking gets mislabeled VEHICLE (val_2026_05_31_pm: 8/17 df
+    // calibs landed at gait=2 on walking-pace k_obs ~920-968, starving the WALK slot).
+    // 0.6 reuses the WALK floor below. Paired with the getStepInfo() staleness fix, a TRUE
+    // ride reports step_freq_hz=0 (<0.6) within MAX_STEP_PERIOD_S and STILL promotes to
+    // VEHICLE — a bare step-freq veto alone would pin a walk→ride in WALK forever.
+    // OLD: if (si.time_since_last_step_s > 3.0 && accel_speed > 0.5) cand = GaitMode::VEHICLE;
+    const bool vehicle_cand = (si.time_since_last_step_s > 3.0 && accel_speed > 0.5);
+    if (vehicle_cand && si.step_freq_hz < 0.6)               cand = GaitMode::VEHICLE;
+    else if (si.step_freq_hz > 2.7)                          cand = GaitMode::RUN;
+    else if (si.step_freq_hz >= 0.6)                         cand = GaitMode::WALK;
+    else                                                     cand = active_mode_;  // hold on cold/ambiguous
+    if (vehicle_cand && si.step_freq_hz >= 0.6) {  // VEHICLE candidate blocked by recent cadence
+        navsight::eventCounters().gait_vehicle_suppressed.fetch_add(1, std::memory_order_relaxed);
+        if (frame_counter_ % 30 == 0)
+            LOGI("GAIT_VEHICLE_SUPPRESS: tsls=%.2f step_freq=%.2f accel_spd=%.2f held=%d",
+                 si.time_since_last_step_s, si.step_freq_hz, accel_speed, static_cast<int>(active_mode_));
+    }
 
     // Hysteresis: only switch after kModeHoldFrames consecutive candidate frames.
     if (cand == active_mode_) { mode_hold_frames_ = 0; last_gait_frame_ = frame_counter_; return active_mode_; }
@@ -1318,6 +1339,22 @@ void Tracker::updateDepthFlowSpeed(const std::vector<cv::Point2f>& prev_ud,
                  k_obs, cur_k, visual_rel_dist_accum_, static_cast<int>(active_mode_));
         }
         if (std::isfinite(k_obs) && k_obs > 0.0 && !k_outlier) {
+            // 2026-05-31 (FIX A — cold fast-converge arm). A pure walk on a device with a
+            // STALE PERSISTED K (setMidasScaleK left cur_k>0) never hits onModeSwitch, so
+            // it crawls at kNormalAlpha and cannot reach the live k_obs in a short walk
+            // (val_2026_05_31_pm: 13m walk read 0.68x; K crawled 745->897 vs observed
+            // ~1340). Arm the EXISTING fast window ONCE per session at the first accepted
+            // calib so the persisted seed is treated like a slot seed. No new tunable
+            // (reuses kFastConvergeFrames); sits inside the !k_outlier guard so a
+            // degenerate k_obs still cannot arm. Heading-safe: only the EMA blend weight
+            // on midas_scale_K_ (a SPEED scale) changes — no rotation/azimuth state.
+            if (!cold_fast_converge_armed_ && cur_k > 0.0) {
+                mode_switch_fast_alpha_frames_ = kFastConvergeFrames;
+                cold_fast_converge_armed_ = true;
+                navsight::eventCounters().cold_fast_converge_armed.fetch_add(1, std::memory_order_relaxed);
+                LOGI("ACCEL_K_COLD_ARM[df]: cur_K=%.1f k_obs=%.1f gait=%d fast_frames=%d",
+                     cur_k, k_obs, static_cast<int>(active_mode_), mode_switch_fast_alpha_frames_);
+            }
             // 2026-05-30 (Scale fix Step 3) — fast-converge EMA for the first
             // kFastConvergeFrames after a mode switch (so the new slot leaves its
             // seed quickly); otherwise the steady-state α (== legacy 0.05). On a
@@ -1859,11 +1896,46 @@ VisionOutput Tracker::processFrame(const uint8_t* yuv_data, int width, int heigh
         // 10 m walked, velocity_clamped = 177. Pre-fix v22 walked 109 m at 1.1 %.
         // Restored: setPosition(global_t_) before propagateIMU. Proper long-term
         // fix is the audit's *alternative* (P_pp drift-rate floor) — separate work.
-        ekf_.setPosition(global_t_);
+        // 2026-05-31 — REPLAY-ONLY experiment gate (docs/MSCKF_PG_WIRING_VERDICT_
+        // 2026_05_31.md §4). Default (autonomous_pg_==false) → identical to the
+        // restored Tier-1 behaviour above: setPosition runs every frame and the
+        // device build is byte-for-byte unchanged. When the harness --autonomous-pg
+        // flag is set, this overwrite is SKIPPED so p_G_ propagates autonomously and
+        // the MSCKF/ZUPT updates are no longer wiped each frame — the A/B that
+        // measures whether those updates BOUND p_G_ or it drifts like v31. Line 1863
+        // propagateIMU is INTENTIONALLY left intact in both arms.
+        if (!autonomous_pg_) ekf_.setPosition(global_t_);
         ekf_.propagateIMU(imu_delta.deltaR, imu_delta.deltaV, imu_delta.deltaP,
                           imu_delta.dt, imu_delta.cov,
                           imu_delta.J_R_bg, imu_delta.J_V_bg, imu_delta.J_V_ba,
                           imu_delta.J_P_bg, imu_delta.J_P_ba);
+
+        // 2026-05-31 — REPLAY-ONLY read-only diagnostics for the autonomous-p_G_
+        // A/B (verdict §4). Gated on autonomous_pg_ so the device build emits
+        // nothing. Throttled ~every 30 frames. Three signals make the A/B
+        // measurable from logcat even if the CSV is post-processed:
+        //   * |p_G_| net displacement from the world origin (the drift magnitude),
+        //   * running max |p_G_ - global_t_| (how far the EKF diverges from the dot),
+        //   * |v_G_| (confirms ZUPT re-zeros velocity at stops — v31 failed here).
+        // Purely observational: no state is mutated.
+        if (autonomous_pg_) {
+            const cv::Mat p_ekf = ekf_.getPosition();
+            const cv::Mat v_ekf = ekf_.getVelocity();
+            if (!p_ekf.empty() && p_ekf.rows >= 3 && p_ekf.type() == CV_64F &&
+                !global_t_.empty() && global_t_.rows >= 3 &&
+                global_t_.type() == CV_64F) {
+                const double pg_norm = cv::norm(p_ekf);
+                const double div = cv::norm(p_ekf - global_t_);
+                if (div > autonomous_pg_max_div_m_) autonomous_pg_max_div_m_ = div;
+                const double vg_norm =
+                    (!v_ekf.empty() && v_ekf.rows >= 3 && v_ekf.type() == CV_64F)
+                        ? cv::norm(v_ekf) : std::nan("");
+                if ((frame_counter_ % 30) == 0) {
+                    LOGI("AUTONOMOUS_PG_DIAG: pG_disp_m=%.3f max_div_m=%.3f "
+                         "vG_mps=%.3f", pg_norm, autonomous_pg_max_div_m_, vg_norm);
+                }
+            }
+        }
 
         // 2026-05-16 — EKF→IMU gyro-bias feedback RE-ADDED at keyframe cadence.
         //
@@ -4522,8 +4594,10 @@ VisionOutput Tracker::processFrame(const uint8_t* yuv_data, int width, int heigh
                     const float u_img = static_cast<float>(obs_anchor.x * fx_use + cx_use);
                     const float v_img = static_cast<float>(obs_anchor.y * fy_use + cy_use);
                     double z_midas = 0.0;
-                    if (sampleMidasMetricDepth(u_img, v_img, z_midas) &&
-                        std::isfinite(z_midas) && z_midas > 0.05) {
+                    const bool sample_ok =
+                        sampleMidasMetricDepth(u_img, v_img, z_midas) &&
+                        std::isfinite(z_midas) && z_midas > 0.05;
+                    if (sample_ok) {
                         cv::Mat p_cam_midas = (cv::Mat_<double>(3, 1) <<
                             obs_anchor.x * z_midas, obs_anchor.y * z_midas, z_midas);
                         cv::Mat p_world_midas = R_anchor.t() * p_cam_midas + p_anchor;
@@ -4538,6 +4612,35 @@ VisionOutput Tracker::processFrame(const uint8_t* yuv_data, int width, int heigh
                             midas_rescued = true;
                             navsight::eventCounters().slam_promotions_seeded_with_midas
                                 .fetch_add(1, std::memory_order_relaxed);
+                        } else {
+                            // 2026-05-31 DIAG (verdict §3, failure mode (b)) — depth
+                            // sampled OK but the MiDaS-seeded point still re-projects
+                            // over the 1.5px gate (or < 2 clones survived). The depth
+                            // disagrees with the multi-clone geometry; the gate is
+                            // correctly rejecting it (NO loosening). Throttled: this
+                            // runs per-candidate (~24k/walk) — emit ~every 90 frames,
+                            // matching the per-candidate-loop throttle convention.
+                            navsight::eventCounters().slam_promo_midas_rescore_failed
+                                .fetch_add(1, std::memory_order_relaxed);
+                            if ((frame_counter_ % 90) == 0) {
+                                LOGI("SLAM_PROMOTE_MIDAS_DIAG: rescore_fail "
+                                     "z_midas=%.2f rms_midas=%.1fpx n=%d",
+                                     z_midas, rms_midas, n_midas);
+                            }
+                        }
+                    } else {
+                        // 2026-05-31 DIAG (verdict §3, failure mode (a)) —
+                        // sampleMidasMetricDepth returned false OR z_midas was
+                        // <= 0.05 / non-finite, so the rescue could not even
+                        // attempt. If this dominates the device walk, the MiDaS
+                        // sampler (depth map / pixel mapping / range) is the
+                        // bottleneck, not the triangulation geometry. Same 90-frame
+                        // throttle as above.
+                        navsight::eventCounters().slam_promo_midas_sample_failed
+                            .fetch_add(1, std::memory_order_relaxed);
+                        if ((frame_counter_ % 90) == 0) {
+                            LOGI("SLAM_PROMOTE_MIDAS_DIAG: sample_fail "
+                                 "u=%.0f v=%.0f z=%.3f", u_img, v_img, z_midas);
                         }
                     }
                 }
@@ -8460,6 +8563,20 @@ void Tracker::updateExpansionSpeed(const std::vector<cv::Point2f>& prev_ud,
                      k_obs, cur_k, visual_rel_dist_loom_, static_cast<int>(active_mode_));
             }
             if (std::isfinite(k_obs) && k_obs > 0.0 && !k_outlier) {
+                // 2026-05-31 (FIX A — cold fast-converge arm; see updateDepthFlowSpeed).
+                // Arm the existing fast window once per session at the first accepted
+                // calib when running on a persisted seed (cur_k>0), so a pure walk
+                // converges to the live k_obs instead of crawling at α=0.05. Shared
+                // one-shot flag + shared mode_switch_fast_alpha_frames_ with the
+                // depth-flow path; inside the !k_outlier guard. Heading-safe (EMA weight
+                // on expansion_scale_K_, a SPEED scale).
+                if (!cold_fast_converge_armed_ && cur_k > 0.0) {
+                    mode_switch_fast_alpha_frames_ = kFastConvergeFrames;
+                    cold_fast_converge_armed_ = true;
+                    navsight::eventCounters().cold_fast_converge_armed.fetch_add(1, std::memory_order_relaxed);
+                    LOGI("ACCEL_K_COLD_ARM[loom]: cur_K=%.1f k_obs=%.1f gait=%d fast_frames=%d",
+                         cur_k, k_obs, static_cast<int>(active_mode_), mode_switch_fast_alpha_frames_);
+                }
                 // 2026-05-30 (Scale fix Step 3) — fast-converge EMA after a mode
                 // switch; else steady-state α (== legacy 0.05). Pure walk: 0 fast
                 // frames → α=0.05 exactly as before.

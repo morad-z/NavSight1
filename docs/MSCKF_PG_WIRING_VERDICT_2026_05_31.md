@@ -1,0 +1,58 @@
+# NavSight EKF / MSCKF Synthesis: Can We Wire p_G_ to MSCKF?
+
+## 1. DIRECT ANSWERS
+
+**(a) Landmark matching — WORKING.** The descriptor matcher is well-gated with three independent filters before any match reaches the EKF: Lowe ratio 0.75, Hamming ≤50/256, and a 15px spatial reprojection gate against the EKF-projected pixel (Tracker.cpp:5852-5904). Per-keyframe local-map tracking rate is 8364 matched / 15330 observed = **55%**, which is healthy for ORB local-map tracking. Downstream the EKF adds chi² + Huber + a 1.0m per-call rollback. The 42% chi² reject on matched observations (3514/8364) is the robust filter working as designed under noisy axial geometry, **not** a flood of mismatches. `msckf_inversion_failed=0`, `landmark_obs_runaway_total=0`. Verdict: not injecting bad constraints.
+
+**(b) SLAM promotion — NOT WORKING (0 of 24084), root cause = forward-motion / low-parallax degeneracy.** This is a geometry limit, not a code bug. The rejection split is decisive:
+- RMS 11336 (47%), parallax 7215 (30%), chirality 5445 (23%), n_used 88 (0.4%) — sums to exactly 24084.
+- `slam_promo_rejected_baseline_total=0` and `slam_promo_rejected_solve_total=0`: features **do** have >1.5cm baseline and the SVD solve never fails — they simply have **no usable parallax**. A camera moving along its optical axis during a walk has near-zero parallax for features near the focus-of-expansion.
+- The rejected RMS population is mean ≈139px, p95 ≈42.7px — i.e. 28–93× over the 1.5px gate. A frame/scale bug would push the *entire* distribution into the thousands and make chirality reject ~everything; instead the bulk sits at 40–140px with a thin >1000px tail. The 17758px max was quantitatively reproduced from parallax-just-above-gate triangulation under 0.3px KLT noise (3× depth error → hundreds-to-thousands px reproj). Triangulation and reprojection are transpose-consistent (R_anchor.t() builds the ray, R projects it back). **Not a frame bug.**
+- The designed escape hatch (MiDaS seed/rescue, Tracker.cpp:4521-4643) genuinely never fires in replay (`slam_promotions_seeded_with_midas=0`) — but that is a secondary effect, and whether it *can* fire on a real device walk with live GPU depth is unknown.
+
+**(c) MSCKF — WORKING but discarded.** The lost-feature update math is sound and matches the OpenVINS/Mourikis canonical form: DLT triangulation with behind-camera reject, correct H_f / H_θ (with the 2026-05-09 sign fix documented in-code) / H_pos, left null-space projection via SVD, per-feature chi² (Cholesky), measurement compression, Joseph-form covariance update with FEJ clone poses. The historical frame-transpose and sign bugs are fixed. It fires `msckf_update_lines=1957` and `landmarks_msckf_accepted=4850`. **It is mathematically correct and actively producing position corrections within each frame — but every correction is wiped the next frame** because `ekf_.setPosition(global_t_)` at Tracker.cpp:1862 hard-overwrites p_G_ before propagateIMU. The chi² gate is **not** too tight (multiplier 1.5 → α≈0.985, *looser* than canonical 0.95); rejections are bad geometry, not gate tightness. There is no remaining Jacobian/sign/frame defect.
+
+## 2. CAN p_G_ BE WIRED?
+
+**Honest verdict: No — not on current evidence. MSCKF is very unlikely to bound p_G_ if `setPosition` is removed. It would most probably repeat the 75m/10m drift, especially on straight walks and scooter.**
+
+**Confidence: likely (not certain).** The replay test below converts this from "likely" to "verified" cheaply, but the prior is strong and recent and lives in the same codebase.
+
+**The single deciding factor: absence of long-baseline absolute-position constraints.** It is *not* a fixable chi² gate (the gate is fine), and it is only partly the degeneracy. The structural problem is that nothing closes the loop on **absolute** position:
+- MSCKF H_x writes **only** into clone slots [δθ_c, δp_c] — there are **no rows on the IMU position block 12-14**. MSCKF constrains *relative* clone geometry; it touches IMU p_G_ only indirectly through P_ cross-correlations.
+- The intended absolute anchors are dead: SLAM promotion = 0 (the designed between-keyframe drift-binder), and ZUPT zeros **velocity, not position** (EKFState.cpp:653-672 never touches p_G_).
+- So with setPosition removed, p_G_ free-integrates accel through propagateIMU (`p_new = p_G_ + v·dt + ½g·dt² + Rᵀδp`) — quadratic in residual bias/attitude error — while the only correcting signal is many short (~4-frame, ~0.2s baseline) transient MSCKF tracks that are weak drift-binders, with the long-lived SLAM channel that was meant to bound it absent.
+
+The 4850 accepted updates sound like a lot, but high count ≠ high information-per-meter: the same axial low-parallax that starves SLAM also makes every along-track position residual weakly informative. MSCKF can only correct what it observes, and along-axis depth/position is exactly what is unobservable on a forward walk.
+
+## 3. WHAT WOULD FIX SLAM PROMOTION
+
+**It is pure degeneracy, not a frame/scale bug — so the lever is PnP-with-depth (MiDaS metric depth), not a triangulation-path fix.** Evidence: rejection mass is parallax+chirality (12660/24084 = 53%) and RMS, with baseline-reject=0 and solve-fail=0; the RMS distribution and the 17758px max are reproducible from low-parallax geometry under KLT noise; triangulation/reproj are transpose-consistent. There is nothing to "fix" in the 2-view midpoint — the depth is genuinely unobservable from axial motion.
+
+**The change that would actually help:** make the existing MiDaS seed/rescue hook (Tracker.cpp:4521-4543 rescue, 4596-4643 sanity-replace) reliably engage, i.e. seed a candidate's depth from `sampleMidasMetricDepth` as a **baseline-independent anchor** when parallax is degenerate, then promote on the MiDaS-seeded depth rather than triangulated depth. This is essentially PnP-with-monocular-depth. Today `slam_promotions_seeded_with_midas=0`, so either `sampleMidasMetricDepth` returns false for every candidate or the re-scored point still fails the 1.5px gate. **This is unproven and out of scope for the p_G_ decision** — it needs a device logcat checking `SLAM_PROMOTE_MIDAS_RESCUE` / `_SEED` lines and the `sampleMidasMetricDepth` return rate before any code change. Do **not** touch the 1.5px RMS threshold (rejected features are 28–93× over it — decisively bad, not marginal).
+
+## 4. THE SAFE TEST
+
+**One-line, default-off, reversible flag — replay A/B only, never a device build.**
+
+- **Change (~6 lines, follows "comment out, don't delete"):** wrap **only** Tracker.cpp:1862 as `if (!autonomous_pg_) ekf_.setPosition(global_t_);` — leave 1863 propagateIMU intact. Add a `Tracker` member bool, a `VioEngine::setAutonomousPgExperiment(bool)` forwarder, and a `replay_harness --autonomous-pg` CLI flag. Default OFF, so the JNI/Android path is byte-for-byte identical and there is zero device risk. **Heading is untouched by construction** — setPosition only writes p_G_ (EKFState.cpp:2314-2317), never R_GtoI_.
+- **Run (no device build):** re-link the desktop target at `tests/cpp/build_mingw`, run both arms on the house loop `tests/sims/val_2026_05_30b/simulation_data_1780150361149.json` (~100m loop, GPS net start→end only **12.07m** = near-closed):
+  - BASELINE: `replay_harness sim.json out_base.csv --frames-dir <…>.frames --depth-dir <depth> --frame-match-tolerance-ms 50`
+  - EXPERIMENT: same `+ --autonomous-pg`
+  - Score both with `python scripts/analyze_replay_csv.py out_*.csv` and diff the "EKF (p_G_ dead-reckon)" path-ratio / Procrustes residual / end-displacement. The harness already logs `ekf_x/y/z` (=p_G_) and `traj_x/y/z` (=global_t_) every row — no schema change. Since global_t_ is identical in both arms, the DOT row is a built-in sanity check that the flag changed nothing else.
+- **Add 3 read-only logs:** per-frame |p_G_| and |global_t_| net displacement from origin; running max |p_G_ − global_t_| divergence; per-frame |v_G_| (to confirm ZUPT re-zeros velocity at stops). Watch existing counters `velocity_clamped` (was **177** in the v31 75m-drift failure), `zrup_fired_total`, `msckf_update_lines`, `msckf_chi2_rejected`.
+- **What it proves (trust as RELATIVE/ordinal):** whether MSCKF+ZUPT geometrically **bound** p_G_ on this loop (end displacement ≈ O(12m) → PASS) or **run away** like v31 (O(50–100m+) → FAIL). A 12m-vs-75m-class gap survives the harness caveats (cadence 18.7 vs 23fps ≈1.2×; the magnitudes are an order apart). `velocity_clamped` climbing into triple digits = preintegration diverging = unsafe.
+- **What it CANNOT prove (still needs a device walk before any on-device wiring):** the harness shortcuts WAIT_STATIONARY (no cold ZUPT anchor → under-represents the cold-start velocity bias that drove v31), feeds grayscale + offline MiDaS not live GPU depth, and lower fps perturbs update/integration counts unpredictably. A replay PASS is **necessary-but-not-sufficient**.
+- **Critical note:** no existing CSV answers this. Every prior `ekf_x` is post-setPosition+1-step, i.e. global_t_ + one propagation — not autonomous. The flag-gated re-run is the minimum work; you cannot mine old recordings.
+
+## 5. RECOMMENDATION
+
+**Decisive: (i) run the safe replay test once as a cheap falsifier, then default to (iii) leave the EKF as a passenger.** Do **not** wire p_G_ to the dot on current evidence, and do **not** start by fixing SLAM promotion as a means to wire p_G_.
+
+Reasoning against the 1km/5% goal + heading-off-limits + the drift history:
+- **The prior is strongly negative and the test will most likely confirm it.** Run it anyway — it is ~6 reversible lines, costs no device build, honors heading-off-limits by construction, and converts "likely unsafe" into a verified yes/no. But budget for a FAIL: SLAM=0 + ZUPT-doesn't-anchor-position + forward-degeneracy + the recorded 75m/10m all point the same way.
+- **Reject (ii) "fix SLAM promotion first."** Even fully reviving SLAM does not change the verdict on a forward walk: SLAM promotion is starved by the *same* axial degeneracy that weakens p_G_'s position constraints, so on straight walks/scooter it stays ≈0 regardless. Fixing SLAM is valuable on its own merits (and MiDaS-seeded PnP-with-depth is the right mechanism), but it is a large, unproven effort that does not de-risk the p_G_ wiring for the motion profile that matters (1km mostly-straight).
+- **global_t_ is the safer dot source.** It accumulates *bounded* visual displacement (~5%) and does not double-integrate accel; for the 1km/5% goal that is the path that can plausibly hit target. The honest route to absolute-position binding is a **real** drift-binder — map-matching for cross-track (per prior memory) and a learned-inertial velocity fallback / per-mode scale for along-track — not flipping the setPosition switch.
+- **Heading:** even though setPosition doesn't write R_GtoI_, removing it changes P_ cross-correlation structure and thus Kalman gain on attitude rows via cross terms. Any arm of the test must log R_GtoI yaw under both branches and confirm ~0 regression, exactly as the 2026-05-24 yaw-Q bisection required.
+
+**Bottom line:** Landmark matching works; MSCKF math works but is overwritten every frame; SLAM promotion is dead from forward-motion degeneracy (not a bug). Wiring p_G_ would, on the strongest available evidence, reproduce the 75m/10m drift because the absolute-position binders are absent. Run the cheap, reversible, heading-gated replay A/B to confirm — then keep global_t_ driving the dot and invest in real drift-binders rather than the setPosition switch.

@@ -385,6 +385,9 @@ int main(int argc, char** argv) {
     std::string depth_dir;  // 2026-05-29 — MiDaS depth rasters (--depth-dir)
     double seed_k = 0.0;    // 2026-05-29 — warm-start K seed (--seed-k); 0 = cold
     int64_t frame_tolerance_ns = 0;
+    bool autonomous_pg = false;  // 2026-05-31 — --autonomous-pg (verdict §4):
+                                 // skip ekf_.setPosition(global_t_) so p_G_
+                                 // propagates autonomously. Default OFF.
     {
         std::vector<std::string> positional;
         for (int i = 1; i < argc; ++i) {
@@ -417,6 +420,11 @@ int main(int argc, char** argv) {
                     std::fprintf(stderr, "replay_harness: --seed-k parse error: %s\n", e.what());
                     return 2;
                 }
+            } else if (a == "--autonomous-pg") {
+                // 2026-05-31 — verdict §4 safe A/B: skip the per-frame
+                // ekf_.setPosition(global_t_) overwrite so the EKF p_G_ runs
+                // autonomously (MSCKF/ZUPT updates survive). No value arg.
+                autonomous_pg = true;
             } else if (a == "--frame-match-tolerance-ms") {
                 if (i + 1 >= argc) {
                     std::fprintf(stderr,
@@ -440,7 +448,8 @@ int main(int argc, char** argv) {
         if (positional.size() != 2) {
             std::fprintf(stderr,
                 "Usage: %s <sim_input.json> <pose_output.csv> "
-                "[--frames-dir <path>] [--frame-match-tolerance-ms <N>]\n",
+                "[--frames-dir <path>] [--depth-dir <path>] [--seed-k <v>] "
+                "[--frame-match-tolerance-ms <N>] [--autonomous-pg]\n",
                 (argc > 0 ? argv[0] : "replay_harness"));
             return 2;
         }
@@ -859,6 +868,15 @@ int main(int argc, char** argv) {
     if (seed_k > 0.0) {
         engine.getTracker()->setMidasScaleK(seed_k);
         std::fprintf(stdout, "replay_harness: seeded warm K = %.1f\n", seed_k);
+    }
+
+    // 2026-05-31 — verdict §4 autonomous-p_G_ A/B. Enable BEFORE processing so
+    // the very first frame's setPosition is already gated. Default arm leaves
+    // this off (byte-identical to the device build's setPosition behaviour).
+    if (autonomous_pg) {
+        engine.setAutonomousPgExperiment(true);
+        std::fprintf(stdout, "replay_harness: AUTONOMOUS p_G_ experiment ON "
+                             "(setPosition skipped; ekf_x/y/z = autonomous p_G_)\n");
     }
 
     // Skip samples already fed during Madgwick warmup (otherwise they

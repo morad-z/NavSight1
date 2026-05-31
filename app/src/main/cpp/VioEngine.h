@@ -50,6 +50,11 @@ public:
     void setMagnetometerHeading(float yaw_rad);
     void setDepthMap(const float* depth_data, int width, int height);
     void setUserScaleCorrection(double correction);
+    // 2026-05-31 — REPLAY-ONLY forwarder for the autonomous-p_G_ experiment
+    // (docs/MSCKF_PG_WIRING_VERDICT_2026_05_31.md §4). Default OFF; only the
+    // replay harness --autonomous-pg flag calls this. The JNI/Android path never
+    // does, so the device build is byte-identical. See Tracker::setAutonomousPgExperiment.
+    void setAutonomousPgExperiment(bool on);
     // Step 8c: forward rolling-shutter row-skew into the Tracker. See Tracker.h.
     void setRollingShutterSkew(int64_t row_skew_ns);
 

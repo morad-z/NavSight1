@@ -68,6 +68,17 @@ The two touch nearly **disjoint files** — migration = `RoadSnapper.kt`, `Navig
 3. The **scale-dependent matcher** (Step D HMM, K̂ estimator, Step E confidence, Step F EKF feedback) stays
    **DEFERRED** until the speed (Fix A/B/C) is validated on `morad` and merged — a scale-collapsed dot can't be
    arc-length-matched (§0.3 M1, §0.5). Build those AFTER the merge, on the correct-scale base.
+   > **UPDATE 2026-05-31 (see §0.9):** the matcher was brought forward as a **display-only** implementation. It
+   > first ran on **OSRM `/match`** (hosted HMM) but that URL was a dead end (bearings collapsed confidence
+   > 0.96→0.06; the demo caps trace coords at 10 "TooBig"; rate-limits/network), so it was **replaced by an
+   > on-device Newson-Krumm Viterbi decoder — `LocalMatcher`** (the offline "own-it" path §5/§0.9 had named as the
+   > future architecture). This does not violate the deferral, which is really about **closing the scale loop into
+   > the engine**: the matcher map-matches the *geographic* trajectory regardless of metric scale (scale error only
+   > degrades its quality — a frozen/collapsed VIO gives a degenerate window — never its function). So **Step D
+   > (matcher, now OFFLINE) + Step E (confidence) + §0.7 (turn detection) are IMPLEMENTED display-only**; what stays
+   > **DEFERRED** is the **scale/heading FEEDBACK** — Step D.5's closed loop + Step F's EKF observation = **#9
+   > (§0.10)** — which needs the correct-scale base and belongs on `morad`. Step D.5 ships here as a **read-only
+   > `K̂_map` log only** (measured k_map≈1.42 on a real drive).
 4. **Commit/push to `osm-migration` only** — plain `git commit` / `git push` in this folder; never name `morad`.
 5. **Merge order (later, from the `morad` folder):** validate speed on `morad` → `git checkout morad &&
    git merge osm-migration` → then build the deferred scale-dependent matcher on the merged base →
@@ -173,27 +184,34 @@ PREREQ  Fix A (accel-K self-calibration) + Fix B (per-frame dot advance)  — NO
         Gate: a real walk shows dot metric scale within ~±20% of truth.  (Confirm via on-device logcat.)
         Fix C (TURNS, see §0.7) — narrow the `rotation_dominated` freeze (Tracker.cpp:3562) to gate on a real
         translation signal, not PDR step_speed. Required before any turn (roundabout/U-turn) renders as an arc.
- 0   Re-baseline this doc (M1/M4/M5/M6/M7 edits).
- B   Tracker::current_vio_lla  (read-only, ~50 LOC).  Acceptance rewritten (drop the 75° claim).
+ 0   ✅ DONE   Re-baseline this doc (M1/M4/M5/M6/M7 edits).
+ B   ✅ DONE   Tracker::current_vio_lla  (read-only, ~50 LOC).  Acceptance rewritten (drop the 75° claim).
      (v1 keeps the Google display + gms LatLng — no GeoPoint refactor needed for the hybrid.)
- A*  LEAN data layer — Haifa-only OSM extract + hand-rolled R-tree over ways.  Defer GraphHopper/Valhalla/BRouter
-     decision and the region manager until Step K actually needs routing.
- C   Snap-to-nearest, display-only — REPLACES RoadSnapper.kt's Google Roads call.   ← v1 user-visible payload.
- E*  LITE confidence + off-road silent-disable (snap-distance + VIO-variance + LC-recency; keep silent-disable).
- I*  PARTIAL — extend the EXISTING harness; labelling tool; 1–2 fixtures (not the 5-corpus).
+ A*  ✅ DONE + EXTENDED to DYNAMIC   LEAN data layer — Haifa OSM extract + hand-rolled R-tree over ways. NOW the
+     dynamic RoadRegionManager (fetches the region around the user wherever they are; tile + hysteresis + LRU).
+ C   ✅ DONE   Snap-to-nearest, display-only — REPLACED RoadSnapper.kt's Google Roads call. Now the OFFLINE FALLBACK under D.
+ E*  ✅ DONE   LITE confidence + off-road silent-disable + matcher confidence gating & break detection (Tier-1 #4).
+ I*  ◑ PARTIAL  extend the EXISTING harness; labelling tool; 1–2 fixtures (not the 5-corpus).
         ── v1 ships here: free display + free road-snapping, $0, offline. ──
- D + D.5   Windowed shape HMM with shared-K̂ scale handling (M2) + the K̂_map scale estimator (§0.4).
-           Only after scale is fixed AND if Step C mis-snaps on parallel roads in practice.  Distance-based 50 m window.
- F   Soft EKF position observation — only after on-device replay shows no self-reinforcing lock-in; default-OFF.
- K   ROUTING + SEARCH MIGRATION — offline router (BRouter/Valhalla) replaces Directions API ("routing works again");
-     offline Nominatim-style index replaces Places API.   [the other half of the Google→free migration]
- L*  OPTIONAL/DEFERRED — DISPLAY swap GoogleMap → MapLibre/osmdroid + neutral GeoPoint. Only for a fully-offline,
-     no-key, jam-proof basemap. v1 KEEPS the Google display (free; the bill was Roads/Directions/Places, now gone).
- —   CUT from v1: Step G (intersection-yaw) — heading is fixed; cutting on PRIORITY grounds (not "heading solved
-     forever": 2.5° over 1 km ≈ 44 m cross-track, but the matcher absorbs it). Keep G named as the heading-re-drift
-     backstop, since the geometric LC that would otherwise catch re-drift is currently dead (geom_accepts=0).
+ D + D.5   ✅ D DONE (OFFLINE, display-only) / D.5 OBSERVATION-ONLY   Windowed HMM = **on-device Viterbi
+           `LocalMatcher`** (Newson-Krumm over the OSM segments R-tree) — the PRIMARY dot source; per-point Step C is
+           the fallback. Tier-1 #3 matched geometry rendered. *(OSRM `/match`/`LiveMatcher` was the ONLINE stop-gap,
+           now DROPPED + kept-in-tree-unused: bearings collapsed confidence 0.96→0.06, the demo caps trace coords at
+           10 "TooBig", + rate-limits/network. bearings removed; SNAP_SOURCE=`local:match`.)* D.5 = K̂_map computed +
+           hard-gated + LOGGED only (MAP_SCALE_OBS) — NOT fed to engine (that's #9/§0.10). Full quality still
+           SCALE-GATED: a frozen / scale-collapsed VIO yields a degenerate window → garbage-in (the raw trail cuts
+           across blocks; k_map~1.42 = ~30% under-read on a real drive) until Fix A/B/C on `morad`.
+ F   ⏸ DEFERRED → #9 (§0.10)   Soft EKF position observation — the closed loop; gated on the scale fix, lands on `morad`.
+ K   ✅ DONE   ROUTING + SEARCH MIGRATION — **OnlineRouter (OSRM /route)** + DijkstraRouter offline fallback replaces
+     Directions API; Israel-wide offline geocode index (254,790 places) replaces Places API. + #8 route-pinned
+     matching & off-route rerouting (RoutePinMath + NavigationManager).
+ L*  ⏸ DEFERRED (by design)   DISPLAY swap GoogleMap → MapLibre/osmdroid + neutral GeoPoint. v1 KEEPS Google display.
+ —   ✂ CUT from v1: Step G (intersection-yaw) — heading is fixed; the matcher absorbs the residual cross-track.
+     Keep G named as the heading-re-drift backstop (now to be delivered by #9's heading leg instead, §0.10).
  —   SPLIT OUT: the rest of Step K's turn-by-turn navigation → docs/NAVIGATION_PLAN.md once a matched dot ships.
 ```
+> **Status legend:** ✅ DONE = code-complete + unit-tested + installed (NOT real-ride-accepted; that bar is §0.8,
+> gated on the scale fix).  ◑ PARTIAL/observation-only.  ⏸ DEFERRED.  ✂ CUT. Full detail in **§0.9**.
 
 ### 0.6 Updated answers to §11 open questions
 
@@ -259,6 +277,77 @@ hitting this also exercises the U-turn handling.)
   (magenta) next to GPS (green) + VIO (blue) when `mm_lat`/`mm_lng` are present, report its path length, and
   run the out-and-back ≤5% endpoint-return assessment for all three tracks. No-op on recordings lacking the field.
 - **Both branches:** this requirement is synced to `morad` and `osm-migration`.
+
+### 0.9 Implementation status (2026-05-31) — `osm-migration`
+
+Everything below is **code-complete + unit-tested + installed** on the S21 Ultra (`com.example.navsight1.osm`,
+side-by-side with the speed app). Per [[feedback_follow_plan_rules]] / [[feedback_no_metric_celebration]],
+"✅ DONE" means *build green + unit tests pass + runs on device* — it is **NOT "accepted"**: the real bar is the
+§0.8 goal (1 km out-and-back ≤5%), which is gated on the scale fix (Fix A/B/C on `morad`) and a real ride.
+**Pushed to `origin/osm-migration`: `78751bd`** (matcher + maneuvers + nav/UI) **+ `62b5027`** (`LocalMatcher`). NOT
+yet merged to `morad` (merge direction = `osm-migration → morad`, after the speed work; shared C++ surface =
+`Tracker.cpp/.h`, `native-lib.cpp`, `EventCounters.h` — Step B*'s additive read-only accessor + `vio_lla_*` counters).
+
+| Step | Status | What shipped (files) |
+|------|--------|----------------------|
+| **B** current_vio_lla | ✅ | `Tracker::current_vio_lla()` read-only from `global_t_`; JNI `nativeCurrentVioLla`; counters `vio_lla_*`. |
+| **A\*** data layer → dynamic | ✅ +ext | `RoadRegionManager` fetches the ~8.8 km region around the user anywhere (tile-quantized, hysteresis, LRU, accept-stale-offline) via Overpass; `RoadsJsonParser`, `DynamicRoadRegion`. `OsmDataLayer` = Israel-wide geocode only. |
+| **C** snap-to-nearest | ✅ | `RoadSnapper` (STR R-tree; soft-snap == search radius). Now the **offline fallback** under D. |
+| **E\*** confidence + off-road | ✅ | snap-distance confidence + **matcher confidence gating + break detection** (Tier-1 #4); silent-disable kept. |
+| **D** windowed HMM | ✅ **offline** | **`LocalMatcher`** — on-device Newson-Krumm Viterbi over the OSM segments R-tree (emission Gaussian + N-K transition + same-OSM-way bonus; pure `matchCandidates` unit-tested). PRIMARY dot source (`SNAP_SOURCE=local:match`); per-point Step C is the fallback; Tier-1 **#3 matched geometry** rendered. **OSRM `/match`/`LiveMatcher` DROPPED** (bearings→conf 0.96→0.06; demo caps trace coords at 10 "TooBig"; rate-limits/network) — kept in-tree, unused; bearings removed. Quality scale-gated. |
+| **D.5** K̂_map estimator | ◑ obs-only | `K̂_map = d_route/d_vio` computed, hard-gated, **logged only** (`MAP_SCALE_OBS`; per-sample in the sim JSON). On a real drive measured **k_map ≈ 1.42 (~30 % under-read)**. NOT fed to engine → that's #9. |
+| **§0.7** turn DETECTION | ✅ | `ManeuverStateMachine`: roundabout entry / exit-by-heading / mid-road U-turn / U-turn-via-roundabout. RENDERING still gated (§0.7: Fix C + A/B). `RoundaboutIndex(Builder)`. |
+| **§0.8** recorder mm_lat/lng | ✅ | per-sample `mm_lat`/`mm_lng`/`mm_conf` in sim JSON + analyzer (`compare_gps_vio.py`). |
+| **K** routing + search | ✅ | `OnlineRouter` (OSRM `/route` + turn-by-turn) → any dest, `DijkstraRouter` offline fallback; offline geocode search (254,790 places, Israel). |
+| **K / #8** route-pinned + reroute | ✅ | `RoutePinMath` + `NavigationManager`: project the dot onto the planned route within a 30 m corridor; >50 m for 4 ticks → recompute from here. |
+| **nav turn-by-turn** | ✅ | fixed instruction off-by-one (show the UPCOMING maneuver via `NavStepLogic.advanceLeg`, incl. an out-and-back no-skip); **roundabout-STRAIGHT** icon (was always a right turn); proper Material turn glyphs; blank-road-name text. |
+| **map UI** | ✅ | recenter button **hoisted above the sheet** (+ survives a gesture-interrupted camera animation that used to kill the follow loop); **long-press to relocate the start pin** (`overrideStartLocation`); redesigned **HeroHeader**; **slim footer** (dropped GPX recording / fake "incidents" / duplicate pills+buttons / the redundant bottom-left speed badge); debug speed → **km/h**. |
+| **robustness** | ✅ | maneuver SM ticks every cycle (was starved by an in-flight network call); green polyline no longer flickers on a transient miss. (Adversarial review: 13 confirmed / 0 critical; 2 HIGH + 2 cheap fixed.) |
+| **L\*** display swap | ⏸ | v1 keeps the Google display (free). |
+| **F** EKF feedback | ⏸ → #9 | the closed loop; see §0.10. |
+| **G** intersection-yaw | ✂ | cut (v1); its job moves to #9's heading leg. |
+
+**Unit tests (JVM, 54 total, green):** `LocalMatcherTest` (4), `LiveMatcherParseTest` (8), `NavStepLogicTest` (5),
+`RoutePinMathTest` (4), `ManeuverStateMachineTest` (6), `RoundaboutIndexBuilderTest` (2), `OnlineRouterParseTest`
+(5), `DynamicRoadsParseTest` (4), `OsmDataLayerRoundTripTest` (10), `OsmRealAssetsTest` (1). **Pending:** the
+on-device real ride (the §0.8 bar) — currently blocked NOT by the matcher but by the VIO trajectory (raw trail
+cuts across blocks; see Step D row + [[project_osm_local_matcher_2026_05_31]]).
+
+### 0.10 Step F restated — Map-as-a-sensor fusion (#9)  [DEFERRED — gated on the scale fix; lands on `morad`]
+
+**What it is (plain terms).** Today information flows one way: VIO → dot → snapped onto a road (the map is a
+passive display). #9 **flips it into a feedback loop** — the matched road becomes a *sensor* that feeds two
+corrections back into VIO, because the road tells us two things VIO otherwise only guesses:
+
+  1. **Heading** — a confidently-matched straight road has a known bearing; the match's tangent is a **yaw
+     observation** that corrects slow gyro/heading drift. (This is the job Step G — intersection-yaw, cut in v1
+     — was meant to do; the map delivers it instead, the "heading-re-drift backstop" of §0.5/§0.6.4.)
+  2. **Scale** — `K̂_map = d_route/d_vio` (Step D.5) fed into `Tracker::updateDepthFlowSpeed` **above** accel-K
+     with the existing >3× blow-up guard (counters `map_scale_k_milli` / `map_scale_calib_updates`). This closes
+     the loop §0.4 designed — the GPS-free, ZUPT-free scale anchor accel-K never produces.
+
+**Mechanism.** The plan's **Step F machinery**: a soft, **default-OFF** EKF measurement that never writes
+mean/covariance directly, always goes through the confidence gate (Principle 11), uses the FEJ machinery from
+visual-plan Step 11.5. Gated **hard** (the §0.4 identity-confidence gate): only fuse **high-confidence, long,
+straight, forward-progress, unambiguous** matches — a mis-identified parallel road is the ADR-004 divergence
+loop, so the gate is mandatory, not optional.
+
+**SHOULD WE BUILD #9 NOW? — NO. Wait for the scale fix.** (Binding reasons:)
+- **Scale leg is downstream of Fix B** (§0.4 caveat i): `d_vio` is corrupted by the same verification-gating bug
+  (~28 % of frames advance) until Fix B lands, so `K̂_map` mixes scale error with sampling error — calibrating
+  against a moving target.
+- **Heading leg touches the PROTECTED signal.** Per [[feedback_no_magnetometer]] / the user's "don't risk
+  oversteer," a map→heading feedback loop is exactly the kind of change to validate **alone**, not stacked on an
+  unstable scale.
+- **It's EKF surgery → wrong branch.** #9 edits `Tracker.cpp`/`EKFState.cpp`, which is forbidden on
+  `osm-migration` (§0.0 rule 2). It belongs on `morad`, after Fix A/B/C.
+- **#2 is the safe precursor, already shipping.** The read-only `MAP_SCALE_OBS` log (Step D.5) lets us collect
+  `K̂_map` on real rides FIRST and confirm it's consistent/trustworthy **before** any value feeds back.
+
+**Sequence:** Fix A/B/C validated on `morad` → merge `osm-migration` → confirm `MAP_SCALE_OBS` is stable on a
+real ride → **then** build #9 on the merged base: **scale leg first** (wire D.5 via `updateDepthFlowSpeed`),
+**heading leg second** behind a stricter gate, **default-OFF**, A/B-tested on the replay harness before any walk
+([[feedback_no_unsure_changes]]). This supersedes the old standalone Step F.
 
 ---
 

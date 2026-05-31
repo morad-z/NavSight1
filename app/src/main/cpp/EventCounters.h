@@ -519,6 +519,12 @@ struct EventCounters {
     std::atomic<long long> midas_scale_k_milli{0};
     std::atomic<long long> midas_scale_k_min_milli{0};
     std::atomic<long long> midas_scale_k_max_milli{0};
+    // 2026-05-31 (FIX A) — times the cold fast-converge arm fired (expect 1/session: the
+    // first accepted accel-K calib on a persisted seed). 0 = never armed (e.g. virgin K).
+    std::atomic<long long> cold_fast_converge_armed{0};
+    // 2026-05-31 (FIX B) — times a VEHICLE gait candidate was blocked by recent cadence
+    // (step_freq_hz>=0.6): walking pause/turn that would otherwise mislabel as VEHICLE.
+    std::atomic<long long> gait_vehicle_suppressed{0};
     // 2026-05-28 — Looming / flow-divergence speed estimator (updateExpansionSpeed).
     //   depth_flow_looming_updates   frames the looming Vz estimate fired (≥10 inliers)
     //   depth_flow_looming_used      frames the FUSED speed was looming-dominant (w_loom>0.5)
@@ -896,6 +902,32 @@ struct EventCounters {
     std::atomic<long long> slam_promo_rms_sum_milli{0};
     std::atomic<long long> slam_promo_rms_milli_max{0};
 
+    // 2026-05-31 — MiDaS depth-seed RESCUE diagnostic (docs/MSCKF_PG_WIRING_
+    // VERDICT_2026_05_31.md §3). The rescue at Tracker.cpp ~4521-4543 re-seeds an
+    // RMS-rejected (rms>1.5px) candidate from baseline-independent MiDaS metric
+    // depth and re-scores; it only ever logged SUCCESS (slam_promotions_seeded_
+    // with_midas), so when that stays 0 we cannot tell WHICH of the two failure
+    // modes occurred. These split the failure:
+    //   slam_promo_midas_sample_failed   sampleMidasMetricDepth returned false OR
+    //                                     z_midas <= 0.05 / non-finite — the rescue
+    //                                     could not even attempt (no usable depth at
+    //                                     the anchor pixel). If this dominates on the
+    //                                     device walk, debug sampleMidasMetricDepth
+    //                                     (depth map empty / pixel out of range / NN
+    //                                     mapping), NOT the geometry.
+    //   slam_promo_midas_rescore_failed  depth sampled OK but the MiDaS-seeded point
+    //                                     still re-projects at rms_midas > 1.5px (or
+    //                                     < 2 obs survived) — the depth disagrees with
+    //                                     the multi-clone reprojection. If this
+    //                                     dominates, the MiDaS depth is wrong/noisy at
+    //                                     that pixel; the 1.5px gate is correctly
+    //                                     rejecting it (do NOT loosen — rejected
+    //                                     triangulations are 28-93x over the gate).
+    // Behaviour-neutral: increment only, no gate change. Falsifier: tomorrow's
+    // device-walk event_summary shows exactly one of these dominating.
+    std::atomic<long long> slam_promo_midas_sample_failed{0};
+    std::atomic<long long> slam_promo_midas_rescore_failed{0};
+
     // 2026-05-17 — translation gated because motion is rotation-only.
     // Catches "user sitting in chair rotating phone" that defeats is_static
     // (gyro != 0) and is_pure_rotation (Rayleigh threshold too strict).
@@ -1024,6 +1056,8 @@ struct EventCounters {
         midas_scale_k_milli.store(0, std::memory_order_relaxed);
         midas_scale_k_min_milli.store(0, std::memory_order_relaxed);
         midas_scale_k_max_milli.store(0, std::memory_order_relaxed);
+        cold_fast_converge_armed.store(0, std::memory_order_relaxed);
+        gait_vehicle_suppressed.store(0, std::memory_order_relaxed);
         depth_flow_looming_updates.store(0, std::memory_order_relaxed);
         depth_flow_looming_used.store(0, std::memory_order_relaxed);
         depth_flow_looming_skipped.store(0, std::memory_order_relaxed);
@@ -1087,6 +1121,8 @@ struct EventCounters {
         slam_promo_rms_milli_p95.store(0, std::memory_order_relaxed);
         slam_promo_rms_sum_milli.store(0, std::memory_order_relaxed);
         slam_promo_rms_milli_max.store(0, std::memory_order_relaxed);
+        slam_promo_midas_sample_failed.store(0, std::memory_order_relaxed);
+        slam_promo_midas_rescore_failed.store(0, std::memory_order_relaxed);
         global_t_gated_rotation_dominated_total.store(0, std::memory_order_relaxed);
         translation_heading_projection_total.store(0, std::memory_order_relaxed);
         global_t_advanced_via_depthflow_fallback_total.store(0, std::memory_order_relaxed);
@@ -1216,6 +1252,8 @@ struct EventCounters {
         const long long v_midas_scale_k_milli = midas_scale_k_milli.load(std::memory_order_relaxed);
         const long long v_midas_scale_k_min_milli = midas_scale_k_min_milli.load(std::memory_order_relaxed);
         const long long v_midas_scale_k_max_milli = midas_scale_k_max_milli.load(std::memory_order_relaxed);
+        const long long v_cold_fast_converge_armed = cold_fast_converge_armed.load(std::memory_order_relaxed);
+        const long long v_gait_vehicle_suppressed = gait_vehicle_suppressed.load(std::memory_order_relaxed);
         const long long v_depth_flow_looming_updates = depth_flow_looming_updates.load(std::memory_order_relaxed);
         const long long v_depth_flow_looming_used = depth_flow_looming_used.load(std::memory_order_relaxed);
         const long long v_depth_flow_looming_skipped = depth_flow_looming_skipped.load(std::memory_order_relaxed);
@@ -1280,6 +1318,8 @@ struct EventCounters {
         const long long v_slam_promo_rms_milli_p95            = slam_promo_rms_milli_p95.load(std::memory_order_relaxed);
         const long long v_slam_promo_rms_sum_milli            = slam_promo_rms_sum_milli.load(std::memory_order_relaxed);
         const long long v_slam_promo_rms_milli_max            = slam_promo_rms_milli_max.load(std::memory_order_relaxed);
+        const long long v_slam_promo_midas_sample_failed      = slam_promo_midas_sample_failed.load(std::memory_order_relaxed);
+        const long long v_slam_promo_midas_rescore_failed     = slam_promo_midas_rescore_failed.load(std::memory_order_relaxed);
         const long long v_global_t_gated_rotation_dominated_total = global_t_gated_rotation_dominated_total.load(std::memory_order_relaxed);
         const long long v_translation_heading_projection_total = translation_heading_projection_total.load(std::memory_order_relaxed);
         const long long v_global_t_advanced_via_depthflow_fallback_total = global_t_advanced_via_depthflow_fallback_total.load(std::memory_order_relaxed);
@@ -1392,6 +1432,8 @@ struct EventCounters {
         appendKv(out, "midas_scale_k_milli", v_midas_scale_k_milli); out += ',';
         appendKv(out, "midas_scale_k_min_milli", v_midas_scale_k_min_milli); out += ',';
         appendKv(out, "midas_scale_k_max_milli", v_midas_scale_k_max_milli); out += ',';
+        appendKv(out, "cold_fast_converge_armed", v_cold_fast_converge_armed); out += ',';
+        appendKv(out, "gait_vehicle_suppressed", v_gait_vehicle_suppressed); out += ',';
         appendKv(out, "depth_flow_looming_updates", v_depth_flow_looming_updates); out += ',';
         appendKv(out, "depth_flow_looming_used", v_depth_flow_looming_used); out += ',';
         appendKv(out, "depth_flow_looming_skipped", v_depth_flow_looming_skipped); out += ',';
@@ -1456,6 +1498,8 @@ struct EventCounters {
         appendKv(out, "slam_promo_rms_milli_p95",            v_slam_promo_rms_milli_p95);            out += ',';
         appendKv(out, "slam_promo_rms_sum_milli",            v_slam_promo_rms_sum_milli);            out += ',';
         appendKv(out, "slam_promo_rms_milli_max",            v_slam_promo_rms_milli_max);            out += ',';
+        appendKv(out, "slam_promo_midas_sample_failed",      v_slam_promo_midas_sample_failed);      out += ',';
+        appendKv(out, "slam_promo_midas_rescore_failed",     v_slam_promo_midas_rescore_failed);     out += ',';
         appendKv(out, "global_t_gated_rotation_dominated_total", v_global_t_gated_rotation_dominated_total); out += ',';
         appendKv(out, "translation_heading_projection_total",    v_translation_heading_projection_total); out += ',';
         appendKv(out, "global_t_advanced_via_depthflow_fallback_total", v_global_t_advanced_via_depthflow_fallback_total);

@@ -183,6 +183,12 @@ void VioEngine::setUserScaleCorrection(double correction) {
     tracker_.setUserScaleCorrection(correction);
 }
 
+// 2026-05-31 — REPLAY-ONLY forwarder (verdict §4). Default OFF; the device/JNI
+// path never calls this so the shipped build is unchanged.
+void VioEngine::setAutonomousPgExperiment(bool on) {
+    tracker_.setAutonomousPgExperiment(on);
+}
+
 // Step 8c: forward rolling-shutter skew into the Tracker.
 void VioEngine::setRollingShutterSkew(int64_t row_skew_ns) {
     tracker_.setRollingShutterSkew(row_skew_ns);

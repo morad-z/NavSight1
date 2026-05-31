@@ -203,6 +203,16 @@ public:
     // at -1 forever, looming bails (it requires K>0), and the UI shows 0.
     void setMidasScaleK(double k);
     double getMidasScaleK() const;
+    // 2026-05-31 — REPLAY-ONLY experiment flag (docs/MSCKF_PG_WIRING_VERDICT_
+    // 2026_05_31.md §4). Default OFF: the device/JNI path never calls this, so
+    // the shipped build is byte-identical. When ON, processFrame STOPS calling
+    // ekf_.setPosition(global_t_) before propagateIMU (Tracker.cpp:~1862), so
+    // p_G_ propagates autonomously and the MSCKF/ZUPT updates are no longer
+    // overwritten every frame. Lets the replay A/B measure whether MSCKF+ZUPT
+    // geometrically BOUND p_G_ (end-displacement ≈ loop GPS ~12m) or run away
+    // like v31 (50-100m+). Heading is untouched by construction — setPosition
+    // writes only p_G_ (EKFState.cpp:2314-2317), never R_GtoI_.
+    void setAutonomousPgExperiment(bool on) { autonomous_pg_ = on; }
     bool isInitialized() const { return initialized_; }
     const EKFState* getEKF() const { return &ekf_; }
     // Step 2.4: variance of the last keyframe-derived visual yaw measurement
@@ -582,6 +592,13 @@ private:
     // verification_ok frame; without this they halve the kFastConvergeFrames window
     // on frames where both fire. -1 = unset.
     long long last_fast_alpha_frame_{-1};
+    // 2026-05-31 — one-shot COLD fast-converge arm. A pure walk on a device with a
+    // STALE PERSISTED K (setMidasScaleK leaves cur_k>0) never hits onModeSwitch, so it
+    // crawls at kNormalAlpha from the seed and cannot reach the live k_obs in a short
+    // walk (val_2026_05_31_pm: 13m walk read 0.68x). Arm the EXISTING fast-converge
+    // window once per session at the first accepted calib so the persisted seed is
+    // treated like a slot seed, not a calibrated value. Reset to false in reset().
+    bool cold_fast_converge_armed_{false};
     // 15 frames @ 30 Hz ≈ 0.5 s hysteresis before any mode switch (debounces a
     // misclassified frame from swapping K slots).
     static constexpr int    kModeHoldFrames     = 15;
@@ -653,6 +670,15 @@ private:
     // pixel, BEFORE the metric affine fit. No midas_affine_valid_ gate, so it works
     // even when the affine fit bails (too few 3D points). false if no depth map yet.
     bool sampleMidasRawDisparity(float u, float v, double& disparity_out) const;
+
+    // 2026-05-31 — REPLAY-ONLY autonomous-p_G_ experiment flag (verdict §4).
+    // Default false → device build is byte-identical (JNI never sets it). Set
+    // true only via VioEngine::setAutonomousPgExperiment from the replay harness
+    // --autonomous-pg flag. Gates the single setPosition line in processFrame.
+    bool autonomous_pg_{false};
+    // Running max |p_G_ - global_t_| divergence (m), for the verdict §4 read-only
+    // diagnostic log. Only updated/logged when autonomous_pg_ is true.
+    double autonomous_pg_max_div_m_{0.0};
 
     cv::Ptr<cv::CLAHE> clahe_;
 

@@ -563,7 +563,17 @@ IMUPreintegrator::StepInfo IMUPreintegrator::getStepInfo() const {
     // 2026-05-30 (Scale fix Step 0) — step cadence for gait classification.
     // step_period_s_ is the interval between the last two detected steps (s),
     // set in detectStep(); 0 when no recent step → report 0 Hz.
-    info.step_freq_hz = (step_period_s_ > 0.0) ? (1.0 / step_period_s_) : 0.0;
+    // 2026-05-31 (FIX B Part 1) — also report 0 Hz when the last step is STALE (older
+    // than MAX_STEP_PERIOD_S). step_period_s_ does NOT time-decay (detectStep only zeroes
+    // it on a late detected step at :536), so a paused walker — or a walk→ride transition
+    // — would otherwise carry a frozen ~2 Hz cadence forever. This staleness is what makes
+    // classifyGait's VEHICLE veto safe: a genuine ride emits no steps for >MAX_STEP_PERIOD_S
+    // → step_freq_hz=0 → still promotes to VEHICLE. Reuses MAX_STEP_PERIOD_S (no new const).
+    const double tsls_freq = (last_step_ns_ > 0 && last_accel_ts_ns_ > 0)
+        ? std::max(0.0, static_cast<double>(last_accel_ts_ns_ - last_step_ns_) * 1e-9)
+        : 1e9;
+    info.step_freq_hz = (step_period_s_ > 0.0 && tsls_freq <= MAX_STEP_PERIOD_S)
+        ? (1.0 / step_period_s_) : 0.0;
 
     // Step 3 Observer A: time-since-last-step. Used by Tracker to fade PDR
     // confidence smoothly as a step ages, instead of a hard cutoff.
