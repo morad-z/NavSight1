@@ -2,6 +2,8 @@ package com.example.navsight1
 
 import androidx.compose.foundation.BorderStroke
 import androidx.compose.foundation.layout.*
+import androidx.compose.foundation.rememberScrollState
+import androidx.compose.foundation.verticalScroll
 import androidx.compose.foundation.shape.RoundedCornerShape
 import androidx.compose.material.icons.Icons
 import androidx.compose.material.icons.filled.*
@@ -42,7 +44,15 @@ fun DebugPanel(
         border          = BorderStroke(1.dp, pal.teal.copy(0.3f)),
         modifier        = Modifier.width(192.dp)
     ) {
-        Column(Modifier.padding(horizontal = 10.dp, vertical = 8.dp), verticalArrangement = Arrangement.spacedBy(3.dp)) {
+        // Scrollable so the lower rows (mount height, calibration) aren't cut off by the bottom footer
+        // (owner: "the footer is blocking some of it"). Bounded height → scrolls when content overflows.
+        Column(
+            Modifier
+                .padding(horizontal = 10.dp, vertical = 8.dp)
+                .heightIn(max = 360.dp)
+                .verticalScroll(rememberScrollState()),
+            verticalArrangement = Arrangement.spacedBy(3.dp)
+        ) {
             Text("DEBUG", color = pal.teal, fontSize = 9.sp, fontWeight = FontWeight.Bold, letterSpacing = 1.5.sp)
             HorizontalDivider(color = pal.teal.copy(0.2f), thickness = 0.5.dp)
 
@@ -87,6 +97,27 @@ fun DebugPanel(
                         containerColor = pal.cardBorder, modifier = Modifier.size(20.dp)
                     ) { Text("+", color = Color.White, fontSize = 10.sp) }
                 }
+            }
+
+            // CAMERA MOUNT height (m) — drives the ground-plane (IPM) speed scale. Auto-calibrated from GPS,
+            // but set it MANUALLY here when GPS fails (owner request). ✓ = GPS/manual calibrated this mount.
+            Row(Modifier.fillMaxWidth(), Arrangement.SpaceBetween, Alignment.CenterVertically) {
+                Text("Mount", color = pal.textSecondary, fontSize = 10.sp)
+                Row(verticalAlignment = Alignment.CenterVertically) {
+                    SmallFloatingActionButton(
+                        onClick        = { viewModel.setMountHeight(viewModel.mountHeightM - 0.05) },
+                        containerColor = pal.cardBorder, modifier = Modifier.size(20.dp)
+                    ) { Text("-", color = Color.White, fontSize = 10.sp) }
+                    Text("${"%.2f".format(viewModel.mountHeightM)}m", color = pal.orange,
+                        fontSize = 10.sp, fontWeight = FontWeight.Bold, modifier = Modifier.padding(horizontal = 4.dp))
+                    SmallFloatingActionButton(
+                        onClick        = { viewModel.setMountHeight(viewModel.mountHeightM + 0.05) },
+                        containerColor = pal.cardBorder, modifier = Modifier.size(20.dp)
+                    ) { Text("+", color = Color.White, fontSize = 10.sp) }
+                }
+            }
+            viewModel.heightCalibStatus?.let {
+                Text(it, color = pal.teal, fontSize = 9.sp)
             }
 
             HorizontalDivider(color = pal.teal.copy(0.2f), thickness = 0.5.dp)

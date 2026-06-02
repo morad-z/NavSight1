@@ -31,6 +31,11 @@ static jmethodID g_viodata_ctor = nullptr;
 static double g_x = 0, g_y = 0, g_z = 0;
 static double g_roll = 0, g_pitch = 0, g_yaw = 0;
 static double g_scale = 1.0;
+// 2026-06-02 — camera mount height (m), persisted so startVIO can RE-APPLY it. ROOT CAUSE of the IPM
+// never firing (road=0): the VM calls setCameraHeight in its init{} block, which runs BEFORE startVIO
+// creates g_vision, so the JNI setter saw a null engine and silently dropped the value → camera_height_m_
+// stayed 0 → updateGroundFlowSpeed / GroundPlaneEstimator / computeGroundGrid all bailed at their height guard.
+static double g_camera_height = 0.0;
 static double g_user_scale_correction = 1.0;
 
 // RAW VO for simulation
@@ -206,6 +211,12 @@ Java_com_example_navsight1_NativeBridge_startVIO(JNIEnv*, jobject) {
     }
     g_vision = std::make_shared<VioEngine>();
     g_vision->setUserScaleCorrection(g_user_scale_correction);
+    // Re-apply the camera mount height that was set BEFORE the engine existed (VM init races startVIO).
+    // Without this, camera_height_m_ stays 0 and the entire ground-plane/IPM path silently no-ops (road=0).
+    if (g_camera_height > 0.0 && g_vision->getTracker()) {
+        g_vision->getTracker()->setCameraHeight(g_camera_height);
+        LOGI("VIO started: camera_height re-applied = %.3f m", g_camera_height);
+    }
     resetPoseState();
     LOGI("VIO started");
 }
@@ -803,6 +814,7 @@ Java_com_example_navsight1_NativeBridge_setCameraHeight(
     std::shared_ptr<VioEngine> vision;
     {
         std::lock_guard<std::mutex> lock(state_mutex);
+        g_camera_height = static_cast<double>(heightM);   // persist so startVIO re-applies it after the engine exists
         vision = g_vision;
     }
     if (vision && vision->getTracker()) {
@@ -1193,6 +1205,24 @@ Java_com_example_navsight1_NativeBridge_getFusedSpeedMps(
     return tracker ? static_cast<jfloat>(tracker->getFusedSpeedMps()) : -1.0f;
 }
 
+// 2026-06-02 — READ-ONLY ground-plane optical-flow speed (Tracker::updateGroundFlowSpeed),
+// the IPM Phase-1 scooter-speed candidate: metric speed from de-rotated road-pixel flow +
+// the known camera mount height, observable at CONSTANT CRUISE where accel-K is blind. It
+// NEVER feeds the dot; this getter exists only so the sim recording can log it next to GPS
+// for offline scoring before any fusion decision. -1.0 until it has ≥5 road inliers.
+JNIEXPORT jfloat JNICALL
+Java_com_example_navsight1_NativeBridge_getGroundFlowSpeedMps(
+        JNIEnv*, jobject /* thiz */) {
+    std::shared_ptr<VioEngine> vision;
+    {
+        std::lock_guard<std::mutex> lock(state_mutex);
+        vision = g_vision;
+    }
+    if (!vision) return -1.0f;
+    const Tracker* tracker = vision->getTracker();
+    return tracker ? static_cast<jfloat>(tracker->getGroundFlowSpeedMps()) : -1.0f;
+}
+
 // 2026-05-28 — cross-app-launch persistence of the MiDaS scale K.
 // Without this, every cold start re-pays the K calibration tax; on the
 // first recording of a session if essential-matrix verification fails
@@ -1315,6 +1345,51 @@ Java_com_example_navsight1_NativeBridge_getLastTrackedPointInlierFlags(
     }
     const jsize n = std::min<jsize>(cap, static_cast<jsize>(flags_copy.size()));
     if (n > 0) env->SetByteArrayRegion(out, 0, n, reinterpret_cast<const jbyte*>(flags_copy.data()));
+    return static_cast<jint>(n);
+}
+
+// 2026-06-02 — IPM ground-plane VIZ: the (x,y) pixel positions of the road pixels the IPM speed
+// (updateGroundFlowSpeed) used this frame, in analyzer/undistorted coords. Caller passes a preallocated
+// FloatArray; returns the number of FLOATS written (= 2 × point count). Lets the camera overlay show
+// exactly which pixels are recognized as ground. Read-only.
+extern "C" JNIEXPORT jint JNICALL
+Java_com_example_navsight1_NativeBridge_getIpmInlierPoints(
+        JNIEnv* env, jobject, jfloatArray out) {
+    if (!out) return 0;
+    const jsize cap = env->GetArrayLength(out);
+    if (cap <= 0) return 0;
+    std::vector<float> xy;
+    {
+        std::lock_guard<std::mutex> lock(state_mutex);
+        VioEngine* vision_raw = g_vision.get();
+        const Tracker* tracker = vision_raw ? vision_raw->getTracker() : nullptr;
+        if (!tracker) return 0;
+        tracker->getIpmInlierPixels(xy);
+    }
+    const jsize n = std::min<jsize>(cap, static_cast<jsize>(xy.size()));
+    if (n > 0) env->SetFloatArrayRegion(out, 0, n, xy.data());
+    return static_cast<jint>(n);
+}
+
+// 2026-06-02 — AV-style ground-plane GRID line segments [x0,y0,x1,y1, ...] (analyzer pixels): the IPM
+// ground plane projected onto the image. Caller passes a preallocated FloatArray; returns the number of
+// FLOATS written (4 per segment). Drawn as a perspective road mesh on the camera overlay. Read-only.
+extern "C" JNIEXPORT jint JNICALL
+Java_com_example_navsight1_NativeBridge_getGroundGridSegments(
+        JNIEnv* env, jobject, jfloatArray out) {
+    if (!out) return 0;
+    const jsize cap = env->GetArrayLength(out);
+    if (cap <= 0) return 0;
+    std::vector<float> segs;
+    {
+        std::lock_guard<std::mutex> lock(state_mutex);
+        VioEngine* vision_raw = g_vision.get();
+        const Tracker* tracker = vision_raw ? vision_raw->getTracker() : nullptr;
+        if (!tracker) return 0;
+        tracker->getGroundGridSegments(segs);
+    }
+    const jsize n = std::min<jsize>(cap, static_cast<jsize>(segs.size()));
+    if (n > 0) env->SetFloatArrayRegion(out, 0, n, segs.data());
     return static_cast<jint>(n);
 }
 

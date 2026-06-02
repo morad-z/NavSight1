@@ -223,6 +223,12 @@ class SensorRepository(private val context: Context) : SensorEventListener {
         // 2026-06-02 — ground-plane snapshot [is_valid, horizon_v_px, confidence, scale, cand, inl];
         // empty when the estimator is off (no camera height set).
         val groundPlane: FloatArray = FloatArray(0),
+        // 2026-06-02 — IPM road-inlier pixel positions [x0,y0, x1,y1, ...] (analyzer coords) the
+        // ground-plane speed used this frame; drawn as amber dots so the rider sees ground recognition.
+        val ipmInlierPoints: FloatArray = FloatArray(0),
+        // 2026-06-02 — AV-style ground-plane grid line segments [x0,y0,x1,y1, ...] (analyzer coords):
+        // the IPM ground plane projected onto the image as a perspective road mesh.
+        val groundGridSegs: FloatArray = FloatArray(0),
     ) {
         // Compose reads-per-frame; equality on identity is enough.
         override fun equals(other: Any?): Boolean = this === other
@@ -239,6 +245,8 @@ class SensorRepository(private val context: Context) : SensorEventListener {
     private val agesBuf = IntArray(512)
     private val inlierFlagsBuf = ByteArray(512)   // 2026-06-02 — recoverPose inlier flags (parallel to points)
     private val groundPlaneBuf = FloatArray(6)    // 2026-06-02 — [valid, horizon_v, conf, scale, cand, inl]
+    private val ipmInlierBuf = FloatArray(512)    // 2026-06-02 — IPM road-inlier pixel positions (x,y pairs)
+    private val groundGridBuf = FloatArray(1024)  // 2026-06-02 — ground-plane grid segments (x0,y0,x1,y1 each)
     // v23.11: stride increased from 4 → 7 floats per feature
     // (fid, wx, wy, wz, obs_u, obs_v, has_obs).
     private val slamBuf = FloatArray(7 * 12)
@@ -1290,6 +1298,15 @@ class SensorRepository(private val context: Context) : SensorEventListener {
         val gpN = NativeBridge.getGroundPlaneSnapshot(groundPlaneBuf)
         val gpArr: FloatArray = if (gpN >= 6) groundPlaneBuf.copyOf(6) else emptyFloats
 
+        // 2026-06-02: IPM road-inlier pixel positions (x,y pairs) — the pixels the ground-plane speed
+        // used this frame. Empty when the IPM found no road pixels (then the overlay shows none).
+        val ipmN = NativeBridge.getIpmInlierPoints(ipmInlierBuf)
+        val ipmArr: FloatArray = if (ipmN >= 2) ipmInlierBuf.copyOf(ipmN) else emptyFloats
+
+        // 2026-06-02: AV-style ground-plane grid segments (x0,y0,x1,y1 each). Empty until gravity-aligned.
+        val gridN = NativeBridge.getGroundGridSegments(groundGridBuf)
+        val gridArr: FloatArray = if (gridN >= 4) groundGridBuf.copyOf(gridN) else emptyFloats
+
         // Phase 3: SLAM positions (Y-up world). Bounded by MAX_SLAM_FEATURES.
         val slamCount = NativeBridge.getSlamSnapshot(slamBuf)
         // v23.11: stride 7 (fid, wx, wy, wz, obs_u, obs_v, has_obs).
@@ -1311,6 +1328,8 @@ class SensorRepository(private val context: Context) : SensorEventListener {
             loopClosureCount = lcCount,
             trackedInlierFlags = inlierArr,
             groundPlane = gpArr,
+            ipmInlierPoints = ipmArr,
+            groundGridSegs = gridArr,
         )
     }
 

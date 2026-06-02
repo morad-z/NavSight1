@@ -3047,6 +3047,29 @@ VisionOutput Tracker::processFrame(const uint8_t* yuv_data, int width, int heigh
              !is_static ? 1 : 0, !frame_blurry_ ? 1 : 0,
              (sufficient_motion && has_parallax && !is_static && tracked >= 8 && !frame_blurry_) ? 1 : 0);
     }
+    // ── IPM ground-plane speed runs OUTSIDE the recoverPose gate ─────────────────────────────────────
+    // It needs only road-pixel FLOW + GRAVITY + camera height — NOT parallax, essential-matrix
+    // verification, or !is_static. Gating it on the full gate above starved it: in offline replay (and on
+    // a real ride whenever the gate flickers) it ran only sporadically, so its EMA held a STALE value and
+    // the dt ballooned (10-frame gaps → wrong de-rotation → speed collapse). Run it on EVERY frame that has
+    // enough tracked points. READ-ONLY (writes ground_flow_speed_mps_ only) so this never affects the dot.
+    if (camera_height_m_ > 0.0 && !frame_blurry_ &&
+        prev_good_buf_.size() == next_good_buf_.size() && prev_good_buf_.size() >= 8) {
+        std::vector<cv::Point2f> gp_prev = prev_good_buf_;
+        std::vector<cv::Point2f> gp_next = next_good_buf_;
+        lens_.undistortMatchedPoints(gp_prev, gp_next);
+        cv::Vec3d gp_gyro(0.0, 0.0, 0.0);
+        if (!imu_delta.deltaR.empty() && imu_delta.deltaR.rows == 3 && imu_delta.deltaR.cols == 3) {
+            cv::Mat gp_rvm; cv::Rodrigues(imu_delta.deltaR, gp_rvm);
+            if (gp_rvm.rows == 3 && gp_rvm.cols == 1) {
+                const cv::Matx33d gp_Rbc = ekf_.getExtrinsicsRotation();
+                gp_gyro = gp_Rbc * cv::Vec3d(gp_rvm.at<double>(0), gp_rvm.at<double>(1), gp_rvm.at<double>(2));
+            }
+        }
+        const double gp_dt = (timestamp_ns - current_prev_ts) * 1e-9;
+        updateGroundFlowSpeed(gp_prev, gp_next, gp_dt, gp_gyro, imu);
+    }
+
     if (sufficient_motion && has_parallax && !is_static && tracked >= 8
         && !frame_blurry_) {
         geo_verification_attempted = true;
@@ -3103,7 +3126,8 @@ VisionOutput Tracker::processFrame(const uint8_t* yuv_data, int width, int heigh
         // (turn-suppression). gyro_norm is the function-scope value computed at the
         // top of processFrame (rad/s); imu is in scope here.
         updateExpansionSpeed(prev_ud, next_ud, dt_s_speed, gyro_rot_cam, imu, gyro_norm);
-        updateGroundFlowSpeed(prev_ud, next_ud, dt_s_speed, gyro_rot_cam);
+        // (updateGroundFlowSpeed moved OUT of this gate — see the IPM block above the gate; it must run on
+        //  every frame, not only when recoverPose's parallax/!is_static gate passes.)
 
         // Depth-weighted metric speed (see updateDepthFlowSpeed): recovers the
         // metric scale of the recoverPose translation from the tracked points'
@@ -5539,19 +5563,28 @@ VisionOutput Tracker::processFrame(const uint8_t* yuv_data, int width, int heigh
                                     // 2026-05-25 walk, so it must NOT override the
                                     // mag. Stays active as a fallback when the mag
                                     // is unavailable (dirty field / indoors).
+                                    // 2026-06-02 (owner decision): the VISUAL yaw nudge is DISABLED. The
+                                    // displayed heading must be ROAD + GYRO + MAGNETOMETER only — NEVER the
+                                    // essential-matrix-ambiguous visual yaw. On a degenerate scene (a flat
+                                    // video / dirty-mag indoors, where this nudge used to fire because the
+                                    // mag isn't fusing) the visual yaw leaked into the Madgwick yaw that the
+                                    // rail's gyro-relative steering reads (lastVioHeadingDeg) → spurious
+                                    // "rotation" → false U-turn 180° flips. The road-bearing nudge (§9.0b)
+                                    // and the magnetometer are the heading sources now. The application is
+                                    // commented (kept per the no-delete rule) — we still LOG what it WOULD
+                                    // have done so the visual/gyro disagreement stays observable.
                                     if (std::isfinite(yaw_resid_madg) &&
                                         std::abs(yaw_resid_madg) < kBug5MaxResidualRad &&
                                         !imu.isMagActivelyFusing()) {
+                                        /* DISABLED 2026-06-02 — visual must not touch the heading:
                                         imu.nudgeMadgwickYawAroundWorldZ(
                                             kBug5SyncStrength * yaw_resid_madg);
                                         navsight::eventCounters()
                                             .madgwick_visual_yaw_nudges_total
-                                            .fetch_add(1, std::memory_order_relaxed);
+                                            .fetch_add(1, std::memory_order_relaxed); */
                                         if (frame_counter_ % 30 == 0) {
-                                            LOGI("MADG_VISUAL_SYNC: residual=%+.2f° "
-                                                 "applied=%+.2f° madg_was=%+.2f° "
-                                                 "(BUG-02b: now fires regardless of "
-                                                 "is_static/translation_degenerate)",
+                                            LOGI("MADG_VISUAL_SYNC[DISABLED]: would_resid=%+.2f° "
+                                                 "would_apply=%+.2f° madg=%+.2f° (visual no longer affects heading)",
                                                  yaw_resid_madg * 180.0 / M_PI,
                                                  kBug5SyncStrength * yaw_resid_madg *
                                                      180.0 / M_PI,
@@ -6812,6 +6845,9 @@ VisionOutput Tracker::processFrame(const uint8_t* yuv_data, int width, int heigh
                  gp.ground_scale, gp.confidence, gp.h_vio, gp.n_candidates, gp.n_inliers, gp.horizon_v_px);
         }
     }
+    // AV-style ground-plane GRID for the camera overlay — runs every frame when a camera height is set
+    // (independent of is_static, so it shows while stopped too), gated internally on IMU gravity-settle.
+    if (camera_height_m_ > 0.0) computeGroundGrid(imu);
     return out;
 }
 
@@ -8970,78 +9006,159 @@ void Tracker::updateExpansionSpeed(const std::vector<cv::Point2f>& prev_ud,
 void Tracker::updateGroundFlowSpeed(const std::vector<cv::Point2f>& prev_ud,
                                     const std::vector<cv::Point2f>& next_ud,
                                     double dt_s,
-                                    const cv::Vec3d& gyro_rot_cam) {
-    if (dt_s <= 1e-4 || fx_ <= 0.0 || fy_ <= 0.0 || camera_height_m_ <= 0.0) return;
+                                    const cv::Vec3d& gyro_rot_cam,
+                                    const IMUPreintegrator& imu) {
+    if (dt_s <= 1e-4 || fx_ <= 0.0 || fy_ <= 0.0 || camera_height_m_ <= 0.0) {
+        if (frame_counter_ % 30 == 0)
+            LOGI("GROUND_FLOW_FUNNEL: skipped dt=%.3f fx=%.1f h=%.2f (need h>0, fx>0)", dt_s, fx_, camera_height_m_);
+        return;
+    }
 
-    // 1. Get ground plane normal in camera frame.
-    // Use the EKF's gravity vector (Up in camera frame) as the ground normal reference.
-    const cv::Matx33d R_GtoI = ekf_.getRotation();
-    const cv::Matx33d R_bc   = ekf_.getExtrinsicsRotation();
-    const cv::Matx33d R_GtoC = R_bc * R_GtoI;
-    
-    // Unit normal pointing UP (towards camera) from ground in camera frame.
-    // ENU world: Z is up.
-    const cv::Vec3d n_up_c = R_GtoC * cv::Vec3d(0, 0, 1);
-    
-    // 2. Unit forward vector in camera frame (along heading).
-    // scalar_heading_ is CW-positive radians from North.
-    const cv::Vec3d fwd_w(std::sin(scalar_heading_), std::cos(scalar_heading_), 0.0);
-    const cv::Vec3d u_fwd_c = R_GtoC * fwd_w;
+    // 1. Ground-plane normal in the CAMERA frame, straight from the FILTERED GRAVITY (the LP-filtered
+    // accelerometer, which points UP in the body frame), rotated by the camera extrinsic: n_up_c = R_bc·ĝ.
+    // AUDIT 2026-06-02 + offline-replay: this needs NO VIO init and NO Madgwick gravity-settle flag — gravity
+    // is available from the first accel sample, even while static. The earlier versions failed because
+    // ekf_.getRotation() is IDENTITY pre-VIO-init (→ n_up=(0,0,-1)=a wall ahead) AND the imu.isInitialized()
+    // gate (gravity_initialized_, which needs a stationary startup window) blocked the replay harness and
+    // cold starts entirely (gp_flow fired 0×). Gravity gives a correct "down" immediately. Yaw is NOT used
+    // (forward is the optical axis below), so this is fully VIO/heading-independent. READ-ONLY: writes only
+    // ground_flow_speed_mps_, never the dot.
+    const cv::Point3f g_filt = imu.getFilteredGravity();
+    const double g_norm = std::sqrt(static_cast<double>(g_filt.x) * g_filt.x +
+                                    static_cast<double>(g_filt.y) * g_filt.y +
+                                    static_cast<double>(g_filt.z) * g_filt.z);
+    if (g_norm < 1.0) {   // no gravity sample yet (very first frames) — nothing to do
+        if (frame_counter_ % 30 == 0) LOGI("GROUND_FLOW_FUNNEL: skipped reason=no_gravity_sample");
+        return;
+    }
+    const cv::Matx33d R_bc = ekf_.getExtrinsicsRotation();
+    // world-up in camera frame = R_bc · (filtered-accel direction, which points up in body when level)
+    const cv::Vec3d n_up_c = R_bc * (cv::Vec3d(g_filt.x, g_filt.y, g_filt.z) / g_norm);
+
+    // Skip when the camera is looking UP (no ground in front). n_up_c(2) is the optical-axis component of
+    // world-up: <0 = camera tilted DOWN (ground ahead). When aimed up the projection is degenerate (the
+    // grid sprayed into the sky, and any speed would be garbage), so bail. -0.05 ≈ at/just-below the horizon.
+    if (n_up_c(2) > -0.05) {
+        if (frame_counter_ % 30 == 0)
+            LOGI("GROUND_FLOW_FUNNEL: skipped reason=camera_looking_up n_up_z=%.2f", n_up_c(2));
+        return;
+    }
+
+    // 2. Forward = the camera's OPTICAL AXIS projected onto the ground plane (where the camera is looking,
+    // flattened to the road) — heading-INDEPENDENT. AUDIT/on-device 2026-06-02 (screenshot: grid skewed off
+    // the road + 19× under-read): the old code derived forward from the WORLD heading (scalar_heading_),
+    // which is drifting/offset, so the predicted per-unit-speed flow direction `a` was rotated ~perpendicular
+    // to the real road-ahead flow → grid lay off the road AND f·a≈0 → v_i rejected (speed_ok=0, under-read by
+    // ~cos θ). The optical axis projected to the ground IS the road the camera sees = the scooter's travel
+    // direction (forward-mounted), so it aligns `a` with the real flow. Must be UNIT (the speed scale needs it).
+    cv::Vec3d u_fwd_c = cv::Vec3d(0.0, 0.0, 1.0) - cv::Vec3d(0.0, 0.0, 1.0).dot(n_up_c) * n_up_c;
+    const double fwd_norm = cv::norm(u_fwd_c);
+    if (fwd_norm < 1e-6) return;   // camera looking straight along gravity → no forward on the plane
+    u_fwd_c /= fwd_norm;
 
     // 3. De-rotate flow and project each point to ground plane.
     const double wx = gyro_rot_cam[0];
     const double wy = gyro_rot_cam[1];
     const double wz = gyro_rot_cam[2];
-    
-    // Road region logic (matches GroundPlaneEstimator)
-    const int img_width = static_cast<int>(cx_ * 2.0);
-    const int img_height= static_cast<int>(cy_ * 2.0);
-    const int rot = ((analyzer_rotation_deg_.load() % 360) + 360) % 360;
-    const float frac = 0.55f; // kLowerImageFrac
-    
+
+    const int rot = ((analyzer_rotation_deg_.load() % 360) + 360) % 360;   // kept for the funnel log only
+    // GEOMETRIC road-point selection (AUDIT 2026-06-02, 3 converging lenses). A "road" point is one whose ray
+    // is BELOW the gravity horizon (n_up·ray < 0 → Z = -h/(n_up·ray) > 0, the ground plane IN FRONT) within a
+    // plausible depth band. This REPLACES the old hardcoded pixel strip (px > 0.55·width): in this sensor-
+    // native R_bc frame the horizon is a near-VERTICAL line, so the fixed strip STRADDLED it and fed OFF-PLANE
+    // (sky/horizon, D2>0 → Z<0) points into the median → cos(f,a)≈0 → the ~20× under-read. Following gravity is
+    // rotation/mount-agnostic and matches how the overlay grid (computeGroundGrid) already selects the road.
+    constexpr double kIpmMinRoadDepthM = 0.5;    // closest plausible road point for a ~1 m forward-down mount
+    constexpr double kIpmMaxRoadDepthM = 50.0;   // beyond this the road flow is sub-pixel + the planar assumption fails
+
     std::vector<double> speeds;
+    std::vector<cv::Point2f> inlier_px;   // 2026-06-02 VIZ — road pixels the IPM used (current frame)
+    int n_in_road = 0;   // FUNNEL diag: points in the lower-image road region
+    int n_denom_ok = 0;  // FUNNEL diag: of those, points with a well-conditioned ground-plane denom
+    std::vector<double> dbg_raw_vi, dbg_fmag_px, dbg_Z, dbg_align;   // TEMP IPM_DIAG (raw, ungated)
     const size_t n_pts = std::min(prev_ud.size(), next_ud.size());
     for (size_t i = 0; i < n_pts; ++i) {
         const float px = prev_ud[i].x;
         const float py = prev_ud[i].y;
         
-        bool in_road = false;
-        switch (rot) {
-            case 90:  in_road = (px > frac * img_width); break;
-            case 180: in_road = (py < (1.0f - frac) * img_height); break;
-            case 270: in_road = (px < (1.0f - frac) * img_width); break;
-            default:  in_road = (py > frac * img_height); break;
-        }
-        if (!in_road) continue;
-
         const double xp = (px - cx_) / fx_;
         const double yp = (py - cy_) / fy_;
-        
-        // De-rotate: Heeger-Jepson 1992 (normalized angular flow per frame interval)
+
+        // GEOMETRIC road test: keep the point only if its ray is BELOW the gravity horizon (D2<0 → Z>0,
+        // ground plane in front) within the plausible depth band. Subsumes the missing Z>0 filter and
+        // replaces the off-plane-admitting pixel strip — see the note above.
+        const double D2 = n_up_c(0) * xp + n_up_c(1) * yp + n_up_c(2);   // n_up·ray  (= -h/Z)
+        const double inv_Z = -D2 / camera_height_m_;                      // 1/Z from the known mount height
+        if (inv_Z <= 0.0) continue;                                       // D2 ≥ 0 → at/above horizon, not road
+        const double Z = 1.0 / inv_Z;
+        if (Z < kIpmMinRoadDepthM || Z > kIpmMaxRoadDepthM) continue;     // implausible depth → off-plane, reject
+        ++n_in_road;
+
+        // De-rotate flow (Heeger-Jepson 1992, normalized angular flow per frame interval).
         const double u_rot = xp * yp * wx - (1.0 + xp * xp) * wy + yp * wz;
         const double v_rot = (1.0 + yp * yp) * wx - xp * yp * wy - xp * wz;
-        
-        // Observed normalized flow
         const double dx = (next_ud[i].x - px) / fx_;
         const double dy = (next_ud[i].y - py) / fy_;
-        
-        // Translational component of flow
-        const double dv_tr = dy - v_rot;
-        
-        // Speed formula with exact pitch/roll compensation:
-        // v = h * (dv_tr / dt) / denom
-        // denom = (u_fwd.y - yp * u_fwd.z) * (n_up.x * xp + n_up.y * yp + n_up.z)
-        const double denom = (u_fwd_c(1) - yp * u_fwd_c(2)) * (n_up_c(0) * xp + n_up_c(1) * yp + n_up_c(2));
-        
-        // Sanity check: points above horizon have denom signs that flip or go through zero.
-        // For road points, denom should be well-behaved.
-        if (std::abs(denom) > 1e-4) {
-            double v_i = (camera_height_m_ * dv_tr / dt_s) / denom;
+        const double f_tr_x = dx - u_rot;   // de-rotated TRANSLATIONAL flow, both axes
+        const double f_tr_y = dy - v_rot;
+
+        // A static ground point's flow is f = -v·a, where a = u_fwd⊥/Z is the per-unit-speed direction:
+        //   u_fwd⊥ = (u_fwd.x - xp·u_fwd.z,  u_fwd.y - yp·u_fwd.z). Least-squares over BOTH axes:
+        //   v = -(f·a)/(a·a). For a true road point cos(f,a) → -1 (the geometric gate above guarantees the
+        //   point is on the plane, so the perpendicular cos≈0 case — off-plane points — can no longer occur).
+        const double a_x = (u_fwd_c(0) - xp * u_fwd_c(2)) * inv_Z;
+        const double a_y = (u_fwd_c(1) - yp * u_fwd_c(2)) * inv_Z;
+        const double aa = a_x * a_x + a_y * a_y;
+        if (aa > 1e-8) {
+            ++n_denom_ok;
+            const double v_i = -((f_tr_x * a_x + f_tr_y * a_y) / aa) / dt_s;   // metres/frame → m/s
+            // TEMP IPM_DIAG — raw (ungated) per-point internals.
+            dbg_raw_vi.push_back(v_i);
+            dbg_fmag_px.push_back(std::sqrt(f_tr_x * f_tr_x + f_tr_y * f_tr_y) * fx_);   // flow magnitude px/frame
+            dbg_Z.push_back(Z);                                                          // depth (m), now > 0
+            dbg_align.push_back((f_tr_x * a_x + f_tr_y * a_y) /
+                                (std::sqrt(f_tr_x * f_tr_x + f_tr_y * f_tr_y) * std::sqrt(aa) + 1e-12));  // cos(f,a)
             // Scooters don't go backwards or faster than 50 m/s (180 km/h).
             if (v_i > 0.1 && v_i < 50.0) {
                 speeds.push_back(v_i);
+                inlier_px.push_back(next_ud[i]);   // VIZ — this road pixel fed the speed (current frame)
             }
         }
+    }
+
+    // FUNNEL diagnostic — logs WHERE the road pixels are lost, even when the IPM produces nothing (the
+    // GROUND_SPEED_DBG line only fires on success, so a failing ride was previously invisible). Fires
+    // whenever it under-produces (<5) or every 30 frames. Read it as a funnel:
+    //   in_road=0          → the road region is empty (wrong rotation, or the road isn't in the lower
+    //                         image — e.g. filming a vertical screen, or camera aimed too high).
+    //   in_road>0,denom~0  → the ground-plane geometry is degenerate (EKF/heading/gravity not valid yet,
+    //                         or the surface isn't a horizontal ground plane — the screen-video case).
+    //   denom_ok>0,speed=0 → all v_i fell outside (0.1,50) m/s (not actually translating / wrong scale).
+    // FUNNEL + RAW INTERNALS — on-device-visible (LOGI → logcat) so a real ride pinpoints the under-read.
+    // raw_vi = ungated per-point speed (signed); fmag_px = de-rotated flow px/frame; Z = recovered depth
+    // (must be POSITIVE — a road point in front); cos_fa = alignment of measured flow with the predicted
+    // ground-flow direction (should be ≈ −1 for forward motion; ≈0 = the forward/geometry is wrong → speed
+    // collapses). The harness can't exercise this (KLT tracks <8 pts on fast/blurred scooter frames), so
+    // these are read from logcat on-device.
+    auto med = [](std::vector<double>& v) -> double {
+        if (v.empty()) return -9.0; std::sort(v.begin(), v.end()); return v[v.size() / 2]; };
+    if (speeds.size() < 5 || frame_counter_ % 20 == 0) {
+        LOGI("GROUND_FLOW_FUNNEL: in_road=%d denom_ok=%d speed_ok=%zu dt=%.3f raw_vi=%.2f fmag_px=%.1f "
+             "Z=%.2f cos_fa=%.2f n_up=(%.2f,%.2f,%.2f) u_fwd=(%.2f,%.2f,%.2f) rot=%d h=%.2f",
+             n_in_road, n_denom_ok, speeds.size(), dt_s, med(dbg_raw_vi), med(dbg_fmag_px),
+             med(dbg_Z), med(dbg_align), n_up_c(0), n_up_c(1), n_up_c(2),
+             u_fwd_c(0), u_fwd_c(1), u_fwd_c(2), rot, camera_height_m_);
+    }
+    // FILE mirror for the harness (stderr buffering ate prints there; fopen no-ops on device).
+    static FILE* dbgf = std::fopen("ipm_diag.txt", "w");
+    static int dbgc = 0;
+    if (dbgf && (dbgc++ % 5 == 0)) {
+        std::fprintf(dbgf, "IPM_DIAG in_road=%d denom_ok=%d speed_ok=%zu dt=%.3f raw_vi=%.2f fmag_px=%.1f "
+                     "Z=%.2f cos_fa=%.2f n_up=(%.2f,%.2f,%.2f) u_fwd=(%.2f,%.2f,%.2f)\n",
+                     n_in_road, n_denom_ok, speeds.size(), dt_s, med(dbg_raw_vi), med(dbg_fmag_px),
+                     med(dbg_Z), med(dbg_align), n_up_c(0), n_up_c(1), n_up_c(2),
+                     u_fwd_c(0), u_fwd_c(1), u_fwd_c(2));
+        std::fflush(dbgf);
     }
     
     // 4. Robust median and EMA.
@@ -9060,4 +9177,90 @@ void Tracker::updateGroundFlowSpeed(const std::vector<cv::Point2f>& prev_ud,
         LOGI("GROUND_SPEED_DBG raw_mps=%.3f ema_mps=%.3f inliers=%d dt=%.3f",
              v_med, ground_flow_speed_mps_.load(), (int)speeds.size(), dt_s);
     }
+
+    // VIZ — publish the road pixels used this frame (or the few candidates when <5) so the camera
+    // overlay shows the ground-plane recognition live. Always set (even empty) so stale dots clear.
+    {
+        std::lock_guard<std::mutex> lk(ipm_viz_mutex_);
+        ipm_inlier_px_.swap(inlier_px);
+    }
+}
+
+// 2026-06-02 — AV-style ground-plane GRID. Projects the IPM ground plane (the flat surface at the known
+// mount height, tilted by gravity, oriented by heading) into a perspective mesh of image-pixel line
+// segments. Gravity (from the IMU/Madgwick attitude — valid immediately, even static) sets the tilt, so
+// the grid lies flat on the real road when the geometry is correct — exactly the "show the road" view AVs
+// render (minus the learned road SEGMENTATION, which needs a model we don't have). READ-ONLY: drawn on the
+// camera overlay, never feeds the dot. Empty until imu.isInitialized() (gravity settled) — NOT gated on
+// full VIO init, so it shows on a bench/video as soon as the accelerometer locks gravity (AUDIT 2026-06-02).
+void Tracker::computeGroundGrid(const IMUPreintegrator& imu) {
+    std::vector<float> segs;
+    auto publish = [&]() {
+        std::lock_guard<std::mutex> lk(ground_grid_mutex_);
+        ground_grid_segs_.swap(segs);
+    };
+    const cv::Point3f g_filt = imu.getFilteredGravity();
+    const double g_norm = std::sqrt(static_cast<double>(g_filt.x) * g_filt.x +
+                                    static_cast<double>(g_filt.y) * g_filt.y +
+                                    static_cast<double>(g_filt.z) * g_filt.z);
+    if (camera_height_m_ <= 0.0 || fx_ <= 0.0 || fy_ <= 0.0 || g_norm < 1.0) {
+        publish();   // clear — no camera height or no gravity sample yet (empty grid = "not locked")
+        return;
+    }
+    // Ground normal straight from filtered gravity (no VIO/Madgwick-init gate) — see updateGroundFlowSpeed.
+    const cv::Vec3d n_up = ekf_.getExtrinsicsRotation() * (cv::Vec3d(g_filt.x, g_filt.y, g_filt.z) / g_norm);
+    // Only draw when the camera is looking DOWN/forward enough that the GROUND is in front of it. n_up(2) is
+    // the optical-axis component of world-up: <0 = camera tilted DOWN (ground ahead), >0 = tilted UP (sky
+    // ahead, ground behind). When aimed up the projection degenerates and the grid sprays into the sky
+    // (owner-reported), so skip it there — no ground in front to draw. -0.05 ≈ at/just-below the horizon.
+    if (n_up(2) > -0.05) { publish(); return; }
+    // Forward = camera OPTICAL AXIS projected onto the ground plane (heading-independent — lies on the road
+    // the camera actually sees). See updateGroundFlowSpeed for why the world-heading version skewed it.
+    cv::Vec3d fwd_g = cv::Vec3d(0.0, 0.0, 1.0) - cv::Vec3d(0.0, 0.0, 1.0).dot(n_up) * n_up;
+    const double fn = cv::norm(fwd_g);
+    if (fn < 1e-6) { publish(); return; }
+    fwd_g /= fn;
+    cv::Vec3d right_g = fwd_g.cross(n_up);                                           // right ON the plane
+    const double rn = cv::norm(right_g);
+    if (rn < 1e-6) { publish(); return; }
+    right_g /= rn;
+    const double h = camera_height_m_;
+    const cv::Vec3d G0 = -h * n_up;                                                  // ground point below cam
+    const double img_w = cx_ * 2.0, img_h = cy_ * 2.0;
+    auto project = [&](double d, double l, float& px, float& py) -> bool {
+        const cv::Vec3d P = G0 + d * fwd_g + l * right_g;
+        if (P[2] <= 0.05) return false;                                             // behind / at the camera
+        px = static_cast<float>(fx_ * P[0] / P[2] + cx_);
+        py = static_cast<float>(fy_ * P[1] / P[2] + cy_);
+        if (!std::isfinite(px) || !std::isfinite(py)) return false;
+        // keep segments near the frame (allow a margin so lines run to the edges)
+        return px > -img_w && px < 2.0 * img_w && py > -img_h && py < 2.0 * img_h;
+    };
+    auto addSeg = [&](float x0, float y0, float x1, float y1) {
+        segs.push_back(x0); segs.push_back(y0); segs.push_back(x1); segs.push_back(y1);
+    };
+    // Longitudinal rails (constant lateral offset, sweeping forward distance) — the "lane" lines. Capped at
+    // 8 m (was 16): far points approach the horizon, which is HIGH in the frame when the camera isn't steeply
+    // down (e.g. held near-horizontal at a video) — making the grid look like it sprays at the sky. Keeping it
+    // to the near road foreground keeps it visibly ON the road. (The SPEED uses the full road depth band.)
+    const double lanes[] = {-2.0, -1.0, 0.0, 1.0, 2.0};
+    for (double l : lanes) {
+        float px0 = 0, py0 = 0; bool have = project(1.0, l, px0, py0);
+        for (double d = 2.0; d <= 8.0; d += 1.0) {
+            float px1, py1; const bool h1 = project(d, l, px1, py1);
+            if (have && h1) addSeg(px0, py0, px1, py1);
+            px0 = px1; py0 = py1; have = h1;
+        }
+    }
+    // Lateral rungs (constant forward distance, sweeping lateral) — the perspective "ladder".
+    const double rungs[] = {2.0, 3.0, 4.0, 5.0, 6.0, 7.0, 8.0};
+    for (double d : rungs) {
+        float px0 = 0, py0 = 0; bool have = project(d, -2.5, px0, py0);
+        for (double l = -2.0; l <= 2.5; l += 0.5) {
+            float px1, py1; const bool h1 = project(d, l, px1, py1);
+            if (have && h1) addSeg(px0, py0, px1, py1);
+            px0 = px1; py0 = py1; have = h1;
+        }
+    }
+    publish();
 }

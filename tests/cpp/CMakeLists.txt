@@ -52,6 +52,9 @@ add_library(navsight_core STATIC
     ${CMAKE_CURRENT_SOURCE_DIR}/desktop_stubs/ViewerServer_stub.cpp
     ${VIO_SRC_DIR}/ScaleEstimatorVI.cpp
     ${VIO_SRC_DIR}/ScaleFuser.cpp
+    # 2026-06-02: ground-plane metric-scale estimator (camera-height scale recovery,
+    # read-only Phase 0). Tracker.cpp uses it; the harness logs it vs GPS.
+    ${VIO_SRC_DIR}/GroundPlaneEstimator.cpp
     # Plan Step 6 (ADR-012): local windowed bundle adjustment. test_windowed_ba.cpp
     # links against WindowedBA::solve, so the TU must be in navsight_core.
     ${VIO_SRC_DIR}/WindowedBA.cpp

@@ -208,6 +208,31 @@ public:
     // scooter, bike, etc. Returns -1.0 before the first valid estimate (caller
     // shows 0/"--").
     double getFusedSpeedMps() const;
+    // 2026-06-02 — READ-ONLY ground-plane optical-flow speed (m/s), the IPM Phase-1 scooter-speed
+    // candidate (Tracker::updateGroundFlowSpeed). NEVER feeds the dot; surfaced (public) only so the
+    // JNI/sim recording can log it next to GPS for offline scoring. -1.0 until ≥5 road inliers.
+    double getGroundFlowSpeedMps() const {
+        return ground_flow_speed_mps_.load(std::memory_order_relaxed);
+    }
+    // 2026-06-02 — IPM ground-plane VIZ: copies the pixel positions (x,y pairs, analyzer/undistorted
+    // coords) of the road pixels the IPM speed actually USED this frame into out; returns the point
+    // count. Lets the camera overlay show WHICH pixels are recognized as ground. Read-only / display.
+    int getIpmInlierPixels(std::vector<float>& out) const {
+        std::lock_guard<std::mutex> lk(ipm_viz_mutex_);
+        out.clear();
+        out.reserve(ipm_inlier_px_.size() * 2);
+        for (const auto& p : ipm_inlier_px_) { out.push_back(p.x); out.push_back(p.y); }
+        return static_cast<int>(ipm_inlier_px_.size());
+    }
+    // 2026-06-02 — AV-style ground-plane GRID: copies the projected grid line SEGMENTS (x0,y0,x1,y1 per
+    // segment, analyzer pixels) into out; returns the segment count. The grid is the IPM ground plane
+    // (gravity-down + mount height + heading) projected onto the image — it shows WHERE the system thinks
+    // the flat road surface is (the AV "ground mesh"). Empty until the EKF is gravity-aligned. Display-only.
+    int getGroundGridSegments(std::vector<float>& out) const {
+        std::lock_guard<std::mutex> lk(ground_grid_mutex_);
+        out = ground_grid_segs_;
+        return static_cast<int>(ground_grid_segs_.size() / 4);
+    }
     // 2026-05-28 — cross-app-launch persistence of the MiDaS scale K (the
     // metric-per-relative depth-flow scale calibrated inside updateDepthFlowSpeed).
     // The Kotlin layer loads K from SharedPreferences on app start and pushes it
@@ -593,6 +618,20 @@ private:
     // metric speed. Independent of KLT triangulation or MiDaS.
     std::atomic<double> ground_flow_speed_mps_{-1.0};
 
+    // 2026-06-02 — IPM ground-plane VIZ: the road-inlier pixel positions updateGroundFlowSpeed used
+    // this frame (analyzer/undistorted coords), for the camera overlay so the rider can SEE which
+    // pixels are recognized as ground. Guarded by its own mutex (written camera-thread in
+    // updateGroundFlowSpeed, read by the JNI overlay getter). Display-only; never feeds the dot.
+    mutable std::mutex ipm_viz_mutex_;
+    std::vector<cv::Point2f> ipm_inlier_px_;
+
+    // 2026-06-02 — AV-style ground-plane GRID line segments (x0,y0,x1,y1 per segment, analyzer pixels):
+    // the IPM ground plane (gravity + mount height + heading) projected onto the image so the rider sees
+    // the road surface as a perspective mesh. Built in computeGroundGrid (camera thread), read by the JNI
+    // overlay getter. Display-only; never feeds the dot.
+    mutable std::mutex ground_grid_mutex_;
+    std::vector<float> ground_grid_segs_;
+
     // 2026-05-28 — trajectory-applied speed (m/s). What the trajectory accumulator
     // is ACTUALLY using to advance global_t_ this frame, regardless of source:
     //   - depth_flow_speed_mps_ when depth-flow / looming is valid;
@@ -607,10 +646,8 @@ private:
     // the depth-flow internals; trajectory_speed_mps_ is the UI-facing view.
     std::atomic<double> trajectory_speed_mps_{0.0};
 
-    // 2026-06-02 — read-only access to the ground-plane speed estimate (m/s).
-    double getGroundFlowSpeedMps() const {
-        return ground_flow_speed_mps_.load(std::memory_order_relaxed);
-    }
+    // (getGroundFlowSpeedMps moved to the public section, near getFusedSpeedMps, so the
+    //  JNI can read it; the atomic member ground_flow_speed_mps_ stays declared above.)
 
     // 2026-05-27 — expansion-rate metric speed (Tracker::updateExpansionSpeed):
     // implements "Vz = expansion_rate * Z_rel * K" robustly via Median + WLS.
@@ -649,7 +686,13 @@ private:
     void updateGroundFlowSpeed(const std::vector<cv::Point2f>& prev_ud,
                                const std::vector<cv::Point2f>& next_ud,
                                double dt_s,
-                               const cv::Vec3d& gyro_rot_cam);
+                               const cv::Vec3d& gyro_rot_cam,
+                               const IMUPreintegrator& imu);
+    // 2026-06-02 — projects the IPM ground plane (gravity-down + mount height + heading) into a
+    // perspective grid of image-pixel line segments for the AV-style camera overlay. Gravity gives the
+    // tilt, so the grid sits flat on the road when the geometry is right. Uses the IMU/Madgwick attitude
+    // (valid immediately, even static), gated on imu.isInitialized() — NOT on full VIO init.
+    void computeGroundGrid(const IMUPreintegrator& imu);
 
     // 2026-05-30 (Scale fix Steps 1-3, docs/SCALE_FIX_DESIGN_2026_05_30.md) —
     // PER-GAIT K. A single shared K cannot serve walk/run/vehicle: the measured

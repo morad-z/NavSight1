@@ -75,6 +75,12 @@ object NativeBridge {
     // the first estimate; the ViewModel then shows 0 and smooths the value.
     external fun getFusedSpeedMps(): Float
 
+    // 2026-06-02 — READ-ONLY ground-plane optical-flow speed (m/s): IPM metric speed from
+    // de-rotated road-pixel flow + the known camera mount height, observable at constant
+    // cruise where accel-K is blind. NEVER feeds the dot; logged per-sample next to GPS so
+    // we can score it offline before deciding to fuse it. -1.0 until ≥5 road inliers.
+    external fun getGroundFlowSpeedMps(): Float
+
     // 2026-05-28 — MiDaS scale K (relative-disparity → metric m). Calibrated
     // inside the C++ depth-flow path from accumulated accel distance vs visual
     // relative distance. Persisting it across app launches is required because
@@ -170,6 +176,14 @@ object NativeBridge {
     // 2026-06-02 — read-only ground-plane snapshot for the camera overlay. Caller passes FloatArray(6);
     // layout [is_valid(0/1), horizon_v_px, confidence, ground_scale, candidates, inliers]. Returns count.
     external fun getGroundPlaneSnapshot(out: FloatArray): Int
+    // 2026-06-02 — IPM ground-plane VIZ: the (x,y) analyzer-pixel positions of the road pixels the IPM
+    // speed used this frame. Caller preallocates a FloatArray; returns the number of FLOATS written
+    // (2 per point). Drawn as amber dots on the camera overlay so the rider sees the ground recognition.
+    external fun getIpmInlierPoints(out: FloatArray): Int
+    // 2026-06-02 — AV-style ground-plane GRID line segments [x0,y0,x1,y1, ...] (analyzer pixels): the IPM
+    // ground plane projected onto the image. Caller preallocates a FloatArray; returns #floats (4/segment).
+    // Drawn as a perspective road mesh on the camera overlay so the rider sees where the road plane is.
+    external fun getGroundGridSegments(out: FloatArray): Int
     // 2026-06-02 — set the scooter camera-to-road mount height (m); activates the read-only ground-plane
     // metric-scale estimator. 0 = off. Distinct from setUserHeight (rider body height for stride).
     external fun setCameraHeight(heightM: Double)

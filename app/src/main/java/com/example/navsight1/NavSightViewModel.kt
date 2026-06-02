@@ -96,9 +96,22 @@ class NavSightViewModel(application: Application) : AndroidViewModel(application
         // tick. This separates "took a junction" from "followed the curve" for the log; it is NOT a
         // steering threshold (steering is the anchor model) so it changes no behaviour.
         private const val RAIL_JUNCTION_LOG_MIN_TURN_DEG = 1.0
-        // Scooter camera-to-road mount height (m) for the read-only ground-plane estimator. Adjustable;
-        // a wrong value scales the recovered speed linearly, so measure the real mount for production.
+        // Scooter camera-to-road mount height (m) for the read-only ground-plane estimator. Default guess;
+        // a wrong value scales the recovered speed linearly. Auto-calibrated from GPS once per mount (below).
         private const val SCOOTER_CAMERA_HEIGHT_M = 1.05
+        // Persisted GPS-calibrated mount height. Key PRESENCE = "already calibrated" (don't re-calibrate).
+        private const val PREF_CAMERA_HEIGHT = "camera_height_m"
+        // Bumped whenever the IPM geometry changes — a height auto-calibrated against an OLD (e.g. under-
+        // reading) IPM is STALE and must be discarded so it re-calibrates against the corrected estimator.
+        // v2 = the 2026-06-02 geometric road-point fix (a prior calib like 1.70 = the under-read compensation).
+        private const val PREF_CAMERA_HEIGHT_VERSION = "camera_height_calib_version"
+        private const val CAMERA_HEIGHT_CALIB_VERSION = 2
+        // Samples of a clean GPS+IPM pair before committing the height (~5 s at the ~5 Hz UI tick).
+        private const val HEIGHT_CALIB_SAMPLES = 25
+        // Min GPS accuracy (m) and min speed (m/s) for a calibration sample, and the plausible-correction
+        // band on a single ratio (the final height is hard-clamped to 0.3–2.5 m regardless).
+        private const val HEIGHT_CALIB_MAX_GPS_ACC_M = 12f
+        private const val HEIGHT_CALIB_MIN_MPS = 3.0f
     }
 
     private val sensorRepository = SensorRepository(application)
@@ -212,6 +225,12 @@ class NavSightViewModel(application: Application) : AndroidViewModel(application
     var currentSpeedKmh by mutableStateOf(0f)
         private set
 
+    // 2026-06-02 — READ-ONLY live readout of the IPM ground-plane speed (km/h) for on-device
+    // eyeballing vs the speedometer (the candidate scooter speed-fix). null = not firing yet
+    // (the IPM needs ≥5 road-pixel inliers). It NEVER drives the dot/speedometer — display only.
+    var groundFlowSpeedKmh by mutableStateOf<Float?>(null)
+        private set
+
     var totalDistanceM by mutableStateOf(0.0)
         private set
 
@@ -230,6 +249,17 @@ class NavSightViewModel(application: Application) : AndroidViewModel(application
     var scaleCalibrationSession by mutableStateOf<ScaleCalibrationSession?>(null)
         private set
     var userHeight by mutableStateOf(prefs.getFloat(PREF_USER_HEIGHT, 1.70f))
+        private set
+
+    // 2026-06-02 — GPS-auto-calibrated camera mount height (m). The IPM speed is LINEAR in this height,
+    // so one trusted GPS speed solves it: h_true = h × (gps/ipm). Loaded from prefs (key presence =
+    // already calibrated → don't redo); default = the scooter guess. GPS is used ONLY for this physical
+    // constant — the dot/position stays pure VIO. Exposed read-only for the camera HUD.
+    private var cameraHeightM = prefs.getFloat(PREF_CAMERA_HEIGHT, SCOOTER_CAMERA_HEIGHT_M.toFloat()).toDouble()
+    private var heightCalibrated = prefs.contains(PREF_CAMERA_HEIGHT)
+    private val heightCalibRatios = mutableListOf<Double>()
+    val mountHeightM: Double get() = cameraHeightM
+    var heightCalibStatus by mutableStateOf<String?>(null)
         private set
 
     // Step 1 (Visual plan): camera-calibration JSON existence.
@@ -281,7 +311,13 @@ class NavSightViewModel(application: Application) : AndroidViewModel(application
         //   mmSrc    — "osrm:match" | "snap" | "raw" | null (which matcher produced the dot)
         //   kMap     — per-sample K̂_map = d_route/d_vio (scale observation; null when unmatched)
         //   maneuver — ManeuverState ("FREE_ROAD" | "ON_ROUNDABOUT" | "MID_ROAD_UTURN")
-        val mmSrc: String?, val kMap: Double?, val maneuver: String?
+        val mmSrc: String?, val kMap: Double?, val maneuver: String?,
+        // 2026-06-02 — READ-ONLY speed channels logged for offline scoring vs GPS (the IPM
+        // ground-plane speed-fix validation). gpFlow = Tracker::updateGroundFlowSpeed (the
+        // candidate); fused = the currently-DISPLAYED speed (getFusedSpeedMps). Both m/s,
+        // null when the native estimate is the -1.0 "not yet" sentinel. Compare both to the
+        // glat/glng-derived GPS speed to decide whether the IPM corrects the under-read.
+        val gpFlowSpeed: Double?, val fusedSpeed: Double?
     )
     // ──────────────────────────────────────────────────────────────────────────
 
@@ -430,11 +466,20 @@ class NavSightViewModel(application: Application) : AndroidViewModel(application
     init {
         NativeBridge.setScale(scaleCalibrationFactor)
         NativeBridge.setUserHeight(userHeight)
+        // Discard a mount height auto-calibrated against an OLD IPM (the geometry was fixed 2026-06-02 — a
+        // prior calib of ~1.70 m was just the under-read compensation). Reset to the default so GPS
+        // re-calibrates against the corrected estimator.
+        if (prefs.getInt(PREF_CAMERA_HEIGHT_VERSION, 0) != CAMERA_HEIGHT_CALIB_VERSION) {
+            prefs.edit().remove(PREF_CAMERA_HEIGHT)
+                .putInt(PREF_CAMERA_HEIGHT_VERSION, CAMERA_HEIGHT_CALIB_VERSION).apply()
+            cameraHeightM = SCOOTER_CAMERA_HEIGHT_M
+            heightCalibrated = false
+        }
         // 2026-06-02 — activate the read-only ground-plane metric-scale estimator with the scooter
         // camera-to-road mount height (default ~1.05 m; the camera debug overlay draws what it finds).
         // READ-ONLY: it never feeds the dot — it's the on-device validation tool for the camera-height
         // scooter-speed idea (gpt_speed_suggestion.md; the offline harness can't fire on sparse frames).
-        NativeBridge.setCameraHeight(SCOOTER_CAMERA_HEIGHT_M)
+        NativeBridge.setCameraHeight(cameraHeightM)   // persisted GPS-calibrated value, else the default guess
         // 2026-05-28 — push persisted MiDaS scale K to native at startup.
         // -1 = never calibrated; native ignores non-positive values so this is a
         // safe no-op on first launch. Once any session calibrates K (run, walk+run,
@@ -599,6 +644,12 @@ class NavSightViewModel(application: Application) : AndroidViewModel(application
                 val mmS = lastSnapSource.ifEmpty { null }   // matcher source (osrm:match/snap/raw)
                 val kM = lastKMap   // per-sample scale observation (null when unmatched)
                 val mvr = maneuverState.name   // current maneuver state (Main thread read)
+                // READ-ONLY speed channels for offline GPS scoring (IPM ground-plane validation).
+                // Cheap native atomic reads; -1.0 sentinel → null so the analyzer skips "not yet".
+                val gpFlow = runCatching { NativeBridge.getGroundFlowSpeedMps() }.getOrNull()
+                    ?.takeIf { it >= 0f }?.toDouble()
+                val fusedSp = runCatching { NativeBridge.getFusedSpeedMps() }.getOrNull()
+                    ?.takeIf { it >= 0f }?.toDouble()
                 synchronized(simulationDataPoints) {
                     simulationDataPoints.add(SimulationPoint(
                         timestamp = System.currentTimeMillis(),
@@ -615,7 +666,8 @@ class NavSightViewModel(application: Application) : AndroidViewModel(application
                         vioLat = vioLla?.getOrNull(0), vioLng = vioLla?.getOrNull(1),
                         vioVarXy = vioLla?.getOrNull(3),
                         mmLat = mm?.latitude, mmLng = mm?.longitude, mmConf = mmC,
-                        mmSrc = mmS, kMap = kM, maneuver = mvr
+                        mmSrc = mmS, kMap = kM, maneuver = mvr,
+                        gpFlowSpeed = gpFlow, fusedSpeed = fusedSp
                     ))
                 }
             }
@@ -635,7 +687,21 @@ class NavSightViewModel(application: Application) : AndroidViewModel(application
             // estimate; until then show 0.
             if (NativeBridge.isLoaded()) {
                 val fusedMps = NativeBridge.getFusedSpeedMps()
-                if (fusedMps >= 0f) {
+                // READ-ONLY IPM ground-plane speed for the live debug readout (never drives anything).
+                val gpMps = NativeBridge.getGroundFlowSpeedMps()
+                groundFlowSpeedKmh = if (gpMps >= 0f) gpMps * 3.6f else null
+                maybeAutoCalibrateHeight(gpMps)   // GPS one-time mount-height solve (read-only of position)
+                if (fusedMps == 0.0f) {
+                    // TRUE STOP: native stores EXACTLY 0.0 in trajectory_speed_mps_ when is_static /
+                    // rotation-only is detected (Tracker.cpp). SNAP the speedometer to 0 — do NOT run the
+                    // EMA toward it. The τ≈0.7s EMA otherwise bleeds the prior reading down over ~2s, so a
+                    // stopped scooter showed a phantom ~4 km/h slowly dying (owner: "when standing still
+                    // speed still moves"). A moving speed is never exactly 0.0, so this only catches real
+                    // stops. (The separate ZUPT-miss case — native wrongly reporting non-zero on a vibrating
+                    // parked scooter — is a Tracker.cpp speed-gate fix tracked with the speed-accuracy work.)
+                    speedEmaMps = 0f
+                    currentSpeedKmh = 0f
+                } else if (fusedMps > 0f) {
                     // EMA low-pass for a stable speedometer. τ ≈ 0.7 s; at the UI
                     // tick cadence α = dt/(τ+dt). Cited, not magic: 0.7 s trades a
                     // little display lag for jitter rejection on a moving vehicle
@@ -646,6 +712,7 @@ class NavSightViewModel(application: Application) : AndroidViewModel(application
                     speedEmaMps += alpha * (fusedMps - speedEmaMps)
                     currentSpeedKmh = speedEmaMps * 3.6f
                 } else {
+                    // fusedMps < 0 = the -1.0 sentinel before the first estimate.
                     speedEmaMps = 0f
                     currentSpeedKmh = 0f
                 }
@@ -829,25 +896,19 @@ class NavSightViewModel(application: Application) : AndroidViewModel(application
                             headingOffsetDeg = if (headingOffsetDeg.isNaN()) inst
                                 else headingOffsetDeg + HEADING_OFFSET_ALPHA *
                                     ManeuverMath.angularDifferenceDeg(inst, headingOffsetDeg)
-                            // Re-anchor the drift-free junction reference on THIS confident-straight tick:
-                            // the road bearing the ball is actually on (graph-edge tangent — the frame the
-                            // junction choice compares against) + the current gyro. On a long straight road
-                            // this re-anchors every tick so the gyro delta stays ~0 → shallow forks resolve
-                            // to the straight continuation; once the user turns by ENOUGH to break this same
-                            // straightRoad gate (two matched segments >30° apart — i.e. a real intersection
-                            // turn), the anchor freezes and the delta accumulates the real rotation → the ball
-                            // takes the matching exit. KNOWN TRADEOFF (verify-rail-junction-anchor wf, 3 lenses
-                            // 2026-06-02): a turn so gradual it NEVER breaks the 30° gate yet leads onto a
-                            // <30° SHALLOW fork can be re-absorbed each tick → the ball keeps straight (the
-                            // dual of the fixed bug). This makes "go straight" the DEFAULT at a shallow fork —
-                            // the safer default (the shallow branch is usually the minor road), and MATCHER
-                            // supervision re-acquires if the VIO clearly follows the branch. The proper fix is
-                            // a gyro-QUIESCENCE re-anchor gate (re-anchor only when |per-tick gyro| is at the
-                            // noise floor), but that threshold must be MEASURED from a real ride (project rule:
-                            // cite the sim before adding a constant), so it is deferred until a sim shows a
-                            // genuine missed shallow-fork turn (RAIL_JUNCTION log = the witness).
+                            // 2026-06-02 (owner's offset model: "have the road's heading but only turn when
+                            // the offset is met — if the road is 100 and there's a turn to 50 and a turn to
+                            // 150, offset +50 → take 150, −50 → take 50"). The gyro-reference re-anchor MOVED
+                            // OUT of this every-straight-tick block down to an EDGE-CHANGE gate (after
+                            // advance/reverse). Re-anchoring here on every confident-straight tick wiped the
+                            // offset each tick — gyroDelta only ever held ONE tick's rotation (≈0) → steerHeading
+                            // ≈ the road → the ball ONLY went straight and never took a junction or U-turn
+                            // (owner: "i cant do a u turn or chose a road on a junction... it only goes
+                            // straight"). headingOffsetDeg (the EMA above) is KEPT as the correctedHeading
+                            // fallback for the earliest ticks before the anchor is first seeded on acquire.
+                            /* MOVED to the edge-change re-anchor below (2026-06-02) — see the EDGE-CHANGE block:
                             railRoadBearingAnchorDeg = rail.currentBearingDeg() ?: roadTangentDeg
-                            railHeadingAnchorGyroDeg = lastVioHeadingDeg
+                            railHeadingAnchorGyroDeg = lastVioHeadingDeg */
                         }
                         // EMA correctedHeading (gyro − smoothed offset) — kept as the FALLBACK only, used
                         // until the drift-free anchor below has been set on the first confident-straight tick.
@@ -905,6 +966,27 @@ class NavSightViewModel(application: Application) : AndroidViewModel(application
                                 railReverseTicks = 0
                             }
                         } else railReverseTicks = 0
+                        // OFFSET-PRESERVING EDGE-CHANGE RE-ANCHOR (2026-06-02 — owner's "road heading + offset"
+                        // model; the fix for "it only goes straight, can't U-turn or choose a junction"). Reset
+                        // the gyro reference to offset=0 ONLY when the ball actually crossed to a NEW-bearing
+                        // edge THIS tick — a junction taken (facing changed during advance) or a reverse (facing
+                        // flipped). Between edge crossings the anchor stays FROZEN, so gyroDelta = the user's
+                        // REAL rotation since they got on the current road → steerHeading = road + offset picks
+                        // the matching exit (road 100 + gyro +50 → the 150 exit) and a sustained ~180° offset
+                        // trips reverse(). Reuses RAIL_JUNCTION_LOG_MIN_TURN_DEG (1°) — the same exact-graph-
+                        // geometry "the ball changed road direction" threshold the junction log just above uses
+                        // — so no new constant. On a STRAIGHT road facing is unchanged → no re-anchor → the
+                        // offset survives to the next junction; on a CURVE each segment re-anchors so following
+                        // the road's own bend is never mistaken for the user's offset.
+                        val facingAfter = rail.currentBearingDeg()
+                        if (facingBefore != null && facingAfter != null && !lastVioHeadingDeg.isNaN() &&
+                            kotlin.math.abs(ManeuverMath.angularDifferenceDeg(facingAfter, facingBefore)) >
+                                RAIL_JUNCTION_LOG_MIN_TURN_DEG) {
+                            railRoadBearingAnchorDeg = facingAfter
+                            railHeadingAnchorGyroDeg = lastVioHeadingDeg
+                            Log.i("RailDot", "RAIL_REANCHOR: road=%.0f offset->0 (edge %.0f->%.0f)".format(
+                                facingAfter, facingBefore, facingAfter))
+                        }
                         // WIRE THE MATCHER (2026-06-02) — supervise the ball's road choice. The junction
                         // CHOICE stays VIO-bearing-driven (the user's actual motion is the true signal for
                         // which exit they took), but if the ball then stays far from the matcher's CONFIDENT
@@ -1113,6 +1195,44 @@ class NavSightViewModel(application: Application) : AndroidViewModel(application
 
     /** Drop the advance-along-rail ball state so the next snap re-acquires from scratch. Used on a full
      *  reset and on a deliberate start-location relocation (both are origin teleports the ball must follow). */
+    /**
+     * 2026-06-02 — GPS one-time mount-height auto-calibration. The IPM ground-plane speed is LINEAR in the
+     * camera mount height, so a single trusted GPS speed solves the height: h_true = h × (gps_mps / ipm_mps).
+     * Runs ONLY until calibrated (key persisted), needs a clean GPS fix + real motion + the IPM firing, and
+     * the committed height is hard-clamped to a physically sane 0.3–2.5 m — so a still-wrong IPM (e.g. a bad
+     * direction frame producing a 13 m height) is rejected and the calibration self-activates only once the
+     * IPM is actually correct. GPS is used ONLY to set this physical constant; the dot/position stays VIO.
+     */
+    private fun maybeAutoCalibrateHeight(ipmMps: Float) {
+        if (heightCalibrated || ipmMps < 0.8f) return
+        val g = currentGpsLocation ?: return
+        if (!g.hasSpeed() || !g.hasAccuracy() || g.accuracy > HEIGHT_CALIB_MAX_GPS_ACC_M ||
+            g.speed < HEIGHT_CALIB_MIN_MPS) return
+        val ratio = g.speed.toDouble() / ipmMps.toDouble()   // = h_true / h_current
+        if (!ratio.isFinite() || ratio < 0.2 || ratio > 5.0) return
+        heightCalibRatios.add(ratio)
+        if (heightCalibRatios.size < HEIGHT_CALIB_SAMPLES) return
+        val hNew = (cameraHeightM * heightCalibRatios.sorted()[heightCalibRatios.size / 2]).coerceIn(0.3, 2.5)
+        cameraHeightM = hNew
+        NativeBridge.setCameraHeight(hNew)
+        prefs.edit().putFloat(PREF_CAMERA_HEIGHT, hNew.toFloat()).apply()
+        heightCalibrated = true
+        heightCalibStatus = "h=%.2fm ✓".format(hNew)
+        Log.i("NavSightVM", "HEIGHT_CALIB: h=$hNew n=${heightCalibRatios.size}")
+    }
+
+    /** Manual mount-height set (debug-panel fallback when GPS auto-calibration can't run, e.g. GPS jammed).
+     *  Clamps to the physical range, applies + persists, and marks calibrated so the GPS auto-calibration
+     *  won't override a deliberate manual value. */
+    fun setMountHeight(h: Double) {
+        val hc = h.coerceIn(0.3, 2.5)
+        cameraHeightM = hc
+        heightCalibrated = true
+        NativeBridge.setCameraHeight(hc)
+        prefs.edit().putFloat(PREF_CAMERA_HEIGHT, hc.toFloat()).apply()
+        heightCalibStatus = "h=%.2fm (manual)".format(hc)
+    }
+
     private fun resetRailState() {
         graphRail = null
         graphRailRegion = null
@@ -1216,6 +1336,8 @@ class NavSightViewModel(application: Application) : AndroidViewModel(application
                 sb.append("\"mflow\":${p.meanFlow},\"inl\":${p.inlierCount},")
                 sb.append("\"steps\":${p.stepCount},\"sfreq\":${p.stepFreq},")
                 sb.append("\"stride\":${p.strideLength},\"pflags\":${p.poseFlags},")
+                // READ-ONLY speed channels for offline GPS scoring (IPM ground-plane validation).
+                sb.append("\"gp_flow_speed\":${p.gpFlowSpeed ?: "null"},\"fused_speed\":${p.fusedSpeed ?: "null"},")
                 sb.append("\"hdg\":${p.heading}}")
             }
             sb.append("]}")

@@ -434,59 +434,85 @@ fun CameraFeatureOverlay(viewModel: NavSightViewModel, pal: NavPalette) {
 }
 
 /**
- * 2026-06-02 — Ground-plane overlay. Draws WHERE the read-only GroundPlaneEstimator thinks the road
- * plane is: the ground vanishing line (horizon, amber) + a translucent fill of the road region below it.
- * Gated on a valid, confident estimate (the estimator only fires when the lower-image triangulation
- * produced enough points — so an EMPTY overlay is itself the signal that the ground plane isn't locking
- * on these frames). Read-only: it never moves the dot; it is the on-device validation of the
- * camera-height scooter-speed idea (gpt_speed_suggestion.md). Uses the identical FILL_CENTER + rotate
- * transform as the KLT/SLAM overlays so it aligns to the live preview.
+ * 2026-06-02 — Ground-plane (IPM) overlay. Shows HOW the ground plane is recognized for the read-only
+ * IPM speed (Tracker::updateGroundFlowSpeed): each AMBER DOT is a road pixel the IPM accepted as flat
+ * ground and used to measure speed this frame, drawn through the same FILL_CENTER + rotate transform as
+ * the KLT overlay so the dots sit on the live road. A translucent band marks the lower-image road-search
+ * region; it goes amber once the IPM is firing (≥5 road pixels). The HUD reports the live IPM speed +
+ * road-pixel count next to KLT/used so a ride is legible: NO amber dots / "road=0" = the IPM isn't
+ * finding road texture (→ geometric path weak here); dots on the asphalt + a plausible "IPM km/h" =
+ * it's working. Read-only — it never moves the dot or the speedometer (validation of the camera-height
+ * scooter-speed idea, gpt_speed_suggestion.md).
  */
 @androidx.compose.runtime.Composable
 fun GroundPlaneOverlay(viewModel: NavSightViewModel, pal: NavPalette) {
     val snap = viewModel.overlaySnapshot
     val geom = viewModel.cameraFrameGeometry ?: return   // only draw while the camera is active
-    val gp = snap.groundPlane
-    val haveGp = gp.size >= 6
-    val valid = haveGp && gp[0] >= 0.5f
-    val conf = if (haveGp) gp[2] else 0f
-    // Live diagnostics so a real ride is legible (the prior empty overlay was ambiguous): how many KLT
-    // points, how many the VIO USED (recoverPose inliers), and the ground-plane candidate/inlier/conf.
+    val ipm = snap.ipmInlierPoints
+    val ipmN = ipm.size / 2                  // road pixels the IPM used this frame
+    val ipmKmh = viewModel.groundFlowSpeedKmh
     val kltN = snap.trackedPoints.size / 2
     val usedN = snap.trackedInlierFlags.count { it.toInt() != 0 }
-    val locked = valid && conf >= 0.30f
+    val firing = ipmN >= 5                    // IPM trusts a frame only with ≥5 road inliers
     val amber = Color(0xFFFFB300)
     Canvas(Modifier.fillMaxSize()) {
         val viewW = size.width; val viewH = size.height
         // Road-search band drawn in CANVAS (portrait) coords — always the BOTTOM of what the user sees,
-        // regardless of how the sensor frame is rotated. White = searching, amber = ground plane LOCKED.
-        // (The estimator is told the rotation separately, so the analyzer region it scans matches this.)
+        // regardless of how the sensor frame is rotated. Dim = searching, amber = IPM firing.
         val bandTopY = viewH * 0.55f
-        val bandColor = if (locked) amber.copy(alpha = 0.12f + 0.12f * conf.coerceIn(0f, 1f))
-                        else Color(0x14FFFFFF)
+        val bandColor = if (firing) amber.copy(alpha = 0.16f) else Color(0x14FFFFFF)
         val band = Path().apply {
             moveTo(0f, bandTopY); lineTo(viewW, bandTopY); lineTo(viewW, viewH); lineTo(0f, viewH); close()
         }
         drawPath(band, color = bandColor)
         drawLine(
-            color = if (locked) amber.copy(alpha = 0.9f) else Color(0x55FFFFFF),
+            color = if (firing) amber.copy(alpha = 0.9f) else Color(0x55FFFFFF),
             start = Offset(0f, bandTopY), end = Offset(viewW, bandTopY), strokeWidth = 3f
         )
-        // Diagnostic HUD at the BOTTOM (portrait-readable). KLT=tracked, used=recoverPose inliers,
-        // GP=ground-plane state. "GP off" until a real ride produces road points in the band.
-        // rot = CameraX rotationDegrees. R_bc is hardcoded for 90 (portrait); anything else means the
-        // camera↔IMU extrinsic does not match the mount → the whole VIO is mis-rotated (investigate).
-        val hud = if (haveGp)
-            "rot=${geom.rotationDegrees}  KLT=$kltN used=$usedN  |  GP ${if (locked) "LOCKED" else "search"} cand=${gp[4].toInt()} inl=${gp[5].toInt()} conf=${"%.2f".format(conf)}"
-        else "rot=${geom.rotationDegrees}  KLT=$kltN used=$usedN  |  GP off"
+        // FILL_CENTER + rotate transform shared by the grid and the IPM dots (analyzer → display).
+        val (prevW, prevH) = overlayRotatedDims(geom.analyzerWidth, geom.analyzerHeight, geom.rotationDegrees)
+        val haveTf = prevW > 0 && prevH > 0
+        val s = if (haveTf) maxOf(viewW / prevW.toFloat(), viewH / prevH.toFloat()) else 1f
+        val ox = if (haveTf) (viewW - prevW * s) / 2f else 0f
+        val oy = if (haveTf) (viewH - prevH * s) / 2f else 0f
+        fun toView(ax: Float, ay: Float): Offset {
+            val r = overlayRotatePoint(ax, ay, geom.analyzerWidth, geom.analyzerHeight, geom.rotationDegrees)
+            return Offset(ox + r.x * s, oy + r.y * s)
+        }
+        // AV-STYLE GROUND GRID — the IPM ground plane (gravity-down + mount height + heading) projected as
+        // a perspective road mesh. Teal lines that lie FLAT on the real road when the geometry is right;
+        // empty until the EKF is gravity-aligned, so an absent grid = "the road plane isn't locked yet".
+        val grid = snap.groundGridSegs
+        if (haveTf && grid.size >= 4) {
+            val gridColor = Color(0xFF26C6DA).copy(alpha = 0.65f)
+            var i = 0
+            while (i + 3 < grid.size) {
+                drawLine(gridColor, toView(grid[i], grid[i + 1]), toView(grid[i + 2], grid[i + 3]),
+                    strokeWidth = 3f)
+                i += 4
+            }
+        }
+        // The actual road pixels the IPM accepted as ground this frame (amber dots), via the same
+        // FILL_CENTER + rotate transform the KLT overlay uses → they land on the live road surface.
+        if (haveTf && ipmN > 0) {
+            for (i in 0 until ipmN) {
+                drawCircle(color = amber.copy(0.9f), radius = 7f, center = toView(ipm[2 * i], ipm[2 * i + 1]))
+            }
+        }
+        // Diagnostic HUD just below the band line (portrait-readable, above the footer). KLT=tracked,
+        // used=recoverPose inliers, IPM=ground-plane speed + road-pixel count. rot=CameraX rotation
+        // (R_bc is hardcoded for 90/portrait; anything else means the camera↔IMU extrinsic is mismatched).
+        val hud = "rot=${geom.rotationDegrees}  KLT=$kltN used=$usedN  |  " +
+            "IPM ${ipmKmh?.let { "%.0f".format(it) } ?: "--"} km/h  road=$ipmN  " +
+            (viewModel.heightCalibStatus ?: "h=%.2fm…".format(viewModel.mountHeightM))
         val paint = android.graphics.Paint().apply {
-            color = if (locked) android.graphics.Color.rgb(255, 179, 0) else android.graphics.Color.WHITE
+            color = if (firing) android.graphics.Color.rgb(255, 179, 0) else android.graphics.Color.WHITE
             textSize = 34f; isAntiAlias = true
             setShadowLayer(6f, 0f, 0f, android.graphics.Color.BLACK)
         }
-        // Place the HUD just BELOW the band line (lower-middle of the screen), not at the very bottom
-        // where the footer panel covers it. Still clearly in the portrait bottom-half.
-        drawContext.canvas.nativeCanvas.drawText(hud, 28f, bandTopY + 48f, paint)
+        // HUD in the UPPER third — the bottom sheet / footer covers the lower portion, so keep it high
+        // and clearly visible (owner: "the footer is blocking the debug panel").
+        drawContext.canvas.nativeCanvas.drawText(hud, 28f, viewH * 0.24f, paint)
     }
 }
 

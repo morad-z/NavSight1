@@ -384,6 +384,7 @@ int main(int argc, char** argv) {
     std::string frames_dir_override;
     std::string depth_dir;  // 2026-05-29 — MiDaS depth rasters (--depth-dir)
     double seed_k = 0.0;    // 2026-05-29 — warm-start K seed (--seed-k); 0 = cold
+    double camera_height = 0.0;  // 2026-06-02 — scooter mount camera-to-road height (--camera-height); 0 = off
     int64_t frame_tolerance_ns = 0;
     bool autonomous_pg = false;  // 2026-05-31 — --autonomous-pg (verdict §4):
                                  // skip ekf_.setPosition(global_t_) so p_G_
@@ -418,6 +419,18 @@ int main(int argc, char** argv) {
                 try { seed_k = std::stod(argv[++i]); }
                 catch (const std::exception& e) {
                     std::fprintf(stderr, "replay_harness: --seed-k parse error: %s\n", e.what());
+                    return 2;
+                }
+            } else if (a == "--camera-height") {
+                // 2026-06-02 — measured scooter camera-to-road height (m) for the read-only ground-plane
+                // metric-scale eval (gpt_speed_suggestion.md Phase 0). Drives Tracker::setCameraHeight.
+                if (i + 1 >= argc) {
+                    std::fprintf(stderr, "replay_harness: --camera-height requires a value\n");
+                    return 2;
+                }
+                try { camera_height = std::stod(argv[++i]); }
+                catch (const std::exception& e) {
+                    std::fprintf(stderr, "replay_harness: --camera-height parse error: %s\n", e.what());
                     return 2;
                 }
             } else if (a == "--autonomous-pg") {
@@ -525,7 +538,8 @@ int main(int argc, char** argv) {
         // p_G_ — a DIFFERENT trajectory that the depth-flow speed work does NOT
         // drive. To score what the user actually sees on the map (and what the
         // velocity work changes), the scorer must read traj_x/traj_z, not ekf_*.
-        << "traj_x,traj_y,traj_z,fused_speed_mps\n";
+        << "traj_x,traj_y,traj_z,fused_speed_mps,gp_flow_speed_mps,"
+        << "gp_valid,gp_scale,gp_conf,gp_hvio,gp_cand,gp_inl,gp_horizon_v\n";
 
     VioEngine engine;
     // Synthetic intrinsics (used as defaults when no frames are present).
@@ -865,6 +879,10 @@ int main(int argc, char** argv) {
     // (K=-1) so the looming speed path bails until depth-flow calibrates K — but
     // depth-flow is gated on essential-matrix verification, which fails on slow
     // walks → deadlock. Seeding K emulates a prior session having calibrated it.
+    if (camera_height > 0.0) {
+        engine.getTracker()->setCameraHeight(camera_height);
+        std::fprintf(stdout, "replay_harness: ground-plane camera height = %.3f m\n", camera_height);
+    }
     if (seed_k > 0.0) {
         engine.getTracker()->setMidasScaleK(seed_k);
         std::fprintf(stdout, "replay_harness: seeded warm K = %.1f\n", seed_k);
@@ -970,7 +988,16 @@ int main(int argc, char** argv) {
             tz = vout.t.at<double>(2, 0);
         }
         const double fused_speed = engine.getTracker()->getFusedSpeedMps();
-        csv << tx << ',' << ty << ',' << tz << ',' << fused_speed << '\n';
+        const Tracker* tk = engine.getTracker();
+        csv << tx << ',' << ty << ',' << tz << ',' << fused_speed << ','
+            << tk->getGroundFlowSpeedMps() << ','
+            << (tk->isGroundPlaneValid() ? 1 : 0) << ','
+            << tk->getGroundPlaneScale() << ','
+            << tk->getGroundPlaneConfidence() << ','
+            << tk->getGroundPlaneHvio() << ','
+            << tk->getGroundPlaneCandidates() << ','
+            << tk->getGroundPlaneInliers() << ','
+            << tk->getGroundPlaneHorizonV() << '\n';
     }
     csv.flush();
     if (!csv) {

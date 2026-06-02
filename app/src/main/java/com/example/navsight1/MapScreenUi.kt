@@ -184,7 +184,7 @@ fun MainScreen(viewModel: NavSightViewModel, pal: NavPalette, isNight: Boolean, 
                 Modifier.align(Alignment.TopCenter).fillMaxWidth()
                     .statusBarsPadding().padding(horizontal = 10.dp, vertical = 6.dp)
             ) {
-                HeroHeader(viewModel.currentSpeedKmh, compassLabel, fusionMode,
+                HeroHeader(viewModel.currentSpeedKmh, viewModel.groundFlowSpeedKmh, compassLabel, fusionMode,
                     (vio.trackingQuality * 100).toFloat(), pal)
                 Spacer(Modifier.height(4.dp))
                 Row(verticalAlignment = Alignment.CenterVertically,
@@ -545,7 +545,7 @@ fun SensorRadarWaze(history: List<PathPoint>, currentAzimuth: Float, pal: NavPal
 }
 
 @Composable
-fun HeroHeader(speedKmh: Float, compassLabel: String, fusionMode: String, qualityPct: Float, pal: NavPalette) {
+fun HeroHeader(speedKmh: Float, gpFlowKmh: Float?, compassLabel: String, fusionMode: String, qualityPct: Float, pal: NavPalette) {
     // Health colors: fusion mode + tracking quality drive the two accent dots so a glance
     // reads "where am I heading / how fast / is tracking healthy" without parsing text.
     val modeColor = when (fusionMode) {
@@ -589,6 +589,13 @@ fun HeroHeader(speedKmh: Float, compassLabel: String, fusionMode: String, qualit
                         fontWeight = FontWeight.Black, lineHeight = 34.sp)
                     Text("KM/H", color = Color.White.copy(0.6f), fontSize = 9.sp,
                         letterSpacing = 3.sp, fontWeight = FontWeight.Bold)
+                    // READ-ONLY IPM ground-plane speed (the candidate scooter speed-fix), shown small
+                    // under the live speed so it can be eyeballed against it. "--" until it fires (needs
+                    // road texture / ≥5 inliers). Teal = a separate debug channel, NOT the speedometer.
+                    Text(gpFlowKmh?.let { "IPM ${"%.0f".format(it)}" } ?: "IPM --",
+                        color = Teal500.copy(0.9f), fontSize = 9.sp,
+                        letterSpacing = 1.sp, fontWeight = FontWeight.Bold,
+                        modifier = Modifier.padding(top = 2.dp))
                 }
             }
             // RIGHT — tracking-quality readout with a health dot
