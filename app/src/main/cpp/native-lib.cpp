@@ -55,6 +55,10 @@ static double g_heading = 0;
 // getLastTrackedPointAges JNI accessor for the overlay's age-coloring.
 // Cleared in resetPoseState() so a fresh VIO session starts empty.
 static std::vector<int> g_tracked_point_ages;
+// 2026-06-02 overlay — per-point recoverPose inlier flag (1=VIO used it, 0=rejected/unverified),
+// parallel to trackedPoints. Published with the ages under the same state_mutex so the overlay reads
+// a coherent (ages, inliers) snapshot of one frame.
+static std::vector<unsigned char> g_tracked_inlier_flags;
 
 // 2026-05-16: single-snapshot consistency fix (per ekf-inv-dot-investigation agent)
 //
@@ -144,6 +148,7 @@ static void resetPoseState() {
     g_mean_flow = 0; g_inlier_count = 0; g_step_count = 0;
     g_step_freq = 0; g_stride_length = 0; g_pose_flags = 0; g_heading = 0;
     g_tracked_point_ages.clear();
+    g_tracked_inlier_flags.clear();
     // 2026-05-16: single-snapshot consistency fix (per ekf-inv-dot-investigation agent)
     g_overlay_snapshot = EKFState::OverlaySnapshot{};
     g_overlay_snapshot_valid = false;
@@ -578,6 +583,7 @@ Java_com_example_navsight1_NativeBridge_processCameraFrameDirect(
     {
         std::lock_guard<std::mutex> lock(state_mutex);
         g_tracked_point_ages = output.trackedPointAges;
+        g_tracked_inlier_flags = output.trackedPointInlierFlags;
     }
 
     double ret_x, ret_y, ret_z, ret_roll, ret_pitch, ret_yaw;
@@ -785,6 +791,37 @@ Java_com_example_navsight1_NativeBridge_setUserHeight(
     }
     if (vision) {
         vision->setUserHeight(static_cast<float>(heightM));
+    }
+}
+
+// ── setCameraHeight (2026-06-02) — scooter camera-to-road mount height (m). Activates the read-only
+// ground-plane metric-scale estimator (gpt_speed_suggestion.md). Distinct from setUserHeight (the
+// rider's body height for the pedestrian stride model). 0 = off. ─────────────────────────────────
+JNIEXPORT void JNICALL
+Java_com_example_navsight1_NativeBridge_setCameraHeight(
+        JNIEnv*, jobject /* thiz */, jdouble heightM) {
+    std::shared_ptr<VioEngine> vision;
+    {
+        std::lock_guard<std::mutex> lock(state_mutex);
+        vision = g_vision;
+    }
+    if (vision && vision->getTracker()) {
+        vision->getTracker()->setCameraHeight(static_cast<double>(heightM));
+    }
+}
+
+// ── setAnalyzerRotation (2026-06-02) — CameraX rotationDegrees, so the ground-plane estimator searches
+// the analyzer region that maps to the bottom of the upright (portrait) display (the road). ─────────
+JNIEXPORT void JNICALL
+Java_com_example_navsight1_NativeBridge_setAnalyzerRotation(
+        JNIEnv*, jobject /* thiz */, jint deg) {
+    std::shared_ptr<VioEngine> vision;
+    {
+        std::lock_guard<std::mutex> lock(state_mutex);
+        vision = g_vision;
+    }
+    if (vision && vision->getTracker()) {
+        vision->getTracker()->setAnalyzerRotation(static_cast<int>(deg));
     }
 }
 
@@ -1176,6 +1213,49 @@ Java_com_example_navsight1_NativeBridge_setMidasScaleK(
     if (tracker) tracker->setMidasScaleK(static_cast<double>(k));
 }
 
+// 2026-05-31 (map-as-sensor HEADING leg) — Kotlin matcher pushes the matched road bearing (deg).
+extern "C" JNIEXPORT void JNICALL
+Java_com_example_navsight1_NativeBridge_setRoadHeadingHint(
+        JNIEnv*, jobject /* thiz */, jdouble bearing_deg) {
+    std::shared_ptr<VioEngine> vision;
+    {
+        std::lock_guard<std::mutex> lock(state_mutex);
+        vision = g_vision;
+    }
+    if (!vision) return;
+    Tracker* tracker = vision->getTracker();
+    if (tracker) tracker->setRoadHeadingHint(static_cast<double>(bearing_deg));
+}
+
+// 2026-05-31 (map-as-sensor POSITION leg) — Kotlin matcher pushes the world-frame error vector
+// (matched-ball − raw-VIO), metres east/north; native bleeds its cross-track part into global_t_.
+extern "C" JNIEXPORT void JNICALL
+Java_com_example_navsight1_NativeBridge_setMapPositionCorrection(
+        JNIEnv*, jobject /* thiz */, jdouble d_east_m, jdouble d_north_m) {
+    std::shared_ptr<VioEngine> vision;
+    {
+        std::lock_guard<std::mutex> lock(state_mutex);
+        vision = g_vision;
+    }
+    if (!vision) return;
+    Tracker* tracker = vision->getTracker();
+    if (tracker) tracker->setMapPositionCorrection(static_cast<double>(d_east_m), static_cast<double>(d_north_m));
+}
+
+// Runtime toggle for the map→VIO POSITION leg (default-OFF). Heading leg is separate + on.
+extern "C" JNIEXPORT void JNICALL
+Java_com_example_navsight1_NativeBridge_setMapPositionEnabled(
+        JNIEnv*, jobject /* thiz */, jboolean enabled) {
+    std::shared_ptr<VioEngine> vision;
+    {
+        std::lock_guard<std::mutex> lock(state_mutex);
+        vision = g_vision;
+    }
+    if (!vision) return;
+    Tracker* tracker = vision->getTracker();
+    if (tracker) tracker->setMapPositionEnabled(enabled == JNI_TRUE);
+}
+
 extern "C" JNIEXPORT jdouble JNICALL
 Java_com_example_navsight1_NativeBridge_getMidasScaleK(
         JNIEnv*, jobject /* thiz */) {
@@ -1218,6 +1298,47 @@ Java_com_example_navsight1_NativeBridge_getLastTrackedPointAges(
     const jsize n = std::min<jsize>(cap, static_cast<jsize>(ages_copy.size()));
     if (n > 0) env->SetIntArrayRegion(out, 0, n, ages_copy.data());
     return static_cast<jint>(n);
+}
+
+// 2026-06-02 overlay — per-point recoverPose inlier flags (1=VIO used, 0=rejected/unverified),
+// parallel to trackedPoints. Caller passes a preallocated ByteArray; returns the count written.
+extern "C" JNIEXPORT jint JNICALL
+Java_com_example_navsight1_NativeBridge_getLastTrackedPointInlierFlags(
+        JNIEnv* env, jobject, jbyteArray out) {
+    if (!out) return 0;
+    const jsize cap = env->GetArrayLength(out);
+    if (cap <= 0) return 0;
+    std::vector<unsigned char> flags_copy;
+    {
+        std::lock_guard<std::mutex> lock(state_mutex);
+        flags_copy = g_tracked_inlier_flags;
+    }
+    const jsize n = std::min<jsize>(cap, static_cast<jsize>(flags_copy.size()));
+    if (n > 0) env->SetByteArrayRegion(out, 0, n, reinterpret_cast<const jbyte*>(flags_copy.data()));
+    return static_cast<jint>(n);
+}
+
+// 2026-06-02 — read-only ground-plane metric-scale snapshot for the camera overlay.
+// Layout (6 floats): [is_valid(0/1), horizon_v_px, confidence, ground_scale, candidates, inliers].
+extern "C" JNIEXPORT jint JNICALL
+Java_com_example_navsight1_NativeBridge_getGroundPlaneSnapshot(
+        JNIEnv* env, jobject, jfloatArray out) {
+    if (!out) return 0;
+    if (env->GetArrayLength(out) < 6) return 0;
+    std::lock_guard<std::mutex> lock(state_mutex);
+    VioEngine* vision_raw = g_vision.get();
+    if (!vision_raw) return 0;
+    const Tracker* tracker = vision_raw->getTracker();
+    if (!tracker) return 0;
+    float vals[6];
+    vals[0] = tracker->isGroundPlaneValid() ? 1.0f : 0.0f;
+    vals[1] = static_cast<float>(tracker->getGroundPlaneHorizonV());
+    vals[2] = static_cast<float>(tracker->getGroundPlaneConfidence());
+    vals[3] = static_cast<float>(tracker->getGroundPlaneScale());
+    vals[4] = static_cast<float>(tracker->getGroundPlaneCandidates());
+    vals[5] = static_cast<float>(tracker->getGroundPlaneInliers());
+    env->SetFloatArrayRegion(out, 0, 6, vals);
+    return 6;
 }
 
 // Phase 3: flat snapshot of currently-active SLAM features in the EKF.

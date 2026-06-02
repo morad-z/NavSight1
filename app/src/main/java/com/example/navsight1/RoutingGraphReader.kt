@@ -113,6 +113,55 @@ internal class GraphStore(
         }
     }
 
+    // ---- Map-matching accessors (GraphRailDot / advance-along-rail, 2026-05-31) -------------
+    // The ball-on-rail lives on a graph EDGE and walks the adjacency, so it needs read access
+    // to vertex coordinates + per-vertex out-neighbours + a nearest-edge query. All additive,
+    // no behaviour change to the router above.
+
+    /** Vertex count (alias of [vertexCount] for the matcher). */
+    val vCount: Int get() = vertexCount
+
+    fun vLatAt(i: Int): Double = vLat[i]
+    fun vLngAt(i: Int): Double = vLng[i]
+
+    /** Out-degree of vertex [v] (directed; a oneway edge contributes only its allowed direction). */
+    fun degreeOf(v: Int): Int = adjStart[v + 1] - adjStart[v]
+
+    /** The k-th out-neighbour vertex of [v] (0 ≤ k < [degreeOf]). */
+    fun neighborAt(v: Int, k: Int): Int = adjTo[adjStart[v] + k]
+
+    /** Foot of the nearest graph edge to (lat,lng): the directed edge u→w, the along-edge
+     *  fraction [t] ∈ [0,1], the foot lat/lng, and the metric offset. */
+    class EdgeHit(
+        val u: Int, val w: Int, val t: Double,
+        val footLat: Double, val footLng: Double, val offsetM: Double
+    )
+
+    /** Nearest graph edge to (lat,lng). Scans the directed CSR (undirected edges are visited
+     *  twice — harmless for a min) and projects the point onto each edge segment. Returns null
+     *  only for an empty graph. O(E); called at (re)acquire, which is rare, not per frame. */
+    fun nearestEdge(lat: Double, lng: Double): EdgeHit? {
+        if (vertexCount == 0) return null
+        var bU = -1; var bW = -1; var bT = 0.0; var bFLat = 0.0; var bFLng = 0.0
+        var bestD = Double.POSITIVE_INFINITY
+        for (u in 0 until vertexCount) {
+            var k = adjStart[u]
+            val end = adjStart[u + 1]
+            while (k < end) {
+                val w = adjTo[k]; k++
+                val pr = RoadSnapMath.projectPointOntoSegment(
+                    lat, lng, vLat[u], vLng[u], vLat[w], vLng[w]
+                )
+                if (pr.distanceM < bestD) {
+                    bestD = pr.distanceM; bU = u; bW = w; bT = pr.t
+                    bFLat = pr.snappedLat; bFLng = pr.snappedLng
+                }
+            }
+        }
+        if (bU < 0) return null
+        return EdgeHit(bU, bW, bT, bFLat, bFLng, bestD)
+    }
+
     /** Index of the graph vertex nearest to (lat,lng), or -1 if the graph is empty. */
     fun nearestVertex(lat: Double, lng: Double): Int {
         var best = -1

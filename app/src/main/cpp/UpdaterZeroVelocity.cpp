@@ -69,19 +69,26 @@ bool UpdaterZeroVelocity::is_stationary(const std::vector<AccelSample>& accel_wi
     }
     double chi2_a = sum_sq_a / (options_.sigma_a * options_.sigma_a);
 
-    // 4. Gravity Magnitude Test (Is mean accel close to gravity?)
+    // 4. Robust Stationary Checks (2023 Standards)
+    // ARE: Angular Rate Energy (mean magnitude) — ensures we aren't rotating constantly.
+    // We allow up to 0.15 rad/s (~8 deg/s) mean rotation to account for hand jitter + bias.
+    double mean_gyro_mag = std::sqrt(mean_gx*mean_gx + mean_gy*mean_gy + mean_gz*mean_gz);
+    bool gyro_mean_ok = (mean_gyro_mag < 0.15);
+
+    // MAG: Gravity Magnitude Test — relaxed for uncalibrated smartphone sensors.
+    // Some phones report 9.3 or 10.3 m/s² at rest.
     double mean_accel_mag = std::sqrt(mean_ax*mean_ax + mean_ay*mean_ay + mean_az*mean_az);
     double gravity_err = std::abs(mean_accel_mag - options_.gravity_mag);
-    bool gravity_ok = (gravity_err < options_.sigma_a * 3.0);
+    bool gravity_ok = (gravity_err < 0.75); // Relaxed from 0.45
 
     // Thresholds for dof = 3*(N-1)
     double threshold = get_chi2_threshold(3 * (N - 1)) * options_.chi2_multiplier;
 
-    bool stationary = (chi2_g < threshold) && (chi2_a < threshold) && gravity_ok;
+    bool stationary = (chi2_g < threshold) && (chi2_a < threshold) && gyro_mean_ok && gravity_ok;
 
     if (stationary || chi2_g < threshold * 2.0) {
-        LOGD("ZUPT Test: chi2_g=%.2f, chi2_a=%.2f, threshold=%.2f, disp=%.2f, g_err=%.2f -> %s",
-             chi2_g, chi2_a, threshold, visual_disparity, gravity_err, stationary ? "STATIONARY" : "MOVING");
+        LOGD("ZUPT Test: chi2_g=%.2f, chi2_a=%.2f, threshold=%.2f, disp=%.2f, g_err=%.2f, g_mean=%.3f -> %s",
+             chi2_g, chi2_a, threshold, visual_disparity, gravity_err, mean_gyro_mag, stationary ? "STATIONARY" : "MOVING");
     }
 
     return stationary;

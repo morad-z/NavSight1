@@ -6,6 +6,7 @@ import org.junit.Assert.assertNotNull
 import org.junit.Assert.assertNull
 import org.junit.Assert.assertTrue
 import org.junit.Test
+import kotlin.math.abs
 
 /**
  * Tests the pure Viterbi core ([LocalMatcher.matchCandidates]) — the offline equivalent of
@@ -64,5 +65,46 @@ class LocalMatcherTest {
         val r = m.matchCandidates(window, cands)
         assertNotNull(r)
         assertEquals(window.last().latitude, r!!.matched.latitude, 1e-6)
+    }
+
+    // ── RAIL-LOCK (2026-05-31): follow the road, not the drifting trace ──────────
+    // Trace drifts NORTH along its length so the LATER points sit closer to a PARALLEL road
+    // (the exact correlated-drift case that teleported the dot onto a parallel road and inflated
+    // the matched path to 2.09x GPS on the scooter sims). True road = way 1 (lat 32.80), parallel
+    // road = way 2, 25 m north.
+    private val driftM = doubleArrayOf(0.0, 6.0, 12.0, 18.0, 24.0, 30.0)
+    private val driftWindow: List<LatLng> = (0 until 6).map {
+        LatLng(32.80 + driftM[it] / mPerDegLat, 35.000 + it * 20.0 / mPerDegLng(32.80))
+    }
+    private val driftCands: List<List<LocalMatcher.Candidate>> = (0 until 6).map { i ->
+        listOf(
+            LocalMatcher.Candidate(32.80, driftWindow[i].longitude, driftM[i], 1L),                          // true road
+            LocalMatcher.Candidate(32.80 + 25.0 / mPerDegLat, driftWindow[i].longitude, abs(25.0 - driftM[i]), 2L) // parallel
+        )
+    }
+
+    @Test
+    fun `without a rail the drifting trace jumps to the parallel road (the bug)`() {
+        val r = m.matchCandidates(driftWindow, driftCands)   // railWayId = null (today's behavior)
+        assertNotNull(r)
+        assertEquals("free matcher follows the drift onto the parallel road", 2L, r!!.matchedWayId)
+    }
+
+    @Test
+    fun `rail-lock keeps the dot on the committed road despite the drift`() {
+        val r = m.matchCandidates(driftWindow, driftCands, railWayId = 1L)
+        assertNotNull(r)
+        assertEquals("railed matcher stays on the road it committed to", 1L, r!!.matchedWayId)
+        // every chosen point stays on the railed way → no lateral teleport to the parallel road
+        assertTrue("railed path should hug the true road (north of it by <=drift)",
+            r.matchedPath.last().latitude <= 32.80 + 1e-6)
+    }
+
+    @Test
+    fun `matchedWayId is reported on a normal match`() {
+        val cands = window.map { p -> listOf(LocalMatcher.Candidate(p.latitude, p.longitude, 5.0, 7L)) }
+        val r = m.matchCandidates(window, cands)
+        assertNotNull(r)
+        assertEquals(7L, r!!.matchedWayId)
     }
 }

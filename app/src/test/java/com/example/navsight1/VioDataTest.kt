@@ -138,6 +138,11 @@ class VioDataTest {
         assertNull(resolved)
     }
 
+    // LEGACY 2026-05-31 — NavSightUtils.computeCalibrationStraightness is commented out
+    // in main (NavSightUtils.kt:19), so this test is orphaned and broke
+    // compileDebugUnitTestKotlin (pre-existing, NOT a merge regression). Commented out
+    // (not deleted) per convention; restore if the function is reinstated.
+    /*
     @Test
     fun computeCalibrationStraightness_capsAtOne() {
         val straightness = NavSightUtils.computeCalibrationStraightness(
@@ -147,6 +152,7 @@ class VioDataTest {
 
         assertEquals(1.0, straightness, 0.001)
     }
+    */
 
     @Test
     fun computeUpdatedScaleCalibrationFactor_multipliesCurrentFactor() {

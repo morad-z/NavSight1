@@ -217,6 +217,12 @@ class SensorRepository(private val context: Context) : SensorEventListener {
         val slamSnapshot: FloatArray,     // [fid,x,y,z, ...] Y-up world
         val cameraPose: FloatArray,       // 16 floats; empty if EKF not ready
         val loopClosureCount: Long,       // cumulative
+        // 2026-06-02 — per-point recoverPose inlier flags (1=VIO used it, 0=rejected/unverified),
+        // parallel to trackedPoints; empty when unavailable.
+        val trackedInlierFlags: ByteArray = ByteArray(0),
+        // 2026-06-02 — ground-plane snapshot [is_valid, horizon_v_px, confidence, scale, cand, inl];
+        // empty when the estimator is off (no camera height set).
+        val groundPlane: FloatArray = FloatArray(0),
     ) {
         // Compose reads-per-frame; equality on identity is enough.
         override fun equals(other: Any?): Boolean = this === other
@@ -231,12 +237,15 @@ class SensorRepository(private val context: Context) : SensorEventListener {
     // does not allocate. The agesBuf trims via copyOf when fewer features
     // are returned. SLAM is bounded by MAX_SLAM_FEATURES = 12 (ADR-009).
     private val agesBuf = IntArray(512)
+    private val inlierFlagsBuf = ByteArray(512)   // 2026-06-02 — recoverPose inlier flags (parallel to points)
+    private val groundPlaneBuf = FloatArray(6)    // 2026-06-02 — [valid, horizon_v, conf, scale, cand, inl]
     // v23.11: stride increased from 4 → 7 floats per feature
     // (fid, wx, wy, wz, obs_u, obs_v, has_obs).
     private val slamBuf = FloatArray(7 * 12)
     private val cameraPoseBuf = FloatArray(16)
     private val emptyFloats = FloatArray(0)
     private val emptyInts = IntArray(0)
+    private val emptyBytes = ByteArray(0)
 
     private val _startLocation = MutableStateFlow<LatLng?>(null)
     val startLocation = _startLocation.asStateFlow()
@@ -973,6 +982,9 @@ class SensorRepository(private val context: Context) : SensorEventListener {
                 cur.analyzerHeight != h ||
                 cur.rotationDegrees != rot) {
                 _cameraFrameGeometry.value = CameraFrameGeometry(w, h, rot)
+                // Tell native the analyzer rotation so the ground-plane estimator searches the region
+                // that maps to the bottom of the upright (portrait) view (where the road is).
+                NativeBridge.setAnalyzerRotation(rot)
             }
         }
 
@@ -1266,6 +1278,18 @@ class SensorRepository(private val context: Context) : SensorEventListener {
             if (n == expectedAgeCount) agesBuf.copyOf(n) else emptyInts
         }
 
+        // 2026-06-02: per-point recoverPose inlier flags, parallel to trackedPoints. Read under the
+        // same coherent (ages, flags) writer lock; trim/blank on a count mismatch (treated as unknown).
+        val inlierArr: ByteArray = if (expectedAgeCount <= 0) emptyBytes
+        else {
+            val n = NativeBridge.getLastTrackedPointInlierFlags(inlierFlagsBuf)
+            if (n == expectedAgeCount) inlierFlagsBuf.copyOf(n) else emptyBytes
+        }
+
+        // 2026-06-02: ground-plane snapshot [valid, horizon_v, conf, scale, cand, inl] (empty when off).
+        val gpN = NativeBridge.getGroundPlaneSnapshot(groundPlaneBuf)
+        val gpArr: FloatArray = if (gpN >= 6) groundPlaneBuf.copyOf(6) else emptyFloats
+
         // Phase 3: SLAM positions (Y-up world). Bounded by MAX_SLAM_FEATURES.
         val slamCount = NativeBridge.getSlamSnapshot(slamBuf)
         // v23.11: stride 7 (fid, wx, wy, wz, obs_u, obs_v, has_obs).
@@ -1285,6 +1309,8 @@ class SensorRepository(private val context: Context) : SensorEventListener {
             slamSnapshot = slamArr,
             cameraPose = poseArr,
             loopClosureCount = lcCount,
+            trackedInlierFlags = inlierArr,
+            groundPlane = gpArr,
         )
     }
 

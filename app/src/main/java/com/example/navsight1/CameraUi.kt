@@ -28,6 +28,8 @@ import androidx.compose.ui.draw.clip
 import androidx.compose.ui.geometry.Offset
 import androidx.compose.ui.graphics.Brush
 import androidx.compose.ui.graphics.Color
+import androidx.compose.ui.graphics.Path
+import androidx.compose.ui.graphics.nativeCanvas
 import androidx.compose.ui.platform.LocalLifecycleOwner
 import androidx.compose.ui.text.font.FontWeight
 import androidx.compose.ui.unit.dp
@@ -389,6 +391,13 @@ fun CameraFeatureOverlay(viewModel: NavSightViewModel, pal: NavPalette) {
     val useAgeColors = ages.size == n
     val fallbackColor = pal.teal.copy(alpha = 0.85f)
     val dotRadius = 6f
+    // 2026-06-02 — recoverPose inlier flags (1 = the VIO actually USED this point). When present we
+    // draw used points bright (age-coloured) and tracked-but-REJECTED points dim+small, so the overlay
+    // shows the real post-calculation feature set, not the pre-verification KLT candidates. When the
+    // flags are unavailable (size mismatch / not computed) we keep the old all-bright behaviour.
+    val flags = snap.trackedInlierFlags
+    val haveFlags = flags.size == n
+    val rejectedColor = Color(0x55A8B0B8)
 
     Canvas(Modifier.fillMaxSize()) {
         val (prevW, prevH) = overlayRotatedDims(
@@ -412,9 +421,72 @@ fun CameraFeatureOverlay(viewModel: NavSightViewModel, pal: NavPalette) {
             )
             val cx = ox + r.x * s
             val cy = oy + r.y * s
-            val color = if (useAgeColors) ageToColor(ages[i]) else fallbackColor
-            drawCircle(color = color, radius = dotRadius, center = Offset(cx, cy))
+            val isInlier = !haveFlags || flags[i].toInt() != 0
+            if (isInlier) {
+                val color = if (useAgeColors) ageToColor(ages[i]) else fallbackColor
+                drawCircle(color = color, radius = dotRadius, center = Offset(cx, cy))
+            } else {
+                // Tracked by KLT but rejected by recoverPose (or verification not run) → dim + small.
+                drawCircle(color = rejectedColor, radius = dotRadius * 0.5f, center = Offset(cx, cy))
+            }
         }
+    }
+}
+
+/**
+ * 2026-06-02 — Ground-plane overlay. Draws WHERE the read-only GroundPlaneEstimator thinks the road
+ * plane is: the ground vanishing line (horizon, amber) + a translucent fill of the road region below it.
+ * Gated on a valid, confident estimate (the estimator only fires when the lower-image triangulation
+ * produced enough points — so an EMPTY overlay is itself the signal that the ground plane isn't locking
+ * on these frames). Read-only: it never moves the dot; it is the on-device validation of the
+ * camera-height scooter-speed idea (gpt_speed_suggestion.md). Uses the identical FILL_CENTER + rotate
+ * transform as the KLT/SLAM overlays so it aligns to the live preview.
+ */
+@androidx.compose.runtime.Composable
+fun GroundPlaneOverlay(viewModel: NavSightViewModel, pal: NavPalette) {
+    val snap = viewModel.overlaySnapshot
+    val geom = viewModel.cameraFrameGeometry ?: return   // only draw while the camera is active
+    val gp = snap.groundPlane
+    val haveGp = gp.size >= 6
+    val valid = haveGp && gp[0] >= 0.5f
+    val conf = if (haveGp) gp[2] else 0f
+    // Live diagnostics so a real ride is legible (the prior empty overlay was ambiguous): how many KLT
+    // points, how many the VIO USED (recoverPose inliers), and the ground-plane candidate/inlier/conf.
+    val kltN = snap.trackedPoints.size / 2
+    val usedN = snap.trackedInlierFlags.count { it.toInt() != 0 }
+    val locked = valid && conf >= 0.30f
+    val amber = Color(0xFFFFB300)
+    Canvas(Modifier.fillMaxSize()) {
+        val viewW = size.width; val viewH = size.height
+        // Road-search band drawn in CANVAS (portrait) coords — always the BOTTOM of what the user sees,
+        // regardless of how the sensor frame is rotated. White = searching, amber = ground plane LOCKED.
+        // (The estimator is told the rotation separately, so the analyzer region it scans matches this.)
+        val bandTopY = viewH * 0.55f
+        val bandColor = if (locked) amber.copy(alpha = 0.12f + 0.12f * conf.coerceIn(0f, 1f))
+                        else Color(0x14FFFFFF)
+        val band = Path().apply {
+            moveTo(0f, bandTopY); lineTo(viewW, bandTopY); lineTo(viewW, viewH); lineTo(0f, viewH); close()
+        }
+        drawPath(band, color = bandColor)
+        drawLine(
+            color = if (locked) amber.copy(alpha = 0.9f) else Color(0x55FFFFFF),
+            start = Offset(0f, bandTopY), end = Offset(viewW, bandTopY), strokeWidth = 3f
+        )
+        // Diagnostic HUD at the BOTTOM (portrait-readable). KLT=tracked, used=recoverPose inliers,
+        // GP=ground-plane state. "GP off" until a real ride produces road points in the band.
+        // rot = CameraX rotationDegrees. R_bc is hardcoded for 90 (portrait); anything else means the
+        // camera↔IMU extrinsic does not match the mount → the whole VIO is mis-rotated (investigate).
+        val hud = if (haveGp)
+            "rot=${geom.rotationDegrees}  KLT=$kltN used=$usedN  |  GP ${if (locked) "LOCKED" else "search"} cand=${gp[4].toInt()} inl=${gp[5].toInt()} conf=${"%.2f".format(conf)}"
+        else "rot=${geom.rotationDegrees}  KLT=$kltN used=$usedN  |  GP off"
+        val paint = android.graphics.Paint().apply {
+            color = if (locked) android.graphics.Color.rgb(255, 179, 0) else android.graphics.Color.WHITE
+            textSize = 34f; isAntiAlias = true
+            setShadowLayer(6f, 0f, 0f, android.graphics.Color.BLACK)
+        }
+        // Place the HUD just BELOW the band line (lower-middle of the screen), not at the very bottom
+        // where the footer panel covers it. Still clearly in the portrait bottom-half.
+        drawContext.canvas.nativeCanvas.drawText(hud, 28f, bandTopY + 48f, paint)
     }
 }
 

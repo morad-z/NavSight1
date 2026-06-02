@@ -85,6 +85,16 @@ object NativeBridge {
     // setMidasScaleK; periodically reads via getMidasScaleK and writes back.
     external fun setMidasScaleK(k: Double)
     external fun getMidasScaleK(): Double
+    // 2026-05-31 (map-as-sensor HEADING leg) — push the matched road bearing (deg, 0=N CW) when the
+    // matcher is confidently railed on a straight road; native nudges the VIO heading onto it so the
+    // trajectory stops drifting off the road. Push a sentinel (-1000) to clear when not applicable.
+    external fun setRoadHeadingHint(bearingDeg: Double)
+    // 2026-05-31 (map-as-sensor POSITION leg) — push the world-frame error (matched-ball − raw-VIO),
+    // metres east/north, when confidently railed; native bleeds its cross-track part into global_t_ so
+    // the VIO trajectory stops drifting off the road. Push (0,0) freely — native gates on magnitude.
+    external fun setMapPositionCorrection(dEastM: Double, dNorthM: Double)
+    // Runtime toggle for the POSITION leg (default-OFF in native; heading leg is separate + on).
+    external fun setMapPositionEnabled(enabled: Boolean)
 
     // Step 5: Calibration & Initialization
     // Returns 0=WAIT_STATIONARY, 1=WAIT_MOTION, 2=READY, 3=TIMEOUT_NEEDS_USER
@@ -154,6 +164,18 @@ object NativeBridge {
     // At 30 Hz: <30 frames is "new" (≤1 s), 30-89 is "established"
     // (1-3 s), ≥90 is "mature" (≥3 s) for the overlay color ramp.
     external fun getLastTrackedPointAges(out: IntArray): Int
+    // 2026-06-02 overlay — per-point recoverPose inlier flags (1=VIO used the point, 0=rejected /
+    // verification not attempted), parallel to trackedPoints. Caller preallocates ByteArray + reuses.
+    external fun getLastTrackedPointInlierFlags(out: ByteArray): Int
+    // 2026-06-02 — read-only ground-plane snapshot for the camera overlay. Caller passes FloatArray(6);
+    // layout [is_valid(0/1), horizon_v_px, confidence, ground_scale, candidates, inliers]. Returns count.
+    external fun getGroundPlaneSnapshot(out: FloatArray): Int
+    // 2026-06-02 — set the scooter camera-to-road mount height (m); activates the read-only ground-plane
+    // metric-scale estimator. 0 = off. Distinct from setUserHeight (rider body height for stride).
+    external fun setCameraHeight(heightM: Double)
+    // 2026-06-02 — CameraX rotationDegrees (0/90/180/270) so the ground-plane estimator searches the
+    // analyzer region that maps to the bottom of the upright (portrait) view (where the road is).
+    external fun setAnalyzerRotation(deg: Int)
 
     // Phase 3: flat snapshot of currently-active SLAM features.
     // Audit Finding 8 (2026-05-16): KDoc previously said stride=4 / FloatArray(48)

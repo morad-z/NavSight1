@@ -67,6 +67,38 @@ class NavSightViewModel(application: Application) : AndroidViewModel(application
         private const val SCALE_OBS_MIN_RATIO = 0.2
         private const val SCALE_OBS_MAX_RATIO = 5.0
         private const val SCALE_OBS_LOG_INTERVAL_MS = 3_000L
+        // 2026-05-31 advance-along-rail — cap a single tick's graph advance to a plausible
+        // speed (54 km/h) so a VIO teleport-spike can't race the ball down the road.
+        private const val RAIL_MAX_SPEED_MPS = 15.0
+        // map→VIO POSITION leg gates (review HIGH — wrong-road runaway). Push only when the matcher is
+        // high-confidence (≥0.6 = the rail-lock bar) and has stayed so for MAP_POS_MIN_STREAK ticks.
+        private const val MAP_POS_MIN_CONFIDENCE = 0.6
+        private const val MAP_POS_MIN_STREAK = 3
+        // Matcher-supervised wrong-turn recovery: re-acquire the ball onto the matcher's road only after
+        // it has stayed >25 m from the confident matcher dot for 5 consecutive ticks (~2.5 s) — long
+        // enough that a transient parallel-road matcher flicker can't cause a spurious teleport.
+        private const val RAIL_MATCHER_REACQUIRE_M = 25.0
+        private const val RAIL_MATCHER_REACQUIRE_TICKS = 5
+        // DEFAULT-OFF: matcher-supervised wrong-turn recovery. OFFLINE on sim A (a heading-disaster ride
+        // where the matcher is itself unreliable) it REGRESSES the dot — 968 m/1.33×/3 teleports vs pure
+        // dead-reckoning's 599 m/0.82×/0. Its benefit needs a device re-record where the (on) heading leg
+        // makes the matcher trustworthy. Enable together with the position leg after that validation.
+        private const val MATCHER_SUPERVISION_ENABLED = false
+        private const val RAIL_TRAIL_MAX = 600   // ~5 min of on-road breadcrumb at the 0.5 s snap tick
+        // EMA rate for the gyro↔road heading offset. Slow (0.1) so the offset is a stable calibration of
+        // the gyro's absolute error and brief junction transients don't shift it.
+        private const val HEADING_OFFSET_ALPHA = 0.1
+        // Sustained ticks of "heading clearly opposite the ball's facing" before flipping (a real U-turn /
+        // wrong facing). ~1.5 s at the 0.5 s snap tick — long enough that noise never triggers a flip.
+        private const val RAIL_REVERSE_TICKS = 3
+        // INSTRUMENTATION-ONLY noise floor for the RAIL_JUNCTION log: a junction switch is a discrete
+        // graph-edge tangent JUMP (many degrees); curvature-following along one road is sub-degree per
+        // tick. This separates "took a junction" from "followed the curve" for the log; it is NOT a
+        // steering threshold (steering is the anchor model) so it changes no behaviour.
+        private const val RAIL_JUNCTION_LOG_MIN_TURN_DEG = 1.0
+        // Scooter camera-to-road mount height (m) for the read-only ground-plane estimator. Adjustable;
+        // a wrong value scales the recovered speed linearly, so measure the real mount for production.
+        private const val SCOOTER_CAMERA_HEIGHT_M = 1.05
     }
 
     private val sensorRepository = SensorRepository(application)
@@ -279,6 +311,51 @@ class NavSightViewModel(application: Application) : AndroidViewModel(application
     // longer the dot source.
     private val localMatcher = LocalMatcher()
     @Suppress("unused") private val liveMatcher = LiveMatcher()
+    // 2026-05-31 advance-along-rail — the displayed dot is a BALL constrained to the routing graph
+    // (DynamicRoadRegion.graph): it advances ALONG its current road by the distance travelled and can
+    // only cross to a CONNECTED edge at a junction, so it never teleports to a parallel road ("ball in
+    // a maze", owner). Rebuilt when the region changes. lastSnapVio carries the previous tick's VIO
+    // position so we can derive the per-tick distance + travel bearing the ball advances by.
+    @Volatile private var graphRail: GraphRailDot? = null
+    @Volatile private var graphRailRegion: DynamicRoadRegion? = null
+    @Volatile private var lastSnapVio: LatLng? = null
+    // Consecutive confident-railed ticks; the map→VIO position push only fires once this reaches
+    // MAP_POS_MIN_STREAK (review HIGH — a single wrong-road Viterbi win must not start the feedback).
+    @Volatile private var mapPosPushStreak = 0
+    // Consecutive ticks the ball has stayed far from the matcher's confident dot ON THE SAME wayId;
+    // once it reaches RAIL_MATCHER_REACQUIRE_TICKS the ball re-acquires onto the matcher's road
+    // (wrong-turn recovery). railMatcherWayId is the way that streak is accumulating on.
+    @Volatile private var railMatcherDivergeTicks = 0
+    @Volatile private var railMatcherWayId: Long? = null
+    // 2026-06-02 — last STABLE travel direction along the road (net bearing over the matched polyline);
+    // held across no-match ticks so the ball's orientation + the arrow never flip on per-tick VIO noise.
+    @Volatile private var lastTravelBearing: Double = Double.NaN
+    // 2026-06-02 (owner's heading-lock model): the gyro/Madgwick heading (deg), and the running offset
+    // between it and the road tangent. While on a road the gyro's ABSOLUTE value may be wrong but its
+    // RELATIVE change is reliable, so we calibrate offset = gyro − road_tangent; at a junction the road
+    // is picked by gyro − offset (the user's real heading), giving "rotate −50 → take the 130 road".
+    @Volatile private var lastVioHeadingDeg: Double = Double.NaN
+    @Volatile private var headingOffsetDeg: Double = Double.NaN
+    // 2026-06-02 (owner: "on a straight road with a slight fork it takes the OTHER exit even though I
+    // didn't rotate") — the drift-free GYRO-RELATIVE junction anchor. We snapshot (road bearing, gyro)
+    // whenever the ball is confidently STRAIGHT on a road; the STEERING heading that decides the next exit
+    // is then railRoadBearingAnchorDeg + (gyroNow − railHeadingAnchorGyroDeg). This uses the EXACT live
+    // road geometry + only the SMALL recent gyro delta, so it is free of the absolute-heading error that
+    // the EMA-based steering carried at the decision instant. That error has two independent sources: (1)
+    // the rail offset EMA (α=0.1) LAGS road-direction changes (magnetometer-independent — the dominant
+    // one); (2) the magnetometer yaw correction is gyro-primary, SLOW (τ=5s complementary, IMUPreintegrator
+    // ~958) and GATED OFF in magnetic disturbance (>35° mag/gyro disagreement — common on a scooter mount),
+    // so it does not null gyro drift instantly. At a SHALLOW fork the decision boundary is half the (small)
+    // fork angle, so a few degrees of that error was enough to flip onto the branch when the user hadn't
+    // turned. The gyro's RELATIVE rotation over a few seconds is reliable regardless, so we use it instead.
+    // With the anchor: no rotation → delta ≈ 0 → the straight continuation wins; a real turn moves the
+    // delta → the matching exit wins ("stayed → 180, rotated −50 → 130", the owner's spec). Held (NOT
+    // updated) through curves/turns where straightRoad is false, so the delta accumulates the real turn.
+    @Volatile private var railHeadingAnchorGyroDeg: Double = Double.NaN
+    @Volatile private var railRoadBearingAnchorDeg: Double = Double.NaN
+    // Consecutive ticks the corrected heading has been clearly opposite the ball's facing → a confirmed
+    // U-turn / wrong-facing once it reaches RAIL_REVERSE_TICKS (debounced so noise never flips the dot).
+    @Volatile private var railReverseTicks = 0
     @Volatile private var lastSnapSource = ""
     // Guards against overlapping snap coroutines while a /match HTTP call is in flight
     // (set/cleared on the Main collector thread + the IO finally).
@@ -286,6 +363,17 @@ class NavSightViewModel(application: Application) : AndroidViewModel(application
     // Tier-1 #3: the matched ROAD polyline for the current window (on-road geometry the
     // dot sits on). Empty when on the per-point fallback / unmatched. Rendered by the map.
     var matchedRoadPath by mutableStateOf<List<LatLng>>(emptyList())
+        private set
+    // 2026-06-02 — on-road breadcrumb of the advance-along-rail ball positions. The clean trail of
+    // where the user actually went, ON the roads, that never teleports (the ball is graph-constrained).
+    // Rendered as the green trail in place of the raw Viterbi matchedRoadPath (which still teleports).
+    val railTrail = androidx.compose.runtime.mutableStateListOf<LatLng>()
+    // 2026-06-02 — last position the dot sat ON a road; the dot HOLDS here when the VIO drifts past any
+    // road (never renders the raw off-road VIO). Owner: "i dont want it to go offroad, never."
+    @Volatile private var lastOnRoadPos: LatLng? = null
+    // 2026-06-02 — the map arrow's heading = the road's tangent at the ball (so it points ALONG the road
+    // and turns only at junctions), not the VIO heading. null until the ball has acquired.
+    var railBearingDeg by mutableStateOf<Float?>(null)
         private set
     // Tier-1 #2: throttle for the read-only K̂_map scale observation log (ms).
     @Volatile private var lastScaleObsMs = 0L
@@ -342,6 +430,11 @@ class NavSightViewModel(application: Application) : AndroidViewModel(application
     init {
         NativeBridge.setScale(scaleCalibrationFactor)
         NativeBridge.setUserHeight(userHeight)
+        // 2026-06-02 — activate the read-only ground-plane metric-scale estimator with the scooter
+        // camera-to-road mount height (default ~1.05 m; the camera debug overlay draws what it finds).
+        // READ-ONLY: it never feeds the dot — it's the on-device validation tool for the camera-height
+        // scooter-speed idea (gpt_speed_suggestion.md; the offline harness can't fire on sparse frames).
+        NativeBridge.setCameraHeight(SCOOTER_CAMERA_HEIGHT_M)
         // 2026-05-28 — push persisted MiDaS scale K to native at startup.
         // -1 = never calibrated; native ignores non-positive values so this is a
         // safe no-op on first launch. Once any session calibrates K (run, walk+run,
@@ -607,14 +700,21 @@ class NavSightViewModel(application: Application) : AndroidViewModel(application
                     // Heading-aware matcher (§0.7): detect roundabout traversal/exit + U-turns
                     // from the VIO heading (radians → degrees; MapScreenUi convention).
                     val headingDeg = Math.toDegrees(vio.heading)
+                    lastVioHeadingDeg = headingDeg   // gyro/Madgwick heading → ball junction choice (relative turn)
                     val maneuver = maneuverStateMachine.tick(
                         currentLatLng.latitude, currentLatLng.longitude, headingDeg, region?.roundabouts
                     )
                     maneuver.event?.let { ev ->
+                        // RAIL-LOCK (2026-05-31): a maneuver — roundabout entry/exit, U-turn — is the
+                        // sanctioned reason to leave the current road. Release the matcher's rail so it
+                        // re-locks to the NEW road, instead of being dragged back onto the old one.
+                        // (Plain intersection turns with no event are caught by LocalMatcher's range
+                        // recovery; a dedicated ~90° classifier is the next refinement.)
+                        localMatcher.releaseRail()
                         Log.i("ManeuverSM", "MANEUVER event=$ev state=${maneuver.state} " +
                             "sweep=${"%.0f".format(maneuver.accumulatedSweepDeg)} " +
                             "exitBearing=${maneuver.suggestedExit?.bearingDeg?.let { "%.0f".format(it) } ?: "-"} " +
-                            "dir=${maneuver.travelDirection}")
+                            "dir=${maneuver.travelDirection} railReleased=1")
                     }
                     maneuverState = maneuver.state  // Compose state; collector is on Main
                     // Gate ONLY the network snap so /match coroutines never stack; the SM has
@@ -652,18 +752,247 @@ class NavSightViewModel(application: Application) : AndroidViewModel(application
                 // confident and the trace was not split. Otherwise fall back to per-point snap.
                 val accept = matched != null &&
                     matched.confidence >= MIN_MATCH_CONFIDENCE && !matched.broken
+                // ── advance-along-rail (ball-in-maze, 2026-05-31) — the displayed dot is a ball
+                // CONSTRAINED to the routing graph: it advances ALONG its road by the VIO step and can
+                // only cross to a CONNECTED edge at a junction, so it never teleports to a parallel road
+                // ("it stays inside the maze... it can't jump through the wall"). Offline-validated on
+                // sim A: 0 teleports, 0.82× GPS (vs the re-projecting matcher's 8 teleports / 1.80×). ──
+                if (region != null && region !== graphRailRegion) {
+                    graphRail = GraphRailDot(region.graph); graphRailRegion = region; lastSnapVio = null
+                }
+                val rail = graphRail
+                val prevVio = lastSnapVio
+                val dVioRaw = if (prevVio != null) RoadSnapMath.haversineM(
+                    prevVio.latitude, prevVio.longitude, currentLatLng.latitude, currentLatLng.longitude) else 0.0
+                val advanceM = minOf(dVioRaw, RAIL_MAX_SPEED_MPS * 0.5)   // cap a VIO teleport-spike (~0.5 s tick)
+                // TRAVEL DIRECTION along the road = net bearing over the MATCHED polyline (snapped
+                // positions, oldest→newest). Road-aligned, time-ordered, HEADING-INDEPENDENT → stable even
+                // at crawl speed. The per-tick VIO delta we used before is pure noise at 3 km/h and made
+                // the ball/arrow flip 180° every tick. Held across a no-match tick so it never goes NaN.
+                val mpw = matched?.matchedPath
+                val travelBearing: Double = if (accept && mpw != null && mpw.size >= 2 &&
+                        RoadSnapMath.haversineM(mpw.first().latitude, mpw.first().longitude,
+                                                mpw.last().latitude, mpw.last().longitude) > 2.0) {
+                    val tb = ManeuverMath.bearingDeg(mpw.first().latitude, mpw.first().longitude,
+                                                     mpw.last().latitude, mpw.last().longitude)
+                    lastTravelBearing = tb; tb
+                } else lastTravelBearing
+                val seedBearing = if (travelBearing.isNaN()) 0.0 else travelBearing
+                var railPos: GeoPt? = null
+                if (rail != null) {
+                    if (!rail.acquired) {
+                        val sLat = if (accept && matched != null) matched.matched.latitude else currentLatLng.latitude
+                        val sLng = if (accept && matched != null) matched.matched.longitude else currentLatLng.longitude
+                        if (rail.acquire(sLat, sLng, seedBearing)) {
+                            // Seed the junction anchor AT acquire time (not only on the first straight tick)
+                            // so steerHeading uses the drift-free gyro-relative model from tick 0. Without
+                            // this, the first ticks after an acquire / matcher re-acquire (a teleport onto a
+                            // new road, when the ball is most likely right next to a junction) steer on the
+                            // stale travelBearing fallback → a transient wrong-exit. The acquired edge tangent
+                            // is a drift-free reference; pair it with the current gyro (NaN-guarded downstream).
+                            railRoadBearingAnchorDeg = rail.currentBearingDeg() ?: seedBearing
+                            railHeadingAnchorGyroDeg = lastVioHeadingDeg
+                        }
+                    } else {
+                        // OWNER'S HEADING-LOCK MODEL: the heading IS the road tangent; at a junction the
+                        // road is chosen by the gyro's RELATIVE rotation. While on a road, calibrate the
+                        // offset between the (possibly-wrong-absolute) gyro heading and the road tangent;
+                        // the ball then turns at a junction toward (gyro − offset) = the user's real
+                        // heading, so "rotate −50 → take the 130 road", etc. The gyro change is reliable
+                        // even when its absolute value is off, so this is stable across the intersection.
+                        // Calibrate offset = gyro − road on a confident STRAIGHT stretch only, from the
+                        // EXTERNAL matched-road direction (NOT the ball edge — that would be circular and
+                        // re-oscillate). Held through junctions/curves where the matched direction is noisy.
+                        // LOCAL road tangent = bearing of the LAST matched segment (the road direction AT the
+                        // ball's current position). Calibrate the gyro offset against THIS, not the net
+                        // first→last travelBearing. WHY (owner-reported U-turn flip-back, 2026-06-02): right
+                        // after a U-turn the matched window still holds the OLD-direction half, so the NET
+                        // bearing points ~180° the wrong way while the last segment already points the NEW way.
+                        // The straightRoad gate (last-2-segs colinear) goes true the moment you're straight
+                        // again, so calibrating off the stale NET would rewrite a correct held offset with one
+                        // corrupted by ~180° → correctedHeading snaps back the old way → reverse() re-fires →
+                        // the arrow rotates back. The gyro offset (sensor bias vs true heading) is
+                        // direction-INDEPENDENT, so the held value is already correct for the new heading; we
+                        // must just stop poisoning it with the lagging net. The last segment is the gate's own
+                        // validated, transition-safe road direction.
+                        val roadTangentDeg = if (mpw != null && mpw.size >= 2)
+                            ManeuverMath.bearingDeg(mpw[mpw.size - 2].latitude, mpw[mpw.size - 2].longitude,
+                                                    mpw[mpw.size - 1].latitude, mpw[mpw.size - 1].longitude)
+                            else Double.NaN
+                        val straightRoad = mpw != null && mpw.size >= 3 && !roadTangentDeg.isNaN() && kotlin.math.abs(
+                            ManeuverMath.angularDifferenceDeg(roadTangentDeg,
+                                ManeuverMath.bearingDeg(mpw[mpw.size - 3].latitude, mpw[mpw.size - 3].longitude,
+                                                        mpw[mpw.size - 2].latitude, mpw[mpw.size - 2].longitude))) < 30.0
+                        if (accept && straightRoad && !roadTangentDeg.isNaN() && !lastVioHeadingDeg.isNaN() &&
+                                maneuver.state != ManeuverState.ON_ROUNDABOUT) {
+                            val inst = ManeuverMath.angularDifferenceDeg(lastVioHeadingDeg, roadTangentDeg)
+                            headingOffsetDeg = if (headingOffsetDeg.isNaN()) inst
+                                else headingOffsetDeg + HEADING_OFFSET_ALPHA *
+                                    ManeuverMath.angularDifferenceDeg(inst, headingOffsetDeg)
+                            // Re-anchor the drift-free junction reference on THIS confident-straight tick:
+                            // the road bearing the ball is actually on (graph-edge tangent — the frame the
+                            // junction choice compares against) + the current gyro. On a long straight road
+                            // this re-anchors every tick so the gyro delta stays ~0 → shallow forks resolve
+                            // to the straight continuation; once the user turns by ENOUGH to break this same
+                            // straightRoad gate (two matched segments >30° apart — i.e. a real intersection
+                            // turn), the anchor freezes and the delta accumulates the real rotation → the ball
+                            // takes the matching exit. KNOWN TRADEOFF (verify-rail-junction-anchor wf, 3 lenses
+                            // 2026-06-02): a turn so gradual it NEVER breaks the 30° gate yet leads onto a
+                            // <30° SHALLOW fork can be re-absorbed each tick → the ball keeps straight (the
+                            // dual of the fixed bug). This makes "go straight" the DEFAULT at a shallow fork —
+                            // the safer default (the shallow branch is usually the minor road), and MATCHER
+                            // supervision re-acquires if the VIO clearly follows the branch. The proper fix is
+                            // a gyro-QUIESCENCE re-anchor gate (re-anchor only when |per-tick gyro| is at the
+                            // noise floor), but that threshold must be MEASURED from a real ride (project rule:
+                            // cite the sim before adding a constant), so it is deferred until a sim shows a
+                            // genuine missed shallow-fork turn (RAIL_JUNCTION log = the witness).
+                            railRoadBearingAnchorDeg = rail.currentBearingDeg() ?: roadTangentDeg
+                            railHeadingAnchorGyroDeg = lastVioHeadingDeg
+                        }
+                        // EMA correctedHeading (gyro − smoothed offset) — kept as the FALLBACK only, used
+                        // until the drift-free anchor below has been set on the first confident-straight tick.
+                        val correctedHeading = if (!lastVioHeadingDeg.isNaN() && !headingOffsetDeg.isNaN())
+                            ((lastVioHeadingDeg - headingOffsetDeg) % 360.0 + 360.0) % 360.0
+                            else travelBearing
+                        // STEERING heading = the drift-free anchor model: the road bearing the ball is on +
+                        // the gyro rotation since the last confident-straight tick. THIS is what picks the
+                        // exit at a junction. It is robust to the EMA-offset lag that was making the ball
+                        // take a slight fork when the user hadn't turned: no rotation → gyroDelta ≈ 0 →
+                        // steer = the road the ball is on → the straight continuation wins. Falls back to the
+                        // EMA correctedHeading until the anchor is first set (early ticks after acquire).
+                        val gyroDelta = if (!railHeadingAnchorGyroDeg.isNaN() && !lastVioHeadingDeg.isNaN())
+                            ManeuverMath.angularDifferenceDeg(lastVioHeadingDeg, railHeadingAnchorGyroDeg)
+                            else Double.NaN
+                        // Final fallback is seedBearing (coerced non-NaN), NOT correctedHeading — which is
+                        // itself NaN on the earliest ticks (offset + travelBearing both unset) — so steerHeading
+                        // is never NaN and no silent bad value reaches advance()/the reversal test.
+                        val steerHeading = if (!railRoadBearingAnchorDeg.isNaN() && !gyroDelta.isNaN())
+                            ((railRoadBearingAnchorDeg + gyroDelta) % 360.0 + 360.0) % 360.0
+                            else if (!correctedHeading.isNaN()) correctedHeading
+                            else seedBearing
+                        val facingBefore = rail.currentBearingDeg()
+                        // U-TURN DEBOUNCE BACK-HOP GUARD: when the steering heading is CLEARLY opposite the
+                        // ball's facing (>120°), a U-turn (or wrong facing) is being debounced. Do NOT let
+                        // advance() junction-hop onto a backward-pointing connected edge during the debounce —
+                        // that is an ungated pseudo-U-turn before the clean, latched reverse() flip (a brief
+                        // wrong-edge excursion at a multi-way junction). Keep advancing along the CURRENT
+                        // facing; only reverse() (after RAIL_REVERSE_TICKS) changes direction. Same 120° gate,
+                        // computed once and reused for both the advance guard and the reversal counter.
+                        val opposed = facingBefore != null && !steerHeading.isNaN() &&
+                            kotlin.math.abs(ManeuverMath.angularDifferenceDeg(steerHeading, facingBefore)) > 120.0
+                        rail.advance(advanceM, if (opposed) (facingBefore ?: steerHeading) else steerHeading)
+                        // INSTRUMENTATION: log ONLY when the ball actually changed road direction this tick
+                        // (a junction was taken) — the exact event being debugged, not per-tick spam. A
+                        // wrong-exit shows as a large facing jump with gyroD≈0 (took a branch without turning);
+                        // a swallowed turn shows as NO RAIL_JUNCTION line on the tick the user turned at a
+                        // shallow fork (anchor re-absorbed the rotation) — both diagnosable from a logcat pull.
+                        val facing = rail.currentBearingDeg()
+                        if (facingBefore != null && facing != null &&
+                            kotlin.math.abs(ManeuverMath.angularDifferenceDeg(facing, facingBefore)) > RAIL_JUNCTION_LOG_MIN_TURN_DEG) {
+                            Log.i("RailDot", "RAIL_JUNCTION: %.0f->%.0f steer=%.0f gyroD=%.0f anchorRoad=%.0f".format(
+                                facingBefore, facing, steerHeading,
+                                if (gyroDelta.isNaN()) 0.0 else gyroDelta,
+                                railRoadBearingAnchorDeg))
+                        }
+                        // DEBOUNCED REVERSAL (owner: "if it thinks I'm facing the wrong direction, how do
+                        // we make it rotate? what if I did a U-turn?"). Sustained "steering clearly opposite
+                        // the facing" (the `opposed` flag above) for RAIL_REVERSE_TICKS → a real U-turn /
+                        // wrong facing → flip the ball 180°. Debounced so per-tick noise never flips it.
+                        if (opposed) {
+                            railReverseTicks++
+                            if (railReverseTicks >= RAIL_REVERSE_TICKS) {
+                                if (rail.reverse()) Log.i("RailDot", "RAIL_REVERSE: sustained heading opposite facing")
+                                railReverseTicks = 0
+                            }
+                        } else railReverseTicks = 0
+                        // WIRE THE MATCHER (2026-06-02) — supervise the ball's road choice. The junction
+                        // CHOICE stays VIO-bearing-driven (the user's actual motion is the true signal for
+                        // which exit they took), but if the ball then stays far from the matcher's CONFIDENT
+                        // window-Viterbi dot for several consecutive ticks, it took a WRONG exit / wrong road
+                        // → re-acquire onto the matcher's road. This is the multi-exit / wrong-turn recovery
+                        // (and the root mitigation for the position-leg wrong-road runaway). Sustained +
+                        // high-confidence gating means a transient parallel-road matcher flicker (which flips
+                        // back within a tick) can't trigger a spurious teleport.
+                        val rp = rail.position()
+                        val mWayId = matched?.matchedWayId
+                        val mOff = if (matched != null && rp != null) RoadSnapMath.haversineM(
+                            rp.lat, rp.lng, matched.matched.latitude, matched.matched.longitude) else 0.0
+                        if (MATCHER_SUPERVISION_ENABLED &&
+                            accept && matched != null && matched.confidence >= MAP_POS_MIN_CONFIDENCE &&
+                            mWayId != null && rp != null && mOff > RAIL_MATCHER_REACQUIRE_M) {
+                            // Diverged from a confident matcher THIS tick. Only count it when the matcher
+                            // is STABLE on the SAME wayId — a flickering matcher (jumping between parallel
+                            // roads, the unreliable-heading signature) keeps resetting the streak and never
+                            // triggers a spurious re-acquire; a rock-solid disagreement (a real wrong road)
+                            // accumulates and recovers the ball onto the matcher's road.
+                            if (mWayId == railMatcherWayId) railMatcherDivergeTicks++
+                            else { railMatcherWayId = mWayId; railMatcherDivergeTicks = 1 }
+                            if (railMatcherDivergeTicks >= RAIL_MATCHER_REACQUIRE_TICKS) {
+                                rail.acquire(matched.matched.latitude, matched.matched.longitude, seedBearing)
+                                railMatcherDivergeTicks = 0; railMatcherWayId = null
+                                Log.i("RailDot", "RAIL_REACQUIRE matcherOff=%.0fm conf=%.2f way=%d".format(mOff, matched.confidence, mWayId))
+                            }
+                        } else { railMatcherDivergeTicks = 0; railMatcherWayId = null }
+                    }
+                    railPos = rail.position()
+                }
+                lastSnapVio = currentLatLng
+
                 val snapped: SnappedLatLng
                 val matchedPath: List<LatLng>
-                if (accept && matched != null) {
+                if (railPos != null && rail?.acquired == true) {
+                    // Ball is on a road — it IS the dot whether or not THIS tick's matcher accepted
+                    // (dead-reckoning along the graph keeps us on the road between confident matches).
+                    snapped = SnappedLatLng(railPos.lat, railPos.lng, if (accept) "rail" else "rail-dr", null, true)
+                    matchedPath = if (accept && matched != null) matched.matchedPath else matchedRoadPath
+                } else if (accept && matched != null) {
                     snapped = SnappedLatLng(matched.matched.latitude, matched.matched.longitude, "local:match", null, true)
                     matchedPath = matched.matchedPath        // #3 — on-road geometry
                 } else {
                     snapped = roadSnapper.snapToRoad(currentLatLng, recentPath, maneuver)
-                    // #10 — keep the last matched road on a TRANSIENT /match miss (no green-line
-                    // flicker); only drop it when we are truly off any road.
+                    // #10 — keep the last matched road on a TRANSIENT /match miss (no green-line flicker).
                     matchedPath = if (snapped.isSnapped) matchedRoadPath else emptyList()
                 }
-                val srcLabel = if (accept) "local:match" else if (snapped.isSnapped) "snap" else "raw"
+                // 2026-05-31 (map-as-sensor HEADING leg) — when confidently RAILED on a STRAIGHT road
+                // in FREE_ROAD, push that road's bearing to native so it nudges the VIO heading onto the
+                // road (stops the off-road drift; the user's "fix the heading so we stay on the road").
+                // Native gates on |heading-road|<35° + magnetometer-not-fusing, so a crossing road is
+                // rejected (un-drift only). Sentinel -1000 clears the hint when not applicable.
+                // 2026-06-02 — road→heading correction TARGET = the ball-on-rail's CURRENT edge bearing
+                // (the road's LOCAL TANGENT where you are). Per-road by construction (the ball is
+                // graph-constrained), and it follows CURVATURE as the ball advances (owner: "when a road
+                // is curved the heading doesn't match the curvature, update simultaneously") — a turn onto
+                // a different road just transitions the ball to that road's tangent. TRUST = the ball is
+                // acquired on a road AND the matcher confidently agrees (a wrong/crossing road won't be
+                // confidently matched). No averaged segment, no sharp-turn skip (a curve IS the road);
+                // only a roundabout is skipped (its tangent is meaningless while circulating). Native
+                // picks the travel-aligned direction (no 180° flip) + the 90° crossing-road backstop.
+                val roadHint: Double = if (accept && matched != null &&
+                        matched.confidence >= MAP_POS_MIN_CONFIDENCE && rail?.acquired == true &&
+                        maneuver.state != ManeuverState.ON_ROUNDABOUT) {
+                    rail.currentBearingDeg() ?: -1000.0
+                } else -1000.0
+                NativeBridge.setRoadHeadingHint(roadHint)
+                // map-as-sensor POSITION leg — push the world-frame (ball − VIO) error so native bleeds
+                // its CROSS-TRACK part into global_t_, pulling the drifting VIO trajectory onto the road
+                // (owner: "fix the drifting vio based on the map matcher"). HARD-GATED (review HIGH —
+                // wrong-road runaway / ADR-004): only when the SAME condition the heading hint requires
+                // holds (roadHint != -1000 ⇒ accept + railed + FREE_ROAD + straight), AND the match is
+                // high-confidence, AND it has held for several consecutive ticks — so a transient or a
+                // wrong-parallel-road lock cannot start dragging the VIO. Native applies it only when the
+                // position leg is enabled (default-OFF until the heading leg is validated on device).
+                val posConfident = accept && matched != null &&
+                    matched.confidence >= MAP_POS_MIN_CONFIDENCE && roadHint != -1000.0
+                mapPosPushStreak = if (posConfident) mapPosPushStreak + 1 else 0
+                if (railPos != null && rail?.acquired == true && posConfident &&
+                    mapPosPushStreak >= MAP_POS_MIN_STREAK) {
+                    val mLat = RoadSnapMath.M_PER_DEG_LAT
+                    val mLng = RoadSnapMath.M_PER_DEG_LAT * kotlin.math.cos(Math.toRadians(currentLatLng.latitude))
+                    val dEast = (railPos.lng - currentLatLng.longitude) * mLng
+                    val dNorth = (railPos.lat - currentLatLng.latitude) * mLat
+                    NativeBridge.setMapPositionCorrection(dEast, dNorth)
+                }
+                val srcLabel = snapped.placeId ?: if (snapped.isSnapped) "snap" else "raw"
                 if (srcLabel != lastSnapSource) {
                     lastSnapSource = srcLabel
                     Log.i("LiveMatcher", "SNAP_SOURCE source=$srcLabel " +
@@ -686,14 +1015,36 @@ class NavSightViewModel(application: Application) : AndroidViewModel(application
                 }
                 // #8 — when navigating, project onto the planned route (route-pinned) + detect
                 // off-route → reroute. Returns the display position (pinned within the corridor).
+                // NEVER OFF-ROAD (owner: "i dont want it to go offroad, never"): the dot must always sit
+                // on a road. When this tick is on a road (snapped) remember it; when it is NOT (the VIO
+                // drifted past the search radius and there's no road within reach), HOLD the last on-road
+                // position instead of rendering the raw off-road VIO. The dot freezes on the road until the
+                // VIO comes back into reach — never visibly leaves it.
+                if (snapped.isSnapped) lastOnRoadPos = snapped.toLatLng()
+                val dotLatLng = if (snapped.isSnapped) snapped.toLatLng()
+                                else (lastOnRoadPos ?: snapped.toLatLng())
                 val displayPos = if (navigationState is NavigationState.Active) {
-                    navigationManager.updateVioPosition(snapped.toLatLng())
+                    navigationManager.updateVioPosition(dotLatLng)
                 } else {
-                    snapped.toLatLng()
+                    dotLatLng
                 }
+                val railBreadcrumb = if (railPos != null && rail?.acquired == true)
+                    LatLng(railPos.lat, railPos.lng) else null
+                // Arrow direction = the ball's road TANGENT (the road's direction where you are), NOT the
+                // VIO Madgwick heading (which can be 90° off when the heading nudge is gated out). The
+                // arrow then points ALONG the road and rotates only at turns/junctions, where the ball
+                // crosses to the next edge (owner: "the arrow should point wherever the roads direction
+                // is and only rotate on turns/roundabouts"). Held across a transient miss so it never
+                // snaps back to the wrong VIO heading.
+                val railBearing: Float? = (if (rail?.acquired == true) rail.currentBearingDeg() else null)?.toFloat()
                 withContext(Dispatchers.Main) {
                     snappedPosition = displayPos
                     matchedRoadPath = matchedPath
+                    if (railBearing != null) railBearingDeg = railBearing
+                    if (railBreadcrumb != null) {
+                        railTrail.add(railBreadcrumb)
+                        while (railTrail.size > RAIL_TRAIL_MAX) railTrail.removeAt(0)
+                    }
                 }
             } finally {
                 snapInFlight = false
@@ -745,8 +1096,38 @@ class NavSightViewModel(application: Application) : AndroidViewModel(application
     fun overrideStartLocation(latLng: LatLng) {
         startLocationOverridden = true
         startLocation = latLng
+        // A long-press relocation is a DELIBERATE teleport of the origin. The ball-on-rail ignores VIO
+        // position jumps by design (it advances along the road by capped steps), so it would otherwise
+        // stay stuck on its old edge and the dot wouldn't move. Drop it → the next snap re-acquires the
+        // ball at the new location (regression: "when i hold to change location it doesnt change").
+        resetRailState()
+        // Anchor the never-off-road HOLD at the point you tapped, and show the dot there immediately.
+        // If that area's roads aren't downloaded/cached yet, the dot STAYS here (on the road you placed)
+        // until the region loads and the ball acquires — instead of drifting off-road from the raw VIO
+        // (owner: "if i hold on a place and it isn't downloaded/cached it still goes offroad").
+        lastOnRoadPos = latLng
+        snappedPosition = latLng
         RoadRegionManager.ensureRegion(latLng.latitude, latLng.longitude)
         Log.i("NavSightVM", "START_OVERRIDE lat=${latLng.latitude} lng=${latLng.longitude}")
+    }
+
+    /** Drop the advance-along-rail ball state so the next snap re-acquires from scratch. Used on a full
+     *  reset and on a deliberate start-location relocation (both are origin teleports the ball must follow). */
+    private fun resetRailState() {
+        graphRail = null
+        graphRailRegion = null
+        lastSnapVio = null
+        mapPosPushStreak = 0
+        railMatcherDivergeTicks = 0
+        railMatcherWayId = null
+        railTrail.clear()
+        lastOnRoadPos = null
+        railBearingDeg = null
+        lastTravelBearing = Double.NaN
+        headingOffsetDeg = Double.NaN
+        railHeadingAnchorGyroDeg = Double.NaN
+        railRoadBearingAnchorDeg = Double.NaN
+        railReverseTicks = 0
     }
 
     fun toggleSimulationRecording(getExternalFilesDir: (String?) -> java.io.File?, filesDir: java.io.File) {
@@ -936,6 +1317,9 @@ class NavSightViewModel(application: Application) : AndroidViewModel(application
         // ── Main-thread immediate UI clear ─────────────────────────────
         // Clear visible state synchronously so the user sees the dot/path
         // disappear right away. The rest happens off-thread below.
+        // Drop the advance-along-rail state on the MAIN thread (before the IO block) so a restart in the
+        // SAME road region can't reuse a stale acquired ball / cross-session lastSnapVio jump (review HIGH).
+        resetRailState()
         _pathHistory.clear()
         pathHistoryVersion = _pathHistoryVersion.incrementAndGet()
         virtualX = 0.0

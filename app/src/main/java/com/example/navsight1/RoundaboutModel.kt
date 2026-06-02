@@ -34,7 +34,12 @@ internal class RoundaboutIndex(val rings: List<RoundaboutRing>) {
         var bestD = Double.POSITIVE_INFINITY
         for (r in rings) {
             val d = RoadSnapMath.haversineM(lat, lng, r.centerLat, r.centerLng)
-            if (d <= r.radiusM + marginM && d < bestD) { bestD = d; best = r }
+            // 2026-05-31 — enter on the ring ANNULUS (within marginM of the ring CIRCLE), not the
+            // center DISC. The old `d <= radius+margin` latched ON_ROUNDABOUT for any straight road
+            // passing near a ring CENTRE (48-55% false-positive on the scooter sims). |d-radius|
+            // keeps the same outer edge (radius+margin) but excludes the inner disc near the centre.
+            val ringDist = kotlin.math.abs(d - r.radiusM)
+            if (ringDist <= marginM && ringDist < bestD) { bestD = ringDist; best = r }
         }
         return best
     }

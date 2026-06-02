@@ -1030,6 +1030,28 @@ double Tracker::getMidasScaleK() const {
     return expansion_scale_K_.load(std::memory_order_relaxed);
 }
 
+// 2026-05-31 (map-as-sensor HEADING leg) — the Kotlin matcher pushes the matched road's bearing
+// (deg, 0=N CW) here whenever it is confidently railed on a straight road (FREE_ROAD); processFrame
+// nudges the Madgwick heading toward it (gated) so the trajectory stops drifting off the road.
+// Pushed ~2 Hz from the snap loop; frames_since_road_hint_ ages it so a paused matcher stops it.
+void Tracker::setRoadHeadingHint(double bearing_deg) {
+    road_heading_hint_deg_.store(bearing_deg, std::memory_order_relaxed);
+    frames_since_road_hint_.store(0, std::memory_order_relaxed);
+}
+
+// Map-as-sensor POSITION leg setter (JNI thread) — store the latest world-frame error vector
+// (matched-ball − raw-VIO, metres east/north) and zero its age so the camera thread applies it.
+void Tracker::setMapPositionCorrection(double d_east_m, double d_north_m) {
+    map_pos_err_east_.store(d_east_m, std::memory_order_relaxed);
+    map_pos_err_north_.store(d_north_m, std::memory_order_relaxed);
+    frames_since_map_pos_.store(0, std::memory_order_relaxed);
+}
+
+void Tracker::setMapPositionEnabled(bool enabled) {
+    map_pos_correction_enabled_ = enabled;
+    LOGI("MAP_POS_ENABLE: position-leg %s", enabled ? "ON" : "OFF");
+}
+
 // ── Scale fix Step 2 — gait classifier (camera thread) ──────────────────────────
 // docs/SCALE_FIX_DESIGN_2026_05_30.md §3 Step 2. Thresholds are physics-derived,
 // NOT tuned magic numbers:
@@ -1348,7 +1370,11 @@ void Tracker::updateDepthFlowSpeed(const std::vector<cv::Point2f>& prev_ud,
             // (reuses kFastConvergeFrames); sits inside the !k_outlier guard so a
             // degenerate k_obs still cannot arm. Heading-safe: only the EMA blend weight
             // on midas_scale_K_ (a SPEED scale) changes — no rotation/azimuth state.
-            if (!cold_fast_converge_armed_ && cur_k > 0.0) {
+            // 2026-05-31 (a.3) — gate the cold-arm OFF for VEHICLE: forward-motion degeneracy makes
+            // the vehicle k_obs the LEAST trustworthy, and the fast-α(0.3) blend amplified a noisy
+            // k_obs into the 785→4006 K ratchet on the scooter sims (project_scooter_speed_rootcause).
+            // The cold-arm was built for the pedestrian stale-persisted-seed under-read (WALK/RUN).
+            if (!cold_fast_converge_armed_ && cur_k > 0.0 && active_mode_ != GaitMode::VEHICLE) {
                 mode_switch_fast_alpha_frames_ = kFastConvergeFrames;
                 cold_fast_converge_armed_ = true;
                 navsight::eventCounters().cold_fast_converge_armed.fetch_add(1, std::memory_order_relaxed);
@@ -1664,7 +1690,8 @@ VisionOutput Tracker::processFrame(const uint8_t* yuv_data, int width, int heigh
     // measureBlur returning -1 means "unusable input" — treat as not-blurry
     // so we never silently skip on a degenerate buffer.
     const double blur_var       = measureBlur(gray_buf_);
-    const bool   frame_is_blurry = (blur_var >= 0.0 && blur_var < BLUR_VAR_THRESH);
+    const double blur_thresh    = (active_mode_ == GaitMode::VEHICLE) ? BLUR_VAR_THRESH_SCOOTER : BLUR_VAR_THRESH;
+    const bool   frame_is_blurry = (blur_var >= 0.0 && blur_var < blur_thresh);
     if (frame_is_blurry) {
         const int prev_streak = blur_skipped_streak_;
         blur_skipped_streak_++;
@@ -1675,7 +1702,7 @@ VisionOutput Tracker::processFrame(const uint8_t* yuv_data, int width, int heigh
         // during a 1 s head-turn). The exit transition is logged in the
         // else branch below when a non-trivial streak ends.
         if (prev_streak == 0) {
-            LOGI("BLUR: enter var=%.1f thresh=%.1f", blur_var, BLUR_VAR_THRESH);
+            LOGI("BLUR: enter var=%.1f thresh=%.1f", blur_var, blur_thresh);
             navsight::eventCounters().blur_enter_events.fetch_add(
                 1, std::memory_order_relaxed);
         }
@@ -2272,7 +2299,8 @@ VisionOutput Tracker::processFrame(const uint8_t* yuv_data, int width, int heigh
     // gyro-only candidate, which is preserved as the conservative default
     // for code paths that fire BEFORE the Rayleigh stage (none today, but
     // explicit for future maintenance).
-    bool gyro_pure_rotation_candidate = (gyro_norm > GYRO_ROT_ONLY_THRESH);
+    const double rot_thresh = (active_mode_ == GaitMode::VEHICLE) ? GYRO_ROT_ONLY_THRESH_SCOOTER : GYRO_ROT_ONLY_THRESH;
+    bool gyro_pure_rotation_candidate = (gyro_norm > rot_thresh);
     bool is_pure_rotation = gyro_pure_rotation_candidate;
 
     // ── 5. Optical flow tracking (TrackKLT) ──────────────────────────────────
@@ -2350,6 +2378,12 @@ VisionOutput Tracker::processFrame(const uint8_t* yuv_data, int width, int heigh
         tracked_pts_flat.push_back(pt.x);
         tracked_pts_flat.push_back(pt.y);
     }
+    // 2026-06-02 overlay — per-point recoverPose inlier flag, parallel to tracked_pts_flat. Filled
+    // from status_verification after geometricVerification below; stays all-0 ("unverified") on frames
+    // where verification was NOT attempted (blurry / static / low-parallax) so the overlay can show the
+    // points the VIO actually USED (bright) vs tracked-but-rejected/unused (dim) — the owner's
+    // "the KLT points I see now are pre-calculations".
+    std::vector<unsigned char> tracked_pts_inlier_flags(next_good_buf_.size(), 0);
 
     // Phase 2 camera overlay (camera_overlay_phase23_plan.md, Task C):
     // populate per-feature age (frames survived) parallel to
@@ -2656,14 +2690,31 @@ VisionOutput Tracker::processFrame(const uint8_t* yuv_data, int width, int heigh
         }
     }
 
+    // ── 2026-06-02: Gait-aware ZUPT thresholds (scooter vibration fix) ───────
+    UpdaterZeroVelocity::Options zupt_opts;
+    if (active_mode_ == GaitMode::VEHICLE) {
+        // Scooter: allow more IMU variance (engine vibration) but tighten
+        // the visual gate (prevent false static while cruising).
+        // 0.075 allows ~0.15 rad/s RMS (matching ZUPT_GYRO_THRESH_SCOOTER).
+        zupt_opts.sigma_g = 0.075;
+        zupt_opts.sigma_a = 0.50;
+        zupt_opts.max_disparity = 1.0;
+    }
+    zupt_detector_.setOptions(zupt_opts);
+
     // ZUPT: Statistical stationary detection (OpenVINS style)
     is_static = zupt_detector_.is_stationary(imu.getAccelBuffer(), imu.getGyroBuffer(), mean_flow);
 
     // Safety overrides (relaxed: KLT has ~0.5-1.5px noise even stationary)
-    if (mean_flow > 2.5) is_static = false;
+    // Scooter (VEHICLE): lower the flow gate to 1.5px (from 2.5px) to break
+    // ZUPT more aggressively during smooth cruising.
+    double flow_gate = (active_mode_ == GaitMode::VEHICLE) ? 1.5 : 3.5;
+    if (mean_flow > flow_gate) is_static = false;
+
     // Don't trust step speed to break ZUPT while rotating fast — phantom steps
     // during in-place rotation used to un-freeze translation and produce arcs.
-    if (is_static && gyro_norm < 0.8 && imu.getStepInfo().speed_mps > 0.3) is_static = false;
+    if (is_static && gyro_norm < 0.8 && imu.getStepInfo().speed_mps > 0.45) is_static = false;
+
 
     // 2026-05-26 — accel world-velocity for MiDaS scale calibration (consumed in
     // updateDepthFlowSpeed). Integrate the SAME per-frame world velocity increment
@@ -3008,6 +3059,14 @@ VisionOutput Tracker::processFrame(const uint8_t* yuv_data, int width, int heigh
         bool verification_ok = klt_.geometricVerification(prev_ud, next_ud, status_verification,
                                                           K, R_vo, t_vo, inlier_count_out);
 
+        // Overlay: carry the recoverPose RANSAC inlier mask out to the per-point flags (parallel to
+        // tracked_pts_flat). Only when the sizes align positionally — else leave all-0 rather than risk
+        // a misaligned colouring (next_good_buf_ is unchanged between the flat-buffer build and here).
+        if (status_verification.size() == tracked_pts_inlier_flags.size()) {
+            for (size_t i = 0; i < status_verification.size(); ++i)
+                tracked_pts_inlier_flags[i] = status_verification[i] ? 1 : 0;
+        }
+
         // 2026-05-28 — gyro rotation vector in CAMERA frame (omega · dt) for
         // de-rotating the optical flow before computing looming/divergence.
         // Computed BEFORE the verification_ok gate because updateExpansionSpeed
@@ -3044,6 +3103,7 @@ VisionOutput Tracker::processFrame(const uint8_t* yuv_data, int width, int heigh
         // (turn-suppression). gyro_norm is the function-scope value computed at the
         // top of processFrame (rad/s); imu is in scope here.
         updateExpansionSpeed(prev_ud, next_ud, dt_s_speed, gyro_rot_cam, imu, gyro_norm);
+        updateGroundFlowSpeed(prev_ud, next_ud, dt_s_speed, gyro_rot_cam);
 
         // Depth-weighted metric speed (see updateDepthFlowSpeed): recovers the
         // metric scale of the recoverPose translation from the tracked points'
@@ -3778,6 +3838,47 @@ VisionOutput Tracker::processFrame(const uint8_t* yuv_data, int width, int heigh
         }
         heading = scalar_heading_;
 
+        // ── 9.0b Map-as-sensor HEADING leg (2026-05-31) ─────────────────────────────
+        // Correct the Madgwick heading toward the matched ROAD bearing so the trajectory stops
+        // drifting off the road ("we should always be on the road we start on"). The Kotlin matcher
+        // pushes the railed road's bearing (FREE_ROAD + confident + straight) via setRoadHeadingHint;
+        // here we nudge a FRACTIONAL step toward it, mirroring the visual yaw nudge (kBug5SyncStrength):
+        // gated on a SMALL residual (|hdg-road| < kRoadMaxResidualRad=35°, so a ~90° crossing road is
+        // REJECTED — this can only un-drift, never re-aim), a FRESH hint, the magnetometer NOT actively
+        // fusing (mag is the absolute reference), and the enable flag. Corrects the Madgwick SOURCE
+        // (not scalar_heading_, which is re-read from it) so the fix persists, then re-reads so THIS
+        // frame's dot advance uses it.
+        if (road_heading_correction_enabled_ && ekf_.isFullInitialized() && !imu.isMagActivelyFusing()) {
+            const int hint_age = frames_since_road_hint_.fetch_add(1, std::memory_order_relaxed);
+            const double road_deg = road_heading_hint_deg_.load(std::memory_order_relaxed);
+            if (hint_age < kRoadHintMaxAgeFrames && road_deg >= -180.0 && road_deg <= 360.0) {
+                const double road_rad = road_deg * M_PI / 180.0;
+                double resid = road_rad - scalar_heading_;
+                while (resid >  M_PI) resid -= 2.0 * M_PI;
+                while (resid < -M_PI) resid += 2.0 * M_PI;
+                // The matched road bearing is ±180° ambiguous. Align to the road direction that matches
+                // TRAVEL (nearer the current heading), not its reverse — this prevents the instant 180°
+                // flip the owner saw AND lets us correct a LARGE initial offset (the road we are ON).
+                double resid_rev = resid + M_PI;
+                while (resid_rev >  M_PI) resid_rev -= 2.0 * M_PI;
+                while (resid_rev < -M_PI) resid_rev += 2.0 * M_PI;
+                if (std::abs(resid_rev) < std::abs(resid)) resid = resid_rev;
+                if (std::isfinite(resid) && std::abs(resid) < kRoadMaxResidualRad) {
+                    imu.nudgeMadgwickYawAroundWorldZ(kRoadSyncStrength * resid);
+                    navsight::eventCounters().madgwick_road_yaw_nudges_total.fetch_add(1, std::memory_order_relaxed);
+                    scalar_heading_ = static_cast<double>(imu.getHeading());
+                    while (scalar_heading_ >  M_PI) scalar_heading_ -= 2.0 * M_PI;
+                    while (scalar_heading_ < -M_PI) scalar_heading_ += 2.0 * M_PI;
+                    heading = scalar_heading_;
+                    if (frame_counter_ % 30 == 0) {
+                        LOGI("MADG_ROAD_SYNC: road=%.1f° hdg=%.1f° resid=%+.1f° applied=%+.1f° age=%d",
+                             road_deg, scalar_heading_ * 180.0 / M_PI, resid * 180.0 / M_PI,
+                             kRoadSyncStrength * resid * 180.0 / M_PI, hint_age);
+                    }
+                }
+            }
+        }
+
         if (frame_counter_ % 30 == 0) {
             const float m_yaw   = imu.getHeading() * 180.0f / static_cast<float>(M_PI);
             const float m_roll  = imu.getMadgwickRoll()  * 180.0f / static_cast<float>(M_PI);
@@ -3940,9 +4041,12 @@ VisionOutput Tracker::processFrame(const uint8_t* yuv_data, int width, int heigh
             // 2026-05-28 — publish the speed actually applied to the trajectory
             // so the UI speedometer (getFusedSpeedMps) reflects what the user
             // sees on the map. Source = depth-flow when valid, else legacy fuser.
-            if (dt_frame > 0.0) {
-                trajectory_speed_mps_.store(disp / dt_frame, std::memory_order_relaxed);
-            }
+            // 2026-05-31 (a.1 speed spike fix) — divide by the FLOORED dt (the same 0.03 floor the
+            // disp cap above uses), NOT the raw dt_frame. A tiny inter-frame dt was dividing a
+            // disp-capped displacement into a 100-600 km/h reading (the scooter speed spikes). With
+            // the floor the published speed inherits the disp cap's 8 m/s ceiling. Heading-safe.
+            const double dt_pub = std::max(dt_frame, 0.03);
+            trajectory_speed_mps_.store(disp / dt_pub, std::memory_order_relaxed);
 
             // Accumulate path length. Pre-2026-05-09 this counter only
             // incremented in the PDR fallback branch (line ~1575), missing
@@ -4044,6 +4148,43 @@ VisionOutput Tracker::processFrame(const uint8_t* yuv_data, int width, int heigh
             global_t_.at<double>(0) += dx_world;
             global_t_.at<double>(1) += dy_world;
             global_t_.at<double>(2) += dz_world;
+
+            // ── Map-as-sensor POSITION leg (2026-05-31) ─────────────────────────────────
+            // Bleed the CROSS-TRACK component of the matcher's position error into global_t_ so the
+            // VIO trajectory stops drifting off the road (owner: "fix the drifting vio based on the
+            // map matcher"). forward = (sin h, cos h); cross-track(right) unit = (cos h, -sin h). We
+            // project the pushed error onto cross-track and apply a small, CAPPED fraction — the
+            // along-track component is deliberately dropped (that is the speed/scale lever). Same
+            // delta-injection channel as loop-closure; gated like the heading leg so a wrong-road lock
+            // cannot run away and the mag (absolute ref) wins when it is actively fusing.
+            if (map_pos_correction_enabled_ && ekf_.isFullInitialized() && !imu.isMagActivelyFusing()) {
+                const int mp_age = frames_since_map_pos_.fetch_add(1, std::memory_order_relaxed);
+                if (mp_age < kMapPosMaxAgeFrames) {
+                    const double e_east  = map_pos_err_east_.load(std::memory_order_relaxed);
+                    const double e_north = map_pos_err_north_.load(std::memory_order_relaxed);
+                    const double cux =  std::cos(heading);   // cross-track (right) unit, east comp
+                    const double cuy = -std::sin(heading);   // cross-track (right) unit, north comp
+                    const double cross = e_east * cux + e_north * cuy;   // signed lateral error (m)
+                    if (std::isfinite(cross) && std::abs(cross) >= kMapPosMinErrM &&
+                        std::abs(cross) <= kMapPosMaxErrM) {
+                        double step = kMapPosSyncStrength * cross;
+                        if (step >  kMapPosMaxStepM) step =  kMapPosMaxStepM;
+                        if (step < -kMapPosMaxStepM) step = -kMapPosMaxStepM;
+                        global_t_.at<double>(0) += step * cux;
+                        global_t_.at<double>(1) += step * cuy;
+                        // Subtract what we just applied from the stored snapshot so the residual
+                        // CONVERGES to zero within the age window (instead of re-applying the SAME full
+                        // error every frame, which never converged while above the dead-band). review MED.
+                        map_pos_err_east_.store(e_east - step * cux, std::memory_order_relaxed);
+                        map_pos_err_north_.store(e_north - step * cuy, std::memory_order_relaxed);
+                        navsight::eventCounters().map_position_corrections_total.fetch_add(1, std::memory_order_relaxed);
+                        if (frame_counter_ % 30 == 0) {
+                            LOGI("MAP_POS_SYNC: cross_err=%+.2fm step=%+.3fm hdg=%.1f° age=%d",
+                                 cross, step, heading * 180.0 / M_PI, mp_age);
+                        }
+                    }
+                }
+            }
 
             // Phase 1 Step 3: integrate the per-frame world-frame
             // displacement magnitude into path_since_last_lc_m_ — used by
@@ -6603,6 +6744,7 @@ VisionOutput Tracker::processFrame(const uint8_t* yuv_data, int width, int heigh
     out.valid = true;
     out.trackedPoints = std::move(tracked_pts_flat);
     out.trackedPointAges = std::move(tracked_pts_ages);
+    out.trackedPointInlierFlags = std::move(tracked_pts_inlier_flags);
     out.meanFlow = mean_flow;
     out.inlierCount = inlier_count_out;
     {
@@ -6646,6 +6788,30 @@ VisionOutput Tracker::processFrame(const uint8_t* yuv_data, int width, int heigh
     frame_out.heading = out.heading;
     frame_out.fx = fx_use; frame_out.fy = fy_use;
     frame_out.cx = cx_use; frame_out.cy = cy_use;
+
+    // ── Ground-plane metric-scale eval (READ-ONLY; gpt_speed_suggestion.md Phase 0) ─────────────────
+    // Recover the monocular scale VIO lacks by fitting a plane to the lower-image triangulated points
+    // and dividing the KNOWN camera height by the plane's VIO-scale height. Runs every kGroundPlaneInterval
+    // frames, only when a camera height has been set (scooter mount). NEVER feeds the dot — it is logged
+    // for offline scoring vs GPS and drawn on the camera overlay. Cheap (~1-2 ms / few frames).
+    if (camera_height_m_ > 0.0 && (frame_counter_ % kGroundPlaneInterval) == 0 &&
+        points_3d_current_.size() >= 12 && next_good_buf_.size() >= points_3d_current_.size()) {
+        GroundPlaneResult gp = ground_plane_estimator_.estimate(
+            next_good_buf_, points_3d_current_, gray_buf_.cols, gray_buf_.rows,
+            fx_use, fy_use, cx_use, cy_use, camera_height_m_,
+            analyzer_rotation_deg_.load(std::memory_order_relaxed));
+        gp_valid_.store(gp.is_valid, std::memory_order_relaxed);
+        gp_scale_.store(gp.ground_scale, std::memory_order_relaxed);
+        gp_conf_.store(gp.confidence, std::memory_order_relaxed);
+        gp_hvio_.store(gp.h_vio, std::memory_order_relaxed);
+        gp_horizon_v_.store(gp.horizon_v_px, std::memory_order_relaxed);
+        gp_cands_.store(gp.n_candidates, std::memory_order_relaxed);
+        gp_inliers_.store(gp.n_inliers, std::memory_order_relaxed);
+        if (gp.is_valid && (frame_counter_ % 15) == 0) {
+            LOGI("GROUND_PLANE: scale=%.3f conf=%.2f h_vio=%.3f cand=%d inl=%d horizon_v=%.0f",
+                 gp.ground_scale, gp.confidence, gp.h_vio, gp.n_candidates, gp.n_inliers, gp.horizon_v_px);
+        }
+    }
     return out;
 }
 
@@ -8647,7 +8813,9 @@ void Tracker::updateExpansionSpeed(const std::vector<cv::Point2f>& prev_ud,
                 // one-shot flag + shared mode_switch_fast_alpha_frames_ with the
                 // depth-flow path; inside the !k_outlier guard. Heading-safe (EMA weight
                 // on expansion_scale_K_, a SPEED scale).
-                if (!cold_fast_converge_armed_ && cur_k > 0.0) {
+                // 2026-05-31 (a.3) — gate cold-arm OFF vehicle (see updateDepthFlowSpeed): fast-α
+                // amplified the noisy scooter k_obs into the K ratchet; cold-arm is for WALK/RUN.
+                if (!cold_fast_converge_armed_ && cur_k > 0.0 && active_mode_ != GaitMode::VEHICLE) {
                     mode_switch_fast_alpha_frames_ = kFastConvergeFrames;
                     cold_fast_converge_armed_ = true;
                     navsight::eventCounters().cold_fast_converge_armed.fetch_add(1, std::memory_order_relaxed);
@@ -8796,5 +8964,100 @@ void Tracker::updateExpansionSpeed(const std::vector<cv::Point2f>& prev_ud,
              used_affine ? "affine" : "K",
              vz_estimates.size(), vz_med, vz_fused_raw, next_loom,
              forward_fraction, w_loom, K_log, s_aff, t_aff, next_loom * 3.6);
+    }
+}
+
+void Tracker::updateGroundFlowSpeed(const std::vector<cv::Point2f>& prev_ud,
+                                    const std::vector<cv::Point2f>& next_ud,
+                                    double dt_s,
+                                    const cv::Vec3d& gyro_rot_cam) {
+    if (dt_s <= 1e-4 || fx_ <= 0.0 || fy_ <= 0.0 || camera_height_m_ <= 0.0) return;
+
+    // 1. Get ground plane normal in camera frame.
+    // Use the EKF's gravity vector (Up in camera frame) as the ground normal reference.
+    const cv::Matx33d R_GtoI = ekf_.getRotation();
+    const cv::Matx33d R_bc   = ekf_.getExtrinsicsRotation();
+    const cv::Matx33d R_GtoC = R_bc * R_GtoI;
+    
+    // Unit normal pointing UP (towards camera) from ground in camera frame.
+    // ENU world: Z is up.
+    const cv::Vec3d n_up_c = R_GtoC * cv::Vec3d(0, 0, 1);
+    
+    // 2. Unit forward vector in camera frame (along heading).
+    // scalar_heading_ is CW-positive radians from North.
+    const cv::Vec3d fwd_w(std::sin(scalar_heading_), std::cos(scalar_heading_), 0.0);
+    const cv::Vec3d u_fwd_c = R_GtoC * fwd_w;
+
+    // 3. De-rotate flow and project each point to ground plane.
+    const double wx = gyro_rot_cam[0];
+    const double wy = gyro_rot_cam[1];
+    const double wz = gyro_rot_cam[2];
+    
+    // Road region logic (matches GroundPlaneEstimator)
+    const int img_width = static_cast<int>(cx_ * 2.0);
+    const int img_height= static_cast<int>(cy_ * 2.0);
+    const int rot = ((analyzer_rotation_deg_.load() % 360) + 360) % 360;
+    const float frac = 0.55f; // kLowerImageFrac
+    
+    std::vector<double> speeds;
+    const size_t n_pts = std::min(prev_ud.size(), next_ud.size());
+    for (size_t i = 0; i < n_pts; ++i) {
+        const float px = prev_ud[i].x;
+        const float py = prev_ud[i].y;
+        
+        bool in_road = false;
+        switch (rot) {
+            case 90:  in_road = (px > frac * img_width); break;
+            case 180: in_road = (py < (1.0f - frac) * img_height); break;
+            case 270: in_road = (px < (1.0f - frac) * img_width); break;
+            default:  in_road = (py > frac * img_height); break;
+        }
+        if (!in_road) continue;
+
+        const double xp = (px - cx_) / fx_;
+        const double yp = (py - cy_) / fy_;
+        
+        // De-rotate: Heeger-Jepson 1992 (normalized angular flow per frame interval)
+        const double u_rot = xp * yp * wx - (1.0 + xp * xp) * wy + yp * wz;
+        const double v_rot = (1.0 + yp * yp) * wx - xp * yp * wy - xp * wz;
+        
+        // Observed normalized flow
+        const double dx = (next_ud[i].x - px) / fx_;
+        const double dy = (next_ud[i].y - py) / fy_;
+        
+        // Translational component of flow
+        const double dv_tr = dy - v_rot;
+        
+        // Speed formula with exact pitch/roll compensation:
+        // v = h * (dv_tr / dt) / denom
+        // denom = (u_fwd.y - yp * u_fwd.z) * (n_up.x * xp + n_up.y * yp + n_up.z)
+        const double denom = (u_fwd_c(1) - yp * u_fwd_c(2)) * (n_up_c(0) * xp + n_up_c(1) * yp + n_up_c(2));
+        
+        // Sanity check: points above horizon have denom signs that flip or go through zero.
+        // For road points, denom should be well-behaved.
+        if (std::abs(denom) > 1e-4) {
+            double v_i = (camera_height_m_ * dv_tr / dt_s) / denom;
+            // Scooters don't go backwards or faster than 50 m/s (180 km/h).
+            if (v_i > 0.1 && v_i < 50.0) {
+                speeds.push_back(v_i);
+            }
+        }
+    }
+    
+    // 4. Robust median and EMA.
+    if (speeds.size() >= 5) {
+        std::sort(speeds.begin(), speeds.end());
+        double v_med = speeds[speeds.size() / 2];
+        
+        double cur_v = ground_flow_speed_mps_.load(std::memory_order_relaxed);
+        if (cur_v < 0.0) {
+            ground_flow_speed_mps_.store(v_med, std::memory_order_relaxed);
+        } else {
+            const double alpha = 0.15;
+            ground_flow_speed_mps_.store((1.0 - alpha) * cur_v + alpha * v_med, std::memory_order_relaxed);
+        }
+        
+        LOGI("GROUND_SPEED_DBG raw_mps=%.3f ema_mps=%.3f inliers=%d dt=%.3f",
+             v_med, ground_flow_speed_mps_.load(), (int)speeds.size(), dt_s);
     }
 }

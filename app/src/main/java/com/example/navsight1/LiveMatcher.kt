@@ -120,7 +120,11 @@ class LiveMatcher {
         val confidence: Double,
         val matchedPath: List<LatLng>,
         val routeDistanceM: Double,
-        val broken: Boolean
+        val broken: Boolean,
+        // 2026-05-31 — the OSM way the dot was matched onto (LocalMatcher rail-lock).
+        // Null for matchers that don't track it (LiveMatcher). Lets the caller keep the
+        // matcher "railed" to the same road across ticks instead of re-snapping per window.
+        val matchedWayId: Long? = null
     )
 
     companion object {

@@ -41,9 +41,12 @@ import kotlin.math.*
 fun MainScreen(viewModel: NavSightViewModel, pal: NavPalette, isNight: Boolean, onToggleNight: () -> Unit) {
     val orientation  = viewModel.orientationState
     val vio          = viewModel.vioState
-    val fusedHeading = if (vio.isInitialized)
-        ((Math.toDegrees(vio.heading).toFloat() % 360f) + 360f) % 360f
-    else orientation.azimuth
+    // Heading UI (compass label, map rotation, arrow) = the ROAD-LOCKED heading (the ball's road tangent)
+    // when on a road, NOT the raw VIO heading (owner: "the heading lock ui should be on the arrow, not the
+    // vio heading"). Falls back to the VIO/device heading only before the ball has locked onto a road.
+    val fusedHeading = viewModel.railBearingDeg
+        ?: if (vio.isInitialized) ((Math.toDegrees(vio.heading).toFloat() % 360f) + 360f) % 360f
+           else orientation.azimuth
 
     val historySnapshot = remember(viewModel.pathHistoryVersion) { viewModel.pathHistory.toList() }
     val navState        = viewModel.navigationState
@@ -97,6 +100,9 @@ fun MainScreen(viewModel: NavSightViewModel, pal: NavPalette, isNight: Boolean, 
                     // recomposition cost. The composable itself early-returns
                     // when geometry/points aren't available yet.
                     if (cameraVisible) {
+                        // 2026-06-02 — ground-plane (horizon + road region), drawn FIRST so the KLT/SLAM
+                        // dots sit on top. Empty until the estimator locks (its own validation signal).
+                        GroundPlaneOverlay(viewModel, pal)
                         CameraFeatureOverlay(viewModel, pal)
                         // Phase 6.5 (post_v19_sprint_plan.md §205-298):
                         // persistent LandmarkMap dots (orange = observed
@@ -396,7 +402,9 @@ fun NavigationMapWrapper(
         if (now - lastOverlay >= interval || navState is NavigationState.Routing) {
             lastOverlay = now; mapPos = displayPos; mapAzi = azimuth
             mapPath = history.map { NavSightUtils.metersToLatLng(start, it.x.toDouble(), it.z.toDouble()) }
-            mapMatched = viewModel.matchedRoadPath
+            // Green trail = the BALL's on-road breadcrumb (graph-constrained → never teleports), not the
+            // raw Viterbi matchedRoadPath which jumped to parallel roads (owner: "green still teleports").
+            mapMatched = viewModel.railTrail.toList()
         }
     }
 
@@ -418,7 +426,9 @@ fun NavigationMapWrapper(
                 Polyline(points = navState.route.polyline, color = pal.teal, width = 14f, zIndex = 10f)
                 Marker(state = MarkerState(navState.route.destination), title = "Destination")
             }
-            if (mapPath.isNotEmpty()) Polyline(points = mapPath, color = pal.orange.copy(0.8f), width = 7f, zIndex = 5f)
+            // Orange raw-VIO trajectory hidden (owner request) — the green on-road ball trail is the
+            // user-facing path now. Kept commented (not deleted) so it can be re-enabled for debugging.
+            // if (mapPath.isNotEmpty()) Polyline(points = mapPath, color = pal.orange.copy(0.8f), width = 7f, zIndex = 5f)
             // Tier-1 #3: the matched ROAD polyline (green, on top of the raw orange trail)
             // — the road the matcher placed the dot on. Empty when on the per-point fallback.
             if (mapMatched.size >= 2) Polyline(points = mapMatched, color = Color(0xFF2ECC71), width = 9f, zIndex = 6f)
@@ -441,7 +451,10 @@ fun NavigationMapWrapper(
                     zIndex      = 4f
                 )
             }
-            Marker(state = MarkerState(mapPos), rotation = mapAzi, flat = true, anchor = Offset(0.5f, 0.5f), icon = arrowIcon)
+            // Arrow heading = the road's tangent at the ball (points ALONG the road, turns only at
+            // junctions), falling back to the VIO heading only before the ball has acquired a road.
+            val arrowAzi = viewModel.railBearingDeg ?: mapAzi
+            Marker(state = MarkerState(mapPos), rotation = arrowAzi, flat = true, anchor = Offset(0.5f, 0.5f), icon = arrowIcon)
             Marker(state = MarkerState(start), title = "Start", icon = startIcon,
                 snippet = "Long-press the map to move me")
         }

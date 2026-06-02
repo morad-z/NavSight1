@@ -1,3 +1,12 @@
+// LEGACY 2026-05-31 — OpticalFlowProcessor was removed in commit 8b5d64a
+// ("remove OpticalFlowProcessor, motion blur fix, heading freeze"). This unit test
+// is orphaned: the class it exercises no longer exists, so it broke
+// compileDebugUnitTestKotlin on BOTH morad and osm-migration ever since that commit
+// (NOT a regression from the osm-migration merge). Commented out (not deleted, per
+// the project's comment-out-don't-delete convention) so the JVM test suite compiles.
+// Restore only if OpticalFlowProcessor (the face-down floor optical-flow direction
+// classifier) is reintroduced.
+/*
 package com.example.navsight1
 
 import org.junit.Assert.assertEquals
@@ -179,3 +188,4 @@ class OpticalFlowProcessorTest {
         assertEquals(OpticalFlowProcessor.MovementDirection.BACKWARD, result)
     }
 }
+*/

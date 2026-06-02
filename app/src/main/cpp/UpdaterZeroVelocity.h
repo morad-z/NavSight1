@@ -19,14 +19,19 @@ public:
 
         Options() :
             window_size(20),
-            sigma_g(0.025),            // Was 0.005; phone gyros are 5-10x noisier than research IMUs
-            sigma_a(0.15),             // Was 0.05; phone accels are noisier too
-            chi2_multiplier(3.0),      // Was 2.0; give margin for noisy Android IMUs
-            max_disparity(1.5),        // Was 1.0; KLT has noise even when stationary
+            sigma_g(0.06),             // 2023 Standard: was 0.025; handheld phone gyros have jitter
+            sigma_a(0.20),             // 2023 Standard: was 0.15; handle micro-vibrations
+            chi2_multiplier(2.5),      // Give moderate margin for non-Gaussian tail noise
+            max_disparity(3.0),        // Was 1.5; handle low-light camera jitter/noise
             gravity_mag(9.81) {}
     };
 
     UpdaterZeroVelocity(const Options& options = Options()) : options_(options) {}
+
+    /**
+     * @brief Updates the detector options (e.g. for different gait modes).
+     */
+    void setOptions(const Options& options) { options_ = options; }
 
     /**
      * @brief Checks if the device is stationary based on IMU and vision.

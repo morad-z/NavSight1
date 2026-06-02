@@ -24,6 +24,7 @@
 // 2026-05-12: VisualMap include reverted — see Tracker.h scaffold note below.
 // #include "VisualMap.h"
 #include "WindowedBA.h"
+#include "GroundPlaneEstimator.h"
 
 #include "InertialInitializer.h"
 #include "LoopClosureDetector.h"
@@ -82,6 +83,20 @@ public:
 
     void setIntrinsics(double fx, double fy, double cx, double cy);
     void setCameraHeight(double height_m) { camera_height_m_ = height_m; }
+    // CameraX rotationDegrees (0/90/180/270) — lets the ground-plane estimator search the analyzer
+    // region that maps to the BOTTOM of the upright display (the road) on a rotated/portrait mount.
+    void setAnalyzerRotation(int deg) { analyzer_rotation_deg_.store(deg, std::memory_order_relaxed); }
+
+    // Ground-plane metric-scale eval (READ-ONLY; gpt_speed_suggestion.md Phase 0). Computed every
+    // kGroundPlaneInterval frames in processFrame from the lower-image triangulated points + the known
+    // camera height; never feeds the dot. Getters for the offline harness + the camera debug overlay.
+    bool   isGroundPlaneValid()       const { return gp_valid_.load(std::memory_order_relaxed); }
+    double getGroundPlaneScale()      const { return gp_scale_.load(std::memory_order_relaxed); }
+    double getGroundPlaneConfidence() const { return gp_conf_.load(std::memory_order_relaxed); }
+    double getGroundPlaneHvio()       const { return gp_hvio_.load(std::memory_order_relaxed); }
+    double getGroundPlaneHorizonV()   const { return gp_horizon_v_.load(std::memory_order_relaxed); }
+    int    getGroundPlaneCandidates() const { return gp_cands_.load(std::memory_order_relaxed); }
+    int    getGroundPlaneInliers()    const { return gp_inliers_.load(std::memory_order_relaxed); }
 
     // Step 1 (Visual Production Plan) — push 8-coefficient rational
     // distortion into the owned LensCorrector. Caller is responsible for
@@ -203,6 +218,17 @@ public:
     // at -1 forever, looming bails (it requires K>0), and the UI shows 0.
     void setMidasScaleK(double k);
     double getMidasScaleK() const;
+    // 2026-05-31 (map-as-sensor HEADING leg) — the Kotlin matcher pushes the matched ROAD bearing
+    // (deg, 0=N CW) when confidently railed on a straight road in FREE_ROAD; processFrame nudges the
+    // Madgwick heading toward it (gated) so the trajectory stops drifting off the road. A sentinel
+    // outside [-180,360] = no correction this tick. Doc ROAD_FOLLOWER_MATCHER_DESIGN_2026_05_31.md.
+    void setRoadHeadingHint(double bearing_deg);
+    // Map-as-sensor POSITION leg: push the world-frame (east,north) error = matched-ball − raw-VIO, in
+    // metres. The camera thread bleeds its cross-track component into global_t_ (see members above).
+    void setMapPositionCorrection(double d_east_m, double d_north_m);
+    // Runtime enable for the POSITION leg (default-OFF; heading leg is separate + ON). Lets the device
+    // validate the heading leg alone first, then turn the position feedback on without a rebuild.
+    void setMapPositionEnabled(bool enabled);
     // 2026-05-31 — REPLAY-ONLY experiment flag (docs/MSCKF_PG_WIRING_VERDICT_
     // 2026_05_31.md §4). Default OFF: the device/JNI path never calls this, so
     // the shipped build is byte-identical. When ON, processFrame STOPS calling
@@ -562,6 +588,11 @@ private:
     // Independent of the (diverging) EKF v_G_ and of the global appliedScale.
     std::atomic<double> depth_flow_speed_mps_{-1.0};
 
+    // 2026-06-02 — ground-plane optical flow speed (Phase 1, gpt_speed_suggestion.md).
+    // Uses known camera height + de-rotated vertical flow of road pixels to recover
+    // metric speed. Independent of KLT triangulation or MiDaS.
+    std::atomic<double> ground_flow_speed_mps_{-1.0};
+
     // 2026-05-28 — trajectory-applied speed (m/s). What the trajectory accumulator
     // is ACTUALLY using to advance global_t_ this frame, regardless of source:
     //   - depth_flow_speed_mps_ when depth-flow / looming is valid;
@@ -575,6 +606,11 @@ private:
     // depth_flow_speed_mps_ atomic stays as the K-calibrated estimate used by
     // the depth-flow internals; trajectory_speed_mps_ is the UI-facing view.
     std::atomic<double> trajectory_speed_mps_{0.0};
+
+    // 2026-06-02 — read-only access to the ground-plane speed estimate (m/s).
+    double getGroundFlowSpeedMps() const {
+        return ground_flow_speed_mps_.load(std::memory_order_relaxed);
+    }
 
     // 2026-05-27 — expansion-rate metric speed (Tracker::updateExpansionSpeed):
     // implements "Vz = expansion_rate * Z_rel * K" robustly via Median + WLS.
@@ -606,6 +642,14 @@ private:
                               double dt_s,
                               const cv::Vec3d& gyro_rot_cam,
                               const IMUPreintegrator& imu, double gyro_norm);
+
+    // 2026-06-02 — Ground-plane optical flow speed estimator (exact pitch derivation).
+    // Estimates forward speed by de-rotating flow of road pixels (lower image) and
+    // projecting to the ground plane via known camera height and EKF attitude.
+    void updateGroundFlowSpeed(const std::vector<cv::Point2f>& prev_ud,
+                               const std::vector<cv::Point2f>& next_ud,
+                               double dt_s,
+                               const cv::Vec3d& gyro_rot_cam);
 
     // 2026-05-30 (Scale fix Steps 1-3, docs/SCALE_FIX_DESIGN_2026_05_30.md) —
     // PER-GAIT K. A single shared K cannot serve walk/run/vehicle: the measured
@@ -664,6 +708,58 @@ private:
     // calibration. Atomic: written camera-thread, read by getFusedSpeedMps (UI).
     // 2026-05-30: now holds the ACTIVE GaitMode's depth-flow K (see k_slots_).
     std::atomic<double> midas_scale_K_{-1.0};
+    // 2026-05-31 map-as-sensor HEADING leg — road bearing hint (deg, 0=N CW) pushed from the Kotlin
+    // matcher when railed on a straight road; -1000 sentinel = none. frames_since_road_hint_ ages it
+    // (camera thread increments, the JNI setter zeroes) so a stale hint (matcher paused) stops
+    // correcting. The nudge is gated (see kRoad* below) so it can only un-drift, never re-aim.
+    std::atomic<double> road_heading_hint_deg_{-1000.0};
+    std::atomic<int>    frames_since_road_hint_{1000000};
+    bool road_heading_correction_enabled_{true};        // heading unlocked by owner 2026-05-31; ON for test
+    static constexpr double kRoadSyncStrength    = 0.10;      // fractional nudge (mirrors kBug5SyncStrength)
+    // NOT a tuning knob — a PHYSICAL boundary: after the nearer-road-direction pick (Tracker.cpp §9.0b)
+    // |resid| ≤ 90°; a road exactly perpendicular (90°) to your heading is one you are CROSSING, not
+    // driving along, so it is rejected. The real wrong-road protection is upstream: the Kotlin side only
+    // pushes a road bearing when the matcher is RAIL-LOCKED on that road (its geometry fits the
+    // trajectory), so a crossing/parallel road you are not on never reaches this nudge. No 35°/80° magic
+    // alignment threshold — the target is each road's OWN bearing, trusted by road identity, not degrees.
+    static constexpr double kRoadMaxResidualRad  = 1.5707963267948966;  // π/2 = 90° = perpendicular = crossing
+    static constexpr int    kRoadHintMaxAgeFrames = 45;       // ~1.5 s @ 30 fps before a hint is stale
+    // 2026-05-31 map-as-sensor POSITION leg (owner: "fix the drifting vio based on the map matcher so
+    // it doesn't keep drifting") — the Kotlin matcher pushes the world-frame error vector (ball-on-rail
+    // position − raw VIO), in metres (east,north), via setMapPositionCorrection. Each frame we bleed a
+    // small fraction of its CROSS-TRACK component (perpendicular to heading) into global_t_, pulling the
+    // dot back onto the road. Along-track is IGNORED (that is the speed/scale lever; the map must not
+    // fight it). Same delta-injection channel loop-closure uses (NOT a re-integrator). Heavily gated:
+    // confident+fresh, magnetometer not fusing, plausible error band, capped per frame — so a wrong-road
+    // lock cannot run away (ADR-004) and it can only un-drift, never teleport.
+    std::atomic<double> map_pos_err_east_{0.0};
+    std::atomic<double> map_pos_err_north_{0.0};
+    std::atomic<int>    frames_since_map_pos_{1000000};
+    // ON (2026-06-02): the ball-on-rail arrow tracked the road correctly on-device (owner confirmed),
+    // which validates the heading leg + road-ID — so the position leg is enabled to pull the raw VIO
+    // (orange) trail onto the road too (owner: "the orange trail isn't fixed to be on the road, it still
+    // drifts"). The earlier wrong-road runaway risk (ADR-004) is mitigated HARD on the Kotlin side
+    // (push only on a sustained high-confidence FREE_ROAD straight rail, streak≥3) plus kMapPosMaxErrM=15
+    // and decrement-on-apply convergence below. Toggle off via setMapPositionEnabled / NativeBridge if it
+    // ever drags the dot — but it cannot move the arrow (display ball is separate), only the orange.
+    bool map_pos_correction_enabled_{true};
+    static constexpr double kMapPosSyncStrength = 0.02;      // per-frame fraction of the residual lateral error
+    static constexpr double kMapPosMaxStepM     = 0.05;      // cap per frame (m) → ≤ ~1 m / 0.67 s pull
+    static constexpr double kMapPosMinErrM      = 1.5;       // ignore sub-noise lateral error
+    static constexpr double kMapPosMaxErrM      = 15.0;      // urban parallel-road bound (was 50; review HIGH)
+    static constexpr int    kMapPosMaxAgeFrames = 20;        // ~0.67 s — covers one missed 500 ms push (was 45)
+    // Ground-plane metric-scale eval (read-only). Estimator + cached latest result (atomics so the
+    // camera-thread getters are lock-free). Runs every kGroundPlaneInterval frames in processFrame.
+    GroundPlaneEstimator ground_plane_estimator_;
+    std::atomic<bool>   gp_valid_{false};
+    std::atomic<double> gp_scale_{0.0};
+    std::atomic<double> gp_conf_{0.0};
+    std::atomic<double> gp_hvio_{0.0};
+    std::atomic<double> gp_horizon_v_{-1.0};
+    std::atomic<int>    gp_cands_{0};
+    std::atomic<int>    gp_inliers_{0};
+    std::atomic<int>    analyzer_rotation_deg_{0};   // CameraX rotationDegrees (road-region orientation)
+    static constexpr int kGroundPlaneInterval = 3;
     // World-frame velocity from accel (g*dt + R_GtoI^T*deltaV, same increment as
     // EKFState.cpp:295), integrated from a ZUPT stop and re-zeroed at the next stop.
     // Trustworthy ONLY in the short post-stop window (drift grows after) -> used to
@@ -1184,6 +1280,7 @@ private:
                   "RELOC_LOW_INLIER_BAR assumes MIN_INLIERS is even");
     static constexpr double MIN_INLIER_RATIO   = 0.25;
     static constexpr double GYRO_ROT_ONLY_THRESH = 2.0;
+    static constexpr double GYRO_ROT_ONLY_THRESH_SCOOTER = 4.0;
     // Plan Step 5: Rayleigh resultant cutoff for the dual-gate pure-rotation
     // detector. R/N is the mean resultant length of the per-feature optical-
     // flow direction vectors on the unit circle. R/N < 0.3 means the flow
@@ -1203,7 +1300,9 @@ private:
     // re-tune from real Haifa head-turn sims if observed false-positive
     // rate climbs.
     static constexpr double BLUR_VAR_THRESH    = 80.0;
+    static constexpr double BLUR_VAR_THRESH_SCOOTER = 50.0;
     static constexpr double ZUPT_GYRO_THRESH   = 0.04;
+    static constexpr double ZUPT_GYRO_THRESH_SCOOTER = 0.15;
     static constexpr int    ACCEL_BIAS_WARMUP  = 150;
     static constexpr double ACCEL_BIAS_ALPHA   = 0.005;
 

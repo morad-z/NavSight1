@@ -599,9 +599,9 @@ IMUPreintegrator::StepInfo IMUPreintegrator::getStepInfo() const {
 
     // ── SMART STOP DETECTION ────────────────────────────────────────────────
     // We detect a stop by checking if the recent acceleration variance is low.
-    // walking has variance > 0.15. If variance < 0.08, we are almost certainly
+    // walking has variance > 0.15. If variance < 0.12, we are almost certainly
     // stationary or moving very smoothly.
-    bool is_stationary = (accel_variance_est_ < 0.08f);
+    bool is_stationary = (accel_variance_est_ < 0.12f);
 
     // Also keep a watchdog: if no step for 3 seconds, force stop (safety)
     int64_t current_time_ns = last_accel_ts_ns_;

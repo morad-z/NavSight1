@@ -295,6 +295,13 @@ struct EventCounters {
     // lower, the upstream gyro-consistency gate is rejecting too many
     // visual measurements (look at KF_HEADING_CORR drift histogram).
     std::atomic<long long> madgwick_visual_yaw_nudges_total{0};
+    // 2026-05-31 — map-as-sensor HEADING leg: times the Madgwick heading was nudged toward the
+    // matched road bearing (the gated road→heading correction). Expect >0 on a railed road ride.
+    std::atomic<long long> madgwick_road_yaw_nudges_total{0};
+    // 2026-05-31 — map-as-sensor POSITION leg: times the cross-track component of the matcher's
+    // position error was injected into global_t_ (the gated road→position un-drift). Expect >0 on a
+    // railed road ride where the VIO drifted laterally.
+    std::atomic<long long> map_position_corrections_total{0};
 
     // 2026-05-21 Bug 3 — post-PnP rotation-residual sanity gate.
     // Increments when an LC accept's PnP-derived target_R is > π/2 (90°)
@@ -1016,6 +1023,8 @@ struct EventCounters {
         visual_relative_rotation_chi2_rejected_total.store(0, std::memory_order_relaxed);
         visual_relative_rotation_gyro_mismatch_total.store(0, std::memory_order_relaxed);
         madgwick_visual_yaw_nudges_total.store(0, std::memory_order_relaxed);
+        madgwick_road_yaw_nudges_total.store(0, std::memory_order_relaxed);
+        map_position_corrections_total.store(0, std::memory_order_relaxed);
         loop_closure_kf_count_in_db.store(0, std::memory_order_relaxed);
         loop_closure_chi2_rejected.store(0, std::memory_order_relaxed);
         loop_closure_corrections_applied.store(0, std::memory_order_relaxed);
@@ -1215,6 +1224,8 @@ struct EventCounters {
         const long long v_visual_relative_rotation_chi2_rejected_total = visual_relative_rotation_chi2_rejected_total.load(std::memory_order_relaxed);
         const long long v_visual_relative_rotation_gyro_mismatch_total = visual_relative_rotation_gyro_mismatch_total.load(std::memory_order_relaxed);
         const long long v_madgwick_visual_yaw_nudges_total = madgwick_visual_yaw_nudges_total.load(std::memory_order_relaxed);
+        const long long v_madgwick_road_yaw_nudges_total = madgwick_road_yaw_nudges_total.load(std::memory_order_relaxed);
+        const long long v_map_position_corrections_total = map_position_corrections_total.load(std::memory_order_relaxed);
         const long long v_loop_closure_kf_count_in_db   = loop_closure_kf_count_in_db.load(std::memory_order_relaxed);
         const long long v_loop_closure_chi2_rejected    = loop_closure_chi2_rejected.load(std::memory_order_relaxed);
         const long long v_loop_closure_corrections_applied = loop_closure_corrections_applied.load(std::memory_order_relaxed);
@@ -1398,6 +1409,8 @@ struct EventCounters {
         appendKv(out, "visual_relative_rotation_chi2_rejected_total", v_visual_relative_rotation_chi2_rejected_total); out += ',';
         appendKv(out, "visual_relative_rotation_gyro_mismatch_total", v_visual_relative_rotation_gyro_mismatch_total); out += ',';
         appendKv(out, "madgwick_visual_yaw_nudges_total", v_madgwick_visual_yaw_nudges_total); out += ',';
+        appendKv(out, "madgwick_road_yaw_nudges_total", v_madgwick_road_yaw_nudges_total); out += ',';
+        appendKv(out, "map_position_corrections_total", v_map_position_corrections_total); out += ',';
         appendKv(out, "loop_closure_kf_count_in_db",   v_loop_closure_kf_count_in_db);   out += ',';
         appendKv(out, "loop_closure_chi2_rejected",    v_loop_closure_chi2_rejected);    out += ',';
         appendKv(out, "loop_closure_corrections_applied", v_loop_closure_corrections_applied); out += ',';

@@ -97,6 +97,7 @@ add_library(
         src/main/cpp/ScaleEstimatorVI.cpp
         src/main/cpp/ScaleFuser.cpp
         src/main/cpp/WindowedBA.cpp
+        src/main/cpp/GroundPlaneEstimator.cpp
 )
 
 target_include_directories(navsight PRIVATE

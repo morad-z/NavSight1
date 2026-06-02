@@ -62,6 +62,7 @@ internal class ManeuverStateMachine {
     private var lastHeadingDeg = Double.NaN
     private var accumulatedSweepDeg = 0.0
     private var signedSweepDeg = 0.0
+    private var ticksOnRing = 0   // 2026-05-31 — dwell-tick safety cap to bail the frozen-dot latch
 
     private var lastLat = Double.NaN
     private var lastLng = Double.NaN
@@ -75,7 +76,7 @@ internal class ManeuverStateMachine {
         state = ManeuverState.FREE_ROAD
         activeRing = null; suggestedExit = null; travelDirection = TravelDirection.FORWARD
         entryBearingDeg = Double.NaN; lastHeadingDeg = Double.NaN
-        accumulatedSweepDeg = 0.0; signedSweepDeg = 0.0
+        accumulatedSweepDeg = 0.0; signedSweepDeg = 0.0; ticksOnRing = 0
         lastLat = Double.NaN; lastLng = Double.NaN
         uturnAnchorLat = Double.NaN; uturnAnchorLng = Double.NaN
         window.clear()
@@ -116,14 +117,24 @@ internal class ManeuverStateMachine {
 
             ManeuverState.ON_ROUNDABOUT -> {
                 val ring = activeRing!!
-                if (moved >= MOVE_GATE_M && !lastHeadingDeg.isNaN()) {
+                ticksOnRing++
+                // 2026-05-31 — accumulate the heading sweep on ANY heading change, NOT gated on
+                // translation. The Fix-C turn-freeze holds the dot in place while heading sweeps, so
+                // a motion-gated sweep stays 0 and the sweep/dwell exits below could never fire — the
+                // exact 20-39s ON_ROUNDABOUT latch seen on the scooter sims (val_2026_05_31_scooter).
+                if (!lastHeadingDeg.isNaN()) {
                     val delta = ManeuverMath.angularDifferenceDeg(headingDeg, lastHeadingDeg)
                     signedSweepDeg += delta
                     accumulatedSweepDeg += abs(delta)
                 }
                 lastHeadingDeg = headingDeg
                 val distToCenter = RoadSnapMath.haversineM(lat, lng, ring.centerLat, ring.centerLng)
-                if (distToCenter > ring.radiusM + EXIT_MARGIN_M) {
+                // EXIT on ANY of: (a) we left the ring outward (the real geometric exit); (b) we have
+                // swept more than a full turn (a real traversal exits well before ~360°, so >MAX means
+                // stuck/spinning); (c) a dwell-tick safety cap (a real pass is bounded — this bails the
+                // frozen-dot latch the distToCenter test alone cannot catch).
+                val leftRing = distToCenter > ring.radiusM + EXIT_MARGIN_M
+                if (leftRing || accumulatedSweepDeg > MAX_RBT_SWEEP_DEG || ticksOnRing > MAX_RING_DWELL_TICKS) {
                     suggestedExit = pickExit(ring, headingDeg, lat, lng)
                     // U-turn via roundabout: we leave heading ~opposite how we entered.
                     val reversed = !entryBearingDeg.isNaN() &&
@@ -154,6 +165,7 @@ internal class ManeuverStateMachine {
         lastHeadingDeg = headingDeg
         accumulatedSweepDeg = 0.0
         signedSweepDeg = 0.0
+        ticksOnRing = 0
         suggestedExit = null
         window.clear()
     }
@@ -206,5 +218,10 @@ internal class ManeuverStateMachine {
         private const val UTURN_MAX_DISPLACEMENT_M = 20.0
         private const val MOVE_GATE_M = 0.5
         private const val UTURN_VIA_RBT_THRESH_DEG = 160.0
+        // 2026-05-31 roundabout-latch exits: a real traversal exits well before a full turn, so a
+        // sweep past ~one revolution = stuck/spinning; the dwell cap (~30 s at 500 ms ticks) is a
+        // hard safety bail for the frozen-dot latch the centre-distance exit can't catch.
+        private const val MAX_RBT_SWEEP_DEG = 400.0
+        private const val MAX_RING_DWELL_TICKS = 60
     }
 }

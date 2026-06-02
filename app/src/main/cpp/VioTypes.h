@@ -23,6 +23,13 @@ struct VisionOutput {
     // (1-3 s), ≥90 is "mature" (≥3 s).
     std::vector<int> trackedPointAges;
 
+    // 2026-06-02 camera overlay — per-point recoverPose inlier flag, parallel to trackedPoints
+    // (size == trackedPoints.size()/2): 1 = the VIO actually USED this point (RANSAC inlier),
+    // 0 = tracked by KLT but rejected / verification not attempted this frame. Lets the overlay
+    // show the REAL points the engine used vs the "pre-calculation" KLT candidates. Empty when
+    // not populated; consumers must check size().
+    std::vector<unsigned char> trackedPointInlierFlags;
+
     // Diagnostic fields for simulation recording
     double meanFlow;
     int    inlierCount;
