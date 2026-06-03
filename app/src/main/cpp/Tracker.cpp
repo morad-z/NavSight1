@@ -2337,6 +2337,33 @@ VisionOutput Tracker::processFrame(const uint8_t* yuv_data, int width, int heigh
              current_prev_pts_buf_.size());
     }
 
+    // ── B-PROBE (2026-06-03, LOG-ONLY, never feeds anything) ─────────────────
+    // Is the fast near-ground flow the production KLT DROPS actually recoverable, or motion-blurred away?
+    // The production window is capped at 41 px (rotation-sized), so road points flowing 30-80 px/frame at
+    // scooter speed get dropped → the IPM saturates (corr(GPS,IPM)≈0). Re-track the SAME points with a BIG
+    // window + deep pyramid and report: how many the big window keeps that production dropped ("recovered"),
+    // and their flow magnitude. High recovered flow ⇒ Fix B = enlarge the window; few/low ⇒ blurred ⇒ pivot.
+    // Every 15th frame to bound the cost; TEMP probe, remove once B is decided.
+    if (frame_counter_ % 15 == 0 && current_prev_pts_buf_.size() >= 8 &&
+        !current_prev_gray.empty() && !gray_buf_.empty() &&
+        next_pts_buf_.size() == current_prev_pts_buf_.size()) {
+        std::vector<cv::Point2f> bn; std::vector<uchar> bs; std::vector<float> be;
+        cv::calcOpticalFlowPyrLK(current_prev_gray, gray_buf_, current_prev_pts_buf_, bn, bs, be,
+                                 cv::Size(61, 61), 5,
+                                 cv::TermCriteria(cv::TermCriteria::COUNT + cv::TermCriteria::EPS, 30, 0.01));
+        int prod_surv = 0, big_surv = 0, recovered = 0;
+        std::vector<double> rec_flow, prod_flow;
+        for (size_t i = 0; i < current_prev_pts_buf_.size(); ++i) {
+            const bool ps  = (i < status.size() && status[i]);
+            const bool bsv = (i < bs.size() && bs[i]);
+            if (ps)  { ++prod_surv; prod_flow.push_back(cv::norm(next_pts_buf_[i] - current_prev_pts_buf_[i])); }
+            if (bsv) { ++big_surv; if (!ps) { ++recovered; rec_flow.push_back(cv::norm(bn[i] - current_prev_pts_buf_[i])); } }
+        }
+        auto medd = [](std::vector<double>& v) { if (v.empty()) return -1.0; std::sort(v.begin(), v.end()); return v[v.size() / 2]; };
+        LOGI("BPROBE: n=%zu prod_surv=%d prod_flow_px=%.1f | bigwin_surv=%d recovered=%d rec_flow_px=%.1f",
+             current_prev_pts_buf_.size(), prod_surv, medd(prod_flow), big_surv, recovered, medd(rec_flow));
+    }
+
     // ── 6. Filter valid points + maintain feature ages + IDs ─────────────────
     prev_good_buf_.clear(); next_good_buf_.clear();
     std::vector<int> surviving_ages;
@@ -3054,20 +3081,38 @@ VisionOutput Tracker::processFrame(const uint8_t* yuv_data, int width, int heigh
     // the dt ballooned (10-frame gaps → wrong de-rotation → speed collapse). Run it on EVERY frame that has
     // enough tracked points. READ-ONLY (writes ground_flow_speed_mps_ only) so this never affects the dot.
     if (camera_height_m_ > 0.0 && !frame_blurry_ &&
-        prev_good_buf_.size() == next_good_buf_.size() && prev_good_buf_.size() >= 8) {
-        std::vector<cv::Point2f> gp_prev = prev_good_buf_;
-        std::vector<cv::Point2f> gp_next = next_good_buf_;
-        lens_.undistortMatchedPoints(gp_prev, gp_next);
-        cv::Vec3d gp_gyro(0.0, 0.0, 0.0);
-        if (!imu_delta.deltaR.empty() && imu_delta.deltaR.rows == 3 && imu_delta.deltaR.cols == 3) {
-            cv::Mat gp_rvm; cv::Rodrigues(imu_delta.deltaR, gp_rvm);
-            if (gp_rvm.rows == 3 && gp_rvm.cols == 1) {
-                const cv::Matx33d gp_Rbc = ekf_.getExtrinsicsRotation();
-                gp_gyro = gp_Rbc * cv::Vec3d(gp_rvm.at<double>(0), gp_rvm.at<double>(1), gp_rvm.at<double>(2));
-            }
+        current_prev_pts_buf_.size() >= 8 && !current_prev_gray.empty() && !gray_buf_.empty()) {
+        // FIX B (2026-06-03, BPROBE-proven): feed the IPM a DEDICATED BIG-WINDOW optical flow instead of
+        // prev_good_buf_ (the production KLT survivors). The production window is rotation-sized (≤41px,
+        // Tracker.cpp:2315), so it DROPS the fast near-ground road points (30-80px/frame at scooter speed) —
+        // exactly the ones carrying the speed signal — leaving the IPM only slow far points → saturation
+        // (corr(GPS,IPM)≈0). The live probe proved a 61px window + deep pyramid RECOVERS them (up to 164 pts
+        // @ 45px flow on the ride, not blurred). Re-track the SAME detected points with that window and feed
+        // the survivors; updateGroundFlowSpeed's forward-coherence + road-geometry + median gates reject any
+        // big-window mismatches. LEGACY (prev_good_buf_ source) replaced 2026-06-03; see git history.
+        std::vector<cv::Point2f> gp_prev, gp_next;
+        {
+            std::vector<cv::Point2f> bn; std::vector<uchar> bs; std::vector<float> be;
+            cv::calcOpticalFlowPyrLK(current_prev_gray, gray_buf_, current_prev_pts_buf_, bn, bs, be,
+                                     cv::Size(61, 61), 5,
+                                     cv::TermCriteria(cv::TermCriteria::COUNT + cv::TermCriteria::EPS, 30, 0.01));
+            gp_prev.reserve(bn.size()); gp_next.reserve(bn.size());
+            for (size_t i = 0; i < current_prev_pts_buf_.size() && i < bn.size(); ++i)
+                if (bs[i]) { gp_prev.push_back(current_prev_pts_buf_[i]); gp_next.push_back(bn[i]); }
         }
-        const double gp_dt = (timestamp_ns - current_prev_ts) * 1e-9;
-        updateGroundFlowSpeed(gp_prev, gp_next, gp_dt, gp_gyro, imu);
+        if (gp_prev.size() >= 8) {
+            lens_.undistortMatchedPoints(gp_prev, gp_next);
+            cv::Vec3d gp_gyro(0.0, 0.0, 0.0);
+            if (!imu_delta.deltaR.empty() && imu_delta.deltaR.rows == 3 && imu_delta.deltaR.cols == 3) {
+                cv::Mat gp_rvm; cv::Rodrigues(imu_delta.deltaR, gp_rvm);
+                if (gp_rvm.rows == 3 && gp_rvm.cols == 1) {
+                    const cv::Matx33d gp_Rbc = ekf_.getExtrinsicsRotation();
+                    gp_gyro = gp_Rbc * cv::Vec3d(gp_rvm.at<double>(0), gp_rvm.at<double>(1), gp_rvm.at<double>(2));
+                }
+            }
+            const double gp_dt = (timestamp_ns - current_prev_ts) * 1e-9;
+            updateGroundFlowSpeed(gp_prev, gp_next, gp_dt, gp_gyro, imu);
+        }
     }
 
     if (sufficient_motion && has_parallax && !is_static && tracked >= 8
@@ -9070,11 +9115,39 @@ void Tracker::updateGroundFlowSpeed(const std::vector<cv::Point2f>& prev_ud,
     // rotation/mount-agnostic and matches how the overlay grid (computeGroundGrid) already selects the road.
     constexpr double kIpmMinRoadDepthM = 0.5;    // closest plausible road point for a ~1 m forward-down mount
     constexpr double kIpmMaxRoadDepthM = 50.0;   // beyond this the road flow is sub-pixel + the planar assumption fails
+    // FORWARD-COHERENCE floor (2026-06-03, harness-proven). A genuine static road point under forward
+    // translation has de-rotated flow f_tr = -v*a, i.e. ANTI-parallel to the predicted ground-flow
+    // direction a → cos(f,a) → -1. Require the backward-aligned component to EXCEED the perpendicular
+    // component → cos_fa < -1/√2 (a derived 45° cone: |f·â| > |f_perp| ⟺ |cos| > sin ⟺ |cos| > 1/√2 —
+    // NOT a tuned constant). This rejects the incoherent flow that FABRICATED the standstill speed
+    // (replay ipm_diag on the standstill clip: spurious rows cos_fa = +0.1..+0.97, the one real-motion
+    // row = -0.94) and the off-plane / large-dt de-rotation-residual spikes. cos_fa was already computed
+    // here (dbg_align) but only logged — this finally USES it.
+    constexpr double kIpmFwdCoherenceMin = 0.70710678118654752;   // 1/√2 = cos(135°)
+    // The Heeger-Jepson de-rotation below is FIRST-ORDER in the per-frame rotation θ; its leading
+    // truncation error is ~θ/2. Cap the per-frame rotation magnitude at 0.2 rad (~11°) so that error
+    // stays <10%. Above it (dropped frames / fast pan, e.g. dt=0.3 s × 1 rad/s) the rotational flow is
+    // mis-removed and the residual masquerades as translation (replay: large-dt rows produced coherent-
+    // looking cos_fa from pure de-rotation error). Derived from the model order, not tuned.
+    constexpr double kIpmMaxFrameRotRad = 0.2;
+
+    // Bail when the per-frame rotation exceeds the first-order de-rotation's validity (see above). DECAY
+    // toward 0 rather than HOLD, so a dropped-frame / fast-pan burst can't freeze a stale speed.
+    const double frame_rot_rad = std::sqrt(wx * wx + wy * wy + wz * wz);
+    if (frame_rot_rad > kIpmMaxFrameRotRad) {
+        double cur_v = ground_flow_speed_mps_.load(std::memory_order_relaxed);
+        if (cur_v > 0.0) ground_flow_speed_mps_.store((1.0 - 0.15) * cur_v, std::memory_order_relaxed);
+        if (frame_counter_ % 20 == 0)
+            LOGI("GROUND_FLOW_FUNNEL: skipped reason=large_frame_rotation rot_rad=%.3f thresh=%.2f dt=%.3f → decay",
+                 frame_rot_rad, kIpmMaxFrameRotRad, dt_s);
+        return;
+    }
 
     std::vector<double> speeds;
     std::vector<cv::Point2f> inlier_px;   // 2026-06-02 VIZ — road pixels the IPM used (current frame)
     int n_in_road = 0;   // FUNNEL diag: points in the lower-image road region
     int n_denom_ok = 0;  // FUNNEL diag: of those, points with a well-conditioned ground-plane denom
+    int n_coh_reject = 0;  // FUNNEL diag: points rejected by the forward-coherence gate (incoherent flow)
     std::vector<double> dbg_raw_vi, dbg_fmag_px, dbg_Z, dbg_align;   // TEMP IPM_DIAG (raw, ungated)
     const size_t n_pts = std::min(prev_ud.size(), next_ud.size());
     for (size_t i = 0; i < n_pts; ++i) {
@@ -9112,16 +9185,22 @@ void Tracker::updateGroundFlowSpeed(const std::vector<cv::Point2f>& prev_ud,
         if (aa > 1e-8) {
             ++n_denom_ok;
             const double v_i = -((f_tr_x * a_x + f_tr_y * a_y) / aa) / dt_s;   // metres/frame → m/s
+            const double f_mag = std::sqrt(f_tr_x * f_tr_x + f_tr_y * f_tr_y);
+            const double cos_fa = (f_tr_x * a_x + f_tr_y * a_y) / (f_mag * std::sqrt(aa) + 1e-12);
             // TEMP IPM_DIAG — raw (ungated) per-point internals.
             dbg_raw_vi.push_back(v_i);
-            dbg_fmag_px.push_back(std::sqrt(f_tr_x * f_tr_x + f_tr_y * f_tr_y) * fx_);   // flow magnitude px/frame
-            dbg_Z.push_back(Z);                                                          // depth (m), now > 0
-            dbg_align.push_back((f_tr_x * a_x + f_tr_y * a_y) /
-                                (std::sqrt(f_tr_x * f_tr_x + f_tr_y * f_tr_y) * std::sqrt(aa) + 1e-12));  // cos(f,a)
-            // Scooters don't go backwards or faster than 50 m/s (180 km/h).
-            if (v_i > 0.1 && v_i < 50.0) {
+            dbg_fmag_px.push_back(f_mag * fx_);   // flow magnitude px/frame
+            dbg_Z.push_back(Z);                   // depth (m), now > 0
+            dbg_align.push_back(cos_fa);          // cos(f,a)
+            // COHERENCE GATE: keep the point only when its de-rotated flow is dominantly forward-aligned
+            // (cos_fa < -1/√2). cos_fa < 0 already implies v_i > 0, so this SUBSUMES the old positive-
+            // speed gate; the 50 m/s cap stays as the upper sanity bound. Incoherent standstill / off-
+            // plane / de-rotation-residual flow (cos_fa not near -1) no longer fabricates a speed.
+            if (v_i < 50.0 && cos_fa < -kIpmFwdCoherenceMin) {
                 speeds.push_back(v_i);
                 inlier_px.push_back(next_ud[i]);   // VIZ — this road pixel fed the speed (current frame)
+            } else {
+                ++n_coh_reject;
             }
         }
     }
@@ -9160,7 +9239,14 @@ void Tracker::updateGroundFlowSpeed(const std::vector<cv::Point2f>& prev_ud,
                      u_fwd_c(0), u_fwd_c(1), u_fwd_c(2));
         std::fflush(dbgf);
     }
-    
+    /* RESEARCH 2026-06-03 — per-point (v_i,Z,flow,cos_fa) dump used to test the depth/flow-WEIGHTING idea.
+       VERDICT: do NOT add weighting. On real data v_i rises monotonically with Z (0.58 m/s @ Z<3 → 41 m/s @
+       Z>20) while the measured flow is ~constant ~12px — i.e. the flow is CAPPED at the tracker limit, not
+       ∝1/Z, so v_i is depth-BIASED, not unbiased-noisy. Reweighting only slides along that biased curve
+       (inverse-Z would favour the LOW-reading near points → worse). The unweighted MEDIAN is robust and lands
+       mid-curve; KEEP it. The real lever is un-capping the near flow (window / full frame rate). Dump removed.
+    static FILE* ptf = std::fopen("ipm_points.csv", "w"); ... (re-add to re-run the analysis) */
+
     // 4. Robust median and EMA.
     if (speeds.size() >= 5) {
         std::sort(speeds.begin(), speeds.end());
@@ -9173,9 +9259,23 @@ void Tracker::updateGroundFlowSpeed(const std::vector<cv::Point2f>& prev_ud,
             const double alpha = 0.15;
             ground_flow_speed_mps_.store((1.0 - alpha) * cur_v + alpha * v_med, std::memory_order_relaxed);
         }
-        
-        LOGI("GROUND_SPEED_DBG raw_mps=%.3f ema_mps=%.3f inliers=%d dt=%.3f",
-             v_med, ground_flow_speed_mps_.load(), (int)speeds.size(), dt_s);
+
+        LOGI("GROUND_SPEED_DBG raw_mps=%.3f ema_mps=%.3f inliers=%d dt=%.3f coh_rej=%d",
+             v_med, ground_flow_speed_mps_.load(), (int)speeds.size(), dt_s, n_coh_reject);
+    } else {
+        // No forward-COHERENT road flow this frame → forward motion is not being observed. DECAY the
+        // EMA toward 0 (same α) instead of HOLDING — a real stop then reads ~0 within ~0.7 s instead of
+        // freezing at the last cruise value (owner: "standing still but the speed wasn't 0"). A transient
+        // blur/occlusion dips briefly and recovers the moment coherent road flow returns. Only decays a
+        // POSITIVE running value; the -1 "uninitialised" sentinel is left untouched.
+        double cur_v = ground_flow_speed_mps_.load(std::memory_order_relaxed);
+        if (cur_v > 0.0) {
+            const double alpha = 0.15;
+            ground_flow_speed_mps_.store((1.0 - alpha) * cur_v, std::memory_order_relaxed);
+        }
+        if (frame_counter_ % 20 == 0)
+            LOGI("GROUND_SPEED_DECAY: no coherent road flow (in_road=%d coh_rej=%d) → decay v=%.2f",
+                 n_in_road, n_coh_reject, ground_flow_speed_mps_.load());
     }
 
     // VIZ — publish the road pixels used this frame (or the few candidates when <5) so the camera

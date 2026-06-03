@@ -329,6 +329,10 @@ class NavSightViewModel(application: Application) : AndroidViewModel(application
     // the speed block in the VIO update loop; reset in resetPath()/resetAll().
     private var speedEmaMps = 0f
     private var lastVioForDist: VioData? = null
+    // 2026-06-03 — the displayed in-app distance follows the DOT (snapped on-road position), not the raw
+    // VIO. These track the last displayed-dot position + time for the gated (teleport-excluding) accumulation.
+    private var lastDotForDist: LatLng? = null
+    private var lastDotDistMs: Long = 0L
     private var lastSpeedTimeMs = 0L
     private var lastSnapTimeMs = 0L
     // Heading-aware map-matcher (§0.7): detects roundabout traversal/exit + U-turns
@@ -392,6 +396,9 @@ class NavSightViewModel(application: Application) : AndroidViewModel(application
     // Consecutive ticks the corrected heading has been clearly opposite the ball's facing → a confirmed
     // U-turn / wrong-facing once it reaches RAIL_REVERSE_TICKS (debounced so noise never flips the dot).
     @Volatile private var railReverseTicks = 0
+    // 2026-06-03 — wall time of the last rail-ball advance, so the IPM-speed→distance integration uses the
+    // real (gated, variable) tick interval instead of a fixed 0.5 s.
+    @Volatile private var lastRailAdvanceMs: Long = 0L
     @Volatile private var lastSnapSource = ""
     // Guards against overlapping snap coroutines while a /match HTTP call is in flight
     // (set/cleared on the Main collector thread + the IO finally).
@@ -672,13 +679,17 @@ class NavSightViewModel(application: Application) : AndroidViewModel(application
                 }
             }
 
-            val prevDist = lastVioForDist
+            // 2026-06-03 (owner: "show the dot's distance, not the raw VIO"): the displayed totalDistanceM
+            // now follows the DISPLAYED DOT (the snapped on-road position) — accumulated in launchNetworkSnap
+            // below — instead of the raw VIO global_t_ (vio.x/vio.z), the under-scaled trajectory (e.g. 786 m
+            // vs the dot's ~1195 m on the same ride). Kept (commented) per the no-delete rule.
+            /* val prevDist = lastVioForDist
             if (prevDist != null) {
                 val ddx = vio.x - prevDist.x
                 val ddz = vio.z - prevDist.z
                 totalDistanceM += sqrt(ddx * ddx + ddz * ddz)
             }
-            lastVioForDist = vio
+            lastVioForDist = vio */
 
             // 2026-05-26 — locomotion-agnostic speed. Report the smoothed
             // depth-weighted metric speed (getFusedSpeedMps: recoverPose translation
@@ -686,37 +697,34 @@ class NavSightViewModel(application: Application) : AndroidViewModel(application
             // differencing a stride-scaled position. Returns -1.0 before the first
             // estimate; until then show 0.
             if (NativeBridge.isLoaded()) {
-                val fusedMps = NativeBridge.getFusedSpeedMps()
-                // READ-ONLY IPM ground-plane speed for the live debug readout (never drives anything).
+                val fusedMps = NativeBridge.getFusedSpeedMps()   // LEGACY displayed speed — kept only for the diag log
+                // IPM ground-plane speed. 2026-06-03 (owner): the IPM now DRIVES the displayed speedometer (and the
+                // rail ball, below), REPLACING the frozen getFusedSpeedMps path. With Fix A it is continuous and
+                // decays to ~0 at a stop (no separate true-stop snap needed — the EMA follows it down). NOTE: while
+                // MOVING it is currently front-end-saturated → decorrelated from true speed (Fix B not done); it
+                // will track once B restores the fast near-ground flow. The B probe measures whether that's possible.
                 val gpMps = NativeBridge.getGroundFlowSpeedMps()
                 groundFlowSpeedKmh = if (gpMps >= 0f) gpMps * 3.6f else null
                 maybeAutoCalibrateHeight(gpMps)   // GPS one-time mount-height solve (read-only of position)
-                if (fusedMps == 0.0f) {
-                    // TRUE STOP: native stores EXACTLY 0.0 in trajectory_speed_mps_ when is_static /
-                    // rotation-only is detected (Tracker.cpp). SNAP the speedometer to 0 — do NOT run the
-                    // EMA toward it. The τ≈0.7s EMA otherwise bleeds the prior reading down over ~2s, so a
-                    // stopped scooter showed a phantom ~4 km/h slowly dying (owner: "when standing still
-                    // speed still moves"). A moving speed is never exactly 0.0, so this only catches real
-                    // stops. (The separate ZUPT-miss case — native wrongly reporting non-zero on a vibrating
-                    // parked scooter — is a Tracker.cpp speed-gate fix tracked with the speed-accuracy work.)
+                if (gpMps < 0f) {
+                    // -1.0 sentinel: no IPM estimate yet → show 0.
                     speedEmaMps = 0f
                     currentSpeedKmh = 0f
-                } else if (fusedMps > 0f) {
-                    // EMA low-pass for a stable speedometer. τ ≈ 0.7 s; at the UI
-                    // tick cadence α = dt/(τ+dt). Cited, not magic: 0.7 s trades a
-                    // little display lag for jitter rejection on a moving vehicle
-                    // (Lever D may swap this for a median window later).
+                } else {
+                    // EMA low-pass for a stable speedometer. τ ≈ 0.7 s; at the UI tick cadence α = dt/(τ+dt).
+                    // Cited, not magic: 0.7 s trades a little display lag for jitter rejection (the raw IPM
+                    // jitters 4-48 km/h). Fix A's decay already takes the IPM to ~0 at a stop, so the EMA
+                    // follows it to 0-2 km/h — the standstill behaviour the owner confirmed in-room.
                     val dtS = (nowMs - lastSpeedTimeMs).coerceAtLeast(1L).toDouble() / 1000.0
                     val tauS = 0.7
                     val alpha = (dtS / (tauS + dtS)).toFloat()
-                    speedEmaMps += alpha * (fusedMps - speedEmaMps)
+                    speedEmaMps += alpha * (gpMps - speedEmaMps)
                     currentSpeedKmh = speedEmaMps * 3.6f
-                } else {
-                    // fusedMps < 0 = the -1.0 sentinel before the first estimate.
-                    speedEmaMps = 0f
-                    currentSpeedKmh = 0f
                 }
                 lastSpeedTimeMs = nowMs
+                if (nowMs % 3000L < 60L)
+                    Log.i("NavSightVM", "SPEED_SRC: ipm=%.1f disp=%.1f legacy_fused=%.1f km/h".format(
+                        (groundFlowSpeedKmh ?: -1f), currentSpeedKmh, fusedMps * 3.6f))
 
                 // 2026-05-28 — every 10 s, persist the calibrated MiDaS scale K
                 // to SharedPreferences so the next cold start inherits it. Only
@@ -831,7 +839,19 @@ class NavSightViewModel(application: Application) : AndroidViewModel(application
                 val prevVio = lastSnapVio
                 val dVioRaw = if (prevVio != null) RoadSnapMath.haversineM(
                     prevVio.latitude, prevVio.longitude, currentLatLng.latitude, currentLatLng.longitude) else 0.0
-                val advanceM = minOf(dVioRaw, RAIL_MAX_SPEED_MPS * 0.5)   // cap a VIO teleport-spike (~0.5 s tick)
+                // BALL SPEED = IPM (2026-06-03, owner): advance the ball by the IPM-measured distance (the
+                // displayed, EMA-smoothed speed × the real tick dt) instead of the VIO position delta, so the
+                // ball moves at the SHOWN speed. Falls back to the VIO delta before the first IPM estimate
+                // (groundFlowSpeedKmh == null). Capped at RAIL_MAX_SPEED_MPS × dt to absorb a spike. NOTE: while
+                // the IPM is front-end-saturated (pre-Fix-B) the ball advances at a wrongish ~constant pace —
+                // expected until B; the matcher supervision still corrects the road choice.
+                val railDtS = if (lastRailAdvanceMs > 0L)
+                    (nowMs - lastRailAdvanceMs).coerceIn(50L, 1500L).toDouble() / 1000.0 else 0.5
+                lastRailAdvanceMs = nowMs
+                val ipmBallMps = currentSpeedKmh / 3.6f   // the displayed (EMA-smoothed) IPM speed
+                val advanceM = if (groundFlowSpeedKmh != null)
+                    minOf(ipmBallMps.toDouble() * railDtS, RAIL_MAX_SPEED_MPS * railDtS)
+                    else minOf(dVioRaw, RAIL_MAX_SPEED_MPS * railDtS)
                 // TRAVEL DIRECTION along the road = net bearing over the MATCHED polyline (snapped
                 // positions, oldest→newest). Road-aligned, time-ordered, HEADING-INDEPENDENT → stable even
                 // at crawl speed. The per-tick VIO delta we used before is pure noise at 3 km/h and made
@@ -1086,7 +1106,18 @@ class NavSightViewModel(application: Application) : AndroidViewModel(application
                 else lastKMap = null
                 // §0.8 — record the map-matched position only when snapped to a road.
                 if (snapped.isSnapped) {
-                    lastMapMatched = snapped.toLatLng()
+                    val dotNow = snapped.toLatLng()
+                    // IN-APP DISTANCE = the DISPLAYED DOT's path (2026-06-03, owner). Accumulate the on-road
+                    // dot movement; a step faster than the rail speed cap (RAIL_MAX_SPEED_MPS) is a matcher
+                    // reacquire/teleport — a snap correction, not travel — so it is excluded. This is what
+                    // replaces the raw-VIO totalDistanceM (commented out above) so the counter matches the dot.
+                    lastDotForDist?.let { prev ->
+                        val d = RoadSnapMath.haversineM(prev.latitude, prev.longitude, dotNow.latitude, dotNow.longitude)
+                        val ddt = (nowMs - lastDotDistMs).coerceIn(1L, 3000L).toDouble() / 1000.0
+                        if (d / ddt <= RAIL_MAX_SPEED_MPS) totalDistanceM += d
+                    }
+                    lastDotForDist = dotNow; lastDotDistMs = nowMs
+                    lastMapMatched = dotNow
                     lastMapMatchedConf = if (accept && matched != null) matched.confidence else {
                         val rawSL = SnappedLatLng(currentLatLng.latitude, currentLatLng.longitude, null, null, false)
                         exp(-snapped.distanceTo(rawSL) / 5.0)   // σ=5 m (RoadSnapper.SNAP_SIGMA_M)
@@ -1094,6 +1125,7 @@ class NavSightViewModel(application: Application) : AndroidViewModel(application
                 } else {
                     lastMapMatched = null
                     lastMapMatchedConf = null
+                    lastDotForDist = null   // off-road gap → re-snap starts fresh, don't count the gap as travel
                 }
                 // #8 — when navigating, project onto the planned route (route-pinned) + detect
                 // off-route → reroute. Returns the display position (pinned within the corridor).
@@ -1419,7 +1451,7 @@ class NavSightViewModel(application: Application) : AndroidViewModel(application
         totalDistanceM = 0.0
         lastVioForSpeed = null
         speedEmaMps = 0f
-        lastVioForDist = null
+        lastVioForDist = null; lastDotForDist = null
     }
 
     /**
@@ -1463,7 +1495,7 @@ class NavSightViewModel(application: Application) : AndroidViewModel(application
         startLocationOverridden = false   // a fresh session re-acquires the GPS anchor
         lastMapMatched = null
         lastMapMatchedConf = null
-        lastVioForDist = null
+        lastVioForDist = null; lastDotForDist = null
         snappedPosition = null
         navigationStartMessage = null
         // Camera overlay Phase 2/3/4: clear the bundled snapshot so KLT
