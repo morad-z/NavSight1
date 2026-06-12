@@ -13,6 +13,7 @@ import androidx.compose.material.icons.Icons
 import androidx.compose.material.icons.filled.*
 import androidx.compose.material3.*
 import androidx.compose.runtime.*
+import kotlinx.coroutines.delay
 import androidx.compose.ui.Alignment
 import androidx.compose.ui.Modifier
 import androidx.compose.ui.draw.clip
@@ -33,7 +34,9 @@ fun BottomSheet(
     onMapClick: () -> Unit,
     onResetClick: () -> Unit,
     onStopNavClick: () -> Unit,
-    onNightToggle: () -> Unit
+    onNightToggle: () -> Unit,
+    // 2026-06-12ui — 3-state night-mode label ("Auto" / "Day" / "Night") shown on the toggle.
+    nightModeLabel: String = if (isNight) "Night" else "Day",
 ) {
     Column(modifier.fillMaxWidth().navigationBarsPadding()) {
 
@@ -77,7 +80,10 @@ fun BottomSheet(
         // hero header, camera/debug/calibrate live in the side action stack. This bar keeps
         // only what is unique + useful: the live distance tracked, and the Reset / Night / (Map)
         // actions. (GPX recording + the fake "incidents" panel were dropped as unused.)
-        Surface(color = Color.White, shadowElevation = 14.dp) {
+        // 2026-06-12ui — footer adopts the theme (was hardcoded white → broke dark mode);
+        // Reset gains a CONFIRM step (spec §2: a gloved mis-tap must not wipe a ride);
+        // night toggle shows the 3-state mode and uses a neutral tint (orange retired).
+        Surface(color = pal.card, shadowElevation = 14.dp) {
             Row(
                 Modifier.fillMaxWidth().padding(horizontal = 18.dp, vertical = 9.dp),
                 horizontalArrangement = Arrangement.SpaceBetween,
@@ -86,22 +92,28 @@ fun BottomSheet(
                 // LEFT — the one live stat not shown elsewhere: distance tracked.
                 Row(verticalAlignment = Alignment.CenterVertically, horizontalArrangement = Arrangement.spacedBy(9.dp)) {
                     Box(Modifier.size(8.dp).clip(CircleShape)
-                        .background(if (isMoving) pal.teal else Color(0xFFB7B7C2)))
+                        .background(if (isMoving) pal.statusGood else pal.textSecondary.copy(0.5f)))
                     Column {
-                        Text("${"%.0f".format(totalM)} m", color = LightText,
+                        Text("${"%.0f".format(totalM)} m", color = pal.textPrimary,
                             fontSize = 18.sp, fontWeight = FontWeight.ExtraBold, lineHeight = 19.sp)
                         Text(if (isMoving) "tracking live" else "distance tracked",
-                            color = Color(0xFF9E9EAC), fontSize = 9.sp)
+                            color = pal.textSecondary, fontSize = 9.sp)
                     }
                 }
                 // RIGHT — the genuinely useful actions.
                 Row(horizontalArrangement = Arrangement.spacedBy(10.dp), verticalAlignment = Alignment.CenterVertically) {
-                    if (cameraVisible) FooterAction(Icons.Default.Map, "Map", pal.teal, onMapClick)
-                    FooterAction(Icons.Default.Refresh, "Reset", HeroPurple, onResetClick)
+                    if (cameraVisible) FooterAction(Icons.Default.Map, "Map", pal.brand, onMapClick)
+                    var confirmReset by remember { mutableStateOf(false) }
+                    LaunchedEffect(confirmReset) { if (confirmReset) { delay(3000); confirmReset = false } }
                     FooterAction(
-                        if (isNight) Icons.Default.LightMode else Icons.Default.DarkMode,
-                        if (isNight) "Day" else "Night",
-                        if (isNight) Orange400 else Color(0xFF6B6B7B), onNightToggle
+                        if (confirmReset) Icons.Default.Warning else Icons.Default.Refresh,
+                        if (confirmReset) "Sure?" else "Reset",
+                        if (confirmReset) pal.statusBad else pal.brand
+                    ) { if (confirmReset) { onResetClick(); confirmReset = false } else confirmReset = true }
+                    FooterAction(
+                        if (isNight) Icons.Default.DarkMode else Icons.Default.LightMode,
+                        nightModeLabel,
+                        pal.textSecondary, onNightToggle
                     )
                 }
             }

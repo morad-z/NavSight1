@@ -184,36 +184,60 @@ fun CameraOverlay(
             0.78f to Color.Transparent,    1f    to Color.Black.copy(0.60f)
         )))
 
-        Box(Modifier.align(Alignment.TopStart).statusBarsPadding().padding(14.dp)) {
-            DirectionBadge(isMoving, vioTrackingQuality, pal)
+        // 2026-06-12ui — slim header carried over (continuity + glanceable speed, spec §5) and a
+        // SINGLE banner slot under it: exactly one guidance message at a time, highest priority
+        // first. The old layout scattered five warnings across the screen and the radar card
+        // overlapped content; the radar is a dev visual and now rides with the debug toggle.
+        val camCompass = when {
+            fusedHeading < 22.5f || fusedHeading >= 337.5f -> "N"
+            fusedHeading < 67.5f  -> "NE"
+            fusedHeading < 112.5f -> "E"
+            fusedHeading < 157.5f -> "SE"
+            fusedHeading < 202.5f -> "S"
+            fusedHeading < 247.5f -> "SW"
+            fusedHeading < 292.5f -> "W"
+            else                  -> "NW"
         }
-
+        val camChip = when {
+            !isVioInitialized || !viewModel.calibrationLoaded -> VioChipState.BAD
+            !viewModel.positionCovValid || viewModel.positionSigmaM.isNaN() -> VioChipState.INIT
+            viewModel.positionSigmaM >= 1.5f -> VioChipState.DEGRADED
+            else -> VioChipState.GOOD
+        }
         Column(
-            Modifier.align(Alignment.TopEnd).statusBarsPadding().padding(14.dp),
+            Modifier.align(Alignment.TopCenter).fillMaxWidth()
+                .statusBarsPadding().padding(horizontal = 10.dp, vertical = 6.dp),
+            horizontalAlignment = Alignment.CenterHorizontally
+        ) {
+            HeroHeader(speedMs * 3.6f, camCompass, camChip,
+                onChipClick = { viewModel.showCalibrationSheet = true }, pal = pal)
+            Spacer(Modifier.height(8.dp))
+            // ONE message at a time (the composables keep their existing strings + looks).
+            when {
+                showCameraBlocked        -> CameraBlockedWarning(pal)
+                !isVioInitialized        -> VioInitializingBadge(pal)
+                !orientationIsHorizontal -> PhoneOrientationWarning(orientationDeviation, pal)
+                vioTrackedFeatures < 30  -> NoTextureWarning(pal)
+                else                     -> DirectionBadge(isMoving, vioTrackingQuality, pal)
+            }
+        }
+        Column(
+            Modifier.align(Alignment.TopEnd).statusBarsPadding().padding(top = 70.dp, end = 14.dp),
             verticalArrangement   = Arrangement.spacedBy(10.dp),
             horizontalAlignment   = Alignment.End
         ) {
-            Surface(onClick = onClose, color = Color.White.copy(0.90f), shape = CircleShape, shadowElevation = 4.dp) {
-                Icon(Icons.Default.Close, "Close", tint = LightText, modifier = Modifier.padding(10.dp).size(20.dp))
+            Surface(onClick = onClose, color = pal.card.copy(0.92f), shape = CircleShape, shadowElevation = 4.dp) {
+                Icon(Icons.Default.Close, "Close", tint = pal.textPrimary, modifier = Modifier.padding(10.dp).size(20.dp))
             }
-            SensorRadarWaze(historySnapshot, fusedHeading, pal)
+            if (debugVisible) SensorRadarWaze(historySnapshot, fusedHeading, pal)
         }
-
-        if (!isVioInitialized)
-            Box(Modifier.align(Alignment.Center)) { VioInitializingBadge(pal) }
-        if (showCameraBlocked)
-            Box(Modifier.align(Alignment.Center)) { CameraBlockedWarning(pal) }
-        if (isVioInitialized && !showCameraBlocked && vioTrackedFeatures < 30)
-            Box(Modifier.align(Alignment.BottomStart).padding(start = 14.dp, bottom = 115.dp)) { NoTextureWarning(pal) }
-        if (!orientationIsHorizontal)
-            Box(Modifier.align(Alignment.BottomCenter).padding(bottom = 115.dp)) { PhoneOrientationWarning(orientationDeviation, pal) }
         Box(Modifier.align(Alignment.BottomEnd).padding(end = 14.dp, bottom = 115.dp)) {
             StabilityIndicator(stabilityScore, vioTrackingQuality, pal)
         }
 
         Surface(
             modifier        = Modifier.align(Alignment.BottomCenter).fillMaxWidth().navigationBarsPadding(),
-            color           = Color.White,
+            color           = pal.card,   // 2026-06-12ui — was hardcoded white (broke dark mode)
             shape           = RoundedCornerShape(topStart = 22.dp, topEnd = 22.dp),
             shadowElevation = 14.dp
         ) {
@@ -445,7 +469,10 @@ fun CameraFeatureOverlay(viewModel: NavSightViewModel, pal: NavPalette) {
  * scooter-speed idea, gpt_speed_suggestion.md).
  */
 @androidx.compose.runtime.Composable
-fun GroundPlaneOverlay(viewModel: NavSightViewModel, pal: NavPalette) {
+fun GroundPlaneOverlay(viewModel: NavSightViewModel, pal: NavPalette,
+                       // 2026-06-12ui — the raw text HUD (rot/KLT/IPM line) is a dev readout;
+                       // it now rides with the debug toggle (spec §5). Overlay graphics stay.
+                       debugHud: Boolean = true) {
     val snap = viewModel.overlaySnapshot
     val geom = viewModel.cameraFrameGeometry ?: return   // only draw while the camera is active
     val ipm = snap.ipmInlierPoints
@@ -521,6 +548,7 @@ fun GroundPlaneOverlay(viewModel: NavSightViewModel, pal: NavPalette) {
         // Diagnostic HUD just below the band line (portrait-readable, above the footer). KLT=tracked,
         // used=recoverPose inliers, IPM=ground-plane speed + road-pixel count. rot=CameraX rotation
         // (R_bc is hardcoded for 90/portrait; anything else means the camera↔IMU extrinsic is mismatched).
+        if (!debugHud) return@Canvas   // 2026-06-12ui — dev text only with the debug toggle
         val hud = "rot=${geom.rotationDegrees}  KLT=$kltN used=$usedN  |  " +
             "IPM ${ipmKmh?.let { "%.0f".format(it) } ?: "--"} km/h  road=$ipmN  " +
             (viewModel.heightCalibStatus ?: "h=%.2fm…".format(viewModel.mountHeightM))

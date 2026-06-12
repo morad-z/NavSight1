@@ -274,6 +274,18 @@ class NavSightViewModel(application: Application) : AndroidViewModel(application
 
     var currentSpeedKmh by mutableStateOf(0f)
         private set
+    // 2026-06-12ui — calibration sheet visibility (opened by the header VIO chip; the UI
+    // both opens and dismisses it, so the setter is public).
+    var showCalibrationSheet by mutableStateOf(false)
+    // 2026-06-12ui — read-only matcher readouts for the debug panel (set on the IO snap tick;
+    // Compose snapshot state is thread-safe to write off-main).
+    var mmSrcDebug by mutableStateOf("--")
+        private set
+    var mmConfDebug by mutableStateOf(-1f)
+        private set
+
+    /** 2026-06-12b power-trim — camera-screen overlay polling on/off (see SensorRepository). */
+    fun setOverlayPolling(enabled: Boolean) { sensorRepository.overlayPollingEnabled = enabled }
 
     // 2026-06-02 — READ-ONLY live readout of the IPM ground-plane speed (km/h) for on-device
     // eyeballing vs the speedometer (the candidate scooter speed-fix). null = not firing yet
@@ -1282,6 +1294,9 @@ class NavSightViewModel(application: Application) : AndroidViewModel(application
                     NativeBridge.setMapPositionCorrection(dEast, dNorth)
                 }
                 val srcLabel = snapped.placeId ?: if (snapped.isSnapped) "snap" else "raw"
+                // 2026-06-12ui — feed the debug panel's MATCHER group.
+                mmSrcDebug = srcLabel
+                mmConfDebug = matched?.confidence?.toFloat() ?: -1f
                 if (srcLabel != lastSnapSource) {
                     lastSnapSource = srcLabel
                     Log.i("LiveMatcher", "SNAP_SOURCE source=$srcLabel " +

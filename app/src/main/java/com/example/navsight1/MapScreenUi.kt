@@ -1,6 +1,10 @@
 package com.example.navsight1
 
 import androidx.compose.animation.*
+import androidx.compose.animation.core.RepeatMode
+import androidx.compose.animation.core.animateFloat
+import androidx.compose.animation.core.infiniteRepeatable
+import androidx.compose.animation.core.rememberInfiniteTransition
 import androidx.compose.animation.core.tween
 import androidx.compose.foundation.BorderStroke
 import androidx.compose.foundation.border
@@ -38,7 +42,9 @@ import kotlinx.coroutines.launch
 import kotlin.math.*
 
 @Composable
-fun MainScreen(viewModel: NavSightViewModel, pal: NavPalette, isNight: Boolean, onToggleNight: () -> Unit) {
+fun MainScreen(viewModel: NavSightViewModel, pal: NavPalette, isNight: Boolean,
+               nightModeLabel: String = if (isNight) "Night" else "Day",
+               onToggleNight: () -> Unit) {
     val orientation  = viewModel.orientationState
     val vio          = viewModel.vioState
     // Heading UI (compass label, map rotation, arrow) = the ROAD-LOCKED heading (the ball's road tangent)
@@ -55,6 +61,9 @@ fun MainScreen(viewModel: NavSightViewModel, pal: NavPalette, isNight: Boolean, 
     val isMoving        = vio.isInitialized && vio.meanFlow > 1.0
 
     var cameraVisible       by remember { mutableStateOf(false) }
+    // 2026-06-12b power-trim — the camera screen is the only consumer of the JNI overlay
+    // feeds (KLT dots, grid mesh, IPM candidates …); poll + compute them only while it's open.
+    LaunchedEffect(cameraVisible) { viewModel.setOverlayPolling(cameraVisible) }
     var debugVisible        by remember { mutableStateOf(false) }
     var calibrationVisible  by remember { mutableStateOf(false) }
     // 2026-05-17 — Allan-variance IMU recorder overlay. Standalone, does not
@@ -102,7 +111,7 @@ fun MainScreen(viewModel: NavSightViewModel, pal: NavPalette, isNight: Boolean, 
                     if (cameraVisible) {
                         // 2026-06-02 — ground-plane (horizon + road region), drawn FIRST so the KLT/SLAM
                         // dots sit on top. Empty until the estimator locks (its own validation signal).
-                        GroundPlaneOverlay(viewModel, pal)
+                        GroundPlaneOverlay(viewModel, pal, debugHud = debugVisible)
                         CameraFeatureOverlay(viewModel, pal)
                         // Phase 6.5 (post_v19_sprint_plan.md §205-298):
                         // persistent LandmarkMap dots (orange = observed
@@ -184,8 +193,17 @@ fun MainScreen(viewModel: NavSightViewModel, pal: NavPalette, isNight: Boolean, 
                 Modifier.align(Alignment.TopCenter).fillMaxWidth()
                     .statusBarsPadding().padding(horizontal = 10.dp, vertical = 6.dp)
             ) {
-                HeroHeader(viewModel.currentSpeedKmh, viewModel.groundFlowSpeedKmh, compassLabel, fusionMode,
-                    (vio.trackingQuality * 100).toFloat(), pal)
+                // 2026-06-12ui — slim header; the VIO chip subsumes the two status chips below
+                // (their σ readout lives in the debug panel) and opens the calibration sheet.
+                val vioChip = when {
+                    !vio.isInitialized || !viewModel.calibrationLoaded -> VioChipState.BAD
+                    !viewModel.positionCovValid || viewModel.positionSigmaM.isNaN() -> VioChipState.INIT
+                    viewModel.positionSigmaM >= 1.5f -> VioChipState.DEGRADED
+                    else -> VioChipState.GOOD
+                }
+                HeroHeader(viewModel.currentSpeedKmh, compassLabel, vioChip,
+                    onChipClick = { viewModel.showCalibrationSheet = true }, pal = pal)
+                /* LEGACY 2026-06-12ui — replaced by the header VIO chip (one status surface):
                 Spacer(Modifier.height(4.dp))
                 Row(verticalAlignment = Alignment.CenterVertically,
                     horizontalArrangement = Arrangement.spacedBy(6.dp)) {
@@ -200,7 +218,7 @@ fun MainScreen(viewModel: NavSightViewModel, pal: NavPalette, isNight: Boolean, 
                         pal = pal,
                         onClick = { calibrationVisible = true },
                     )
-                }
+                } */
                 if (!viewModel.calibrationLoaded) {
                     Spacer(Modifier.height(6.dp))
                     CalibrationFirstLaunchBanner(pal) { calibrationVisible = true }
@@ -227,7 +245,9 @@ fun MainScreen(viewModel: NavSightViewModel, pal: NavPalette, isNight: Boolean, 
                 verticalArrangement   = Arrangement.spacedBy(10.dp),
                 horizontalAlignment   = Alignment.End
             ) {
-                AnimatedVisibility(navState is NavigationState.Idle, enter = fadeIn(), exit = fadeOut()) {
+                // 2026-06-12ui — the radar is a DEV visual (it overlapped the search bar on the
+                // live screen); it now appears only with the debug panel.
+                AnimatedVisibility(debugVisible && navState is NavigationState.Idle, enter = fadeIn(), exit = fadeOut()) {
                     val radarHeading = remember(fusedHeading) { (Math.round(fusedHeading / 2f) * 2f) }
                     SensorRadarWaze(historySnapshot, radarHeading, pal)
                 }
@@ -247,6 +267,16 @@ fun MainScreen(viewModel: NavSightViewModel, pal: NavPalette, isNight: Boolean, 
             }
         }
 
+        // 2026-06-12ui — calibration sheet, opened from the header VIO chip (spec §3).
+        if (viewModel.showCalibrationSheet) {
+            CalibrationSheet(
+                viewModel = viewModel, pal = pal,
+                compassAzimuthDeg = viewModel.orientationState.azimuth,
+                onOpenCameraCalibration = { calibrationVisible = true },
+                onDismiss = { viewModel.showCalibrationSheet = false },
+            )
+        }
+
         BottomSheet(
             modifier       = Modifier.align(Alignment.BottomCenter),
             pal            = pal,
@@ -258,7 +288,8 @@ fun MainScreen(viewModel: NavSightViewModel, pal: NavPalette, isNight: Boolean, 
             onMapClick     = { if (cameraVisible) cameraVisible = false },
             onResetClick   = { viewModel.resetAll() },
             onStopNavClick = { viewModel.stopNavigation() },
-            onNightToggle  = onToggleNight
+            onNightToggle  = onToggleNight,
+            nightModeLabel = nightModeLabel,
         )
 
         // Recenter button — drawn AFTER the bottom sheet (so it's on top, not hidden under
@@ -421,7 +452,9 @@ fun NavigationMapWrapper(
             onMapLongClick      = { latLng -> viewModel.overrideStartLocation(latLng) }
         ) {
             val arrowIcon = remember { NavSightUtils.vectorToBitmap(context, R.drawable.navigation_arrow) }
-            val startIcon = remember { BitmapDescriptorFactory.defaultMarker(BitmapDescriptorFactory.HUE_AZURE) }
+            // 2026-06-12ui — start pin joins the brand palette (violet) and stops competing
+            // with the user arrow; slightly transparent so the arrow reads as THE marker.
+            val startIcon = remember { BitmapDescriptorFactory.defaultMarker(BitmapDescriptorFactory.HUE_VIOLET) }
             if (navState is NavigationState.Active) {
                 Polyline(points = navState.route.polyline, color = pal.teal, width = 14f, zIndex = 10f)
                 Marker(state = MarkerState(navState.route.destination), title = "Destination")
@@ -544,10 +577,66 @@ fun SensorRadarWaze(history: List<PathPoint>, currentAzimuth: Float, pal: NavPal
     }
 }
 
+// 2026-06-12ui — slim header (~48dp), approved mock header-final.html: compass circle left,
+// CENTERED speed (owner: "make the speed in the middle"), VIO status chip right (green ✓ /
+// red ⚠ pulsing; tap → calibration sheet). The old hero carried fusion-mode + track% + a raw
+// IPM line — those are dev signals and now live in the debug panel; the IPM *is* the speedometer.
 @Composable
-fun HeroHeader(speedKmh: Float, gpFlowKmh: Float?, compassLabel: String, fusionMode: String, qualityPct: Float, pal: NavPalette) {
-    // Health colors: fusion mode + tracking quality drive the two accent dots so a glance
-    // reads "where am I heading / how fast / is tracking healthy" without parsing text.
+fun HeroHeader(speedKmh: Float, compassLabel: String, chip: VioChipState,
+               onChipClick: () -> Unit, pal: NavPalette) {
+    Box(
+        Modifier.fillMaxWidth()
+            .clip(RoundedCornerShape(14.dp))
+            .background(Brush.linearGradient(listOf(HeroPurple, HeroPurpleDark)))
+            .border(BorderStroke(1.dp, Color.White.copy(0.14f)), RoundedCornerShape(14.dp))
+            .padding(horizontal = 14.dp, vertical = 9.dp)
+    ) {
+        Box(Modifier.size(30.dp).align(Alignment.CenterStart)
+            .clip(CircleShape).background(Color.White.copy(0.18f)),
+            contentAlignment = Alignment.Center) {
+            Text(compassLabel, color = Color.White, fontSize = 12.sp, fontWeight = FontWeight.Bold)
+        }
+        Row(Modifier.align(Alignment.Center), verticalAlignment = Alignment.Bottom) {
+            Text("%.0f".format(speedKmh), color = Color.White, fontSize = 26.sp,
+                fontWeight = FontWeight.ExtraBold, lineHeight = 26.sp)
+            Text(" km/h", color = Color.White.copy(0.8f), fontSize = 11.sp,
+                fontWeight = FontWeight.SemiBold, modifier = Modifier.padding(bottom = 3.dp))
+        }
+        VioChip(chip, onChipClick, Modifier.align(Alignment.CenterEnd))
+    }
+}
+
+// 2026-06-12ui — VIO health chip in the header. State derivation at the call site uses only
+// existing signals (vio.isInitialized, calibrationLoaded, positionCovValid, positionSigmaM);
+// the σ NUMBER moved to the debug panel. BAD pulses gently (approved mock).
+enum class VioChipState { GOOD, INIT, DEGRADED, BAD }
+
+@OptIn(androidx.compose.material3.ExperimentalMaterial3Api::class)
+@Composable
+fun VioChip(state: VioChipState, onClick: () -> Unit, modifier: Modifier = Modifier) {
+    val (label, color) = when (state) {
+        VioChipState.GOOD     -> "VIO ✓" to StatusGood
+        VioChipState.INIT     -> "VIO …" to Color(0xFF9E9E9E)
+        VioChipState.DEGRADED -> "VIO ~" to StatusWarn
+        VioChipState.BAD      -> "VIO ⚠" to StatusBad
+    }
+    val inf = rememberInfiniteTransition(label = "vio")
+    val pulse by inf.animateFloat(0.55f, 1f,
+        infiniteRepeatable(tween(900), RepeatMode.Reverse), label = "vioA")
+    val a = if (state == VioChipState.BAD) pulse else 1f
+    Surface(onClick = onClick, modifier = modifier, shape = RoundedCornerShape(10.dp),
+        color = color.copy(alpha = 0.25f * a),
+        border = BorderStroke(1.dp, color.copy(alpha = a))) {
+        Text(label, color = Color.White, fontSize = 10.sp, fontWeight = FontWeight.Bold,
+            modifier = Modifier.padding(horizontal = 10.dp, vertical = 5.dp))
+    }
+}
+
+/* LEGACY 2026-06-12ui — the old hero header (38sp speed + fabricated speed-limit circle +
+   fusion-mode dot + track% + raw IPM line). Replaced by the slim bar above per the approved
+   redesign; the dev signals it displayed live in the debug panel now.
+@Composable
+fun HeroHeaderLegacy(speedKmh: Float, gpFlowKmh: Float?, compassLabel: String, fusionMode: String, qualityPct: Float, pal: NavPalette) {
     val modeColor = when (fusionMode) {
         "CAMERA" -> Teal500
         "HYBRID" -> Orange400
@@ -559,7 +648,6 @@ fun HeroHeader(speedKmh: Float, gpFlowKmh: Float?, compassLabel: String, fusionM
         Modifier.fillMaxWidth()
             .clip(RoundedCornerShape(22.dp))
             .background(Brush.verticalGradient(listOf(HeroPurple, HeroPurpleDark)))
-            // Top highlight → soft bottom: a 1px gradient edge gives the bar real depth.
             .border(
                 BorderStroke(1.dp, Brush.verticalGradient(
                     listOf(Color.White.copy(0.22f), Color.White.copy(0.04f)))),
@@ -568,7 +656,6 @@ fun HeroHeader(speedKmh: Float, gpFlowKmh: Float?, compassLabel: String, fusionM
             .padding(horizontal = 18.dp, vertical = 9.dp)
     ) {
         Row(Modifier.fillMaxWidth(), Arrangement.SpaceBetween, Alignment.CenterVertically) {
-            // LEFT — heading (the big glyph) + fusion mode dot
             Column(horizontalAlignment = Alignment.Start) {
                 Text(compassLabel, color = Color.White, fontSize = 24.sp,
                     fontWeight = FontWeight.Black, lineHeight = 24.sp)
@@ -580,7 +667,6 @@ fun HeroHeader(speedKmh: Float, gpFlowKmh: Float?, compassLabel: String, fusionM
                         fontWeight = FontWeight.SemiBold, letterSpacing = 0.8.sp)
                 }
             }
-            // CENTER — the hero: live speed paired with the speed-limit sign
             Row(verticalAlignment = Alignment.CenterVertically,
                 horizontalArrangement = Arrangement.spacedBy(10.dp)) {
                 SpeedLimitCore(speedKmh)
@@ -589,16 +675,12 @@ fun HeroHeader(speedKmh: Float, gpFlowKmh: Float?, compassLabel: String, fusionM
                         fontWeight = FontWeight.Black, lineHeight = 34.sp)
                     Text("KM/H", color = Color.White.copy(0.6f), fontSize = 9.sp,
                         letterSpacing = 3.sp, fontWeight = FontWeight.Bold)
-                    // READ-ONLY IPM ground-plane speed (the candidate scooter speed-fix), shown small
-                    // under the live speed so it can be eyeballed against it. "--" until it fires (needs
-                    // road texture / ≥5 inliers). Teal = a separate debug channel, NOT the speedometer.
                     Text(gpFlowKmh?.let { "IPM ${"%.0f".format(it)}" } ?: "IPM --",
                         color = Teal500.copy(0.9f), fontSize = 9.sp,
                         letterSpacing = 1.sp, fontWeight = FontWeight.Bold,
                         modifier = Modifier.padding(top = 2.dp))
                 }
             }
-            // RIGHT — tracking-quality readout with a health dot
             Column(horizontalAlignment = Alignment.End) {
                 Row(verticalAlignment = Alignment.CenterVertically,
                     horizontalArrangement = Arrangement.spacedBy(4.dp)) {
@@ -613,6 +695,7 @@ fun HeroHeader(speedKmh: Float, gpFlowKmh: Float?, compassLabel: String, fusionM
         }
     }
 }
+*/
 
 @Composable
 fun HeroMiniBadge(icon: androidx.compose.ui.graphics.vector.ImageVector, text: String, bg: Color) {
@@ -666,6 +749,9 @@ fun VioStatusChip(
     }
 }
 
+/* LEGACY 2026-06-12ui — the "speed limit" circle displayed max(30, ceil(speed/10)*10): a
+   FABRICATED number derived from the current speed, not a real limit. Removed from the UI
+   per the approved redesign (spec §2); kept per the no-delete rule.
 @Composable
 fun SpeedLimitCore(speedKmh: Float) {
     Surface(color = Color.White, shape = CircleShape, border = BorderStroke(4.dp, Color(0xFFFF6A5E))) {
@@ -687,6 +773,7 @@ fun SpeedLimitBadge(modifier: Modifier, speedKmh: Float, pal: NavPalette) {
         }
     }
 }
+*/
 
 @Composable
 fun MapActionStack(
@@ -697,8 +784,10 @@ fun MapActionStack(
 ) {
     Column(verticalArrangement = Arrangement.spacedBy(8.dp), horizontalAlignment = Alignment.CenterHorizontally) {
         FloatingMapButton(Icons.Default.PhotoCamera, onCameraClick)
-        FloatingMapButton(Icons.Default.CenterFocusStrong, onCalibrateClick)
-        FloatingMapButton(Icons.Default.Tune, onDebugClick, Color.Black, Color.White)
+        // LEGACY 2026-06-12ui — calibration moved to the header VIO chip → calibration sheet;
+        // the middle FAB is retired (spec §2). Param kept for source compatibility.
+        // FloatingMapButton(Icons.Default.CenterFocusStrong, onCalibrateClick)
+        FloatingMapButton(Icons.Default.Tune, onDebugClick, DarkCard, Color.White)
     }
 }
 

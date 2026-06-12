@@ -35,8 +35,13 @@ class MainActivity : ComponentActivity() {
     @Composable
     fun NavSightApp() {
         var showSplash by remember { mutableStateOf(true) }
-        var isNight    by remember { mutableStateOf(isNightTime()) }
-        LaunchedEffect(Unit) { while (true) { delay(60_000L); isNight = isNightTime() } }
+        // 2026-06-12ui — 3-state night mode (spec §6): auto / day / night, persisted. The old
+        // code re-evaluated isNightTime() every 60 s and silently OVERRODE a manual toggle.
+        val uiPrefs = remember { getSharedPreferences("navsight_ui", MODE_PRIVATE) }
+        var nightMode by remember { mutableStateOf(uiPrefs.getString("night_mode", "auto") ?: "auto") }
+        var autoNight by remember { mutableStateOf(isNightTime()) }
+        LaunchedEffect(Unit) { while (true) { delay(60_000L); autoNight = isNightTime() } }
+        val isNight = when (nightMode) { "day" -> false; "night" -> true; else -> autoNight }
         val pal = remember(isNight) { buildNavPalette(isNight) }
 
         if (showSplash) { SplashScreen(pal) { showSplash = false }; return }
@@ -48,6 +53,10 @@ class MainActivity : ComponentActivity() {
             if (perms.allPermissionsGranted) viewModel.requestInitialLocation(true)
         }
         if (!perms.allPermissionsGranted) PermissionScreen(pal) { perms.launchMultiplePermissionRequest() }
-        else MainScreen(viewModel, pal, isNight) { isNight = !isNight }
+        else MainScreen(viewModel, pal, isNight,
+            nightModeLabel = when (nightMode) { "auto" -> "Auto"; "day" -> "Day"; else -> "Night" }) {
+            nightMode = when (nightMode) { "auto" -> "day"; "day" -> "night"; else -> "auto" }
+            uiPrefs.edit().putString("night_mode", nightMode).apply()
+        }
     }
 }

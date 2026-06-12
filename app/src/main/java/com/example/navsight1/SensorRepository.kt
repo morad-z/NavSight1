@@ -1276,7 +1276,28 @@ class SensorRepository(private val context: Context) : SensorEventListener {
      * frame even when all four fields change. Compare to four flows: four
      * invalidations per frame, four StateFlow writes, four equality checks.
      */
+    // 2026-06-12b power-trim — overlay polling runs ONLY while the camera screen is open
+    // (MapScreen sets this via the ViewModel on cameraVisible changes). The native side
+    // lazy-computes its overlay products off these polls, so map-view riding stops paying
+    // ~7 JNI array copies + a Compose snapshot publish per frame. Camera screen unchanged.
+    @Volatile var overlayPollingEnabled = false
+
     private fun publishOverlaySnapshot(vio: VioData) {
+        if (!overlayPollingEnabled) {
+            // One EMPTY publish on the transition so stale overlays clear, then no churn.
+            if (_overlaySnapshot.value.trackedAges.isNotEmpty() ||
+                _overlaySnapshot.value.groundGridSegs.isNotEmpty() ||
+                _overlaySnapshot.value.ipmCandidates.isNotEmpty()) {
+                _overlaySnapshot.value = OverlaySnapshot(
+                    trackedPoints = emptyFloats, trackedAges = emptyInts,
+                    slamSnapshot = emptyFloats, cameraPose = emptyFloats,
+                    loopClosureCount = 0, trackedInlierFlags = emptyBytes,
+                    groundPlane = emptyFloats, ipmInlierPoints = emptyFloats,
+                    groundGridSegs = emptyFloats, ipmCandidates = emptyFloats,
+                )
+            }
+            return
+        }
         // Phase 2: ages parallel to vio.trackedPoints.
         val expectedAgeCount = vio.trackedPoints.size / 2
         val agesArr: IntArray = if (expectedAgeCount <= 0) emptyInts

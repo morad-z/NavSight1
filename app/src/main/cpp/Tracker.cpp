@@ -3759,7 +3759,10 @@ VisionOutput Tracker::processFrame(const uint8_t* yuv_data, int width, int heigh
                 // recoverPose translation; Δp/Δv/dt from imu.integrate over
                 // the frame). Every OBSERVER_C_SOLVE_INTERVAL pairs, run
                 // solve() and feed (s, var) into scale_fuser_ if healthy.
-                if (!is_pure_rotation && !is_static
+                // 2026-06-12b — kScaleEstimatorViEnabled (Tracker.h): the estimator's output
+                // was disabled 2026-05-29 (Step B dead-end); this gate stops the orphaned
+                // per-keyframe accumulation + periodic solve that kept running for nothing.
+                if (kScaleEstimatorViEnabled && !is_pure_rotation && !is_static
                     && imu_delta.dt > 0.005 && imu_delta.dt < 1.0
                     && !t_vo.empty() && cv::norm(t_vo) > 0.5) {
                     ScaleEstimatorVI::KeyframePair kp;
@@ -4664,6 +4667,11 @@ VisionOutput Tracker::processFrame(const uint8_t* yuv_data, int width, int heigh
         //
         // All of this is gated on isFullInitialized(); the EKF must own
         // the pose (Step 4 of the inertial plan) before SLAM updates land.
+        // 2026-06-12 — OWNER DECISION (kSlamLiveEnabled, Tracker.h): the whole §11.1b block
+        // is disabled — promotions have been 0 on every ride since the forward-degeneracy
+        // finding, so the block burned per-keyframe triangulation/re-scoring for nothing.
+        // The flag wraps the ORIGINAL code unmodified (intentionally not re-indented).
+        if (kSlamLiveEnabled) {
         int64_t t_slam_block_start = now_us();
         int64_t t_slam_promote_us = 0;
         int64_t t_slam_update_us  = 0;
@@ -5351,6 +5359,7 @@ VisionOutput Tracker::processFrame(const uint8_t* yuv_data, int width, int heigh
                  feature_mgr_.getLifecycleSize(),
                  n_lifecycle_dropped);
         }
+        }  // if (kSlamLiveEnabled) — 2026-06-12 owner power-trim (§11.1b end)
 
         // ── 11.2 Keyframe heading drift correction (Step 2.1, 2.2) ──
         // Every keyframe interval, match current frame against the last keyframe.
@@ -6945,7 +6954,12 @@ VisionOutput Tracker::processFrame(const uint8_t* yuv_data, int width, int heigh
     // and dividing the KNOWN camera height by the plane's VIO-scale height. Runs every kGroundPlaneInterval
     // frames, only when a camera height has been set (scooter mount). NEVER feeds the dot — it is logged
     // for offline scoring vs GPS and drawn on the camera overlay. Cheap (~1-2 ms / few frames).
-    if (camera_height_m_ > 0.0 && (frame_counter_ % kGroundPlaneInterval) == 0 &&
+    // 2026-06-12b — overlay lazy-compute: this LEGACY estimator (superseded by
+    // updateGroundFlowSpeed for the actual speed) only feeds the camera overlay's
+    // [valid, horizon, conf …] snapshot + an offline-scoring log line, so it now runs only
+    // while the camera screen is polling overlays (overlayRecentlyPolled).
+    if (camera_height_m_ > 0.0 && overlayRecentlyPolled() &&
+        (frame_counter_ % kGroundPlaneInterval) == 0 &&
         points_3d_current_.size() >= 12 && next_good_buf_.size() >= points_3d_current_.size()) {
         GroundPlaneResult gp = ground_plane_estimator_.estimate(
             next_good_buf_, points_3d_current_, gray_buf_.cols, gray_buf_.rows,
@@ -6965,7 +6979,8 @@ VisionOutput Tracker::processFrame(const uint8_t* yuv_data, int width, int heigh
     }
     // AV-style ground-plane GRID for the camera overlay — runs every frame when a camera height is set
     // (independent of is_static, so it shows while stopped too), gated internally on IMU gravity-settle.
-    if (camera_height_m_ > 0.0) computeGroundGrid(imu);
+    // 2026-06-12b — + overlay lazy-compute: the grid is display-only; skip it while nothing polls.
+    if (camera_height_m_ > 0.0 && overlayRecentlyPolled()) computeGroundGrid(imu);
     return out;
 }
 
@@ -7730,6 +7745,15 @@ void Tracker::shutdownBA() {
 //     buffers are torn down (called from reset() and ~Tracker()).
 
 bool Tracker::loadLoopClosureVocabulary(const std::string& vocab_path) {
+    // 2026-06-12 — OWNER DECISION (kLoopClosureEnabled, Tracker.h — full rationale there):
+    // skipping the vocabulary load disables, through the existing isReady() gate, the LC
+    // worker thread, the keyframe + LandmarkMap pipeline, and the windowed-BA kickoff in
+    // one place — and the ~50 MB DBoW2 vocabulary never loads. ORB reloc is unaffected.
+    if (!kLoopClosureEnabled) {
+        LOGI("Tracker: loop-closure/LandmarkMap/windowed-BA DISABLED "
+             "(kLoopClosureEnabled=false, owner power-trim 2026-06-12) — vocabulary not loaded");
+        return false;
+    }
     // Forward to the detector. On success we lazily start the worker
     // thread — until the vocabulary loads `tryDetectLoop` would no-op
     // anyway (gated on isReady()), so deferring the thread launch keeps
@@ -9303,6 +9327,11 @@ void Tracker::updateGroundFlowSpeed(const std::vector<cv::Point2f>& prev_ud,
     }
 
     std::vector<double> speeds;
+    // 2026-06-12b — overlay lazy-compute: the per-point VIZ packaging (inlier pixels +
+    // candidate dots) is display-only; build it only while the camera screen polls.
+    // The ESTIMATOR (votes/zero-witnesses/median) and the band diagnostic persisted into
+    // the sim JSON (ipm_band) are NOT affected by this gate.
+    const bool viz_wanted = overlayRecentlyPolled();
     std::vector<cv::Point2f> inlier_px;   // 2026-06-02 VIZ — road pixels the IPM used (current frame)
     int n_in_road = 0;   // FUNNEL diag: points in the lower-image road region
     int n_denom_ok = 0;  // FUNNEL diag: of those, points with a well-conditioned ground-plane denom
@@ -9370,11 +9399,13 @@ void Tracker::updateGroundFlowSpeed(const std::vector<cv::Point2f>& prev_ud,
                 (kIpmSigmaGate * sigma_v <= kIpmZeroWitnessMaxFloorMps);
             const bool survived = !below_floor && (v_i < 50.0 && cos_fa < -kIpmFwdCoherenceMin);
             dbg_surv.push_back(survived ? 1 : 0);                       // 2026-06-04 IPM_PERPT
-            cand_viz.emplace_back(next_ud[i].x, next_ud[i].y,           // 2026-06-04 diag overlay
-                                  static_cast<float>(v_i * 3.6), survived ? 1.0f : 0.0f);
+            if (viz_wanted)                                             // 2026-06-12b lazy viz
+                cand_viz.emplace_back(next_ud[i].x, next_ud[i].y,       // 2026-06-04 diag overlay
+                                      static_cast<float>(v_i * 3.6), survived ? 1.0f : 0.0f);
             if (survived) {
                 speeds.push_back(v_i);
-                inlier_px.push_back(next_ud[i]);   // VIZ — this road pixel fed the speed (current frame)
+                if (viz_wanted)
+                    inlier_px.push_back(next_ud[i]);   // VIZ — this road pixel fed the speed (current frame)
             } else if (zero_witness) {
                 ++n_zero_witness;
             } else {

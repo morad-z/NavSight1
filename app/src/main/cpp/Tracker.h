@@ -25,6 +25,7 @@
 // #include "VisualMap.h"
 #include "WindowedBA.h"
 #include "GroundPlaneEstimator.h"
+#include <chrono>   // 2026-06-12b — overlay lazy-compute recency clock
 
 #include "InertialInitializer.h"
 #include "LoopClosureDetector.h"
@@ -214,10 +215,30 @@ public:
     double getGroundFlowSpeedMps() const {
         return ground_flow_speed_mps_.load(std::memory_order_relaxed);
     }
+    // 2026-06-12b power-trim — overlay LAZY-COMPUTE. The camera-screen overlay products
+    // (grid mesh, IPM candidate viz, legacy ground-plane snapshot) are computed only while a
+    // JNI overlay getter has polled within the last 1.5 s. Kotlin polls them only while the
+    // camera view is open, so on the map view this work self-disables. THE CAMERA SCREEN IS
+    // UNAFFECTED (owner: "don't turn off stuff used there") — at worst the first overlay tick
+    // after opening the camera misses, then everything streams exactly as before. 1.5 s =
+    // comfortably above the ~30 ms poll cadence, small enough that closing the camera stops
+    // the work within two seconds.
+    void noteOverlayPoll() const {
+        last_overlay_poll_ns_.store(
+            std::chrono::duration_cast<std::chrono::nanoseconds>(
+                std::chrono::steady_clock::now().time_since_epoch()).count(),
+            std::memory_order_relaxed);
+    }
+    bool overlayRecentlyPolled() const {
+        const int64_t now_ns = std::chrono::duration_cast<std::chrono::nanoseconds>(
+            std::chrono::steady_clock::now().time_since_epoch()).count();
+        return now_ns - last_overlay_poll_ns_.load(std::memory_order_relaxed) < 1'500'000'000LL;
+    }
     // 2026-06-02 — IPM ground-plane VIZ: copies the pixel positions (x,y pairs, analyzer/undistorted
     // coords) of the road pixels the IPM speed actually USED this frame into out; returns the point
     // count. Lets the camera overlay show WHICH pixels are recognized as ground. Read-only / display.
     int getIpmInlierPixels(std::vector<float>& out) const {
+        noteOverlayPoll();   // 2026-06-12b — overlay consumer is live
         std::lock_guard<std::mutex> lk(ipm_viz_mutex_);
         out.clear();
         out.reserve(ipm_inlier_px_.size() * 2);
@@ -229,6 +250,7 @@ public:
     // rejects. Lets the owner SEE live whether the near (fast) road points read fast and survive the
     // coherence gate, vs being dropped/diluted. Read-only / display.
     int getIpmCandidates(std::vector<float>& out) const {
+        noteOverlayPoll();   // 2026-06-12b — overlay consumer is live
         std::lock_guard<std::mutex> lk(ipm_viz_mutex_);
         out.clear();
         out.reserve(ipm_cand_viz_.size() * 4);
@@ -248,6 +270,7 @@ public:
     // (gravity-down + mount height + heading) projected onto the image — it shows WHERE the system thinks
     // the flat road surface is (the AV "ground mesh"). Empty until the EKF is gravity-aligned. Display-only.
     int getGroundGridSegments(std::vector<float>& out) const {
+        noteOverlayPoll();   // 2026-06-12b — overlay consumer is live
         std::lock_guard<std::mutex> lk(ground_grid_mutex_);
         out = ground_grid_segs_;
         return static_cast<int>(ground_grid_segs_.size() / 4);
@@ -646,6 +669,9 @@ private:
     // pixels are recognized as ground. Guarded by its own mutex (written camera-thread in
     // updateGroundFlowSpeed, read by the JNI overlay getter). Display-only; never feeds the dot.
     mutable std::mutex ipm_viz_mutex_;
+    // 2026-06-12b — wall-clock (steady) ns of the last overlay-getter poll; drives the
+    // overlay lazy-compute (see noteOverlayPoll/overlayRecentlyPolled in the public section).
+    mutable std::atomic<int64_t> last_overlay_poll_ns_{0};
     std::vector<cv::Point2f> ipm_inlier_px_;
     std::vector<cv::Vec4f> ipm_cand_viz_;   // 2026-06-04 — ALL road candidates (x,y,vi_kmh,survived) for the diag overlay
     std::vector<float> ipm_band_diag_;      // 2026-06-04 — packed near/mid/far band diag (15 floats), persisted to SIM JSON
@@ -1223,6 +1249,36 @@ private:
     //   * 10 frames damping ramp        — ADR-006 schedule
     //   * 0.05 m² translation variance  — Step 7 acceptance criteria
     //   * (3°)² ≈ 2.74e-3 rad² rotation — typical PnP-inlier σ at N≥30
+    // ── 2026-06-12 OWNER DECISION — ride-power trim ─────────────────────────────────────
+    // Measured on val_2026_06_12 ride2 (99 s): SLAM promotions = 0 (dead since the forward-
+    // degeneracy finding), loop closure 39 attempts → 0 accepts, LandmarkMap did 4,038
+    // observations + 492 adds that no user-facing output consumes (its EKF position updates
+    // are overwritten by setPosition(global_t_)), windowed BA solved 4× for nothing
+    // downstream. The map-matched rail ball (shipped 2026-06-12) now does the on-road
+    // correcting loop closure was kept for; the 2026-05-31 "keep LC" verdict assumed map
+    // matching was unproven — that premise no longer holds. Owner: "comment them out …
+    // don't delete." These flags ARE the comment-out (C++ block comments don't nest; a
+    // named compile-time flag keeps the code building so it cannot rot, and re-enabling is
+    // a one-word change):
+    //   * kLoopClosureEnabled=false → loadLoopClosureVocabulary early-returns: the DBoW2
+    //     vocabulary (~50 MB RAM) never loads, the 1 Hz worker never starts, and the entire
+    //     keyframe block gated on loop_closure_.isReady() in processFrame — LC keyframe
+    //     publish, the WHOLE LandmarkMap pipeline, and the windowed-BA kickoff — self-
+    //     disables through the existing gate. ORB relocalization is NOT affected (its
+    //     descriptor ring is fed OUTSIDE that block; reloc accepted 4× on today's rides).
+    //   * kSlamLiveEnabled=false → the §11.1b SLAM-in-EKF block (promote/update/demote/
+    //     expire) is skipped; with zero promotions it was already iterating nothing.
+    // NOT disabled (verified used): MSCKF/EKF updates (σ ring + VIO chip + rotation),
+    // MiDaS + depth-flow/looming (advance the raw trajectory via TRANS_FALLBACK — 36× on
+    // the 06-04 ride; the raw trace feeds the matcher window), ORB relocalization.
+    static constexpr bool kLoopClosureEnabled = false;
+    static constexpr bool kSlamLiveEnabled    = false;
+    // 2026-06-12b (power-trim round 2) — ScaleEstimatorVI's OUTPUT was disabled 2026-05-29
+    // (Step B dead-end: errors-in-variables, unsalvageable offline) but the per-keyframe
+    // ACCUMULATION (KeyframePair build + addKeyframePair + periodic solve) kept running and
+    // feeding nothing. Off entirely; flip to resume the experiment.
+    static constexpr bool kScaleEstimatorViEnabled = false;
+
     static constexpr double  LOOP_CLOSURE_QUERY_PERIOD_S      = 1.0;
     static constexpr int64_t LOOP_CLOSURE_TEMPORAL_EXCL_NS    = 30LL * 1'000'000'000LL;
     static constexpr int     LOOP_CLOSURE_DAMPING_FRAMES      = 10;

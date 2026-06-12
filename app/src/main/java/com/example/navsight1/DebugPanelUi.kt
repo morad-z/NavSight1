@@ -72,15 +72,32 @@ fun DebugPanel(
                 )
             }
 
+            // 2026-06-12ui — grouped readouts (spec §4): everything that left the user-facing
+            // surfaces (σ from the old chip, raw IPM from the old hero, mode/track%) lives here.
             HorizontalDivider(color = pal.teal.copy(0.1f), thickness = 0.5.dp)
+            Text("SPEED", color = pal.textSecondary, fontSize = 8.sp, letterSpacing = 1.2.sp, fontWeight = FontWeight.Bold)
             DebugRow("Dist",    "${"%.2f".format(totalDistanceM)} m", pal.teal, pal)
             DebugRow("Speed",   "${"%.1f".format(speedMs * 3.6f)} km/h", pal.teal, pal)
+            DebugRow("IPM raw", viewModel.groundFlowSpeedKmh?.let { "${"%.1f".format(it)} km/h" } ?: "--",
+                pal.teal, pal)
+            Text("VIO", color = pal.textSecondary, fontSize = 8.sp, letterSpacing = 1.2.sp, fontWeight = FontWeight.Bold)
             DebugRow("Quality", "${"%.0f".format(qualityPct)}%",
-                when { qualityPct > 70f -> pal.teal; qualityPct > 30f -> pal.orange; else -> Color(0xFFEF5350) }, pal)
+                when { qualityPct > 70f -> pal.statusGood; qualityPct > 30f -> pal.statusWarn; else -> pal.statusBad }, pal)
             DebugRow("Mode",    fusionMode,
-                when (fusionMode) { "CAMERA" -> pal.teal; "HYBRID" -> pal.orange; else -> pal.textSecondary }, pal)
+                when (fusionMode) { "CAMERA" -> pal.statusGood; "HYBRID" -> pal.statusWarn; else -> pal.textSecondary }, pal)
+            DebugRow("σ pos",   if (viewModel.positionCovValid && !viewModel.positionSigmaM.isNaN())
+                "${"%.2f".format(viewModel.positionSigmaM)} m" else "--",
+                when { !viewModel.positionCovValid -> pal.textSecondary
+                       viewModel.positionSigmaM < 1.5f -> pal.statusGood; else -> pal.statusWarn }, pal)
             DebugRow("Scale",   "${"%.4f".format(scaleFactor)}", Teal400, pal)
             DebugRow("Heading", "${"%.1f".format(headingDeg)}°", pal.textSecondary, pal)
+            Text("MATCHER", color = pal.textSecondary, fontSize = 8.sp, letterSpacing = 1.2.sp, fontWeight = FontWeight.Bold)
+            DebugRow("State", viewModel.maneuverState.name, pal.textSecondary, pal)
+            DebugRow("Src",   viewModel.mmSrcDebug, pal.textSecondary, pal)
+            DebugRow("Conf",  if (viewModel.mmConfDebug >= 0f) "%.2f".format(viewModel.mmConfDebug) else "--",
+                when { viewModel.mmConfDebug >= 0.55f -> pal.statusGood
+                       viewModel.mmConfDebug >= 0.30f -> pal.statusWarn; else -> pal.textSecondary }, pal)
+            DebugRow("Rail°", viewModel.railBearingDeg?.let { "%.0f".format(it) } ?: "--", pal.textSecondary, pal)
 
             HorizontalDivider(color = pal.teal.copy(0.2f), thickness = 0.5.dp)
             Row(Modifier.fillMaxWidth(), Arrangement.SpaceBetween, Alignment.CenterVertically) {
