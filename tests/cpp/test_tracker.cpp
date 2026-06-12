@@ -81,7 +81,9 @@ TEST_F(TrackerTest, StaticScene_HeadingStable) {
     auto frame = test_utils::createSyntheticNV21(W, H, features);
 
     // Initialize with a known heading
-    tracker.setInitialHeading(1.0); // ~57 degrees
+    // 2026-06-12 — signature gained the IMUPreintegrator arg in cbf20f0 (2026-05-19); the fixture's imu
+    // (static-fed in the loop below) preserves the test's intent.
+    tracker.setInitialHeading(1.0, imu); // ~57 degrees
     double initial_heading = tracker.getHeading();
 
     int num_frames = 90; // 3 seconds at 30fps
@@ -386,7 +388,7 @@ TEST_F(TrackerTest, KeyframeHeadingCorrection_NoExplosion) {
     // Feed enough frames to trigger keyframe matching (every 15 frames).
     auto features = test_utils::generateFeatureGrid(W, H);
 
-    tracker.setInitialHeading(0.5);  // ~28 degrees
+    tracker.setInitialHeading(0.5, imu);  // ~28 degrees (2026-06-12: + imu arg, see cbf20f0)
     double prev_heading = 0.5;
 
     for (int i = 0; i < 60; i++) {

@@ -224,6 +224,25 @@ public:
         for (const auto& p : ipm_inlier_px_) { out.push_back(p.x); out.push_back(p.y); }
         return static_cast<int>(ipm_inlier_px_.size());
     }
+    // 2026-06-04 — IPM per-point DIAGNOSTIC: ALL road candidates this frame as (x, y, vi_kmh, survived),
+    // 4 floats each, so the overlay can colour each road point by its reported speed and show the gate
+    // rejects. Lets the owner SEE live whether the near (fast) road points read fast and survive the
+    // coherence gate, vs being dropped/diluted. Read-only / display.
+    int getIpmCandidates(std::vector<float>& out) const {
+        std::lock_guard<std::mutex> lk(ipm_viz_mutex_);
+        out.clear();
+        out.reserve(ipm_cand_viz_.size() * 4);
+        for (const auto& p : ipm_cand_viz_) { out.push_back(p[0]); out.push_back(p[1]); out.push_back(p[2]); out.push_back(p[3]); }
+        return static_cast<int>(ipm_cand_viz_.size());
+    }
+    // 2026-06-04 — IPM per-DEPTH-BAND diagnostic packed for PERSISTENCE in the sim JSON (logcat rolls off
+    // before a long ride returns): 15 floats = near/mid/far × (n, flow_px, vi_kmh, cos_fa, survived).
+    // Empty until the IPM has run on a frame. Read-only.
+    int getIpmBandDiag(std::vector<float>& out) const {
+        std::lock_guard<std::mutex> lk(ipm_viz_mutex_);
+        out = ipm_band_diag_;
+        return static_cast<int>(ipm_band_diag_.size());
+    }
     // 2026-06-02 — AV-style ground-plane GRID: copies the projected grid line SEGMENTS (x0,y0,x1,y1 per
     // segment, analyzer pixels) into out; returns the segment count. The grid is the IPM ground plane
     // (gravity-down + mount height + heading) projected onto the image — it shows WHERE the system thinks
@@ -617,6 +636,10 @@ private:
     // Uses known camera height + de-rotated vertical flow of road pixels to recover
     // metric speed. Independent of KLT triangulation or MiDaS.
     std::atomic<double> ground_flow_speed_mps_{-1.0};
+    // 2026-06-12c — frames since the last IPM MEASUREMENT (vote median or zero-lock) was accepted into
+    // ground_flow_speed_mps_. Bounds the accel bridge in predictGroundSpeed (camera thread only;
+    // starts huge = no bridging before the first real measurement exists).
+    int gp_frames_since_meas_ = 1 << 20;
 
     // 2026-06-02 — IPM ground-plane VIZ: the road-inlier pixel positions updateGroundFlowSpeed used
     // this frame (analyzer/undistorted coords), for the camera overlay so the rider can SEE which
@@ -624,6 +647,8 @@ private:
     // updateGroundFlowSpeed, read by the JNI overlay getter). Display-only; never feeds the dot.
     mutable std::mutex ipm_viz_mutex_;
     std::vector<cv::Point2f> ipm_inlier_px_;
+    std::vector<cv::Vec4f> ipm_cand_viz_;   // 2026-06-04 — ALL road candidates (x,y,vi_kmh,survived) for the diag overlay
+    std::vector<float> ipm_band_diag_;      // 2026-06-04 — packed near/mid/far band diag (15 floats), persisted to SIM JSON
 
     // 2026-06-02 — AV-style ground-plane GRID line segments (x0,y0,x1,y1 per segment, analyzer pixels):
     // the IPM ground plane (gravity + mount height + heading) projected onto the image so the rider sees
@@ -688,6 +713,15 @@ private:
                                double dt_s,
                                const cv::Vec3d& gyro_rot_cam,
                                const IMUPreintegrator& imu);
+    // 2026-06-12 — gravity→camera ground-plane normal (n_up_c = R_bc·ĝ), the shared first stage of the
+    // IPM: lets the processFrame IPM front-end build its road-region detection mask from the identical
+    // geometry updateGroundFlowSpeed applies per point. False = no gravity yet / camera looking up.
+    bool computeGroundNormalCam(const IMUPreintegrator& imu, cv::Vec3d& n_up_c) const;
+    // 2026-06-12c — accel PREDICT step of the ground-speed filter (impl in Tracker.cpp): runs EVERY
+    // frame, including the frames the gated IPM block skips (blur / <8 tracked points / sustained yaw)
+    // — exactly the frames the bridge must carry. updateGroundFlowSpeed supplies the CORRECT step.
+    void predictGroundSpeed(const PreintegratedMeasurement& imu_delta,
+                            const IMUPreintegrator& imu, double dt_s);
     // 2026-06-02 — projects the IPM ground plane (gravity-down + mount height + heading) into a
     // perspective grid of image-pixel line segments for the AV-style camera overlay. Gravity gives the
     // tilt, so the grid sits flat on the road when the geometry is right. Uses the IMU/Madgwick attitude

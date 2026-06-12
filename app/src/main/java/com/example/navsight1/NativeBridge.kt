@@ -180,6 +180,13 @@ object NativeBridge {
     // speed used this frame. Caller preallocates a FloatArray; returns the number of FLOATS written
     // (2 per point). Drawn as amber dots on the camera overlay so the rider sees the ground recognition.
     external fun getIpmInlierPoints(out: FloatArray): Int
+    // 2026-06-04 — IPM per-point DIAGNOSTIC: ALL road candidates this frame as (x, y, vi_kmh, survived),
+    // 4 floats/point. Returns #floats written. Drawn as speed-graded dots (rejects in red) so the rider
+    // can SEE whether the near/fast road points read fast and survive the coherence gate. Display-only.
+    external fun getIpmCandidates(out: FloatArray): Int
+    // 2026-06-04 — IPM per-DEPTH-BAND diagnostic (15 floats: near/mid/far × n,flow_px,vi_kmh,cos_fa,survived).
+    // Persisted into the sim JSON so it survives a long ride (logcat rolls off). Returns #floats written.
+    external fun getIpmBandDiag(out: FloatArray): Int
     // 2026-06-02 — AV-style ground-plane GRID line segments [x0,y0,x1,y1, ...] (analyzer pixels): the IPM
     // ground plane projected onto the image. Caller preallocates a FloatArray; returns #floats (4/segment).
     // Drawn as a perspective road mesh on the camera overlay so the rider sees where the road plane is.

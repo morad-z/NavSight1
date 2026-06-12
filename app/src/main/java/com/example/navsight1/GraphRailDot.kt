@@ -44,6 +44,16 @@ internal class GraphRailDot(private val graph: GraphStore) {
     private var t = 0.0     // fraction along u → w in [0,1]
     var acquired = false
         private set
+    // 2026-06-12 — true when THIS advance() crossed a vertex offering ≥2 eligible continuations (a real
+    // junction DECISION, not a curve shape-point). The caller re-anchors its gyro-relative steering
+    // reference ONLY then. Re-anchoring on every >1° facing change (the old rule) zeroed the user's
+    // accumulated rotation at every curve vertex (06-04 ride logcat: 49/49 re-anchors were 2-7° curve
+    // steps) — that glued the steering to the road's own tangent, which (a) made the ball prefer the
+    // chord-straight branch at forks on curves and (b) made a roundabout ring inescapable (the exit arm
+    // could never beat the ring tangent).
+    var lastAdvanceTookDecision = false
+        private set
+    private var choiceHadAlternatives = false
 
     /** Current on-graph position, or null when not acquired (off-road / no graph). */
     fun position(): GeoPt? = if (acquired) interp(u, w, t) else null
@@ -102,6 +112,7 @@ internal class GraphRailDot(private val graph: GraphStore) {
      * in place (returns the current position).
      */
     fun advance(distM: Double, bearingDeg: Double): GeoPt? {
+        lastAdvanceTookDecision = false   // 2026-06-12 — set below when a junction choice happens
         if (!acquired) return null
         // NOTE: the facing (forward vs backward along the road) is NOT decided here per-tick — that was
         // fragile and flipped on noise. The caller detects a SUSTAINED reversal (a real U-turn or a
@@ -116,6 +127,7 @@ internal class GraphRailDot(private val graph: GraphStore) {
                 // never divide by ~0 or stall. If the only "exit" is the same vertex (a self-loop),
                 // bail out instead of spinning the backstop 64× every tick (review HIGH).
                 val next = chooseNextNeighbor(w, prevVertex = u, desiredBearingDeg = effectiveBearing(bearingDeg))
+                if (choiceHadAlternatives) lastAdvanceTookDecision = true
                 if (next == w) break
                 u = w; w = next; t = 0.0; hops++
                 continue
@@ -128,6 +140,7 @@ internal class GraphRailDot(private val graph: GraphStore) {
             // Consume the rest of this edge and turn at the junction onto a CONNECTED edge.
             move -= edgeRemaining
             val next = chooseNextNeighbor(w, prevVertex = u, desiredBearingDeg = effectiveBearing(bearingDeg))
+            if (choiceHadAlternatives) lastAdvanceTookDecision = true
             u = w; w = next; t = 0.0; hops++
         }
         // If we exhausted the hop backstop we are stuck on a degenerate/tiny disconnected component —
@@ -161,14 +174,17 @@ internal class GraphRailDot(private val graph: GraphStore) {
         val deg = graph.degreeOf(junction)
         var best = -1
         var bestScore = Double.POSITIVE_INFINITY
+        var eligible = 0   // 2026-06-12 — ≥2 eligible continuations = a real junction decision
         for (k in 0 until deg) {
             val nb = graph.neighborAt(junction, k)
             if (nb == prevVertex && deg > 1) continue   // no instant U-turn unless dead-end
+            eligible++
             val b = ManeuverMath.bearingDeg(graph.vLatAt(junction), graph.vLngAt(junction),
                                             graph.vLatAt(nb), graph.vLngAt(nb))
             val score = abs(ManeuverMath.angularDifferenceDeg(b, desiredBearingDeg))
             if (score < bestScore) { bestScore = score; best = nb }
         }
+        choiceHadAlternatives = eligible >= 2
         return if (best >= 0) best else prevVertex   // dead-end → reverse
     }
 

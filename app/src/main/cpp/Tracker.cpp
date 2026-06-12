@@ -3080,6 +3080,10 @@ VisionOutput Tracker::processFrame(const uint8_t* yuv_data, int width, int heigh
     // a real ride whenever the gate flickers) it ran only sporadically, so its EMA held a STALE value and
     // the dt ballooned (10-frame gaps → wrong de-rotation → speed collapse). Run it on EVERY frame that has
     // enough tracked points. READ-ONLY (writes ground_flow_speed_mps_ only) so this never affects the dot.
+    // 2026-06-12c — accel PREDICT for the ground-speed filter, EVERY frame: the IPM block below is
+    // gated (blur / <8 tracked points), and those gated frames are exactly the ones the bridge must
+    // carry. The measurement CORRECT step happens inside updateGroundFlowSpeed.
+    predictGroundSpeed(imu_delta, imu, (timestamp_ns - current_prev_ts) * 1e-9);
     if (camera_height_m_ > 0.0 && !frame_blurry_ &&
         current_prev_pts_buf_.size() >= 8 && !current_prev_gray.empty() && !gray_buf_.empty()) {
         // FIX B (2026-06-03, BPROBE-proven): feed the IPM a DEDICATED BIG-WINDOW optical flow instead of
@@ -3092,6 +3096,66 @@ VisionOutput Tracker::processFrame(const uint8_t* yuv_data, int width, int heigh
         // big-window mismatches. LEGACY (prev_good_buf_ source) replaced 2026-06-03; see git history.
         std::vector<cv::Point2f> gp_prev, gp_next;
         {
+            // 2026-06-12 IPM FRONT-END FIX (measured offline on the val_2026_06_03b ride frames by
+            // scripts/ipm_frames_flow_probe_2026_06_12.py + ipm_fix_taxonomy_sim_2026_06_12.py).
+            // Two failures in the old front-end:
+            //   (1) ROAD STARVATION — production corners are detected image-wide and are sparse on the
+            //       actual road → the estimator's ≥5-vote gate starved on 77% of cruise frames (dips →
+            //       decay → the 13-19 km/h "saturation"). FIX: top-up corners detected INSIDE the
+            //       gravity road region (quarter-res D2<0 + [0.5,50] m depth-band mask — the same test
+            //       the estimator applies per point; the mask is in distorted pixel space, which is fine
+            //       for detection because every point is re-validated on undistorted coords inside).
+            //   (2) NO BACKWARD CHECK — at riding speed motion blur erases the along-flow texture of the
+            //       near road (along-flow gradient energy 10.2 static → 3.5 moving on that ride) and the
+            //       lane lines run parallel to the flow, so the forward-only LK slid and returned small
+            //       status=1 garbage that voted ~zero speeds (the under-read). FIX: forward-backward
+            //       consistency, same check + threshold as the production tracker (TrackKLT.cpp:57,
+            //       FB_CHECK_THRESH = 4 px²) — sliders wander on the return pass and self-reject.
+            std::vector<cv::Point2f> gp_in = current_prev_pts_buf_;
+            cv::Vec3d gp_n_up;
+            if (computeGroundNormalCam(imu, gp_n_up)) {
+                const int mw = std::max(1, current_prev_gray.cols / 4);
+                const int mh = std::max(1, current_prev_gray.rows / 4);
+                cv::Mat road_q(mh, mw, CV_8UC1, cv::Scalar(0));
+                for (int r = 0; r < mh; ++r) {
+                    uchar* row = road_q.ptr<uchar>(r);
+                    const double yp = (4.0 * r - cy_) / fy_;
+                    for (int c = 0; c < mw; ++c) {
+                        const double xp = (4.0 * c - cx_) / fx_;
+                        const double D2 = gp_n_up(0) * xp + gp_n_up(1) * yp + gp_n_up(2);
+                        if (D2 >= 0.0) continue;                  // at/above the gravity horizon
+                        const double Z = -camera_height_m_ / D2;  // plane depth from the mount height
+                        if (Z >= 0.5 && Z <= 50.0) row[c] = 255;  // same band as updateGroundFlowSpeed
+                    }
+                }
+                cv::Mat road_mask;
+                cv::resize(road_q, road_mask, current_prev_gray.size(), 0, 0, cv::INTER_NEAREST);
+                std::vector<cv::Point2f> topup;
+                cv::goodFeaturesToTrack(current_prev_gray, topup, 60, 0.01, 10.0, road_mask);
+                gp_in.insert(gp_in.end(), topup.begin(), topup.end());
+            }
+            std::vector<cv::Point2f> bn, bk; std::vector<uchar> bs, bs2; std::vector<float> be, be2;
+            cv::calcOpticalFlowPyrLK(current_prev_gray, gray_buf_, gp_in, bn, bs, be,
+                                     cv::Size(61, 61), 5,
+                                     cv::TermCriteria(cv::TermCriteria::COUNT + cv::TermCriteria::EPS, 30, 0.01));
+            cv::calcOpticalFlowPyrLK(gray_buf_, current_prev_gray, bn, bk, bs2, be2,
+                                     cv::Size(61, 61), 5,
+                                     cv::TermCriteria(cv::TermCriteria::COUNT + cv::TermCriteria::EPS, 30, 0.01));
+            gp_prev.reserve(bn.size()); gp_next.reserve(bn.size());
+            int gp_fb_rej = 0;
+            for (size_t i = 0; i < gp_in.size() && i < bn.size() && i < bk.size(); ++i) {
+                if (!bs[i] || !bs2[i]) continue;
+                const float fbdx = gp_in[i].x - bk[i].x;
+                const float fbdy = gp_in[i].y - bk[i].y;
+                if (fbdx * fbdx + fbdy * fbdy > 4.0f) { ++gp_fb_rej; continue; }  // = TrackKLT::FB_CHECK_THRESH
+                gp_prev.push_back(gp_in[i]); gp_next.push_back(bn[i]);
+            }
+            if (frame_counter_ % 30 == 0)
+                LOGI("IPM_FRONTEND: in=%zu (prod=%zu topup=%zu) fb_rej=%d out=%zu",
+                     gp_in.size(), current_prev_pts_buf_.size(),
+                     gp_in.size() - current_prev_pts_buf_.size(), gp_fb_rej, gp_prev.size());
+            /* LEGACY 2026-06-12 — forward-only flow on production corners only (replaced by the road
+               top-up + FB-checked pass above; kept per the no-delete rule):
             std::vector<cv::Point2f> bn; std::vector<uchar> bs; std::vector<float> be;
             cv::calcOpticalFlowPyrLK(current_prev_gray, gray_buf_, current_prev_pts_buf_, bn, bs, be,
                                      cv::Size(61, 61), 5,
@@ -3099,6 +3163,7 @@ VisionOutput Tracker::processFrame(const uint8_t* yuv_data, int width, int heigh
             gp_prev.reserve(bn.size()); gp_next.reserve(bn.size());
             for (size_t i = 0; i < current_prev_pts_buf_.size() && i < bn.size(); ++i)
                 if (bs[i]) { gp_prev.push_back(current_prev_pts_buf_[i]); gp_next.push_back(bn[i]); }
+            */
         }
         if (gp_prev.size() >= 8) {
             lens_.undistortMatchedPoints(gp_prev, gp_next);
@@ -4100,10 +4165,18 @@ VisionOutput Tracker::processFrame(const uint8_t* yuv_data, int width, int heigh
             // path is itself bounded by the looming EMA + recoverPose
             // robust median, so this cap mostly guards the legacy
             // scale_fuser branch.
-            double max_disp = 8.0 * std::max(dt_frame, 0.03);
+            // 2026-06-12 — 8 m/s STILL truncated the scooter: the val_2026_06_04 rides hit this cap
+            // 409× SUSTAINED (one line per frame at cruise — not spike-guarding), and the published
+            // speed plateaued at ~29 km/h on the val_2026_06_03b plot while the ride ran 30-50.
+            // Raised to 15 m/s = RAIL_MAX_SPEED_MPS (NavSightViewModel), the cross-stack single-tick
+            // plausibility bound: above any scooter cruise (~54 km/h) yet 4-10× below the teleport
+            // spikes this cap exists to guard. Counted + log throttled (was per-frame spam).
+            double max_disp = 15.0 * std::max(dt_frame, 0.03);
             if (disp > max_disp) {
-                LOGI("DISP_CAP: disp=%.2f capped to %.2f (dt=%.3f) src=%s",
-                     disp, max_disp, dt_frame, used_depth_flow ? "df" : "fuser");
+                navsight::eventCounters().disp_cap_hits.fetch_add(1, std::memory_order_relaxed);
+                if (frame_counter_ % 30 == 0)
+                    LOGI("DISP_CAP: disp=%.2f capped to %.2f (dt=%.3f) src=%s",
+                         disp, max_disp, dt_frame, used_depth_flow ? "df" : "fuser");
                 disp = max_disp;
             }
 
@@ -9048,6 +9121,72 @@ void Tracker::updateExpansionSpeed(const std::vector<cv::Point2f>& prev_ud,
     }
 }
 
+// 2026-06-12c — ACCEL-BRIDGED SPEED, the PREDICT step (speed lever 1). Measured residual on
+// val_2026_06_12: straights ran 0.91× GPS but the roundabout-circling ride 0.38× and the junction-heavy
+// one 0.83× — during sustained yaw/blur the IPM votes starve and the old behaviour DECAYED the speed
+// toward 0 mid-turn, which is physically wrong (speed is ~constant through a turn; braking happens
+// before it). The published ground speed is now a 1-D complementary filter:
+//   PREDICT (here, EVERY frame): v += a_fwd·dt, a_fwd = mean specific force over the frame
+//     (imu_delta.deltaV/dt, body frame) minus gravity, projected on the horizontalized body-forward
+//     axis (the optical axis R_bc^T·e_z flattened against the filtered gravity).
+//   CORRECT (updateGroundFlowSpeed): ≥5 votes → EMA toward the median; ≥5 zero-witnesses → hard 0.
+// Prediction alone is trusted for kGpBridgeMaxFrames ≈ 6 s — a full roundabout circulation at 20 km/h
+// on a 13 m ring; accel bias ≤0.3 m/s² integrates to ≤1.8 m/s over that, a bounded bridging error.
+// Past the budget the old decay-to-0 resumes so an unobserved speed can never free-integrate.
+void Tracker::predictGroundSpeed(const PreintegratedMeasurement& imu_delta,
+                                 const IMUPreintegrator& imu, double dt_s) {
+    constexpr int kGpBridgeMaxFrames = 138;       // ≈6 s at ~23 fps (derivation above)
+    constexpr double kGpBridgeDecayAlpha = 0.15;  // the pre-bridge decay rate, resumed past the budget
+    const double v = ground_flow_speed_mps_.load(std::memory_order_relaxed);
+    if (v < 0.0 || dt_s <= 1e-4 || dt_s > 0.5) return;   // no estimate yet / bogus dt → nothing to bridge
+    const int since = ++gp_frames_since_meas_;
+    if (since > kGpBridgeMaxFrames) {
+        if (v > 0.0)
+            ground_flow_speed_mps_.store((1.0 - kGpBridgeDecayAlpha) * v, std::memory_order_relaxed);
+        return;
+    }
+    if (imu_delta.dt <= 1e-4 || imu_delta.deltaV.empty() ||
+        imu_delta.deltaV.rows != 3) return;
+    const cv::Point3f gf = imu.getFilteredGravity();
+    cv::Vec3d g_up(gf.x, gf.y, gf.z);
+    const double gn = cv::norm(g_up);
+    if (gn < 1.0) return;                                 // gravity not sampled yet
+    g_up /= gn;
+    // body-forward = the optical axis in body coords (R_bc^T·e_z = third ROW of R_bc), horizontalized
+    const cv::Matx33d R_bc = ekf_.getExtrinsicsRotation();
+    cv::Vec3d fwd(R_bc(2, 0), R_bc(2, 1), R_bc(2, 2));
+    fwd -= fwd.dot(g_up) * g_up;
+    const double fn = cv::norm(fwd);
+    if (fn < 0.2) return;                                 // camera near-vertical → no forward axis
+    fwd /= fn;
+    const cv::Vec3d f_spec(imu_delta.deltaV.at<double>(0) / imu_delta.dt,
+                           imu_delta.deltaV.at<double>(1) / imu_delta.dt,
+                           imu_delta.deltaV.at<double>(2) / imu_delta.dt);
+    const cv::Vec3d a_lin = f_spec - g_up * 9.81;         // specific force minus gravity (at rest → 0)
+    const double a_fwd = a_lin.dot(fwd);
+    const double v_pred = std::max(0.0, v + a_fwd * dt_s);
+    ground_flow_speed_mps_.store(v_pred, std::memory_order_relaxed);
+    navsight::eventCounters().ipm_bridge_frames.fetch_add(1, std::memory_order_relaxed);
+    if (since > 3 && frame_counter_ % 20 == 0)            // log real bridging stretches only, throttled
+        LOGI("GROUND_SPEED_BRIDGE: v=%.2f a_fwd=%+.2f since_meas=%d", v_pred, a_fwd, since);
+}
+
+// 2026-06-12 — ground-plane normal in the CAMERA frame from the filtered gravity (n_up_c = R_bc·ĝ):
+// the same first stage updateGroundFlowSpeed runs below (see the derivation there). Split out so the
+// IPM front-end at the processFrame call site can build its road-region detection mask from identical
+// geometry. Returns false while gravity is unsampled or when the camera looks up (no road in front);
+// the caller just skips the top-up then — updateGroundFlowSpeed keeps its own gates and skip-logging.
+bool Tracker::computeGroundNormalCam(const IMUPreintegrator& imu, cv::Vec3d& n_up_c) const {
+    const cv::Point3f g_filt = imu.getFilteredGravity();
+    const double g_norm = std::sqrt(static_cast<double>(g_filt.x) * g_filt.x +
+                                    static_cast<double>(g_filt.y) * g_filt.y +
+                                    static_cast<double>(g_filt.z) * g_filt.z);
+    if (g_norm < 1.0) return false;
+    const cv::Matx33d R_bc = ekf_.getExtrinsicsRotation();
+    n_up_c = R_bc * (cv::Vec3d(g_filt.x, g_filt.y, g_filt.z) / g_norm);
+    return n_up_c(2) <= -0.05;   // -0.05 ≈ at/just-below the horizon, same gate as the estimator
+}
+
 void Tracker::updateGroundFlowSpeed(const std::vector<cv::Point2f>& prev_ud,
                                     const std::vector<cv::Point2f>& next_ud,
                                     double dt_s,
@@ -9130,15 +9269,35 @@ void Tracker::updateGroundFlowSpeed(const std::vector<cv::Point2f>& prev_ud,
     // mis-removed and the residual masquerades as translation (replay: large-dt rows produced coherent-
     // looking cos_fa from pure de-rotation error). Derived from the model order, not tuned.
     constexpr double kIpmMaxFrameRotRad = 0.2;
+    // 2026-06-12 — per-point RESOLUTION FLOOR (measured offline: scripts/ipm_frames_flow_probe_2026_06_12.py
+    // + ipm_fix_taxonomy_sim_2026_06_12.py on the val_2026_06_03b ride frames).
+    //   kIpmKltNoisePx: KLT flow measured on TRUE-standstill frames of that ride is p50 = 0.57 px (pure
+    //   tracker noise, consistent with the classic LK sub-pixel accuracy bound) → per-axis σ ≈ 0.5 px.
+    //   Propagating through v_i = -(f·a)/(a·a)/dt gives σ_v,i = (σ_px/fx)/(|a|·dt): the SAME 1/|a| factor
+    //   that converts flow to speed amplifies the noise (≈ ∝ Z) — which is how 0.5 px of standstill jitter
+    //   became the owner-reported 1-5 km/h creep: the one-sided coherence gate passes ~34% of random-
+    //   direction noise (measured) and every pass is positive by construction.
+    constexpr double kIpmKltNoisePx = 0.5;
+    // 3σ acceptance (normal table, 99.7%): a point may VOTE a speed only when v_i exceeds its own 3σ_v,i
+    // resolution; below it the point is indistinguishable from stationary → ZERO-WITNESS, never a vote.
+    constexpr double kIpmSigmaGate = 3.0;
+    // A zero-witness must itself be able to EXCLUDE ≥1 m/s of motion (3.6 km/h — the boundary between a
+    // "stopped" and a "moving" speedometer): points whose own floor exceeds this (far Z / near-FoE) can't
+    // distinguish 0 from slow riding and may not testify "stopped". Prevents a false zero-lock when blur
+    // kills all votes at cruise (those points fail the FB check upstream and never reach the taxonomy).
+    constexpr double kIpmZeroWitnessMaxFloorMps = 1.0;
 
     // Bail when the per-frame rotation exceeds the first-order de-rotation's validity (see above). DECAY
     // toward 0 rather than HOLD, so a dropped-frame / fast-pan burst can't freeze a stale speed.
     const double frame_rot_rad = std::sqrt(wx * wx + wy * wy + wz * wz);
     if (frame_rot_rad > kIpmMaxFrameRotRad) {
+        // 2026-06-12c — no decay here any more: the accel bridge (predictGroundSpeed) carried the speed
+        // this frame, and fast-rotation frames are exactly the mid-turn frames the bridge exists for.
+        /* LEGACY 2026-06-12c — mid-turn decay (part of the 0.38× roundabout under-read):
         double cur_v = ground_flow_speed_mps_.load(std::memory_order_relaxed);
-        if (cur_v > 0.0) ground_flow_speed_mps_.store((1.0 - 0.15) * cur_v, std::memory_order_relaxed);
+        if (cur_v > 0.0) ground_flow_speed_mps_.store((1.0 - 0.15) * cur_v, std::memory_order_relaxed); */
         if (frame_counter_ % 20 == 0)
-            LOGI("GROUND_FLOW_FUNNEL: skipped reason=large_frame_rotation rot_rad=%.3f thresh=%.2f dt=%.3f → decay",
+            LOGI("GROUND_FLOW_FUNNEL: skipped reason=large_frame_rotation rot_rad=%.3f thresh=%.2f dt=%.3f → accel bridge",
                  frame_rot_rad, kIpmMaxFrameRotRad, dt_s);
         return;
     }
@@ -9148,7 +9307,11 @@ void Tracker::updateGroundFlowSpeed(const std::vector<cv::Point2f>& prev_ud,
     int n_in_road = 0;   // FUNNEL diag: points in the lower-image road region
     int n_denom_ok = 0;  // FUNNEL diag: of those, points with a well-conditioned ground-plane denom
     int n_coh_reject = 0;  // FUNNEL diag: points rejected by the forward-coherence gate (incoherent flow)
+    int n_zero_witness = 0;  // 2026-06-12 — points below their own 3σ floor that can testify "stationary"
     std::vector<double> dbg_raw_vi, dbg_fmag_px, dbg_Z, dbg_align;   // TEMP IPM_DIAG (raw, ungated)
+    std::vector<int> dbg_surv;          // 2026-06-04 IPM_PERPT — 1 if the point passed the coherence gate
+    std::vector<cv::Vec4f> cand_viz;    // 2026-06-04 — all road candidates (x,y,vi_kmh,survived) for the overlay
+    std::vector<float> band_pack;       // 2026-06-04 — packed near/mid/far band diag, persisted to the SIM JSON
     const size_t n_pts = std::min(prev_ud.size(), next_ud.size());
     for (size_t i = 0; i < n_pts; ++i) {
         const float px = prev_ud[i].x;
@@ -9192,13 +9355,28 @@ void Tracker::updateGroundFlowSpeed(const std::vector<cv::Point2f>& prev_ud,
             dbg_fmag_px.push_back(f_mag * fx_);   // flow magnitude px/frame
             dbg_Z.push_back(Z);                   // depth (m), now > 0
             dbg_align.push_back(cos_fa);          // cos(f,a)
-            // COHERENCE GATE: keep the point only when its de-rotated flow is dominantly forward-aligned
-            // (cos_fa < -1/√2). cos_fa < 0 already implies v_i > 0, so this SUBSUMES the old positive-
-            // speed gate; the 50 m/s cap stays as the upper sanity bound. Incoherent standstill / off-
-            // plane / de-rotation-residual flow (cos_fa not near -1) no longer fabricates a speed.
-            if (v_i < 50.0 && cos_fa < -kIpmFwdCoherenceMin) {
+            // COHERENCE GATE (cos_fa < -1/√2, the derived 45° cone; cos_fa < 0 already implies v_i > 0,
+            // and the 50 m/s cap stays as the upper sanity bound) + 2026-06-12 RESOLUTION-FLOOR TAXONOMY
+            // (constants above). Order matters:
+            //   |v_i| below the point's own 3σ_v,i → indistinguishable from stationary. If the point
+            //     could have detected ≥1 m/s (floor small enough) it becomes a ZERO-WITNESS; either way
+            //     it NEVER votes — at standstill these are ALL the points (the 1-5 km/h creep dies), at
+            //     cruise they are the blur-killed / attached-foreground (handlebar) points that
+            //     previously diluted the median toward zero (the under-read / "saturation").
+            //   above the floor → the original coherence gate decides VOTE vs reject.
+            const double sigma_v = (kIpmKltNoisePx / fx_) / (std::sqrt(aa) * dt_s);
+            const bool below_floor = std::fabs(v_i) < kIpmSigmaGate * sigma_v;
+            const bool zero_witness = below_floor &&
+                (kIpmSigmaGate * sigma_v <= kIpmZeroWitnessMaxFloorMps);
+            const bool survived = !below_floor && (v_i < 50.0 && cos_fa < -kIpmFwdCoherenceMin);
+            dbg_surv.push_back(survived ? 1 : 0);                       // 2026-06-04 IPM_PERPT
+            cand_viz.emplace_back(next_ud[i].x, next_ud[i].y,           // 2026-06-04 diag overlay
+                                  static_cast<float>(v_i * 3.6), survived ? 1.0f : 0.0f);
+            if (survived) {
                 speeds.push_back(v_i);
                 inlier_px.push_back(next_ud[i]);   // VIZ — this road pixel fed the speed (current frame)
+            } else if (zero_witness) {
+                ++n_zero_witness;
             } else {
                 ++n_coh_reject;
             }
@@ -9228,6 +9406,42 @@ void Tracker::updateGroundFlowSpeed(const std::vector<cv::Point2f>& prev_ud,
              med(dbg_Z), med(dbg_align), n_up_c(0), n_up_c(1), n_up_c(2),
              u_fwd_c(0), u_fwd_c(1), u_fwd_c(2), rot, camera_height_m_);
     }
+    // 2026-06-04 IPM_PERPT — per-DEPTH-BAND per-point view, to settle WHY speed under-reads on sharp,
+    // correctly-sampled road (owner-confirmed: amber mesh sits on the road). Bins are DIAGNOSTIC, not
+    // gates: 'near' Z<6m is where the per-point image flow fx*v*dt/Z exceeds the KLT window (~41px) at
+    // cruise (Z = fx*v*dt/41 ≈ 5.9m at v=8m/s, dt=0.067s) — the band most at risk of being DROPPED or
+    // under-measured. Reading: near n≈0 → KLT dropped the fast points; near n>0 but flow≪fx*v*dt/Z →
+    // under-measured; near vi high but surv≈0 → coherence-gated; near vi high+surv yet speed low →
+    // far-point median dilution.
+    // Computed EVERY frame and stored in band_pack → published to ipm_band_diag_ → persisted in the SIM
+    // JSON ("ipm_band") because the logcat ring buffer rolls off before a long ride returns (owner note
+    // 2026-06-04). The LOGI is throttled to every 10 frames; the SIM persistence is per-frame.
+    if (!dbg_Z.empty()) {
+        struct BandStat { int n; double flow; double vi_kmh; double cos; int surv; };
+        auto band = [&](double zlo, double zhi) -> BandStat {
+            std::vector<double> vi, fl, co; int surv = 0;
+            for (size_t i = 0; i < dbg_Z.size(); ++i) {
+                if (dbg_Z[i] >= zlo && dbg_Z[i] < zhi) {
+                    vi.push_back(dbg_raw_vi[i]); fl.push_back(dbg_fmag_px[i]); co.push_back(dbg_align[i]);
+                    if (i < dbg_surv.size() && dbg_surv[i]) ++surv;
+                }
+            }
+            auto m = [](std::vector<double>& v) -> double {
+                if (v.empty()) return -1.0; std::sort(v.begin(), v.end()); return v[v.size() / 2]; };
+            return BandStat{ static_cast<int>(vi.size()), m(fl), m(vi) * 3.6, m(co), surv };
+        };
+        const BandStat nb = band(0.0, 6.0), mb = band(6.0, 12.0), fb = band(12.0, 1e9);
+        band_pack = { (float)nb.n, (float)nb.flow, (float)nb.vi_kmh, (float)nb.cos, (float)nb.surv,
+                      (float)mb.n, (float)mb.flow, (float)mb.vi_kmh, (float)mb.cos, (float)mb.surv,
+                      (float)fb.n, (float)fb.flow, (float)fb.vi_kmh, (float)fb.cos, (float)fb.surv };
+        if (frame_counter_ % 10 == 0)
+            LOGI("IPM_PERPT near[Z<6] n=%d flow=%.1fpx vi=%.1fkmh cos=%.2f surv=%d | "
+                 "mid[6-12] n=%d flow=%.1f vi=%.1f cos=%.2f surv=%d | "
+                 "far[>12] n=%d flow=%.1f vi=%.1f cos=%.2f surv=%d",
+                 nb.n, nb.flow, nb.vi_kmh, nb.cos, nb.surv,
+                 mb.n, mb.flow, mb.vi_kmh, mb.cos, mb.surv,
+                 fb.n, fb.flow, fb.vi_kmh, fb.cos, fb.surv);
+    }
     // FILE mirror for the harness (stderr buffering ate prints there; fopen no-ops on device).
     static FILE* dbgf = std::fopen("ipm_diag.txt", "w");
     static int dbgc = 0;
@@ -9247,8 +9461,10 @@ void Tracker::updateGroundFlowSpeed(const std::vector<cv::Point2f>& prev_ud,
        mid-curve; KEEP it. The real lever is un-capping the near flow (window / full frame rate). Dump removed.
     static FILE* ptf = std::fopen("ipm_points.csv", "w"); ... (re-add to re-run the analysis) */
 
-    // 4. Robust median and EMA.
+    // 4. Robust median and EMA (2026-06-12: + ZERO-LOCK branch and per-outcome counters).
     if (speeds.size() >= 5) {
+        navsight::eventCounters().ipm_vote_frames.fetch_add(1, std::memory_order_relaxed);
+        gp_frames_since_meas_ = 0;   // 2026-06-12c — real measurement → re-arm the accel bridge
         std::sort(speeds.begin(), speeds.end());
         double v_med = speeds[speeds.size() / 2];
         
@@ -9262,19 +9478,34 @@ void Tracker::updateGroundFlowSpeed(const std::vector<cv::Point2f>& prev_ud,
 
         LOGI("GROUND_SPEED_DBG raw_mps=%.3f ema_mps=%.3f inliers=%d dt=%.3f coh_rej=%d",
              v_med, ground_flow_speed_mps_.load(), (int)speeds.size(), dt_s, n_coh_reject);
+    } else if (n_zero_witness >= 5) {
+        // 2026-06-12 — CONFIDENT STANDSTILL: ≥5 tracked, FB-consistent, geometry-valid points that could
+        // each have detected ≥1 m/s of motion ALL measured below their own 3σ noise floor → the ground
+        // is not moving under us. Hard 0 (a measurement, not a decay): the owner-reported 1-5 km/h
+        // standstill creep was the EMA living off rectified noise votes that the taxonomy above now
+        // reclassifies as zero-witnesses. 5 = the same support count the vote branch requires.
+        navsight::eventCounters().ipm_zero_lock_frames.fetch_add(1, std::memory_order_relaxed);
+        gp_frames_since_meas_ = 0;   // 2026-06-12c — a confident 0 is a measurement too
+        ground_flow_speed_mps_.store(0.0, std::memory_order_relaxed);
+        if (frame_counter_ % 20 == 0)
+            LOGI("GROUND_SPEED_ZERO: zero_witness=%d votes=%zu coh_rej=%d -> 0.0",
+                 n_zero_witness, speeds.size(), n_coh_reject);
     } else {
-        // No forward-COHERENT road flow this frame → forward motion is not being observed. DECAY the
-        // EMA toward 0 (same α) instead of HOLDING — a real stop then reads ~0 within ~0.7 s instead of
-        // freezing at the last cruise value (owner: "standing still but the speed wasn't 0"). A transient
-        // blur/occlusion dips briefly and recovers the moment coherent road flow returns. Only decays a
-        // POSITIVE running value; the -1 "uninitialised" sentinel is left untouched.
+        navsight::eventCounters().ipm_decay_frames.fetch_add(1, std::memory_order_relaxed);
+        // 2026-06-12c — starved frame: NO decay here any more. predictGroundSpeed (the accel bridge)
+        // already carried the speed this frame. The unconditional decay below was the turn under-read
+        // (val_2026_06_12: roundabout ride 0.38× GPS vs 0.91× on straights — speed is ~constant through
+        // a turn). Decay still happens, but only once the bridge budget (~6 s with no IPM measurement)
+        // is exhausted — see predictGroundSpeed. A true stop is handled by the ZERO-LOCK branch above,
+        // which is a real measurement, not a decay.
+        /* LEGACY 2026-06-12c — unconditional starved-frame decay:
         double cur_v = ground_flow_speed_mps_.load(std::memory_order_relaxed);
         if (cur_v > 0.0) {
             const double alpha = 0.15;
             ground_flow_speed_mps_.store((1.0 - alpha) * cur_v, std::memory_order_relaxed);
-        }
+        } */
         if (frame_counter_ % 20 == 0)
-            LOGI("GROUND_SPEED_DECAY: no coherent road flow (in_road=%d coh_rej=%d) → decay v=%.2f",
+            LOGI("GROUND_SPEED_DECAY: no coherent road flow (in_road=%d coh_rej=%d) → accel bridge v=%.2f",
                  n_in_road, n_coh_reject, ground_flow_speed_mps_.load());
     }
 
@@ -9283,6 +9514,8 @@ void Tracker::updateGroundFlowSpeed(const std::vector<cv::Point2f>& prev_ud,
     {
         std::lock_guard<std::mutex> lk(ipm_viz_mutex_);
         ipm_inlier_px_.swap(inlier_px);
+        ipm_cand_viz_.swap(cand_viz);   // 2026-06-04 — all road candidates (x,y,vi_kmh,survived) for the diag overlay
+        if (!band_pack.empty()) ipm_band_diag_.swap(band_pack);   // 2026-06-04 — per-frame band diag → SIM JSON
     }
 }
 

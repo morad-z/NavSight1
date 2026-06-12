@@ -87,6 +87,23 @@ struct EventCounters {
     std::atomic<long long> blur_enter_events{0};
     std::atomic<long long> blur_total_skip_frames{0};
 
+    // 2026-06-12 — IPM ground-flow estimator outcome per frame (Tracker::updateGroundFlowSpeed):
+    // vote = ≥5 super-floor coherent speed votes → median; zero_lock = <5 votes but ≥5 zero-witnesses
+    // (points below their own 3σ resolution floor that could have detected ≥1 m/s) → hard 0 — the
+    // standstill-creep fix; decay = starved (neither) → EMA decays toward 0. Diffing these across a
+    // ride tells vote-coverage vs starvation without logcat.
+    std::atomic<long long> ipm_vote_frames{0};
+    std::atomic<long long> ipm_zero_lock_frames{0};
+    std::atomic<long long> ipm_decay_frames{0};
+    // 2026-06-12 — trajectory per-frame displacement cap hits (Tracker.cpp DISP_CAP). Sustained
+    // counts = the cap is truncating real motion (the 8 m/s era hit it 409× on the 06-04 rides);
+    // sporadic counts = it is guarding genuine spikes, as intended.
+    std::atomic<long long> disp_cap_hits{0};
+    // 2026-06-12c — frames the accel bridge predicted the ground speed (Tracker::predictGroundSpeed).
+    // High counts during a ride with turns are EXPECTED; what matters is bridge stretches stay under
+    // the ~6 s budget (then ipm_vote_frames resumes).
+    std::atomic<long long> ipm_bridge_frames{0};
+
     // Step 5 — LOWLIGHT (FeatureManager.cpp replenishSparse)
     std::atomic<long long> lowlight_state_active_frames{0};
     std::atomic<long long> lowlight_log_lines{0};
@@ -973,6 +990,11 @@ struct EventCounters {
         reloc_orb_slam_guarded.store(0, std::memory_order_relaxed);
         blur_enter_events.store(0, std::memory_order_relaxed);
         blur_total_skip_frames.store(0, std::memory_order_relaxed);
+        ipm_vote_frames.store(0, std::memory_order_relaxed);
+        ipm_zero_lock_frames.store(0, std::memory_order_relaxed);
+        ipm_decay_frames.store(0, std::memory_order_relaxed);
+        disp_cap_hits.store(0, std::memory_order_relaxed);
+        ipm_bridge_frames.store(0, std::memory_order_relaxed);
         lowlight_state_active_frames.store(0, std::memory_order_relaxed);
         lowlight_log_lines.store(0, std::memory_order_relaxed);
         rot_gate_pure_rot_confirmed.store(0, std::memory_order_relaxed);
@@ -1174,6 +1196,11 @@ struct EventCounters {
         const long long v_reloc_orb_slam_guarded        = reloc_orb_slam_guarded.load(std::memory_order_relaxed);
         const long long v_blur_enter_events             = blur_enter_events.load(std::memory_order_relaxed);
         const long long v_blur_total_skip_frames        = blur_total_skip_frames.load(std::memory_order_relaxed);
+        const long long v_ipm_vote_frames               = ipm_vote_frames.load(std::memory_order_relaxed);
+        const long long v_ipm_zero_lock_frames          = ipm_zero_lock_frames.load(std::memory_order_relaxed);
+        const long long v_ipm_decay_frames              = ipm_decay_frames.load(std::memory_order_relaxed);
+        const long long v_disp_cap_hits                 = disp_cap_hits.load(std::memory_order_relaxed);
+        const long long v_ipm_bridge_frames             = ipm_bridge_frames.load(std::memory_order_relaxed);
         const long long v_lowlight_state_active_frames  = lowlight_state_active_frames.load(std::memory_order_relaxed);
         const long long v_lowlight_log_lines            = lowlight_log_lines.load(std::memory_order_relaxed);
         const long long v_rot_gate_pure_rot_confirmed   = rot_gate_pure_rot_confirmed.load(std::memory_order_relaxed);
@@ -1359,6 +1386,11 @@ struct EventCounters {
         appendKv(out, "reloc_orb_slam_guarded",       v_reloc_orb_slam_guarded);       out += ',';
         appendKv(out, "blur_enter_events",            v_blur_enter_events);            out += ',';
         appendKv(out, "blur_total_skip_frames",       v_blur_total_skip_frames);       out += ',';
+        appendKv(out, "ipm_vote_frames",              v_ipm_vote_frames);              out += ',';
+        appendKv(out, "ipm_zero_lock_frames",         v_ipm_zero_lock_frames);         out += ',';
+        appendKv(out, "ipm_decay_frames",             v_ipm_decay_frames);             out += ',';
+        appendKv(out, "disp_cap_hits",                v_disp_cap_hits);                out += ',';
+        appendKv(out, "ipm_bridge_frames",            v_ipm_bridge_frames);            out += ',';
         appendKv(out, "lowlight_state_active_frames", v_lowlight_state_active_frames); out += ',';
         appendKv(out, "lowlight_log_lines",           v_lowlight_log_lines);           out += ',';
         appendKv(out, "rot_gate_pure_rot_confirmed",  v_rot_gate_pure_rot_confirmed);  out += ',';

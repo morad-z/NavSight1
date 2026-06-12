@@ -492,9 +492,28 @@ fun GroundPlaneOverlay(viewModel: NavSightViewModel, pal: NavPalette) {
                 i += 4
             }
         }
-        // The actual road pixels the IPM accepted as ground this frame (amber dots), via the same
-        // FILL_CENTER + rotate transform the KLT overlay uses → they land on the live road surface.
-        if (haveTf && ipmN > 0) {
+        // 2026-06-04 DIAGNOSTIC — colour every IPM road CANDIDATE by its per-point speed v_i, and show the
+        // coherence-gate rejects, so the near (fast) road points are visibly distinguishable from the slow
+        // far ones live. Stride 4: (x, y, vi_kmh, survived). Survived → filled dot graded blue(slow)→
+        // green(fast, ≥30 km/h); rejected → small red dot. Falls back to the plain amber survivors when the
+        // candidate stream is absent (older native lib). Display-only; nothing here feeds the dot/speed.
+        val cand = snap.ipmCandidates
+        if (haveTf && cand.size >= 4) {
+            var i = 0
+            while (i + 3 < cand.size) {
+                val c = toView(cand[i], cand[i + 1])
+                val vi = cand[i + 2]
+                val survived = cand[i + 3] != 0f
+                if (survived) {
+                    val t = (vi / 30f).coerceIn(0f, 1f)         // 0 km/h → blue, ≥30 km/h → green
+                    drawCircle(color = Color(red = 0.1f, green = 0.45f + 0.55f * t, blue = 1f - t, alpha = 0.9f),
+                        radius = 7f, center = c)
+                } else {
+                    drawCircle(color = Color(0xCCFF1744), radius = 3.5f, center = c)   // gate-rejected → red
+                }
+                i += 4
+            }
+        } else if (haveTf && ipmN > 0) {
             for (i in 0 until ipmN) {
                 drawCircle(color = amber.copy(0.9f), radius = 7f, center = toView(ipm[2 * i], ipm[2 * i + 1]))
             }

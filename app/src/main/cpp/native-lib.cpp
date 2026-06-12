@@ -1371,6 +1371,49 @@ Java_com_example_navsight1_NativeBridge_getIpmInlierPoints(
     return static_cast<jint>(n);
 }
 
+// 2026-06-04 — IPM per-point DIAGNOSTIC candidates [x,y,vi_kmh,survived, ...] (4 floats/point): all road
+// points the IPM considered this frame, so the overlay can colour them by reported speed and show gate
+// rejects. Caller passes a preallocated FloatArray; returns the number of FLOATS written. Read-only.
+extern "C" JNIEXPORT jint JNICALL
+Java_com_example_navsight1_NativeBridge_getIpmCandidates(
+        JNIEnv* env, jobject, jfloatArray out) {
+    if (!out) return 0;
+    const jsize cap = env->GetArrayLength(out);
+    if (cap <= 0) return 0;
+    std::vector<float> xy;
+    {
+        std::lock_guard<std::mutex> lock(state_mutex);
+        VioEngine* vision_raw = g_vision.get();
+        const Tracker* tracker = vision_raw ? vision_raw->getTracker() : nullptr;
+        if (!tracker) return 0;
+        tracker->getIpmCandidates(xy);
+    }
+    const jsize n = std::min<jsize>(cap, static_cast<jsize>(xy.size()));
+    if (n > 0) env->SetFloatArrayRegion(out, 0, n, xy.data());
+    return static_cast<jint>(n);
+}
+
+// 2026-06-04 — IPM per-DEPTH-BAND diagnostic [near/mid/far × (n, flow_px, vi_kmh, cos_fa, survived)] = 15
+// floats. Persisted into the sim JSON ("ipm_band") so it survives a long ride (logcat rolls off). Read-only.
+extern "C" JNIEXPORT jint JNICALL
+Java_com_example_navsight1_NativeBridge_getIpmBandDiag(
+        JNIEnv* env, jobject, jfloatArray out) {
+    if (!out) return 0;
+    const jsize cap = env->GetArrayLength(out);
+    if (cap <= 0) return 0;
+    std::vector<float> xy;
+    {
+        std::lock_guard<std::mutex> lock(state_mutex);
+        VioEngine* vision_raw = g_vision.get();
+        const Tracker* tracker = vision_raw ? vision_raw->getTracker() : nullptr;
+        if (!tracker) return 0;
+        tracker->getIpmBandDiag(xy);
+    }
+    const jsize n = std::min<jsize>(cap, static_cast<jsize>(xy.size()));
+    if (n > 0) env->SetFloatArrayRegion(out, 0, n, xy.data());
+    return static_cast<jint>(n);
+}
+
 // 2026-06-02 — AV-style ground-plane GRID line segments [x0,y0,x1,y1, ...] (analyzer pixels): the IPM
 // ground plane projected onto the image. Caller passes a preallocated FloatArray; returns the number of
 // FLOATS written (4 per segment). Drawn as a perspective road mesh on the camera overlay. Read-only.

@@ -79,11 +79,58 @@ class NavSightViewModel(application: Application) : AndroidViewModel(application
         // enough that a transient parallel-road matcher flicker can't cause a spurious teleport.
         private const val RAIL_MATCHER_REACQUIRE_M = 25.0
         private const val RAIL_MATCHER_REACQUIRE_TICKS = 5
-        // DEFAULT-OFF: matcher-supervised wrong-turn recovery. OFFLINE on sim A (a heading-disaster ride
-        // where the matcher is itself unreliable) it REGRESSES the dot — 968 m/1.33×/3 teleports vs pure
-        // dead-reckoning's 599 m/0.82×/0. Its benefit needs a device re-record where the (on) heading leg
-        // makes the matcher trustworthy. Enable together with the position leg after that validation.
-        private const val MATCHER_SUPERVISION_ENABLED = false
+        /* LEGACY 2026-06-12 — was DEFAULT-OFF after an offline sim-A regression (968 m/1.33×/3 teleports
+           vs pure dead-reckoning's 599 m/0.82×/0); that ride was a heading disaster and the stated
+           re-enable condition was "once the heading leg makes the matcher trustworthy".
+        private const val MATCHER_SUPERVISION_ENABLED = false */
+        // 2026-06-12 — supervision RE-ENABLED: the re-enable condition is now met (the hint actually
+        // engages — ROAD_HINT_MIN_CONFIDENCE below — and the IPM speed fix restored the trace scale),
+        // and three NEW guards close the sim-A failure mode: (a) only on a ≥RAIL_SUPERVISION_MIN_
+        // CONFIDENCE match, (b) only when the matcher held the SAME way the whole streak, (c) NEVER
+        // onto a roundabout ring way (ride3 val_2026_06_04 matched its ring at conf 0.80 while
+        // orbiting — confidence alone cannot protect against rings). Without supervision every wrong
+        // road was PERMANENT: RAIL_REACQUIRE fired 0× in 20 min of riding; ride3 orbited a ring ~4 min.
+        private const val MATCHER_SUPERVISION_ENABLED = true
+        /* LEGACY 2026-06-12b — the first re-enable used 0.35 + streak. val_2026_06_12 ride2 PROVED it
+           insufficient: the matcher sat STABLY at conf 0.40-0.42 on far ways (forest paths the drifted
+           trace hovered over) and supervision yanked the ball 77-242 m onto them — the owner's
+           "teleported between roads / took me to the woods".
+        private const val RAIL_SUPERVISION_MIN_CONFIDENCE = 0.35 */
+        // 2026-06-12b — measured split: the bad yanks ran conf 0.40-0.42; healthy matched segments run
+        // 0.63-0.86 (rides 1/3). 0.55 separates them. Pairs with the distance band below.
+        private const val RAIL_SUPERVISION_MIN_CONFIDENCE = 0.55
+        // 2026-06-12b — a wrong FORK / parallel road is 25-60 m away (Haifa parallel-road spacing
+        // ~30-50 m); a matcher 60+ m from the graph-constrained ball means the UPSTREAM trace is broken
+        // (today's bad yanks: 77, 192, 242 m) and teleporting the ball there helps nothing — keep
+        // dead-reckoning on the graph instead (the pre-supervision behaviour, which never teleported).
+        private const val RAIL_MATCHER_REACQUIRE_MAX_M = 60.0
+        // 2026-06-12 — the road→heading hint gets its OWN confidence bar. At the old 0.6 it never
+        // engaged while the trace drifted (ride1 p50 = 0.43 → MADG_ROAD_SYNC fired 0× in 20 min) — the
+        // very drift the hint exists to fix. The native side already rejects crossing roads (±35°
+        // residual gate) and picks the travel-aligned direction; the ring guard at the push site (the
+        // matched way must not be a roundabout ring) replaces confidence as the ring protection.
+        // 2026-06-12b — 0.45 was STILL never met on the drifting ride (val_2026_06_12 ride2 p50 = 0.34;
+        // MADG_ROAD_SYNC again 0×): the bar must sit just above the accept floor or the leg only works
+        // on rides that don't need it. The push itself stays harmless on a wrong match — native applies
+        // ≤35° un-drift steps only, FREE_ROAD + straight + railed + non-ring gates still apply.
+        private const val ROAD_HINT_MIN_CONFIDENCE = 0.32
+        // 2026-06-12 — backwards-start fix (owner: "sometimes when i open the app im faced backwards").
+        // Compass (rotation-vector azimuth) vs VIO-heading residual is sampled each snap tick; a TIGHT
+        // cluster (circular resultant R ≥ cos 30° ⇔ spread ≲ 30°) holding near ±180° for ~10 s means
+        // the heading locked to the WRONG END of the road axis (the road hint aligns to the NEAREST
+        // road end so it cannot fix >90° errors, and mag corrections are gated ≤35° so they never cross
+        // 180°). One-shot re-snap (seedMadgwickYaw) + ball reverse. First 3 min only — the error is
+        // born at the startup snap; a genuinely disturbed compass never clusters tightly enough.
+        private const val HEADING_FLIP_WINDOW_TICKS = 20
+        private const val HEADING_FLIP_MIN_RESID_DEG = 135.0
+        private const val HEADING_FLIP_MIN_RESULTANT = 0.87
+        private const val HEADING_FLIP_DEADLINE_MS = 180_000L
+        // 2026-06-12 — quiet-straight steering-anchor re-sync (kills slow gyro drift WITHOUT absorbing
+        // turns): straight-ride heading wobble is ≤ ~6°/s while a deliberate turn is ≥ ~20°/s → at the
+        // ~0.5 s snap tick, < 3°/tick over 2 ticks = "not turning". Anchors to the EXTERNAL matched-road
+        // tangent — never the ball's own edge (that circularity was the wrong-fork-on-curves bug).
+        private const val ANCHOR_RESYNC_QUIET_DEG_PER_TICK = 3.0
+        private const val ANCHOR_RESYNC_QUIET_TICKS = 2
         private const val RAIL_TRAIL_MAX = 600   // ~5 min of on-road breadcrumb at the 0.5 s snap tick
         // EMA rate for the gyro↔road heading offset. Slow (0.1) so the offset is a stable calibration of
         // the gyro's absolute error and brief junction transients don't shift it.
@@ -104,8 +151,11 @@ class NavSightViewModel(application: Application) : AndroidViewModel(application
         // Bumped whenever the IPM geometry changes — a height auto-calibrated against an OLD (e.g. under-
         // reading) IPM is STALE and must be discarded so it re-calibrates against the corrected estimator.
         // v2 = the 2026-06-02 geometric road-point fix (a prior calib like 1.70 = the under-read compensation).
+        // v3 = the 2026-06-12 IPM front-end fix (FB check + road-mask top-up + σ-floor taxonomy): any
+        //      height calibrated against the pre-fix UNDER-reading IPM is inflated (ratio = gps/ipm) and
+        //      must be discarded so it re-solves against the corrected estimator.
         private const val PREF_CAMERA_HEIGHT_VERSION = "camera_height_calib_version"
-        private const val CAMERA_HEIGHT_CALIB_VERSION = 2
+        private const val CAMERA_HEIGHT_CALIB_VERSION = 3
         // Samples of a clean GPS+IPM pair before committing the height (~5 s at the ~5 Hz UI tick).
         private const val HEIGHT_CALIB_SAMPLES = 25
         // Min GPS accuracy (m) and min speed (m/s) for a calibration sample, and the plausible-correction
@@ -258,6 +308,8 @@ class NavSightViewModel(application: Application) : AndroidViewModel(application
     private var cameraHeightM = prefs.getFloat(PREF_CAMERA_HEIGHT, SCOOTER_CAMERA_HEIGHT_M.toFloat()).toDouble()
     private var heightCalibrated = prefs.contains(PREF_CAMERA_HEIGHT)
     private val heightCalibRatios = mutableListOf<Double>()
+    // 2026-06-12 — previous GPS fix the height calibrator accepted (jam cross-check + per-fix dedup).
+    private var lastHeightCalibFix: Location? = null
     val mountHeightM: Double get() = cameraHeightM
     var heightCalibStatus by mutableStateOf<String?>(null)
         private set
@@ -317,7 +369,11 @@ class NavSightViewModel(application: Application) : AndroidViewModel(application
         // candidate); fused = the currently-DISPLAYED speed (getFusedSpeedMps). Both m/s,
         // null when the native estimate is the -1.0 "not yet" sentinel. Compare both to the
         // glat/glng-derived GPS speed to decide whether the IPM corrects the under-read.
-        val gpFlowSpeed: Double?, val fusedSpeed: Double?
+        val gpFlowSpeed: Double?, val fusedSpeed: Double?,
+        // 2026-06-04 — per-DEPTH-BAND IPM diagnostic (near/mid/far × n, flow_px, vi_kmh, cos_fa, survived =
+        // 15 floats), persisted in the sim JSON because logcat rolls off before a long ride returns. Lets
+        // offline analysis tell DROPPED vs UNDER-MEASURED vs GATED vs DILUTED. null when the IPM hasn't run.
+        val ipmBand: FloatArray? = null
     )
     // ──────────────────────────────────────────────────────────────────────────
 
@@ -399,6 +455,19 @@ class NavSightViewModel(application: Application) : AndroidViewModel(application
     // 2026-06-03 — wall time of the last rail-ball advance, so the IPM-speed→distance integration uses the
     // real (gated, variable) tick interval instead of a fixed 0.5 s.
     @Volatile private var lastRailAdvanceMs: Long = 0L
+    // 2026-06-12 — quiet-straight anchor re-sync state (see ANCHOR_RESYNC_*): previous snap-tick heading
+    // + how many consecutive ticks the user has not been turning.
+    @Volatile private var prevSnapTickHeadingDeg: Double = Double.NaN
+    @Volatile private var anchorQuietTicks = 0
+    // 2026-06-12 — backwards-start detector state (see HEADING_FLIP_*). Window of compass−VIO residuals;
+    // one-shot; armed only for the first HEADING_FLIP_DEADLINE_MS of the session.
+    private val headingFlipResidWindow = ArrayDeque<Double>()
+    @Volatile private var headingFlipApplied = false
+    private val headingFlipDeadlineMs = System.currentTimeMillis() + HEADING_FLIP_DEADLINE_MS
+    // 2026-06-12 — cross-thread handoff: the Main collector detects (ring exit / heading flip), the IO
+    // snap tick mutates the ball (GraphRailDot is not thread-safe) — consumed at the top of the rail block.
+    @Volatile private var pendingRingExit: ExitRoad? = null
+    @Volatile private var pendingBallReverse = false
     @Volatile private var lastSnapSource = ""
     // Guards against overlapping snap coroutines while a /match HTTP call is in flight
     // (set/cleared on the Main collector thread + the IO finally).
@@ -657,6 +726,11 @@ class NavSightViewModel(application: Application) : AndroidViewModel(application
                     ?.takeIf { it >= 0f }?.toDouble()
                 val fusedSp = runCatching { NativeBridge.getFusedSpeedMps() }.getOrNull()
                     ?.takeIf { it >= 0f }?.toDouble()
+                // 2026-06-04 — per-frame IPM depth-band diagnostic, persisted in the sim JSON (logcat rolls off).
+                val ipmBandArr = runCatching {
+                    val buf = FloatArray(15)
+                    if (NativeBridge.getIpmBandDiag(buf) >= 15) buf else null
+                }.getOrNull()
                 synchronized(simulationDataPoints) {
                     simulationDataPoints.add(SimulationPoint(
                         timestamp = System.currentTimeMillis(),
@@ -674,7 +748,8 @@ class NavSightViewModel(application: Application) : AndroidViewModel(application
                         vioVarXy = vioLla?.getOrNull(3),
                         mmLat = mm?.latitude, mmLng = mm?.longitude, mmConf = mmC,
                         mmSrc = mmS, kMap = kM, maneuver = mvr,
-                        gpFlowSpeed = gpFlow, fusedSpeed = fusedSp
+                        gpFlowSpeed = gpFlow, fusedSpeed = fusedSp,
+                        ipmBand = ipmBandArr
                     ))
                 }
             }
@@ -776,6 +851,7 @@ class NavSightViewModel(application: Application) : AndroidViewModel(application
                     // from the VIO heading (radians → degrees; MapScreenUi convention).
                     val headingDeg = Math.toDegrees(vio.heading)
                     lastVioHeadingDeg = headingDeg   // gyro/Madgwick heading → ball junction choice (relative turn)
+                    maybeFixBackwardsHeading(headingDeg)   // 2026-06-12 — backwards-start detector (one-shot)
                     val maneuver = maneuverStateMachine.tick(
                         currentLatLng.latitude, currentLatLng.longitude, headingDeg, region?.roundabouts
                     )
@@ -786,6 +862,14 @@ class NavSightViewModel(application: Application) : AndroidViewModel(application
                         // (Plain intersection turns with no event are caught by LocalMatcher's range
                         // recovery; a dedicated ~90° classifier is the next refinement.)
                         localMatcher.releaseRail()
+                        // 2026-06-12 — RING EJECT: on a roundabout exit, physically move the BALL onto the
+                        // chosen exit road. The event alone only released the MATCHER; the ball stayed ON
+                        // the ring → exit→re-enter latch + multi-minute orbits (ride3 val_2026_06_04: 460
+                        // ON_ROUNDABOUT ticks). Mutated on the IO snap tick via pendingRingExit
+                        // (GraphRailDot is not thread-safe; this collector runs on Main).
+                        if (ev == ManeuverEvent.ROUNDABOUT_EXIT || ev == ManeuverEvent.UTURN_VIA_ROUNDABOUT) {
+                            maneuver.suggestedExit?.let { pendingRingExit = it }
+                        }
                         Log.i("ManeuverSM", "MANEUVER event=$ev state=${maneuver.state} " +
                             "sweep=${"%.0f".format(maneuver.accumulatedSweepDeg)} " +
                             "exitBearing=${maneuver.suggestedExit?.bearingDeg?.let { "%.0f".format(it) } ?: "-"} " +
@@ -836,6 +920,39 @@ class NavSightViewModel(application: Application) : AndroidViewModel(application
                     graphRail = GraphRailDot(region.graph); graphRailRegion = region; lastSnapVio = null
                 }
                 val rail = graphRail
+                // 2026-06-12 — consume Main-thread-scheduled ball mutations HERE (this IO tick owns the
+                // ball; GraphRailDot is not thread-safe). RING EJECT: place the ball on the SM's chosen
+                // exit road, oriented outbound — the exit event alone only released the matcher and the
+                // ball kept circling the ring (ride3 val_2026_06_04: ~4 min orbit). BALL REVERSE: the
+                // backwards-start heading flip rotated the heading ~180°; flip the ball with it.
+                if (rail != null) {
+                    pendingRingExit?.let { ex ->
+                        pendingRingExit = null
+                        // 2026-06-12b — acquire ~6 m ALONG the exit road, not AT the shared junction
+                        // node: nearestEdge() at the node itself is a distance-~0 TIE between the ring
+                        // edge and the exit edge and can re-acquire the RING — the exact orbit this
+                        // eject exists to end. 6 m clears the shared vertex while staying well inside
+                        // the 30 m acquire radius of the true position.
+                        val ejBrg = Math.toRadians(ex.bearingDeg)
+                        val ejLat = ex.nodeLat + (6.0 * kotlin.math.cos(ejBrg)) / RoadSnapMath.M_PER_DEG_LAT
+                        val ejLng = ex.nodeLng + (6.0 * kotlin.math.sin(ejBrg)) /
+                            (RoadSnapMath.M_PER_DEG_LAT * kotlin.math.cos(Math.toRadians(ex.nodeLat)))
+                        if (rail.acquire(ejLat, ejLng, ex.bearingDeg)) {
+                            railRoadBearingAnchorDeg = rail.currentBearingDeg() ?: ex.bearingDeg
+                            railHeadingAnchorGyroDeg = lastVioHeadingDeg
+                            Log.i("RailDot", "RAIL_RING_EJECT: ball -> exit way=%d bearing=%.0f"
+                                .format(ex.wayId, ex.bearingDeg))
+                        }
+                    }
+                    if (pendingBallReverse) {
+                        pendingBallReverse = false
+                        if (rail.reverse()) {
+                            rail.currentBearingDeg()?.let { railRoadBearingAnchorDeg = it }
+                            railHeadingAnchorGyroDeg = lastVioHeadingDeg
+                            Log.i("RailDot", "RAIL_REVERSE: heading-flip ball reverse")
+                        }
+                    }
+                }
                 val prevVio = lastSnapVio
                 val dVioRaw = if (prevVio != null) RoadSnapMath.haversineM(
                     prevVio.latitude, prevVio.longitude, currentLatLng.latitude, currentLatLng.longitude) else 0.0
@@ -868,9 +985,15 @@ class NavSightViewModel(application: Application) : AndroidViewModel(application
                 var railPos: GeoPt? = null
                 if (rail != null) {
                     if (!rail.acquired) {
+                        // 2026-06-12 — DEFER acquisition until the travel direction is established from the
+                        // matched window (~2 m of motion). The old path fell back to seedBearing = 0.0 =
+                        // due NORTH, so the ball's initial facing on an east-west street was a coin flip —
+                        // one of the two backwards-start entry points (the other, a bad startup compass
+                        // snap, is handled by maybeFixBackwardsHeading). The matcher/snapper dot serves the
+                        // display until the ball can face the right way.
                         val sLat = if (accept && matched != null) matched.matched.latitude else currentLatLng.latitude
                         val sLng = if (accept && matched != null) matched.matched.longitude else currentLatLng.longitude
-                        if (rail.acquire(sLat, sLng, seedBearing)) {
+                        if (!travelBearing.isNaN() && rail.acquire(sLat, sLng, travelBearing)) {
                             // Seed the junction anchor AT acquire time (not only on the first straight tick)
                             // so steerHeading uses the drift-free gyro-relative model from tick 0. Without
                             // this, the first ticks after an acquire / matcher re-acquire (a teleport onto a
@@ -910,12 +1033,38 @@ class NavSightViewModel(application: Application) : AndroidViewModel(application
                             ManeuverMath.angularDifferenceDeg(roadTangentDeg,
                                 ManeuverMath.bearingDeg(mpw[mpw.size - 3].latitude, mpw[mpw.size - 3].longitude,
                                                         mpw[mpw.size - 2].latitude, mpw[mpw.size - 2].longitude))) < 30.0
+                        // 2026-06-12 — "is the user turning?" tracker for the quiet-straight anchor re-sync.
+                        val tickTurnDeg = if (!prevSnapTickHeadingDeg.isNaN() && !lastVioHeadingDeg.isNaN())
+                            kotlin.math.abs(ManeuverMath.angularDifferenceDeg(lastVioHeadingDeg, prevSnapTickHeadingDeg))
+                            else Double.NaN
+                        anchorQuietTicks = if (!tickTurnDeg.isNaN() && tickTurnDeg < ANCHOR_RESYNC_QUIET_DEG_PER_TICK)
+                            anchorQuietTicks + 1 else 0
+                        prevSnapTickHeadingDeg = lastVioHeadingDeg
                         if (accept && straightRoad && !roadTangentDeg.isNaN() && !lastVioHeadingDeg.isNaN() &&
                                 maneuver.state != ManeuverState.ON_ROUNDABOUT) {
                             val inst = ManeuverMath.angularDifferenceDeg(lastVioHeadingDeg, roadTangentDeg)
                             headingOffsetDeg = if (headingOffsetDeg.isNaN()) inst
                                 else headingOffsetDeg + HEADING_OFFSET_ALPHA *
                                     ManeuverMath.angularDifferenceDeg(inst, headingOffsetDeg)
+                            // 2026-06-12 — QUIET-STRAIGHT ANCHOR RE-SYNC: user not turning (< 3°/tick over
+                            // 2 ticks) + matched road straight → zero the steering reference against the
+                            // EXTERNAL matched tangent. This is the drift correction that replaces the
+                            // per-edge-change re-anchor (below, LEGACY): it kills gyro drift between
+                            // junctions but can never absorb a turn in progress (a turn is ≥ ~20°/s and
+                            // breaks the quiet gate; the 2026-06-02 per-straight-tick re-anchor absorbed
+                            // turns precisely because it lacked this gate).
+                            // 2026-06-12b — TRUST bar: anchoring the steering reference to a LOW-confidence
+                            // matched tangent is how the val_2026_06_12 ride2 flips were born (re-sync at
+                            // conf 0.34 anchored steering to a garbage road's tangent → steer pointed
+                            // backwards on a straight road → 2 false RAIL_REVERSE flips). Gyro drift needs
+                            // only OCCASIONAL correction (deg/minute scale), so requiring a genuinely good
+                            // match (≥0.55, same split as supervision) is fine — the anchor persists between
+                            // confident moments.
+                            if (anchorQuietTicks >= ANCHOR_RESYNC_QUIET_TICKS &&
+                                matched.confidence >= RAIL_SUPERVISION_MIN_CONFIDENCE) {
+                                railRoadBearingAnchorDeg = roadTangentDeg
+                                railHeadingAnchorGyroDeg = lastVioHeadingDeg
+                            }
                             // 2026-06-02 (owner's offset model: "have the road's heading but only turn when
                             // the offset is met — if the road is 100 and there's a turn to 50 and a turn to
                             // 150, offset +50 → take 150, −50 → take 50"). The gyro-reference re-anchor MOVED
@@ -959,7 +1108,15 @@ class NavSightViewModel(application: Application) : AndroidViewModel(application
                         // wrong-edge excursion at a multi-way junction). Keep advancing along the CURRENT
                         // facing; only reverse() (after RAIL_REVERSE_TICKS) changes direction. Same 120° gate,
                         // computed once and reused for both the advance guard and the reversal counter.
-                        val opposed = facingBefore != null && !steerHeading.isNaN() &&
+                        // 2026-06-12b — SECOND WITNESS for the reversal: the matched-window travel
+                        // direction must ALSO oppose the facing. The steer-only test mis-fired on the
+                        // val_2026_06_12 rides (2× RAIL_REVERSE with no user U-turn) when a wrong/stale
+                        // anchor made steer point backwards; travelBearing is a ~6 s baseline over the
+                        // MATCHED polyline, so a real U-turn still confirms within a few ticks (late >
+                        // wrong: a false flip sends the ball backwards down the road).
+                        val travelOpposed = !travelBearing.isNaN() && facingBefore != null &&
+                            kotlin.math.abs(ManeuverMath.angularDifferenceDeg(travelBearing, facingBefore)) > 120.0
+                        val opposed = facingBefore != null && !steerHeading.isNaN() && travelOpposed &&
                             kotlin.math.abs(ManeuverMath.angularDifferenceDeg(steerHeading, facingBefore)) > 120.0
                         rail.advance(advanceM, if (opposed) (facingBefore ?: steerHeading) else steerHeading)
                         // INSTRUMENTATION: log ONLY when the ball actually changed road direction this tick
@@ -996,8 +1153,16 @@ class NavSightViewModel(application: Application) : AndroidViewModel(application
                         // trips reverse(). Reuses RAIL_JUNCTION_LOG_MIN_TURN_DEG (1°) — the same exact-graph-
                         // geometry "the ball changed road direction" threshold the junction log just above uses
                         // — so no new constant. On a STRAIGHT road facing is unchanged → no re-anchor → the
-                        // offset survives to the next junction; on a CURVE each segment re-anchors so following
-                        // the road's own bend is never mistaken for the user's offset.
+                        // offset survives to the next junction.
+                        // 2026-06-12 — the "on a CURVE each segment re-anchors" part of that design was the
+                        // wrong-fork/ring-orbit bug: on curves the >1° rule fired at EVERY shape vertex
+                        // (06-04 ride logcat: 49/49 re-anchors were 2-7° curve steps), zeroing the user's
+                        // accumulated rotation each time → steering degenerated to "follow the last edge's
+                        // tangent" → the chord-straight branch won at forks on curves, and a roundabout
+                        // ring became inescapable. Now: re-anchor ONLY when the ball actually took a
+                        // junction DECISION (≥2 eligible continuations — GraphRailDot.lastAdvanceTookDecision);
+                        // curve-accumulated gyro drift is handled by the quiet-straight EXTERNAL re-sync above.
+                        /* LEGACY 2026-06-12 — per-edge-change re-anchor (the curve-vertex zeroing):
                         val facingAfter = rail.currentBearingDeg()
                         if (facingBefore != null && facingAfter != null && !lastVioHeadingDeg.isNaN() &&
                             kotlin.math.abs(ManeuverMath.angularDifferenceDeg(facingAfter, facingBefore)) >
@@ -1006,6 +1171,13 @@ class NavSightViewModel(application: Application) : AndroidViewModel(application
                             railHeadingAnchorGyroDeg = lastVioHeadingDeg
                             Log.i("RailDot", "RAIL_REANCHOR: road=%.0f offset->0 (edge %.0f->%.0f)".format(
                                 facingAfter, facingBefore, facingAfter))
+                        } */
+                        val facingAfter = rail.currentBearingDeg()
+                        if (rail.lastAdvanceTookDecision && facingAfter != null && !lastVioHeadingDeg.isNaN()) {
+                            railRoadBearingAnchorDeg = facingAfter
+                            railHeadingAnchorGyroDeg = lastVioHeadingDeg
+                            Log.i("RailDot", "RAIL_REANCHOR: road=%.0f offset->0 (junction decision)"
+                                .format(facingAfter))
                         }
                         // WIRE THE MATCHER (2026-06-02) — supervise the ball's road choice. The junction
                         // CHOICE stays VIO-bearing-driven (the user's actual motion is the true signal for
@@ -1019,9 +1191,17 @@ class NavSightViewModel(application: Application) : AndroidViewModel(application
                         val mWayId = matched?.matchedWayId
                         val mOff = if (matched != null && rp != null) RoadSnapMath.haversineM(
                             rp.lat, rp.lng, matched.matched.latitude, matched.matched.longitude) else 0.0
+                        // 2026-06-12 — realistic confidence bar (the 0.6 bar starved recovery — see the
+                        // constants) + RING GUARD: never re-acquire ONTO a roundabout ring way (a circling
+                        // trace matches its ring at high confidence — ride3 hit 0.80 while orbiting).
+                        val mWayIsRing = mWayId != null && region?.roundabouts?.contains(mWayId) == true
+                        // 2026-06-12b — DISTANCE BAND: only correct a plausible wrong-fork (25-60 m).
+                        // Beyond that the trace is broken upstream and the matcher is matching scenery
+                        // (ride2: 77-242 m yanks into forest paths) — keep graph dead-reckoning instead.
                         if (MATCHER_SUPERVISION_ENABLED &&
-                            accept && matched != null && matched.confidence >= MAP_POS_MIN_CONFIDENCE &&
-                            mWayId != null && rp != null && mOff > RAIL_MATCHER_REACQUIRE_M) {
+                            accept && matched != null && matched.confidence >= RAIL_SUPERVISION_MIN_CONFIDENCE &&
+                            mWayId != null && !mWayIsRing && rp != null && mOff > RAIL_MATCHER_REACQUIRE_M &&
+                            mOff <= RAIL_MATCHER_REACQUIRE_MAX_M) {
                             // Diverged from a confident matcher THIS tick. Only count it when the matcher
                             // is STABLE on the SAME wayId — a flickering matcher (jumping between parallel
                             // roads, the unreliable-heading signature) keeps resetting the streak and never
@@ -1069,9 +1249,16 @@ class NavSightViewModel(application: Application) : AndroidViewModel(application
                 // confidently matched). No averaged segment, no sharp-turn skip (a curve IS the road);
                 // only a roundabout is skipped (its tangent is meaningless while circulating). Native
                 // picks the travel-aligned direction (no 180° flip) + the 90° crossing-road backstop.
+                // 2026-06-12 — the hint's confidence bar drops to ROAD_HINT_MIN_CONFIDENCE (0.6 never
+                // engaged on real rides: MADG_ROAD_SYNC fired 0× in 20 min while the heading drifted —
+                // the exact failure the hint exists to fix), and a RING GUARD independent of the SM is
+                // added: ride3 matched its roundabout ring at conf 0.80 while orbiting in FREE_ROAD gaps
+                // (the SM can be blind to rings, e.g. before the region/index loads at startup) — railing
+                // the heading to a ring's rotating tangent is what spins the whole trajectory.
+                val matchedOnRing = matched?.matchedWayId?.let { region?.roundabouts?.contains(it) == true } == true
                 val roadHint: Double = if (accept && matched != null &&
-                        matched.confidence >= MAP_POS_MIN_CONFIDENCE && rail?.acquired == true &&
-                        maneuver.state != ManeuverState.ON_ROUNDABOUT) {
+                        matched.confidence >= ROAD_HINT_MIN_CONFIDENCE && rail?.acquired == true &&
+                        maneuver.state != ManeuverState.ON_ROUNDABOUT && !matchedOnRing) {
                     rail.currentBearingDeg() ?: -1000.0
                 } else -1000.0
                 NativeBridge.setRoadHeadingHint(roadHint)
@@ -1235,11 +1422,65 @@ class NavSightViewModel(application: Application) : AndroidViewModel(application
      * direction frame producing a 13 m height) is rejected and the calibration self-activates only once the
      * IPM is actually correct. GPS is used ONLY to set this physical constant; the dot/position stays VIO.
      */
+    /** 2026-06-12 — backwards-start detector (see HEADING_FLIP_* constants). Called once per ~500 ms
+     *  snap tick from the Main collector. When the compass−VIO residual clusters tightly (circular
+     *  resultant ≥ cos 30°) near ±180° for the full ~10 s window, the heading is locked to the wrong
+     *  end of the road axis (a >90° startup-snap error that neither the ±35°-gated mag corrections nor
+     *  the travel-aligned road hint can ever cross). One-shot: re-snap the Madgwick yaw to the compass,
+     *  rotate the steering reference by the same delta (gyroDelta stays continuous), and schedule the
+     *  ball flip + matcher release on the IO tick. A genuinely disturbed compass never clusters tightly
+     *  enough to trigger (the resultant gate), and the detector disarms after the first 3 minutes. */
+    private fun maybeFixBackwardsHeading(vioHeadingDeg: Double) {
+        if (headingFlipApplied || System.currentTimeMillis() > headingFlipDeadlineMs) return
+        if (vioHeadingDeg.isNaN()) return
+        val az = orientationState.azimuth.toDouble()
+        headingFlipResidWindow.addLast(ManeuverMath.angularDifferenceDeg(az, vioHeadingDeg))
+        while (headingFlipResidWindow.size > HEADING_FLIP_WINDOW_TICKS) headingFlipResidWindow.removeFirst()
+        if (headingFlipResidWindow.size < HEADING_FLIP_WINDOW_TICKS) return
+        var sx = 0.0; var sy = 0.0
+        for (r in headingFlipResidWindow) {
+            sx += kotlin.math.cos(Math.toRadians(r)); sy += kotlin.math.sin(Math.toRadians(r))
+        }
+        val resultant = kotlin.math.sqrt(sx * sx + sy * sy) / headingFlipResidWindow.size
+        val meanResidDeg = Math.toDegrees(kotlin.math.atan2(sy, sx))
+        if (resultant < HEADING_FLIP_MIN_RESULTANT ||
+            kotlin.math.abs(meanResidDeg) < HEADING_FLIP_MIN_RESID_DEG) return
+        val newYawDeg = ((vioHeadingDeg + meanResidDeg) % 360.0 + 360.0) % 360.0
+        NativeBridge.seedMadgwickYaw(Math.toRadians(newYawDeg))
+        if (!railHeadingAnchorGyroDeg.isNaN())
+            railHeadingAnchorGyroDeg = ((railHeadingAnchorGyroDeg + meanResidDeg) % 360.0 + 360.0) % 360.0
+        pendingBallReverse = true
+        localMatcher.releaseRail()
+        lastTravelBearing = Double.NaN   // old-direction travel bearing is now wrong; re-establish
+        headingFlipApplied = true
+        headingFlipResidWindow.clear()
+        Log.i("NavSightVM", "HEADING_FLIP: compass-vs-vio resid=%.0f° R=%.2f → yaw %.0f°→%.0f° + ball reverse"
+            .format(meanResidDeg, resultant, vioHeadingDeg, newYawDeg))
+    }
+
     private fun maybeAutoCalibrateHeight(ipmMps: Float) {
         if (heightCalibrated || ipmMps < 0.8f) return
         val g = currentGpsLocation ?: return
         if (!g.hasSpeed() || !g.hasAccuracy() || g.accuracy > HEIGHT_CALIB_MAX_GPS_ACC_M ||
             g.speed < HEIGHT_CALIB_MIN_MPS) return
+        // 2026-06-12 — GPS-JAM hardening (Haifa). The ride val_2026_06_03b shows jammed segments where
+        // the position FREEZES (position-derived speed ≈ 0) or JUMPS (>60 km/h spikes) while fixes still
+        // report good accuracy — a height solved from such fixes is poison and LATCHES via prefs. A
+        // healthy receiver's Doppler speed agrees with its position-derived speed (~10% at >3 m/s); jam
+        // failure modes disagree at ×-level, so require agreement within 30% (or 0.7 m/s absolute), and
+        // trust the chip's own speed-accuracy estimate when it exists. Also: one sample per NEW fix —
+        // the old path re-sampled the SAME ~1 Hz fix on every ~43 ms UI tick, filling the 25-sample
+        // window from ~2 distinct fixes (a median of near-duplicates has no robustness).
+        if (android.os.Build.VERSION.SDK_INT >= 26 && g.hasSpeedAccuracy() &&
+            g.speedAccuracyMetersPerSecond > 1.5f) return
+        val prevFix = lastHeightCalibFix
+        if (prevFix != null && g.time <= prevFix.time) return   // same fix re-delivered by the UI tick
+        lastHeightCalibFix = g
+        if (prevFix == null) return                              // need two fixes for the cross-check
+        val dtFixS = (g.time - prevFix.time) / 1000.0
+        if (dtFixS < 0.2 || dtFixS > 5.0) return
+        val posMps = g.distanceTo(prevFix) / dtFixS
+        if (kotlin.math.abs(posMps - g.speed) > kotlin.math.max(0.3 * g.speed, 0.7)) return
         val ratio = g.speed.toDouble() / ipmMps.toDouble()   // = h_true / h_current
         if (!ratio.isFinite() || ratio < 0.2 || ratio > 5.0) return
         heightCalibRatios.add(ratio)
@@ -1370,6 +1611,8 @@ class NavSightViewModel(application: Application) : AndroidViewModel(application
                 sb.append("\"stride\":${p.strideLength},\"pflags\":${p.poseFlags},")
                 // READ-ONLY speed channels for offline GPS scoring (IPM ground-plane validation).
                 sb.append("\"gp_flow_speed\":${p.gpFlowSpeed ?: "null"},\"fused_speed\":${p.fusedSpeed ?: "null"},")
+                // 2026-06-04 — per-DEPTH-BAND IPM diagnostic [near n,flow,vi,cos,surv, mid…, far…] = 15 floats.
+                sb.append("\"ipm_band\":${p.ipmBand?.joinToString(",", "[", "]") ?: "null"},")
                 sb.append("\"hdg\":${p.heading}}")
             }
             sb.append("]}")
