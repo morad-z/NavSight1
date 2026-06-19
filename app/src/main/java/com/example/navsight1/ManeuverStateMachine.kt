@@ -72,6 +72,14 @@ internal class ManeuverStateMachine {
     // rolling window for mid-road U-turn detection: each entry = [heading, lat, lng]
     private val window = ArrayDeque<DoubleArray>()
 
+    // 2026-06-12 — ring RE-ENTRY HYSTERESIS. ride3 (val_2026_06_04) latched ON_ROUNDABOUT for 460
+    // consecutive ticks (~4 min): every forced exit (sweep/dwell cap) dropped to FREE_ROAD while the
+    // dot was still ON the ring → the very next tick re-entered → chained 60-tick dwell cycles. After
+    // ANY roundabout exit, the SAME ring may not be re-entered until the position has first been
+    // physically clear of every ring's enter-annulus (nearestRing == null re-arms).
+    private var lastExitedRingWayId = -1L
+    private var reentryArmed = true
+
     fun reset() {
         state = ManeuverState.FREE_ROAD
         activeRing = null; suggestedExit = null; travelDirection = TravelDirection.FORWARD
@@ -80,6 +88,7 @@ internal class ManeuverStateMachine {
         lastLat = Double.NaN; lastLng = Double.NaN
         uturnAnchorLat = Double.NaN; uturnAnchorLng = Double.NaN
         window.clear()
+        lastExitedRingWayId = -1L; reentryArmed = true   // 2026-06-12 — re-entry hysteresis
     }
 
     /**
@@ -100,7 +109,10 @@ internal class ManeuverStateMachine {
         when (state) {
             ManeuverState.FREE_ROAD -> {
                 val ring = roundabouts.nearestRing(lat, lng, ENTER_MARGIN_M)
-                if (ring != null) {
+                // 2026-06-12 — re-entry hysteresis: once clear of every ring annulus, re-arm; the ring
+                // we just exited may not be re-entered before that (kills the exit→re-enter latch loop).
+                if (ring == null) reentryArmed = true
+                if (ring != null && (reentryArmed || ring.wayId != lastExitedRingWayId)) {
                     enterRoundabout(ring, headingDeg)
                     event = ManeuverEvent.ROUNDABOUT_ENTERED
                 } else {
@@ -140,6 +152,8 @@ internal class ManeuverStateMachine {
                     val reversed = !entryBearingDeg.isNaN() &&
                         abs(ManeuverMath.angularDifferenceDeg(headingDeg, entryBearingDeg)) > UTURN_VIA_RBT_THRESH_DEG
                     event = if (reversed) ManeuverEvent.UTURN_VIA_ROUNDABOUT else ManeuverEvent.ROUNDABOUT_EXIT
+                    lastExitedRingWayId = ring.wayId   // 2026-06-12 — arm the re-entry hysteresis
+                    reentryArmed = false
                     toFreeRoad()
                 }
             }
