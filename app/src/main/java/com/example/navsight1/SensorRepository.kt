@@ -265,6 +265,9 @@ class SensorRepository(private val context: Context) : SensorEventListener {
     private var lastOrientationUpdateNs = 0L
     private val accelMagnitudeHistory = ArrayDeque<Float>(20)
     private var lastShakeCheckMs = 0L
+    // 2026-06-19 — count of shake-resets SUPPRESSED because the ride was already underway (see
+    // onSensorChanged shake-reset gate). Observability for the teleport-to-start fix.
+    private var shakeResetSuppressedCount = 0
 
     private var locationTokenSource: CancellationTokenSource? = null
 
@@ -808,8 +811,22 @@ class SensorRepository(private val context: Context) : SensorEventListener {
                     val variance = accelMagnitudeHistory.sumOf { v ->
                         (v - mean) * (v - mean)
                     } / accelMagnitudeHistory.size
+                    // 2026-06-19 — SHAKE-RESET GATE (root cause of the spurious mid-ride teleport-to-start).
+                    // resetPath() zeros the VIO displacement (global_t_) while the start anchor stays valid,
+                    // so the dot reprojects exactly onto the ride start. On a moving scooter/vehicle the
+                    // accel-magnitude variance routinely exceeds 30 (m/s^2)^2 (potholes, braking, vibration),
+                    // so this fired repeatedly mid-ride and teleported the dot home. The auto-reset is only a
+                    // legitimate recovery in the pre-init / stationary phase, so gate it on the VIO not being
+                    // initialized yet — once a ride is underway it can never spontaneously reset.
                     if (variance > 30.0) {
-                        resetPath()
+                        if (_wasVioInitialized.get()) {
+                            shakeResetSuppressedCount++
+                            Log.i(TAG, "SHAKE_RESET_SUPPRESSED variance=%.1f ride-underway count=%d"
+                                .format(variance, shakeResetSuppressedCount))
+                        } else {
+                            Log.i(TAG, "SHAKE_RESET variance=%.1f (pre-init recovery)".format(variance))
+                            resetPath()
+                        }
                     }
                 }
             }

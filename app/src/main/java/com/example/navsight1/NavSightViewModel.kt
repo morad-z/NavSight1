@@ -1543,6 +1543,7 @@ class NavSightViewModel(application: Application) : AndroidViewModel(application
         lastScaleObsMs = 0L
         lastKMap = null
         startLocationOverridden = false   // a fresh session re-acquires the GPS anchor
+        sessionAnchorSet = false          // 2026-06-19 — re-anchor to the NEW start (was: stale anchor reprojected the dot to the old start after a reset)
         lastMapMatched = null
         lastMapMatchedConf = null
         lastVioForDist = null; lastDotForDist = null
