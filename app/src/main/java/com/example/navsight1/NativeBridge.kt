@@ -99,7 +99,8 @@ object NativeBridge {
     // metres east/north, when confidently railed; native bleeds its cross-track part into global_t_ so
     // the VIO trajectory stops drifting off the road. Push (0,0) freely — native gates on magnitude.
     external fun setMapPositionCorrection(dEastM: Double, dNorthM: Double)
-    // Runtime toggle for the POSITION leg (default-OFF in native; heading leg is separate + on).
+    // Runtime kill switch for the POSITION leg (default-ON in native since 2026-06-02 —
+    // Tracker.h map_pos_correction_enabled_{true}; heading leg is separate + on).
     external fun setMapPositionEnabled(enabled: Boolean)
 
     // Step 5: Calibration & Initialization

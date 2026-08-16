@@ -1085,8 +1085,8 @@ class NavSightViewModel(application: Application) : AndroidViewModel(application
                 // 2026-05-31 (map-as-sensor HEADING leg) — when confidently RAILED on a STRAIGHT road
                 // in FREE_ROAD, push that road's bearing to native so it nudges the VIO heading onto the
                 // road (stops the off-road drift; the user's "fix the heading so we stay on the road").
-                // Native gates on |heading-road|<35° + magnetometer-not-fusing, so a crossing road is
-                // rejected (un-drift only). Sentinel -1000 clears the hint when not applicable.
+                // Native gates on |heading-road|<90° (kRoadMaxResidualRad = π/2, the crossing-road
+                // backstop) + magnetometer-not-fusing. Sentinel -1000 clears the hint when not applicable.
                 // 2026-06-02 — road→heading correction TARGET = the ball-on-rail's CURRENT edge bearing
                 // (the road's LOCAL TANGENT where you are). Per-road by construction (the ball is
                 // graph-constrained), and it follows CURVATURE as the ball advances (owner: "when a road
@@ -1108,8 +1108,8 @@ class NavSightViewModel(application: Application) : AndroidViewModel(application
                 // wrong-road runaway / ADR-004): only when the SAME condition the heading hint requires
                 // holds (roadHint != -1000 ⇒ accept + railed + FREE_ROAD + straight), AND the match is
                 // high-confidence, AND it has held for several consecutive ticks — so a transient or a
-                // wrong-parallel-road lock cannot start dragging the VIO. Native applies it only when the
-                // position leg is enabled (default-OFF until the heading leg is validated on device).
+                // wrong-parallel-road lock cannot start dragging the VIO. Native applies it while the
+                // position leg is enabled (default-ON since 2026-06-02, Tracker.h map_pos_correction_enabled_).
                 val posConfident = accept && matched != null &&
                     matched.confidence >= MAP_POS_MIN_CONFIDENCE && roadHint != -1000.0
                 mapPosPushStreak = if (posConfident) mapPosPushStreak + 1 else 0

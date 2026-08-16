@@ -3980,7 +3980,7 @@ VisionOutput Tracker::processFrame(const uint8_t* yuv_data, int width, int heigh
         // drifting off the road ("we should always be on the road we start on"). The Kotlin matcher
         // pushes the railed road's bearing (FREE_ROAD + confident + straight) via setRoadHeadingHint;
         // here we nudge a FRACTIONAL step toward it, mirroring the visual yaw nudge (kBug5SyncStrength):
-        // gated on a SMALL residual (|hdg-road| < kRoadMaxResidualRad=35°, so a ~90° crossing road is
+        // gated below perpendicular (|hdg-road| < kRoadMaxResidualRad=90°, so a crossing road is
         // REJECTED — this can only un-drift, never re-aim), a FRESH hint, the magnetometer NOT actively
         // fusing (mag is the absolute reference), and the enable flag. Corrects the Madgwick SOURCE
         // (not scalar_heading_, which is re-read from it) so the fix persists, then re-reads so THIS
