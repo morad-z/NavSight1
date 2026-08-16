@@ -1,0 +1,22 @@
+# NavSight - Single Camera Frame Lifecycle (~43 ms interval, 15.4 ms median work)
+direction: right
+
+classes: {
+  io:   { style: { fill: "#DBEAFE"; stroke: "#2563EB"; border-radius: 8; font-color: "#0F172A" } }
+  step: { style: { fill: "#CFFAFE"; stroke: "#0891B2"; border-radius: 8; font-color: "#0F172A" } }
+  out:  { style: { fill: "#FEF3C7"; stroke: "#D97706"; border-radius: 18; font-color: "#0F172A" } }
+  sla:  { style: { fill: "#DCFCE7"; stroke: "#16A34A"; border-radius: 8; font-color: "#14532D"; bold: true } }
+}
+
+CAP: "1 - Capture\n640x480 zero-copy ByteBuffer"; CAP.class: io
+LENS: "2 - Lens-correct\nundistort -> normalized (fx ~ 451)"; LENS.class: step
+KLT: "3 - KLT track\npyramidal Lucas-Kanade"; KLT.class: step
+FB: "4 - Forward-backward check\nreject blur / occlusion outliers"; FB.class: step
+DEROT: "5 - De-rotate flow\nsubtract gyro / Madgwick rotation"; DEROT.class: step
+FEED: "6 - Feed IPM speed + EKF update\nMSCKF chi-squared gate"; FEED.class: step
+PUB: "Publish VioData -> UI\nball on road + speed"; PUB.class: out
+
+CAP -> LENS -> KLT -> FB -> DEROT -> FEED -> PUB
+
+SLA: "Per-frame budget: 15.4 ms median - ~78 ms max   vs   200 ms SDD   =>   13x under at median"; SLA.class: sla
+FEED -> SLA: "real-time" { style: { stroke: "#16A34A"; stroke-dash: 3 } }

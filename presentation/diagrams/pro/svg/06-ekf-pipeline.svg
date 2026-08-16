@@ -1,0 +1,58 @@
+<svg xmlns="http://www.w3.org/2000/svg" width="1360" height="1120" viewBox="0 0 1360 1120" font-family="'Segoe UI', 'Helvetica Neue', Arial, sans-serif">
+<defs>
+<marker id="ah-slate" markerWidth="12" markerHeight="12" refX="9" refY="4" orient="auto" markerUnits="userSpaceOnUse"><path d="M0,0 L9,4 L0,8 Z" fill="#475569"/></marker>
+<marker id="ah-red" markerWidth="12" markerHeight="12" refX="9" refY="4" orient="auto" markerUnits="userSpaceOnUse"><path d="M0,0 L9,4 L0,8 Z" fill="#DC2626"/></marker>
+<marker id="ah-cyan" markerWidth="12" markerHeight="12" refX="9" refY="4" orient="auto" markerUnits="userSpaceOnUse"><path d="M0,0 L9,4 L0,8 Z" fill="#0E7490"/></marker>
+<marker id="ah-green" markerWidth="12" markerHeight="12" refX="9" refY="4" orient="auto" markerUnits="userSpaceOnUse"><path d="M0,0 L9,4 L0,8 Z" fill="#16A34A"/></marker>
+<marker id="ah-violet" markerWidth="12" markerHeight="12" refX="9" refY="4" orient="auto" markerUnits="userSpaceOnUse"><path d="M0,0 L9,4 L0,8 Z" fill="#7C3AED"/></marker>
+<marker id="ah-gray" markerWidth="12" markerHeight="12" refX="9" refY="4" orient="auto" markerUnits="userSpaceOnUse"><path d="M0,0 L9,4 L0,8 Z" fill="#94A3B8"/></marker>
+<marker id="ah-ball" markerWidth="12" markerHeight="12" refX="9" refY="4" orient="auto" markerUnits="userSpaceOnUse"><path d="M0,0 L9,4 L0,8 Z" fill="#D97706"/></marker>
+<filter id="ds" x="-10%" y="-10%" width="120%" height="130%"><feDropShadow dx="0" dy="2" stdDeviation="3" flood-color="#0F172A" flood-opacity="0.18"/></filter>
+</defs>
+<rect x="0" y="0" width="1360" height="1120" rx="18" fill="#F8FAFC" stroke="#E2E8F0" stroke-width="2"/>
+<rect x="0" y="0" width="10" height="1120" rx="0" fill="#0891B2"/>
+<text x="42" y="56" font-size="30.0" font-weight="700" fill="#0F172A">NavSight  -  15-DOF Error-State EKF Pipeline</text>
+<text x="42" y="86" font-size="26.1" fill="#475569">tightly-coupled visual-inertial fusion, ENU Z-up world frame</text>
+<rect x="230" y="130" width="900" height="100" rx="12" fill="#CFFAFE" stroke="#0E7490" stroke-width="2.5" filter="url(#ds)"/>
+<text x="680.0" y="161.5" font-size="23.2" font-family="'Segoe UI', 'Helvetica Neue', Arial, sans-serif" font-weight="700" fill="#0F172A" text-anchor="middle" dominant-baseline="middle">Error state  -  15-DOF core + t_d + phi_bc = 19-DOF   (ENU Z-up)</text>
+<text x="680.0" y="180.0" font-size="20.3" font-family="'Segoe UI', 'Helvetica Neue', Arial, sans-serif" font-weight="400" fill="#0F172A" text-anchor="middle" dominant-baseline="middle">[ attitude - gyro bias - velocity - accel bias - position ]</text>
+<text x="680.0" y="198.5" font-size="20.3" font-family="'Segoe UI', 'Helvetica Neue', Arial, sans-serif" font-weight="400" fill="#0F172A" text-anchor="middle" dominant-baseline="middle">+ pose clones (&lt;= 15)  -  SLAM slots (&lt;= 12, idle)</text>
+<rect x="330" y="280" width="700" height="80" rx="12" fill="#F1F5F9" stroke="#334155" stroke-width="2.5" filter="url(#ds)"/>
+<text x="680.0" y="310.1" font-size="24.6" font-family="'Segoe UI', 'Helvetica Neue', Arial, sans-serif" font-weight="700" fill="#0F172A" text-anchor="middle" dominant-baseline="middle">IMU propagation  (Forster midpoint)</text>
+<text x="680.0" y="329.9" font-size="21.8" font-family="'Segoe UI', 'Helvetica Neue', Arial, sans-serif" font-weight="400" fill="#0F172A" text-anchor="middle" dominant-baseline="middle">R &lt;- R . dR ;   v, p integrate dv / dp + gravity</text>
+<rect x="180" y="420" width="1000" height="200" rx="16" fill="#ECFEFF" stroke="#0E7490" stroke-width="2.5" stroke-dasharray="2 0"/>
+<text x="200" y="450" font-size="26.1" font-weight="700" fill="#0E7490">Measurement updates   (Joseph form + per-row Huber)</text>
+<rect x="220" y="490" width="280" height="100" rx="12" fill="#F1F5F9" stroke="#334155" stroke-width="2.5" filter="url(#ds)"/>
+<text x="360.0" y="530.1" font-size="24.6" font-family="'Segoe UI', 'Helvetica Neue', Arial, sans-serif" font-weight="700" fill="#0F172A" text-anchor="middle" dominant-baseline="middle">MSCKF</text>
+<text x="360.0" y="549.9" font-size="21.8" font-family="'Segoe UI', 'Helvetica Neue', Arial, sans-serif" font-weight="400" fill="#0F172A" text-anchor="middle" dominant-baseline="middle">visual update</text>
+<rect x="540" y="490" width="280" height="100" rx="12" fill="#DCFCE7" stroke="#16A34A" stroke-width="2.5" filter="url(#ds)"/>
+<text x="680.0" y="521.5" font-size="23.2" font-family="'Segoe UI', 'Helvetica Neue', Arial, sans-serif" font-weight="700" fill="#14532D" text-anchor="middle" dominant-baseline="middle">Gravity-alignment</text>
+<text x="680.0" y="540.0" font-size="20.3" font-family="'Segoe UI', 'Helvetica Neue', Arial, sans-serif" font-weight="400" fill="#14532D" text-anchor="middle" dominant-baseline="middle">update</text>
+<text x="680.0" y="558.5" font-size="20.3" font-family="'Segoe UI', 'Helvetica Neue', Arial, sans-serif" font-weight="400" fill="#14532D" text-anchor="middle" dominant-baseline="middle">keeps p_G bounded</text>
+<rect x="860" y="490" width="280" height="100" rx="12" fill="#F1F5F9" stroke="#334155" stroke-width="2.5" filter="url(#ds)"/>
+<text x="1000.0" y="521.5" font-size="23.2" font-family="'Segoe UI', 'Helvetica Neue', Arial, sans-serif" font-weight="700" fill="#0F172A" text-anchor="middle" dominant-baseline="middle">ZUPT</text>
+<text x="1000.0" y="540.0" font-size="20.3" font-family="'Segoe UI', 'Helvetica Neue', Arial, sans-serif" font-weight="400" fill="#0F172A" text-anchor="middle" dominant-baseline="middle">v_G = 0 when</text>
+<text x="1000.0" y="558.5" font-size="20.3" font-family="'Segoe UI', 'Helvetica Neue', Arial, sans-serif" font-weight="400" fill="#0F172A" text-anchor="middle" dominant-baseline="middle">stationary</text>
+<polygon points="680,660.0 860.0,730 680,800.0 500.0,730" fill="#FEF9C3" stroke="#CA8A04" stroke-width="2.5" filter="url(#ds)"/>
+<text x="680.0" y="719.4" font-size="26.1" font-family="'Segoe UI', 'Helvetica Neue', Arial, sans-serif" font-weight="700" fill="#0F172A" text-anchor="middle" dominant-baseline="middle">chi^2 gate = 22.5</text>
+<text x="680.0" y="740.6" font-size="23.2" font-family="'Segoe UI', 'Helvetica Neue', Arial, sans-serif" font-weight="400" fill="#0F172A" text-anchor="middle" dominant-baseline="middle">(~ chi2(0.999, 6 dof))</text>
+<rect x="300" y="940" width="760" height="90" rx="12" fill="#0891B2" stroke="#0E7490" stroke-width="2.5" filter="url(#ds)"/>
+<text x="680.0" y="974.4" font-size="26.1" font-family="'Segoe UI', 'Helvetica Neue', Arial, sans-serif" font-weight="700" fill="#FFFFFF" text-anchor="middle" dominant-baseline="middle">Bounded, physically consistent state</text>
+<text x="680.0" y="995.6" font-size="23.2" font-family="'Segoe UI', 'Helvetica Neue', Arial, sans-serif" font-weight="400" fill="#FFFFFF" text-anchor="middle" dominant-baseline="middle">speed + pose  -&gt;  map matcher</text>
+<line x1="680.0" y1="230.0" x2="680.0" y2="280.0" stroke="#475569" stroke-width="2.5" marker-end="url(#ah-slate)"/>
+<line x1="600.0" y1="360.0" x2="360.0" y2="490.0" stroke="#475569" stroke-width="2.5" marker-end="url(#ah-slate)"/>
+<line x1="680.0" y1="360.0" x2="680.0" y2="490.0" stroke="#475569" stroke-width="2.5" marker-end="url(#ah-slate)"/>
+<line x1="760.0" y1="360.0" x2="1000.0" y2="490.0" stroke="#475569" stroke-width="2.5" marker-end="url(#ah-slate)"/>
+<line x1="360.0" y1="590.0" x2="600.0" y2="668.0" stroke="#475569" stroke-width="2.5" marker-end="url(#ah-slate)"/>
+<line x1="680.0" y1="590.0" x2="680.0" y2="660.0" stroke="#475569" stroke-width="2.5" marker-end="url(#ah-slate)"/>
+<line x1="1000.0" y1="590.0" x2="760.0" y2="668.0" stroke="#475569" stroke-width="2.5" marker-end="url(#ah-slate)"/>
+<line x1="680.0" y1="800.0" x2="680.0" y2="940.0" stroke="#0E7490" stroke-width="2.5" marker-end="url(#ah-cyan)"/>
+<rect x="649.5" y="856.7" width="61.0" height="26.6" rx="6" fill="#FFFFFF" stroke="#0E7490" stroke-width="1" opacity="0.95"/>
+<text x="680.0" y="870.0" font-size="20.3" fill="#0F172A" text-anchor="middle" dominant-baseline="middle">accept</text>
+<polyline points="860.0,730.0 1230.0,730.0 1230.0,320.0 1030.0,320.0" fill="none" stroke="#DC2626" stroke-width="2.5" stroke-dasharray="8 6" marker-end="url(#ah-red)"/>
+<rect x="1168.1" y="511.7" width="123.8" height="26.6" rx="6" fill="#FFFFFF" stroke="#DC2626" stroke-width="1" opacity="0.95"/>
+<text x="1230.0" y="525.0" font-size="20.3" fill="#0F172A" text-anchor="middle" dominant-baseline="middle">reject outlier</text>
+<polyline points="300.0,985.0 130.0,985.0 130.0,180.0 230.0,180.0" fill="none" stroke="#0E7490" stroke-width="2.5" stroke-dasharray="8 6" marker-end="url(#ah-cyan)"/>
+<rect x="91.6" y="569.2" width="76.7" height="26.6" rx="6" fill="#FFFFFF" stroke="#0E7490" stroke-width="1" opacity="0.95"/>
+<text x="130.0" y="582.5" font-size="20.3" fill="#0F172A" text-anchor="middle" dominant-baseline="middle">feedback</text>
+</svg>

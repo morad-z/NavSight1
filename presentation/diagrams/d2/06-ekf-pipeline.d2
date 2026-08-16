@@ -1,0 +1,34 @@
+# NavSight - 15-DOF Error-State EKF Pipeline
+direction: down
+
+classes: {
+  engine:   { style: { fill: "#CFFAFE"; stroke: "#0891B2"; border-radius: 8; font-color: "#0F172A" } }
+  step:     { style: { fill: "#F1F5F9"; stroke: "#334155"; border-radius: 8; font-color: "#0F172A" } }
+  good:     { style: { fill: "#DCFCE7"; stroke: "#16A34A"; border-radius: 8; font-color: "#14532D"; bold: true } }
+  accent:   { style: { fill: "#0891B2"; stroke: "#0E7490"; border-radius: 8; font-color: "#FFFFFF"; bold: true } }
+  decision: { style: { fill: "#FEF9C3"; stroke: "#CA8A04"; font-color: "#0F172A"; bold: true } }
+}
+
+STATE: "Error state - 15-DOF  (ENU Z-up, g = (0,0,-9.81))\n[ attitude - gyro bias - velocity - accel bias - position ]\n+ clones (<= 15)"; STATE.class: engine
+PROP: "IMU propagation (Forster midpoint)\nR <- R . dR ;  v, p integrate dv / dp + gravity"; PROP.class: step
+
+UPD: "Measurement updates  (Joseph form + per-row Huber)" {
+  style: { fill: "#ECFEFF"; stroke: "#0891B2"; stroke-width: 2; border-radius: 12; font-color: "#155E75"; bold: true }
+  MSCKF: "MSCKF visual update"; MSCKF.class: step
+  GRAV: "Gravity-alignment update\nkeeps p_G physically bounded"; GRAV.class: good
+  ZUPT: "ZUPT - v_G = 0 when stationary"; ZUPT.class: step
+}
+
+GATE: "MSCKF Mahalanobis gate\n5x chi2_0.95(2K) + Huber"; GATE.shape: diamond; GATE.class: decision
+BOUND: "Bounded, physically consistent state\nspeed + pose -> map matcher"; BOUND.class: accent
+
+STATE -> PROP
+PROP -> UPD.MSCKF
+PROP -> UPD.GRAV
+PROP -> UPD.ZUPT
+UPD.MSCKF -> GATE
+UPD.GRAV -> GATE
+UPD.ZUPT -> GATE
+GATE -> BOUND: "accept"
+GATE -> PROP: "reject outlier" { style: { stroke: "#DC2626"; stroke-dash: 3 } }
+BOUND -> STATE: "feedback" { style: { stroke: "#0891B2"; stroke-dash: 3 } }

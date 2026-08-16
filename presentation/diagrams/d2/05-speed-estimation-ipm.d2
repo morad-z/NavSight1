@@ -1,0 +1,40 @@
+# NavSight - Speed Estimation via Inverse Perspective Mapping (IPM)
+direction: down
+
+classes: {
+  io:       { style: { fill: "#DBEAFE"; stroke: "#2563EB"; border-radius: 8; font-color: "#0F172A" } }
+  step:     { style: { fill: "#CFFAFE"; stroke: "#0891B2"; border-radius: 8; font-color: "#0F172A" } }
+  good:     { style: { fill: "#DCFCE7"; stroke: "#16A34A"; border-radius: 8; font-color: "#14532D"; bold: true } }
+  accent:   { style: { fill: "#0891B2"; stroke: "#0E7490"; border-radius: 8; font-color: "#FFFFFF"; bold: true } }
+  bridge:   { style: { fill: "#FEF3C7"; stroke: "#D97706"; border-radius: 8; font-color: "#0F172A"; bold: true } }
+  decision: { style: { fill: "#FEF9C3"; stroke: "#CA8A04"; font-color: "#0F172A"; bold: true } }
+}
+
+RAY: "Camera ray r_i per road pixel (640x480, fx ~ 451)"; RAY.class: io
+PLANE: "Ground plane at mount height h = 1.05 m"; PLANE.class: step
+Z: "Depth  Z_i = -h / (n_hat . r_i)"; Z.class: step
+A: "Flow-per-speed  a_i = (u_fwd - r_i u_fwd,z) / Z_i"; A.class: step
+VI: "Per-point speed  v_i = -(f_i . a_i)/(a_i . a_i) (1/dt)"; VI.class: step
+FLOOR: "Per-point noise floor  sigma_v = (sigma_px/fx)/(|a_i| dt)\nsigma_px = 0.5 px"; FLOOR.class: step
+
+TAX: "Two-sided vote taxonomy" {
+  style: { fill: "#ECFEFF"; stroke: "#0891B2"; stroke-width: 2; border-radius: 12; font-color: "#155E75"; bold: true }
+  VOTE: "VOTE\nv_i > 3 sigma  AND  forward-coherent (45 deg cone)"; VOTE.class: step
+  ZERO: "ZERO-WITNESS\n|v_i| < 3 sigma  AND  floor <= 1 m/s"; ZERO.class: step
+}
+
+DEC: "Resolve"; DEC.shape: diamond; DEC.class: decision
+MED: "Median speed  (>= 5 votes)"; MED.class: accent
+LOCK: "EXACT 0 km/h - standstill zero-lock\n(>= 5 zero-witnesses)"; LOCK.class: good
+BRIDGE: "Inertial bridge  v_k = (1-a) v_k- + a median\nalpha = 0.15 - trusted ~6 s"; BRIDGE.class: bridge
+
+RAY -> PLANE -> Z -> A -> VI
+FLOOR -> TAX.VOTE
+FLOOR -> TAX.ZERO
+VI -> TAX.VOTE
+VI -> TAX.ZERO
+TAX.VOTE -> DEC
+TAX.ZERO -> DEC
+DEC -> MED: ">= 5 votes"
+DEC -> LOCK: ">= 5 zero-witnesses"
+DEC -> BRIDGE: "else"

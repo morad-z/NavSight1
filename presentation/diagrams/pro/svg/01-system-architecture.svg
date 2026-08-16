@@ -1,0 +1,68 @@
+<svg xmlns="http://www.w3.org/2000/svg" width="1540" height="1210" viewBox="0 0 1540 1210" font-family="'Segoe UI', 'Helvetica Neue', Arial, sans-serif">
+<defs>
+<marker id="ah-slate" markerWidth="12" markerHeight="12" refX="9" refY="4" orient="auto" markerUnits="userSpaceOnUse"><path d="M0,0 L9,4 L0,8 Z" fill="#475569"/></marker>
+<marker id="ah-red" markerWidth="12" markerHeight="12" refX="9" refY="4" orient="auto" markerUnits="userSpaceOnUse"><path d="M0,0 L9,4 L0,8 Z" fill="#DC2626"/></marker>
+<marker id="ah-cyan" markerWidth="12" markerHeight="12" refX="9" refY="4" orient="auto" markerUnits="userSpaceOnUse"><path d="M0,0 L9,4 L0,8 Z" fill="#0E7490"/></marker>
+<marker id="ah-green" markerWidth="12" markerHeight="12" refX="9" refY="4" orient="auto" markerUnits="userSpaceOnUse"><path d="M0,0 L9,4 L0,8 Z" fill="#16A34A"/></marker>
+<marker id="ah-violet" markerWidth="12" markerHeight="12" refX="9" refY="4" orient="auto" markerUnits="userSpaceOnUse"><path d="M0,0 L9,4 L0,8 Z" fill="#7C3AED"/></marker>
+<marker id="ah-gray" markerWidth="12" markerHeight="12" refX="9" refY="4" orient="auto" markerUnits="userSpaceOnUse"><path d="M0,0 L9,4 L0,8 Z" fill="#94A3B8"/></marker>
+<marker id="ah-ball" markerWidth="12" markerHeight="12" refX="9" refY="4" orient="auto" markerUnits="userSpaceOnUse"><path d="M0,0 L9,4 L0,8 Z" fill="#D97706"/></marker>
+<filter id="ds" x="-10%" y="-10%" width="120%" height="130%"><feDropShadow dx="0" dy="2" stdDeviation="3" flood-color="#0F172A" flood-opacity="0.18"/></filter>
+</defs>
+<rect x="0" y="0" width="1540" height="1210" rx="18" fill="#F8FAFC" stroke="#E2E8F0" stroke-width="2"/>
+<rect x="0" y="0" width="10" height="1210" rx="0" fill="#0891B2"/>
+<text x="42" y="56" font-size="30.0" font-weight="700" fill="#0F172A">NavSight  -  4-Tier System Architecture</text>
+<text x="42" y="86" font-size="26.1" fill="#475569">v1.0-osm  -  GPS-denied, fully offline, on-device</text>
+<rect x="60" y="110" width="1280" height="170" rx="16" fill="#EFF6FF" stroke="#2563EB" stroke-width="2.5" stroke-dasharray="2 0"/>
+<text x="80" y="140" font-size="26.1" font-weight="700" fill="#2563EB">TIER 1  -  PRESENTATION / UI   (Kotlin / Jetpack Compose)   -   Roey</text>
+<rect x="95" y="165" width="380" height="90" rx="12" fill="#DBEAFE" stroke="#2563EB" stroke-width="2.5" filter="url(#ds)"/>
+<text x="285.0" y="199.4" font-size="26.1" font-family="'Segoe UI', 'Helvetica Neue', Arial, sans-serif" font-weight="700" fill="#0F172A" text-anchor="middle" dominant-baseline="middle">CameraX</text>
+<text x="285.0" y="220.6" font-size="23.2" font-family="'Segoe UI', 'Helvetica Neue', Arial, sans-serif" font-weight="400" fill="#0F172A" text-anchor="middle" dominant-baseline="middle">rear camera</text>
+<rect x="540" y="165" width="400" height="90" rx="12" fill="#DBEAFE" stroke="#2563EB" stroke-width="2.5" filter="url(#ds)"/>
+<text x="740.0" y="199.4" font-size="26.1" font-family="'Segoe UI', 'Helvetica Neue', Arial, sans-serif" font-weight="700" fill="#0F172A" text-anchor="middle" dominant-baseline="middle">SensorRepository</text>
+<text x="740.0" y="220.6" font-size="23.2" font-family="'Segoe UI', 'Helvetica Neue', Arial, sans-serif" font-weight="400" fill="#0F172A" text-anchor="middle" dominant-baseline="middle">accel + gyro ~50 Hz</text>
+<rect x="1000" y="165" width="305" height="90" rx="12" fill="#DBEAFE" stroke="#2563EB" stroke-width="2.5" filter="url(#ds)"/>
+<text x="1152.5" y="200.1" font-size="24.6" font-family="'Segoe UI', 'Helvetica Neue', Arial, sans-serif" font-weight="700" fill="#0F172A" text-anchor="middle" dominant-baseline="middle">NavSightViewModel</text>
+<text x="1152.5" y="219.9" font-size="21.8" font-family="'Segoe UI', 'Helvetica Neue', Arial, sans-serif" font-weight="400" fill="#0F172A" text-anchor="middle" dominant-baseline="middle">MapScreen - CameraScreen</text>
+<rect x="320" y="320" width="960" height="80" rx="12" fill="#E2E8F0" stroke="#475569" stroke-width="2.5" filter="url(#ds)"/>
+<text x="800.0" y="349.4" font-size="26.1" font-family="'Segoe UI', 'Helvetica Neue', Arial, sans-serif" font-weight="700" fill="#0F172A" text-anchor="middle" dominant-baseline="middle">TIER 2  -  JNI BRIDGE</text>
+<text x="800.0" y="370.6" font-size="23.2" font-family="'Segoe UI', 'Helvetica Neue', Arial, sans-serif" font-weight="400" fill="#0F172A" text-anchor="middle" dominant-baseline="middle">NativeBridge  -  zero-copy ByteBuffer frames</text>
+<rect x="60" y="450" width="1280" height="320" rx="16" fill="#ECFEFF" stroke="#0E7490" stroke-width="2.5" stroke-dasharray="2 0"/>
+<text x="80" y="480" font-size="26.1" font-weight="700" fill="#0E7490">TIER 3  -  VIO ENGINE   (native C++17 / OpenCV 4.5.3)   -   Morad</text>
+<rect x="540" y="500" width="420" height="70" rx="12" fill="#CFFAFE" stroke="#0E7490" stroke-width="2.5" filter="url(#ds)"/>
+<text x="750.0" y="535.0" font-size="23.2" font-family="'Segoe UI', 'Helvetica Neue', Arial, sans-serif" font-weight="700" fill="#0F172A" text-anchor="middle" dominant-baseline="middle">VioEngine  -  orchestrator</text>
+<rect x="110" y="610" width="540" height="70" rx="12" fill="#CFFAFE" stroke="#0E7490" stroke-width="2.5" filter="url(#ds)"/>
+<text x="380.0" y="635.1" font-size="24.6" font-family="'Segoe UI', 'Helvetica Neue', Arial, sans-serif" font-weight="700" fill="#0F172A" text-anchor="middle" dominant-baseline="middle">Tracker</text>
+<text x="380.0" y="654.9" font-size="21.8" font-family="'Segoe UI', 'Helvetica Neue', Arial, sans-serif" font-weight="400" fill="#0F172A" text-anchor="middle" dominant-baseline="middle">KLT flow - ORB reloc - keyframes</text>
+<rect x="760" y="610" width="520" height="70" rx="12" fill="#CFFAFE" stroke="#0E7490" stroke-width="2.5" filter="url(#ds)"/>
+<text x="1020.0" y="635.1" font-size="24.6" font-family="'Segoe UI', 'Helvetica Neue', Arial, sans-serif" font-weight="700" fill="#0F172A" text-anchor="middle" dominant-baseline="middle">IMUPreintegrator</text>
+<text x="1020.0" y="654.9" font-size="21.8" font-family="'Segoe UI', 'Helvetica Neue', Arial, sans-serif" font-weight="400" fill="#0F172A" text-anchor="middle" dominant-baseline="middle">Madgwick AHRS + preintegration</text>
+<rect x="380" y="700" width="760" height="56" rx="12" fill="#CFFAFE" stroke="#0E7490" stroke-width="2.5" filter="url(#ds)"/>
+<text x="760.0" y="728.0" font-size="21.8" font-family="'Segoe UI', 'Helvetica Neue', Arial, sans-serif" font-weight="700" fill="#0F172A" text-anchor="middle" dominant-baseline="middle">EKF  -  15-DOF error state  +  measurement updaters</text>
+<rect x="60" y="840" width="1280" height="250" rx="16" fill="#F5F3FF" stroke="#7C3AED" stroke-width="2.5" stroke-dasharray="2 0"/>
+<text x="80" y="870" font-size="26.1" font-weight="700" fill="#7C3AED">TIER 4  -  OFFLINE OSM MAP-MATCHING   -   Tamir</text>
+<rect x="110" y="905" width="640" height="110" rx="12" fill="#EDE9FE" stroke="#7C3AED" stroke-width="2.5" filter="url(#ds)"/>
+<text x="430.0" y="949.4" font-size="26.1" font-family="'Segoe UI', 'Helvetica Neue', Arial, sans-serif" font-weight="700" fill="#0F172A" text-anchor="middle" dominant-baseline="middle">LocalMatcher  -  Viterbi HMM</text>
+<text x="430.0" y="970.6" font-size="23.2" font-family="'Segoe UI', 'Helvetica Neue', Arial, sans-serif" font-weight="400" fill="#0F172A" text-anchor="middle" dominant-baseline="middle">Haifa OSM ~4.67 MB bundled in APK</text>
+<rect x="830" y="905" width="450" height="110" rx="12" fill="#FEF3C7" stroke="#D97706" stroke-width="2.5" filter="url(#ds)"/>
+<text x="1055.0" y="949.4" font-size="26.1" font-family="'Segoe UI', 'Helvetica Neue', Arial, sans-serif" font-weight="700" fill="#0F172A" text-anchor="middle" dominant-baseline="middle">Graph-rail</text>
+<text x="1055.0" y="970.6" font-size="23.2" font-family="'Segoe UI', 'Helvetica Neue', Arial, sans-serif" font-weight="400" fill="#0F172A" text-anchor="middle" dominant-baseline="middle">'ball on the road' + live speed</text>
+<line x1="285.0" y1="255.0" x2="470.0" y2="320.0" stroke="#475569" stroke-width="2.5" marker-end="url(#ah-slate)"/>
+<rect x="350.9" y="274.2" width="53.2" height="26.6" rx="6" fill="#FFFFFF" stroke="#475569" stroke-width="1" opacity="0.95"/>
+<text x="377.5" y="287.5" font-size="20.3" fill="#0F172A" text-anchor="middle" dominant-baseline="middle">frame</text>
+<line x1="740.0" y1="255.0" x2="700.0" y2="320.0" stroke="#475569" stroke-width="2.5" marker-end="url(#ah-slate)"/>
+<rect x="701.2" y="274.2" width="37.5" height="26.6" rx="6" fill="#FFFFFF" stroke="#475569" stroke-width="1" opacity="0.95"/>
+<text x="720.0" y="287.5" font-size="20.3" fill="#0F172A" text-anchor="middle" dominant-baseline="middle">IMU</text>
+<line x1="800.0" y1="400.0" x2="750.0" y2="500.0" stroke="#475569" stroke-width="2.5" marker-end="url(#ah-slate)"/>
+<line x1="750.0" y1="570.0" x2="380.0" y2="610.0" stroke="#475569" stroke-width="2.5" marker-end="url(#ah-slate)"/>
+<line x1="770.0" y1="570.0" x2="1010.0" y2="610.0" stroke="#475569" stroke-width="2.5" marker-end="url(#ah-slate)"/>
+<line x1="380.0" y1="680.0" x2="600.0" y2="700.0" stroke="#475569" stroke-width="2.5" marker-end="url(#ah-slate)"/>
+<line x1="1010.0" y1="680.0" x2="850.0" y2="700.0" stroke="#475569" stroke-width="2.5" marker-end="url(#ah-slate)"/>
+<line x1="760.0" y1="756.0" x2="430.0" y2="905.0" stroke="#0E7490" stroke-width="2.5" marker-end="url(#ah-cyan)"/>
+<rect x="541.0" y="817.2" width="108.1" height="26.6" rx="6" fill="#FFFFFF" stroke="#0E7490" stroke-width="1" opacity="0.95"/>
+<text x="595.0" y="830.5" font-size="20.3" fill="#0F172A" text-anchor="middle" dominant-baseline="middle">speed + pose</text>
+<line x1="750.0" y1="960.0" x2="830.0" y2="960.0" stroke="#7C3AED" stroke-width="2.5" marker-end="url(#ah-violet)"/>
+<polyline points="1280.0,960.0 1430.0,960.0 1430.0,210.0 1305.0,210.0" fill="none" stroke="#D97706" stroke-width="2.5" marker-end="url(#ah-ball)"/>
+<rect x="1328.9" y="571.7" width="202.2" height="26.6" rx="6" fill="#FFFFFF" stroke="#D97706" stroke-width="1" opacity="0.95"/>
+<text x="1430.0" y="585.0" font-size="20.3" fill="#0F172A" text-anchor="middle" dominant-baseline="middle">matched position + speed</text>
+</svg>

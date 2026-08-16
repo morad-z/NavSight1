@@ -1,0 +1,72 @@
+<svg xmlns="http://www.w3.org/2000/svg" width="2120" height="760" viewBox="0 0 2120 760" font-family="'Segoe UI', 'Helvetica Neue', Arial, sans-serif">
+<defs>
+<marker id="ah-slate" markerWidth="12" markerHeight="12" refX="9" refY="4" orient="auto" markerUnits="userSpaceOnUse"><path d="M0,0 L9,4 L0,8 Z" fill="#475569"/></marker>
+<marker id="ah-red" markerWidth="12" markerHeight="12" refX="9" refY="4" orient="auto" markerUnits="userSpaceOnUse"><path d="M0,0 L9,4 L0,8 Z" fill="#DC2626"/></marker>
+<marker id="ah-cyan" markerWidth="12" markerHeight="12" refX="9" refY="4" orient="auto" markerUnits="userSpaceOnUse"><path d="M0,0 L9,4 L0,8 Z" fill="#0E7490"/></marker>
+<marker id="ah-green" markerWidth="12" markerHeight="12" refX="9" refY="4" orient="auto" markerUnits="userSpaceOnUse"><path d="M0,0 L9,4 L0,8 Z" fill="#16A34A"/></marker>
+<marker id="ah-violet" markerWidth="12" markerHeight="12" refX="9" refY="4" orient="auto" markerUnits="userSpaceOnUse"><path d="M0,0 L9,4 L0,8 Z" fill="#7C3AED"/></marker>
+<marker id="ah-gray" markerWidth="12" markerHeight="12" refX="9" refY="4" orient="auto" markerUnits="userSpaceOnUse"><path d="M0,0 L9,4 L0,8 Z" fill="#94A3B8"/></marker>
+<marker id="ah-ball" markerWidth="12" markerHeight="12" refX="9" refY="4" orient="auto" markerUnits="userSpaceOnUse"><path d="M0,0 L9,4 L0,8 Z" fill="#D97706"/></marker>
+<filter id="ds" x="-10%" y="-10%" width="120%" height="130%"><feDropShadow dx="0" dy="2" stdDeviation="3" flood-color="#0F172A" flood-opacity="0.18"/></filter>
+</defs>
+<rect x="0" y="0" width="2120" height="760" rx="18" fill="#F8FAFC" stroke="#E2E8F0" stroke-width="2"/>
+<rect x="0" y="0" width="10" height="760" rx="0" fill="#0891B2"/>
+<text x="42" y="56" font-size="30.0" font-weight="700" fill="#0F172A">NavSight  -  End-to-End Data Flow</text>
+<text x="42" y="86" font-size="26.1" fill="#475569">sensors -&gt; VIO engine -&gt; offline map ball -&gt; UI   (no GPS in the hot path)</text>
+<rect x="50" y="150" width="360" height="470" rx="16" fill="#F8FAFC" stroke="#94A3B8" stroke-width="2.5" stroke-dasharray="2 0"/>
+<text x="70" y="180" font-size="26.1" font-weight="700" fill="#94A3B8">SENSORS  (on-device)</text>
+<rect x="80" y="210" width="300" height="90" rx="12" fill="#DBEAFE" stroke="#2563EB" stroke-width="2.5" filter="url(#ds)"/>
+<text x="230.0" y="245.1" font-size="24.6" font-family="'Segoe UI', 'Helvetica Neue', Arial, sans-serif" font-weight="700" fill="#0F172A" text-anchor="middle" dominant-baseline="middle">Rear camera</text>
+<text x="230.0" y="264.9" font-size="21.8" font-family="'Segoe UI', 'Helvetica Neue', Arial, sans-serif" font-weight="400" fill="#0F172A" text-anchor="middle" dominant-baseline="middle">640x480 ~23 fps</text>
+<rect x="80" y="330" width="300" height="90" rx="12" fill="#DBEAFE" stroke="#2563EB" stroke-width="2.5" filter="url(#ds)"/>
+<text x="230.0" y="365.1" font-size="24.6" font-family="'Segoe UI', 'Helvetica Neue', Arial, sans-serif" font-weight="700" fill="#0F172A" text-anchor="middle" dominant-baseline="middle">IMU</text>
+<text x="230.0" y="384.9" font-size="21.8" font-family="'Segoe UI', 'Helvetica Neue', Arial, sans-serif" font-weight="400" fill="#0F172A" text-anchor="middle" dominant-baseline="middle">accel + gyro ~50 Hz</text>
+<rect x="80" y="450" width="300" height="90" rx="12" fill="#F8FAFC" stroke="#94A3B8" stroke-width="2.5" filter="url(#ds)"/>
+<text x="230.0" y="476.5" font-size="23.2" font-family="'Segoe UI', 'Helvetica Neue', Arial, sans-serif" font-weight="700" fill="#64748B" text-anchor="middle" dominant-baseline="middle">GPS</text>
+<text x="230.0" y="495.0" font-size="20.3" font-family="'Segoe UI', 'Helvetica Neue', Arial, sans-serif" font-weight="400" fill="#64748B" text-anchor="middle" dominant-baseline="middle">health-check only</text>
+<text x="230.0" y="513.5" font-size="20.3" font-family="'Segoe UI', 'Helvetica Neue', Arial, sans-serif" font-weight="400" fill="#64748B" text-anchor="middle" dominant-baseline="middle">(not in hot path)</text>
+<rect x="500" y="200" width="380" height="360" rx="16" fill="#ECFEFF" stroke="#0E7490" stroke-width="2.5" stroke-dasharray="2 0"/>
+<text x="520" y="230" font-size="26.1" font-weight="700" fill="#0E7490">NATIVE VIO CORE  -  Morad</text>
+<rect x="530" y="270" width="320" height="90" rx="12" fill="#CFFAFE" stroke="#0E7490" stroke-width="2.5" filter="url(#ds)"/>
+<text x="690.0" y="305.1" font-size="24.6" font-family="'Segoe UI', 'Helvetica Neue', Arial, sans-serif" font-weight="700" fill="#0F172A" text-anchor="middle" dominant-baseline="middle">Tracker</text>
+<text x="690.0" y="324.9" font-size="21.8" font-family="'Segoe UI', 'Helvetica Neue', Arial, sans-serif" font-weight="400" fill="#0F172A" text-anchor="middle" dominant-baseline="middle">KLT + ORB reloc</text>
+<rect x="530" y="400" width="320" height="90" rx="12" fill="#CFFAFE" stroke="#0E7490" stroke-width="2.5" filter="url(#ds)"/>
+<text x="690.0" y="435.1" font-size="24.6" font-family="'Segoe UI', 'Helvetica Neue', Arial, sans-serif" font-weight="700" fill="#0F172A" text-anchor="middle" dominant-baseline="middle">EKF  15-DOF</text>
+<text x="690.0" y="454.9" font-size="21.8" font-family="'Segoe UI', 'Helvetica Neue', Arial, sans-serif" font-weight="400" fill="#0F172A" text-anchor="middle" dominant-baseline="middle">+ IMU propagation</text>
+<rect x="960" y="200" width="360" height="360" rx="16" fill="#F8FAFC" stroke="#94A3B8" stroke-width="2.5" stroke-dasharray="2 0"/>
+<text x="980" y="230" font-size="26.1" font-weight="700" fill="#94A3B8">ESTIMATES</text>
+<rect x="990" y="270" width="300" height="90" rx="12" fill="#CFFAFE" stroke="#0E7490" stroke-width="2.5" filter="url(#ds)"/>
+<text x="1140.0" y="305.1" font-size="24.6" font-family="'Segoe UI', 'Helvetica Neue', Arial, sans-serif" font-weight="700" fill="#0F172A" text-anchor="middle" dominant-baseline="middle">Speed</text>
+<text x="1140.0" y="324.9" font-size="21.8" font-family="'Segoe UI', 'Helvetica Neue', Arial, sans-serif" font-weight="400" fill="#0F172A" text-anchor="middle" dominant-baseline="middle">IPM + inertial bridge</text>
+<rect x="990" y="400" width="300" height="90" rx="12" fill="#CFFAFE" stroke="#0E7490" stroke-width="2.5" filter="url(#ds)"/>
+<text x="1140.0" y="445.0" font-size="21.8" font-family="'Segoe UI', 'Helvetica Neue', Arial, sans-serif" font-weight="700" fill="#0F172A" text-anchor="middle" dominant-baseline="middle">Pose / heading</text>
+<rect x="1400" y="200" width="400" height="360" rx="16" fill="#F5F3FF" stroke="#7C3AED" stroke-width="2.5" stroke-dasharray="2 0"/>
+<text x="1420" y="230" font-size="26.1" font-weight="700" fill="#7C3AED">MAP MATCHING  -  Tamir</text>
+<rect x="1430" y="270" width="340" height="90" rx="12" fill="#FEF3C7" stroke="#D97706" stroke-width="2.5" filter="url(#ds)"/>
+<text x="1600.0" y="305.1" font-size="24.6" font-family="'Segoe UI', 'Helvetica Neue', Arial, sans-serif" font-weight="700" fill="#0F172A" text-anchor="middle" dominant-baseline="middle">Graph-rail ball</text>
+<text x="1600.0" y="324.9" font-size="21.8" font-family="'Segoe UI', 'Helvetica Neue', Arial, sans-serif" font-weight="400" fill="#0F172A" text-anchor="middle" dominant-baseline="middle">advanced by speed</text>
+<rect x="1430" y="400" width="340" height="90" rx="12" fill="#EDE9FE" stroke="#7C3AED" stroke-width="2.5" filter="url(#ds)"/>
+<text x="1600.0" y="435.1" font-size="24.6" font-family="'Segoe UI', 'Helvetica Neue', Arial, sans-serif" font-weight="700" fill="#0F172A" text-anchor="middle" dominant-baseline="middle">Viterbi HMM matcher</text>
+<text x="1600.0" y="454.9" font-size="21.8" font-family="'Segoe UI', 'Helvetica Neue', Arial, sans-serif" font-weight="400" fill="#0F172A" text-anchor="middle" dominant-baseline="middle">(offline OSM)</text>
+<rect x="1860" y="300" width="210" height="130" rx="12" fill="#FEF3C7" stroke="#D97706" stroke-width="2.5" filter="url(#ds)"/>
+<text x="1965.0" y="335.3" font-size="24.6" font-family="'Segoe UI', 'Helvetica Neue', Arial, sans-serif" font-weight="700" fill="#0F172A" text-anchor="middle" dominant-baseline="middle">Compose UI</text>
+<text x="1965.0" y="355.1" font-size="21.8" font-family="'Segoe UI', 'Helvetica Neue', Arial, sans-serif" font-weight="400" fill="#0F172A" text-anchor="middle" dominant-baseline="middle">ball on road</text>
+<text x="1965.0" y="374.9" font-size="21.8" font-family="'Segoe UI', 'Helvetica Neue', Arial, sans-serif" font-weight="400" fill="#0F172A" text-anchor="middle" dominant-baseline="middle">+ speed</text>
+<text x="1965.0" y="394.7" font-size="21.8" font-family="'Segoe UI', 'Helvetica Neue', Arial, sans-serif" font-weight="400" fill="#0F172A" text-anchor="middle" dominant-baseline="middle">(Roey)</text>
+<line x1="380.0" y1="255.0" x2="530.0" y2="305.0" stroke="#475569" stroke-width="2.5" marker-end="url(#ah-slate)"/>
+<line x1="380.0" y1="375.0" x2="530.0" y2="435.0" stroke="#475569" stroke-width="2.5" marker-end="url(#ah-slate)"/>
+<line x1="690.0" y1="360.0" x2="690.0" y2="400.0" stroke="#475569" stroke-width="2.5" marker-end="url(#ah-slate)"/>
+<line x1="850.0" y1="420.0" x2="990.0" y2="320.0" stroke="#475569" stroke-width="2.5" marker-end="url(#ah-slate)"/>
+<line x1="850.0" y1="460.0" x2="990.0" y2="445.0" stroke="#475569" stroke-width="2.5" marker-end="url(#ah-slate)"/>
+<line x1="1290.0" y1="315.0" x2="1430.0" y2="315.0" stroke="#475569" stroke-width="2.5" marker-end="url(#ah-slate)"/>
+<rect x="1295.9" y="303.6" width="128.2" height="22.8" rx="6" fill="#FFFFFF" stroke="#475569" stroke-width="1" opacity="0.95"/>
+<text x="1360.0" y="315.0" font-size="17.4" fill="#0F172A" text-anchor="middle" dominant-baseline="middle">advances the ball</text>
+<line x1="1290.0" y1="445.0" x2="1430.0" y2="445.0" stroke="#475569" stroke-width="2.5" marker-end="url(#ah-slate)"/>
+<rect x="1295.9" y="433.6" width="128.2" height="22.8" rx="6" fill="#FFFFFF" stroke="#475569" stroke-width="1" opacity="0.95"/>
+<text x="1360.0" y="445.0" font-size="17.4" fill="#0F172A" text-anchor="middle" dominant-baseline="middle">junction steering</text>
+<line x1="1600.0" y1="400.0" x2="1600.0" y2="360.0" stroke="#7C3AED" stroke-width="2.5" marker-end="url(#ah-violet)"/>
+<line x1="1770.0" y1="315.0" x2="1860.0" y2="360.0" stroke="#475569" stroke-width="2.5" marker-end="url(#ah-slate)"/>
+<polyline points="230.0,540.0 230.0,615.0 1600.0,615.0 1600.0,490.0" fill="none" stroke="#94A3B8" stroke-width="2.5" stroke-dasharray="8 6" marker-end="url(#ah-gray)"/>
+<rect x="849.8" y="602.6" width="130.5" height="24.7" rx="6" fill="#FFFFFF" stroke="#94A3B8" stroke-width="1" opacity="0.95"/>
+<text x="915.0" y="615.0" font-size="18.8" fill="#0F172A" text-anchor="middle" dominant-baseline="middle">GPS: verify only</text>
+</svg>

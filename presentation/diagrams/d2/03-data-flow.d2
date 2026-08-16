@@ -1,0 +1,50 @@
+# NavSight - End-to-End Data Flow (sensors -> engine -> map ball -> UI)
+direction: right
+
+classes: {
+  io:     { style: { fill: "#DBEAFE"; stroke: "#2563EB"; border-radius: 8; font-color: "#0F172A" } }
+  ghost:  { style: { fill: "#F1F5F9"; stroke: "#94A3B8"; border-radius: 8; font-color: "#475569"; stroke-dash: 4 } }
+  engine: { style: { fill: "#CFFAFE"; stroke: "#0891B2"; border-radius: 8; font-color: "#0F172A" } }
+  est:    { style: { fill: "#A5F3FC"; stroke: "#0E7490"; border-radius: 8; font-color: "#0F172A" } }
+  map:    { style: { fill: "#EDE9FE"; stroke: "#7C3AED"; border-radius: 8; font-color: "#0F172A" } }
+  ball:   { style: { fill: "#FEF3C7"; stroke: "#D97706"; border-radius: 18; font-color: "#0F172A" } }
+  out:    { style: { fill: "#FEF3C7"; stroke: "#D97706"; border-radius: 8; font-color: "#0F172A" } }
+}
+
+SENSORS: "Sensors (on-device)" {
+  style: { fill: "#EFF6FF"; stroke: "#2563EB"; stroke-width: 2; border-radius: 12; font-color: "#1E3A8A"; bold: true }
+  C: "Rear camera - 640x480 ~23 fps"; C.class: io
+  I: "IMU - accel + gyro ~50 Hz"; I.class: io
+  G: "GPS - health-check only"; G.class: ghost
+}
+
+CORE: "Native VIO core   -   Morad" {
+  style: { fill: "#ECFEFF"; stroke: "#0891B2"; stroke-width: 2; border-radius: 12; font-color: "#155E75"; bold: true }
+  T: "Tracker - KLT + ORB reloc"; T.class: engine
+  E: "EKF - 15-DOF + IMU propagation"; E.class: engine
+}
+
+EST: "Estimates" {
+  style: { fill: "#ECFEFF"; stroke: "#0E7490"; stroke-width: 2; border-radius: 12; font-color: "#155E75"; bold: true }
+  SP: "Speed - IPM + inertial bridge"; SP.class: est
+  PO: "Pose / heading"; PO.class: est
+}
+
+MM: "Map matching   -   Tamir" {
+  style: { fill: "#F5F3FF"; stroke: "#7C3AED"; stroke-width: 2; border-radius: 12; font-color: "#5B21B6"; bold: true }
+  V: "Viterbi HMM matcher (offline OSM)"; V.class: map
+  B: "Graph-rail ball - advanced by speed"; B.class: ball
+}
+
+UI: "Compose UI - ball on road + speed   -   Roey"; UI.class: out
+
+SENSORS.C -> CORE.T
+SENSORS.I -> CORE.E
+CORE.T -> CORE.E
+SENSORS.G -> MM: "verify only" { style: { stroke: "#94A3B8"; stroke-dash: 4 } }
+CORE.E -> EST.SP
+CORE.E -> EST.PO
+EST.SP -> MM.B: "advances the ball"
+EST.PO -> MM.V: "junction steering"
+MM.V -> MM.B
+MM.B -> UI

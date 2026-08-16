@@ -1,0 +1,72 @@
+<svg xmlns="http://www.w3.org/2000/svg" width="1360" height="1340" viewBox="0 0 1360 1340" font-family="'Segoe UI', 'Helvetica Neue', Arial, sans-serif">
+<defs>
+<marker id="ah-slate" markerWidth="12" markerHeight="12" refX="9" refY="4" orient="auto" markerUnits="userSpaceOnUse"><path d="M0,0 L9,4 L0,8 Z" fill="#475569"/></marker>
+<marker id="ah-red" markerWidth="12" markerHeight="12" refX="9" refY="4" orient="auto" markerUnits="userSpaceOnUse"><path d="M0,0 L9,4 L0,8 Z" fill="#DC2626"/></marker>
+<marker id="ah-cyan" markerWidth="12" markerHeight="12" refX="9" refY="4" orient="auto" markerUnits="userSpaceOnUse"><path d="M0,0 L9,4 L0,8 Z" fill="#0E7490"/></marker>
+<marker id="ah-green" markerWidth="12" markerHeight="12" refX="9" refY="4" orient="auto" markerUnits="userSpaceOnUse"><path d="M0,0 L9,4 L0,8 Z" fill="#16A34A"/></marker>
+<marker id="ah-violet" markerWidth="12" markerHeight="12" refX="9" refY="4" orient="auto" markerUnits="userSpaceOnUse"><path d="M0,0 L9,4 L0,8 Z" fill="#7C3AED"/></marker>
+<marker id="ah-gray" markerWidth="12" markerHeight="12" refX="9" refY="4" orient="auto" markerUnits="userSpaceOnUse"><path d="M0,0 L9,4 L0,8 Z" fill="#94A3B8"/></marker>
+<marker id="ah-ball" markerWidth="12" markerHeight="12" refX="9" refY="4" orient="auto" markerUnits="userSpaceOnUse"><path d="M0,0 L9,4 L0,8 Z" fill="#D97706"/></marker>
+<filter id="ds" x="-10%" y="-10%" width="120%" height="130%"><feDropShadow dx="0" dy="2" stdDeviation="3" flood-color="#0F172A" flood-opacity="0.18"/></filter>
+</defs>
+<rect x="0" y="0" width="1360" height="1340" rx="18" fill="#F8FAFC" stroke="#E2E8F0" stroke-width="2"/>
+<rect x="0" y="0" width="10" height="1340" rx="0" fill="#0891B2"/>
+<text x="42" y="56" font-size="30.0" font-weight="700" fill="#0F172A">NavSight  -  Speed Estimation  (Ground-Plane IPM + Inertial Bridge)</text>
+<text x="42" y="86" font-size="26.1" fill="#475569">metric speed from optical flow; no learned depth in the speed path</text>
+<rect x="360" y="130" width="640" height="64" rx="12" fill="#DBEAFE" stroke="#2563EB" stroke-width="2.5" filter="url(#ds)"/>
+<text x="680.0" y="162.0" font-size="21.8" font-family="'Segoe UI', 'Helvetica Neue', Arial, sans-serif" font-weight="700" fill="#0F172A" text-anchor="middle" dominant-baseline="middle">Camera ray r_i per road pixel  (640x480, fx ~ 451)</text>
+<rect x="410" y="224" width="540" height="56" rx="12" fill="#F1F5F9" stroke="#334155" stroke-width="2.5" filter="url(#ds)"/>
+<text x="680.0" y="252.0" font-size="21.8" font-family="'Segoe UI', 'Helvetica Neue', Arial, sans-serif" font-weight="700" fill="#0F172A" text-anchor="middle" dominant-baseline="middle">Ground plane at mount height  h = 1.05 m</text>
+<rect x="410" y="310" width="540" height="56" rx="12" fill="#F1F5F9" stroke="#334155" stroke-width="2.5" filter="url(#ds)"/>
+<text x="680.0" y="338.0" font-size="21.8" font-family="'Consolas', 'DejaVu Sans Mono', monospace" font-weight="700" fill="#0F172A" text-anchor="middle" dominant-baseline="middle">Depth   Z_i = -h / (n_hat . r_i)</text>
+<rect x="380" y="396" width="600" height="56" rx="12" fill="#F1F5F9" stroke="#334155" stroke-width="2.5" filter="url(#ds)"/>
+<text x="680.0" y="424.0" font-size="20.3" font-family="'Consolas', 'DejaVu Sans Mono', monospace" font-weight="700" fill="#0F172A" text-anchor="middle" dominant-baseline="middle">Flow-per-speed   a_i = (u_fwd - r_i u_fwd,z) / Z_i</text>
+<rect x="360" y="482" width="640" height="56" rx="12" fill="#F1F5F9" stroke="#334155" stroke-width="2.5" filter="url(#ds)"/>
+<text x="680.0" y="510.0" font-size="20.3" font-family="'Consolas', 'DejaVu Sans Mono', monospace" font-weight="700" fill="#0F172A" text-anchor="middle" dominant-baseline="middle">Per-point speed   v_i = -(f_i.a_i)/(a_i.a_i) (1/dt)</text>
+<rect x="40" y="452" width="310" height="108" rx="12" fill="#F1F5F9" stroke="#334155" stroke-width="2.5" filter="url(#ds)"/>
+<text x="195.0" y="491.5" font-size="18.8" font-family="'Segoe UI', 'Helvetica Neue', Arial, sans-serif" font-weight="700" fill="#0F172A" text-anchor="middle" dominant-baseline="middle">Noise floor</text>
+<text x="195.0" y="506.0" font-size="15.9" font-family="'Segoe UI', 'Helvetica Neue', Arial, sans-serif" font-weight="400" fill="#0F172A" text-anchor="middle" dominant-baseline="middle">sigma_v = (sigma_px/fx)/(|a_i| dt)</text>
+<text x="195.0" y="520.5" font-size="15.9" font-family="'Segoe UI', 'Helvetica Neue', Arial, sans-serif" font-weight="400" fill="#0F172A" text-anchor="middle" dominant-baseline="middle">sigma_px = 0.5 px</text>
+<rect x="230" y="600" width="900" height="150" rx="16" fill="#F8FAFC" stroke="#94A3B8" stroke-width="2.5" stroke-dasharray="2 0"/>
+<text x="250" y="630" font-size="26.1" font-weight="700" fill="#94A3B8">Two-sided vote taxonomy</text>
+<rect x="270" y="655" width="380" height="80" rx="12" fill="#F1F5F9" stroke="#334155" stroke-width="2.5" filter="url(#ds)"/>
+<text x="460.0" y="676.5" font-size="23.2" font-family="'Segoe UI', 'Helvetica Neue', Arial, sans-serif" font-weight="700" fill="#0F172A" text-anchor="middle" dominant-baseline="middle">VOTE</text>
+<text x="460.0" y="695.0" font-size="20.3" font-family="'Segoe UI', 'Helvetica Neue', Arial, sans-serif" font-weight="400" fill="#0F172A" text-anchor="middle" dominant-baseline="middle">v_i &gt; 3 sigma  AND</text>
+<text x="460.0" y="713.5" font-size="20.3" font-family="'Segoe UI', 'Helvetica Neue', Arial, sans-serif" font-weight="400" fill="#0F172A" text-anchor="middle" dominant-baseline="middle">forward-coherent (45 deg cone)</text>
+<rect x="710" y="655" width="380" height="80" rx="12" fill="#F1F5F9" stroke="#334155" stroke-width="2.5" filter="url(#ds)"/>
+<text x="900.0" y="676.5" font-size="23.2" font-family="'Segoe UI', 'Helvetica Neue', Arial, sans-serif" font-weight="700" fill="#0F172A" text-anchor="middle" dominant-baseline="middle">ZERO-WITNESS</text>
+<text x="900.0" y="695.0" font-size="20.3" font-family="'Segoe UI', 'Helvetica Neue', Arial, sans-serif" font-weight="400" fill="#0F172A" text-anchor="middle" dominant-baseline="middle">|v_i| &lt; 3 sigma  AND</text>
+<text x="900.0" y="713.5" font-size="20.3" font-family="'Segoe UI', 'Helvetica Neue', Arial, sans-serif" font-weight="400" fill="#0F172A" text-anchor="middle" dominant-baseline="middle">floor &lt;= 1 m/s</text>
+<polygon points="680,790.0 790.0,850 680,910.0 570.0,850" fill="#FEF9C3" stroke="#CA8A04" stroke-width="2.5" filter="url(#ds)"/>
+<text x="680.0" y="850.0" font-size="24.6" font-family="'Segoe UI', 'Helvetica Neue', Arial, sans-serif" font-weight="700" fill="#0F172A" text-anchor="middle" dominant-baseline="middle">Resolve</text>
+<rect x="120" y="990" width="360" height="80" rx="12" fill="#0891B2" stroke="#0E7490" stroke-width="2.5" filter="url(#ds)"/>
+<text x="300.0" y="1020.1" font-size="24.6" font-family="'Segoe UI', 'Helvetica Neue', Arial, sans-serif" font-weight="700" fill="#FFFFFF" text-anchor="middle" dominant-baseline="middle">Median speed</text>
+<text x="300.0" y="1039.9" font-size="21.8" font-family="'Segoe UI', 'Helvetica Neue', Arial, sans-serif" font-weight="400" fill="#FFFFFF" text-anchor="middle" dominant-baseline="middle">(&gt;= 5 votes)</text>
+<rect x="520" y="990" width="380" height="90" rx="12" fill="#DCFCE7" stroke="#16A34A" stroke-width="2.5" filter="url(#ds)"/>
+<text x="710.0" y="1015.2" font-size="24.6" font-family="'Segoe UI', 'Helvetica Neue', Arial, sans-serif" font-weight="700" fill="#14532D" text-anchor="middle" dominant-baseline="middle">EXACT 0 km/h</text>
+<text x="710.0" y="1035.0" font-size="21.8" font-family="'Segoe UI', 'Helvetica Neue', Arial, sans-serif" font-weight="400" fill="#14532D" text-anchor="middle" dominant-baseline="middle">standstill zero-lock</text>
+<text x="710.0" y="1054.8" font-size="21.8" font-family="'Segoe UI', 'Helvetica Neue', Arial, sans-serif" font-weight="400" fill="#14532D" text-anchor="middle" dominant-baseline="middle">(&gt;= 5 zero-witnesses)</text>
+<rect x="950" y="990" width="320" height="90" rx="12" fill="#FEF3C7" stroke="#D97706" stroke-width="2.5" filter="url(#ds)"/>
+<text x="1110.0" y="1016.5" font-size="23.2" font-family="'Segoe UI', 'Helvetica Neue', Arial, sans-serif" font-weight="700" fill="#0F172A" text-anchor="middle" dominant-baseline="middle">Inertial bridge</text>
+<text x="1110.0" y="1035.0" font-size="20.3" font-family="'Segoe UI', 'Helvetica Neue', Arial, sans-serif" font-weight="400" fill="#0F172A" text-anchor="middle" dominant-baseline="middle">alpha = 0.15</text>
+<text x="1110.0" y="1053.5" font-size="20.3" font-family="'Segoe UI', 'Helvetica Neue', Arial, sans-serif" font-weight="400" fill="#0F172A" text-anchor="middle" dominant-baseline="middle">trusted ~6 s, then decays</text>
+<line x1="680.0" y1="194.0" x2="680.0" y2="224.0" stroke="#475569" stroke-width="2.5" marker-end="url(#ah-slate)"/>
+<line x1="680.0" y1="280.0" x2="680.0" y2="310.0" stroke="#475569" stroke-width="2.5" marker-end="url(#ah-slate)"/>
+<line x1="680.0" y1="366.0" x2="680.0" y2="396.0" stroke="#475569" stroke-width="2.5" marker-end="url(#ah-slate)"/>
+<line x1="680.0" y1="452.0" x2="680.0" y2="482.0" stroke="#475569" stroke-width="2.5" marker-end="url(#ah-slate)"/>
+<line x1="460.0" y1="538.0" x2="460.0" y2="655.0" stroke="#475569" stroke-width="2.5" marker-end="url(#ah-slate)"/>
+<line x1="800.0" y1="538.0" x2="850.0" y2="655.0" stroke="#475569" stroke-width="2.5" marker-end="url(#ah-slate)"/>
+<line x1="195.0" y1="560.0" x2="270.0" y2="670.0" stroke="#475569" stroke-width="2.5" marker-end="url(#ah-slate)"/>
+<line x1="320.0" y1="545.0" x2="760.0" y2="660.0" stroke="#94A3B8" stroke-width="2.5" stroke-dasharray="8 6" marker-end="url(#ah-gray)"/>
+<line x1="500.0" y1="735.0" x2="640.0" y2="800.0" stroke="#475569" stroke-width="2.5" marker-end="url(#ah-slate)"/>
+<line x1="880.0" y1="735.0" x2="720.0" y2="800.0" stroke="#475569" stroke-width="2.5" marker-end="url(#ah-slate)"/>
+<line x1="600.0" y1="880.0" x2="300.0" y2="990.0" stroke="#475569" stroke-width="2.5" marker-end="url(#ah-slate)"/>
+<rect x="412.8" y="923.6" width="74.5" height="22.8" rx="6" fill="#FFFFFF" stroke="#475569" stroke-width="1" opacity="0.95"/>
+<text x="450.0" y="935.0" font-size="17.4" fill="#0F172A" text-anchor="middle" dominant-baseline="middle">&gt;=5 votes</text>
+<line x1="690.0" y1="910.0" x2="700.0" y2="990.0" stroke="#475569" stroke-width="2.5" marker-end="url(#ah-slate)"/>
+<rect x="657.8" y="938.6" width="74.5" height="22.8" rx="6" fill="#FFFFFF" stroke="#475569" stroke-width="1" opacity="0.95"/>
+<text x="695.0" y="950.0" font-size="17.4" fill="#0F172A" text-anchor="middle" dominant-baseline="middle">&gt;=5 zeros</text>
+<line x1="780.0" y1="880.0" x2="1050.0" y2="990.0" stroke="#475569" stroke-width="2.5" marker-end="url(#ah-slate)"/>
+<rect x="894.6" y="923.6" width="40.9" height="22.8" rx="6" fill="#FFFFFF" stroke="#475569" stroke-width="1" opacity="0.95"/>
+<text x="915.0" y="935.0" font-size="17.4" fill="#0F172A" text-anchor="middle" dominant-baseline="middle">else</text>
+</svg>

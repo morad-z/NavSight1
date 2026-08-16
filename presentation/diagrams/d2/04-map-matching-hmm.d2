@@ -1,0 +1,33 @@
+# NavSight - HMM Map Matching (Newson and Krumm, Viterbi)
+direction: down
+
+classes: {
+  io:       { style: { fill: "#DBEAFE"; stroke: "#2563EB"; border-radius: 8; font-color: "#0F172A" } }
+  map:      { style: { fill: "#EDE9FE"; stroke: "#7C3AED"; border-radius: 8; font-color: "#0F172A" } }
+  step:     { style: { fill: "#F1F5F9"; stroke: "#334155"; border-radius: 8; font-color: "#0F172A" } }
+  accent:   { style: { fill: "#7C3AED"; stroke: "#5B21B6"; border-radius: 8; font-color: "#FFFFFF"; bold: true } }
+  ball:     { style: { fill: "#FEF3C7"; stroke: "#D97706"; border-radius: 20; font-color: "#0F172A"; bold: true } }
+}
+
+POS: "Estimated position + heading (from EKF)"; POS.class: io
+
+STATES: "Candidate road segments = HMM states (within 30 m)" {
+  style: { fill: "#F5F3FF"; stroke: "#7C3AED"; stroke-width: 2; border-radius: 12; font-color: "#5B21B6"; bold: true }
+  S1: "segment A"; S1.class: map
+  S2: "segment B"; S2.class: map
+  S3: "segment C"; S3.class: map
+}
+
+EMIT: "Emission\nlog p_e = -d_perp^2 / (2 sigma_z^2)\nsigma_z = 20 m"; EMIT.class: step
+TRANS: "Transition\nlog p_t = -|d_gc - d_route|/beta + b_way + b_rail\nbeta = 6 - b_way = 0.7 - b_rail = 1.2"; TRANS.class: step
+VIT: "Viterbi decode\nargmax sum (log p_e + log p_t)"; VIT.class: accent
+STEER: "Junction steering\nbranch by gyro-relative heading offset"; STEER.class: step
+BALL: "Graph-rail ball\nrecovery bounded 25-60 m @ conf >= 0.55"; BALL.class: ball
+
+POS -> STATES
+STATES -> EMIT
+STATES -> TRANS
+EMIT -> VIT
+TRANS -> VIT
+VIT -> STEER
+STEER -> BALL

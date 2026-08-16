@@ -1,0 +1,51 @@
+<svg xmlns="http://www.w3.org/2000/svg" width="1240" height="1180" viewBox="0 0 1240 1180" font-family="'Segoe UI', 'Helvetica Neue', Arial, sans-serif">
+<defs>
+<marker id="ah-slate" markerWidth="12" markerHeight="12" refX="9" refY="4" orient="auto" markerUnits="userSpaceOnUse"><path d="M0,0 L9,4 L0,8 Z" fill="#475569"/></marker>
+<marker id="ah-red" markerWidth="12" markerHeight="12" refX="9" refY="4" orient="auto" markerUnits="userSpaceOnUse"><path d="M0,0 L9,4 L0,8 Z" fill="#DC2626"/></marker>
+<marker id="ah-cyan" markerWidth="12" markerHeight="12" refX="9" refY="4" orient="auto" markerUnits="userSpaceOnUse"><path d="M0,0 L9,4 L0,8 Z" fill="#0E7490"/></marker>
+<marker id="ah-green" markerWidth="12" markerHeight="12" refX="9" refY="4" orient="auto" markerUnits="userSpaceOnUse"><path d="M0,0 L9,4 L0,8 Z" fill="#16A34A"/></marker>
+<marker id="ah-violet" markerWidth="12" markerHeight="12" refX="9" refY="4" orient="auto" markerUnits="userSpaceOnUse"><path d="M0,0 L9,4 L0,8 Z" fill="#7C3AED"/></marker>
+<marker id="ah-gray" markerWidth="12" markerHeight="12" refX="9" refY="4" orient="auto" markerUnits="userSpaceOnUse"><path d="M0,0 L9,4 L0,8 Z" fill="#94A3B8"/></marker>
+<marker id="ah-ball" markerWidth="12" markerHeight="12" refX="9" refY="4" orient="auto" markerUnits="userSpaceOnUse"><path d="M0,0 L9,4 L0,8 Z" fill="#D97706"/></marker>
+<filter id="ds" x="-10%" y="-10%" width="120%" height="130%"><feDropShadow dx="0" dy="2" stdDeviation="3" flood-color="#0F172A" flood-opacity="0.18"/></filter>
+</defs>
+<rect x="0" y="0" width="1240" height="1180" rx="18" fill="#F8FAFC" stroke="#E2E8F0" stroke-width="2"/>
+<rect x="0" y="0" width="10" height="1180" rx="0" fill="#0891B2"/>
+<text x="42" y="56" font-size="30.0" font-weight="700" fill="#0F172A">NavSight  -  HMM Map Matching</text>
+<text x="42" y="86" font-size="26.1" fill="#475569">Newson &amp; Krumm (2009), Viterbi-decoded over offline OSM</text>
+<rect x="380" y="130" width="480" height="70" rx="12" fill="#DBEAFE" stroke="#2563EB" stroke-width="2.5" filter="url(#ds)"/>
+<text x="620.0" y="165.0" font-size="23.2" font-family="'Segoe UI', 'Helvetica Neue', Arial, sans-serif" font-weight="700" fill="#0F172A" text-anchor="middle" dominant-baseline="middle">Estimated position + heading  (from EKF)</text>
+<rect x="250" y="250" width="740" height="150" rx="16" fill="#F5F3FF" stroke="#7C3AED" stroke-width="2.5" stroke-dasharray="2 0"/>
+<text x="270" y="280" font-size="26.1" font-weight="700" fill="#7C3AED">Candidate road segments = HMM states  (within 30 m)</text>
+<rect x="300" y="305" width="180" height="70" rx="12" fill="#EDE9FE" stroke="#7C3AED" stroke-width="2.5" filter="url(#ds)"/>
+<text x="390.0" y="340.0" font-size="21.8" font-family="'Segoe UI', 'Helvetica Neue', Arial, sans-serif" font-weight="700" fill="#0F172A" text-anchor="middle" dominant-baseline="middle">segment A</text>
+<rect x="530" y="305" width="180" height="70" rx="12" fill="#EDE9FE" stroke="#7C3AED" stroke-width="2.5" filter="url(#ds)"/>
+<text x="620.0" y="340.0" font-size="21.8" font-family="'Segoe UI', 'Helvetica Neue', Arial, sans-serif" font-weight="700" fill="#0F172A" text-anchor="middle" dominant-baseline="middle">segment B</text>
+<rect x="760" y="305" width="180" height="70" rx="12" fill="#EDE9FE" stroke="#7C3AED" stroke-width="2.5" filter="url(#ds)"/>
+<text x="850.0" y="340.0" font-size="21.8" font-family="'Segoe UI', 'Helvetica Neue', Arial, sans-serif" font-weight="700" fill="#0F172A" text-anchor="middle" dominant-baseline="middle">segment C</text>
+<rect x="140" y="460" width="440" height="110" rx="12" fill="#F1F5F9" stroke="#334155" stroke-width="2.5" filter="url(#ds)"/>
+<text x="360.0" y="495.2" font-size="24.6" font-family="'Segoe UI', 'Helvetica Neue', Arial, sans-serif" font-weight="700" fill="#0F172A" text-anchor="middle" dominant-baseline="middle">Emission</text>
+<text x="360.0" y="515.0" font-size="21.8" font-family="'Segoe UI', 'Helvetica Neue', Arial, sans-serif" font-weight="400" fill="#0F172A" text-anchor="middle" dominant-baseline="middle">log p_e = -d_perp^2 / (2 sigma_z^2)</text>
+<text x="360.0" y="534.8" font-size="21.8" font-family="'Segoe UI', 'Helvetica Neue', Arial, sans-serif" font-weight="400" fill="#0F172A" text-anchor="middle" dominant-baseline="middle">sigma_z = 20 m</text>
+<rect x="660" y="460" width="460" height="110" rx="12" fill="#F1F5F9" stroke="#334155" stroke-width="2.5" filter="url(#ds)"/>
+<text x="890.0" y="496.5" font-size="23.2" font-family="'Segoe UI', 'Helvetica Neue', Arial, sans-serif" font-weight="700" fill="#0F172A" text-anchor="middle" dominant-baseline="middle">Transition</text>
+<text x="890.0" y="515.0" font-size="20.3" font-family="'Segoe UI', 'Helvetica Neue', Arial, sans-serif" font-weight="400" fill="#0F172A" text-anchor="middle" dominant-baseline="middle">log p_t = -|d_gc - d_route|/b + b_way + b_rail</text>
+<text x="890.0" y="533.5" font-size="20.3" font-family="'Segoe UI', 'Helvetica Neue', Arial, sans-serif" font-weight="400" fill="#0F172A" text-anchor="middle" dominant-baseline="middle">b = 6  -  b_way = 0.7  -  b_rail = 1.2</text>
+<rect x="360" y="640" width="520" height="80" rx="12" fill="#7C3AED" stroke="#5B21B6" stroke-width="2.5" filter="url(#ds)"/>
+<text x="620.0" y="669.4" font-size="26.1" font-family="'Segoe UI', 'Helvetica Neue', Arial, sans-serif" font-weight="700" fill="#FFFFFF" text-anchor="middle" dominant-baseline="middle">Viterbi decode</text>
+<text x="620.0" y="690.6" font-size="23.2" font-family="'Segoe UI', 'Helvetica Neue', Arial, sans-serif" font-weight="400" fill="#FFFFFF" text-anchor="middle" dominant-baseline="middle">argmax  sum ( log p_e + log p_t )</text>
+<rect x="340" y="780" width="560" height="80" rx="12" fill="#F1F5F9" stroke="#334155" stroke-width="2.5" filter="url(#ds)"/>
+<text x="620.0" y="810.1" font-size="24.6" font-family="'Segoe UI', 'Helvetica Neue', Arial, sans-serif" font-weight="700" fill="#0F172A" text-anchor="middle" dominant-baseline="middle">Junction steering</text>
+<text x="620.0" y="829.9" font-size="21.8" font-family="'Segoe UI', 'Helvetica Neue', Arial, sans-serif" font-weight="400" fill="#0F172A" text-anchor="middle" dominant-baseline="middle">branch by gyro-relative heading offset</text>
+<rect x="300" y="920" width="640" height="100" rx="12" fill="#FEF3C7" stroke="#D97706" stroke-width="2.5" filter="url(#ds)"/>
+<text x="620.0" y="950.2" font-size="24.6" font-family="'Segoe UI', 'Helvetica Neue', Arial, sans-serif" font-weight="700" fill="#0F172A" text-anchor="middle" dominant-baseline="middle">Graph-rail ball</text>
+<text x="620.0" y="970.0" font-size="21.8" font-family="'Segoe UI', 'Helvetica Neue', Arial, sans-serif" font-weight="400" fill="#0F172A" text-anchor="middle" dominant-baseline="middle">advances only along road-graph edges  (cap 15 m/s)</text>
+<text x="620.0" y="989.8" font-size="21.8" font-family="'Segoe UI', 'Helvetica Neue', Arial, sans-serif" font-weight="400" fill="#0F172A" text-anchor="middle" dominant-baseline="middle">(can never teleport across town)</text>
+<line x1="620.0" y1="200.0" x2="620.0" y2="250.0" stroke="#475569" stroke-width="2.5" marker-end="url(#ah-slate)"/>
+<line x1="480.0" y1="400.0" x2="360.0" y2="460.0" stroke="#475569" stroke-width="2.5" marker-end="url(#ah-slate)"/>
+<line x1="760.0" y1="400.0" x2="880.0" y2="460.0" stroke="#475569" stroke-width="2.5" marker-end="url(#ah-slate)"/>
+<line x1="360.0" y1="570.0" x2="560.0" y2="640.0" stroke="#475569" stroke-width="2.5" marker-end="url(#ah-slate)"/>
+<line x1="880.0" y1="570.0" x2="700.0" y2="640.0" stroke="#475569" stroke-width="2.5" marker-end="url(#ah-slate)"/>
+<line x1="620.0" y1="720.0" x2="620.0" y2="780.0" stroke="#475569" stroke-width="2.5" marker-end="url(#ah-slate)"/>
+<line x1="620.0" y1="860.0" x2="620.0" y2="920.0" stroke="#7C3AED" stroke-width="2.5" marker-end="url(#ah-violet)"/>
+</svg>

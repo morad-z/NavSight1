@@ -1,0 +1,46 @@
+# NavSight - 4-Tier System Architecture (v1.0-osm)
+direction: down
+
+classes: {
+  ui:     { style: { fill: "#DBEAFE"; stroke: "#2563EB"; border-radius: 8; font-color: "#0F172A" } }
+  bridge: { style: { fill: "#E2E8F0"; stroke: "#475569"; border-radius: 8; font-color: "#0F172A" } }
+  engine: { style: { fill: "#CFFAFE"; stroke: "#0891B2"; border-radius: 8; font-color: "#0F172A" } }
+  map:    { style: { fill: "#EDE9FE"; stroke: "#7C3AED"; border-radius: 8; font-color: "#0F172A" } }
+  ball:   { style: { fill: "#FEF3C7"; stroke: "#D97706"; border-radius: 22; font-color: "#0F172A" } }
+}
+
+T1: "TIER 1 - PRESENTATION / UI   (Kotlin / Jetpack Compose)   -   Roey" {
+  style: { fill: "#EFF6FF"; stroke: "#2563EB"; stroke-width: 2; border-radius: 12; font-color: "#1E3A8A"; font-size: 22; bold: true }
+  CAM: "CameraX - rear camera"; CAM.class: ui
+  SENS: "SensorRepository - accel + gyro ~50 Hz"; SENS.class: ui
+  UI: "NavSightViewModel - MapScreen - CameraScreen"; UI.class: ui
+}
+
+JNI: "TIER 2 - JNI BRIDGE   -   NativeBridge - zero-copy ByteBuffer frames" {
+  style: { fill: "#F1F5F9"; stroke: "#475569"; stroke-width: 2; border-radius: 12; font-color: "#1E293B"; font-size: 20; bold: true }
+}
+
+ENGINE: "TIER 3 - VIO ENGINE   (native C++17 / OpenCV 4.5.3)   -   Morad" {
+  style: { fill: "#ECFEFF"; stroke: "#0891B2"; stroke-width: 2; border-radius: 12; font-color: "#155E75"; font-size: 22; bold: true }
+  VIO: "VioEngine - orchestrator"; VIO.class: engine
+  TRK: "Tracker - KLT flow - ORB reloc - keyframes"; TRK.class: engine
+  EKF: "EKF - 15-DOF error state + updaters"; EKF.class: engine
+  IMU: "IMUPreintegrator - Madgwick AHRS"; IMU.class: engine
+}
+
+OSM: "TIER 4 - OFFLINE OSM MAP-MATCHING   -   Tamir" {
+  style: { fill: "#F5F3FF"; stroke: "#7C3AED"; stroke-width: 2; border-radius: 12; font-color: "#5B21B6"; font-size: 22; bold: true }
+  MATCH: "LocalMatcher - Viterbi HMM - Haifa ~4.67 MB in APK"; MATCH.class: map
+  BALL: "Graph-rail 'ball on the road' + live speed"; BALL.class: ball
+}
+
+T1.CAM -> JNI: "frame"
+T1.SENS -> JNI: "IMU"
+JNI <-> ENGINE.VIO
+ENGINE.VIO -> ENGINE.TRK
+ENGINE.VIO -> ENGINE.IMU
+ENGINE.TRK -> ENGINE.EKF
+ENGINE.IMU -> ENGINE.EKF
+ENGINE.EKF -> OSM.MATCH: "speed + pose"
+OSM.MATCH -> OSM.BALL
+OSM.BALL -> T1.UI: "matched position + speed"

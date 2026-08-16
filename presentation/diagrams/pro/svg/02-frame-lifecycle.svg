@@ -1,0 +1,52 @@
+<svg xmlns="http://www.w3.org/2000/svg" width="2280" height="470" viewBox="0 0 2280 470" font-family="'Segoe UI', 'Helvetica Neue', Arial, sans-serif">
+<defs>
+<marker id="ah-slate" markerWidth="12" markerHeight="12" refX="9" refY="4" orient="auto" markerUnits="userSpaceOnUse"><path d="M0,0 L9,4 L0,8 Z" fill="#475569"/></marker>
+<marker id="ah-red" markerWidth="12" markerHeight="12" refX="9" refY="4" orient="auto" markerUnits="userSpaceOnUse"><path d="M0,0 L9,4 L0,8 Z" fill="#DC2626"/></marker>
+<marker id="ah-cyan" markerWidth="12" markerHeight="12" refX="9" refY="4" orient="auto" markerUnits="userSpaceOnUse"><path d="M0,0 L9,4 L0,8 Z" fill="#0E7490"/></marker>
+<marker id="ah-green" markerWidth="12" markerHeight="12" refX="9" refY="4" orient="auto" markerUnits="userSpaceOnUse"><path d="M0,0 L9,4 L0,8 Z" fill="#16A34A"/></marker>
+<marker id="ah-violet" markerWidth="12" markerHeight="12" refX="9" refY="4" orient="auto" markerUnits="userSpaceOnUse"><path d="M0,0 L9,4 L0,8 Z" fill="#7C3AED"/></marker>
+<marker id="ah-gray" markerWidth="12" markerHeight="12" refX="9" refY="4" orient="auto" markerUnits="userSpaceOnUse"><path d="M0,0 L9,4 L0,8 Z" fill="#94A3B8"/></marker>
+<marker id="ah-ball" markerWidth="12" markerHeight="12" refX="9" refY="4" orient="auto" markerUnits="userSpaceOnUse"><path d="M0,0 L9,4 L0,8 Z" fill="#D97706"/></marker>
+<filter id="ds" x="-10%" y="-10%" width="120%" height="130%"><feDropShadow dx="0" dy="2" stdDeviation="3" flood-color="#0F172A" flood-opacity="0.18"/></filter>
+</defs>
+<rect x="0" y="0" width="2280" height="470" rx="18" fill="#F8FAFC" stroke="#E2E8F0" stroke-width="2"/>
+<rect x="0" y="0" width="10" height="470" rx="0" fill="#0891B2"/>
+<text x="42" y="56" font-size="30.0" font-weight="700" fill="#0F172A">NavSight  -  Single Camera Frame Lifecycle</text>
+<text x="42" y="86" font-size="26.1" fill="#475569">one frame every ~43 ms (native ~23 fps)  -  median 15.4 ms work</text>
+<rect x="42" y="150" width="270" height="150" rx="12" fill="#DBEAFE" stroke="#2563EB" stroke-width="2.5" filter="url(#ds)"/>
+<text x="177.0" y="203.9" font-size="26.1" font-family="'Segoe UI', 'Helvetica Neue', Arial, sans-serif" font-weight="700" fill="#0F172A" text-anchor="middle" dominant-baseline="middle">1 - Capture</text>
+<text x="177.0" y="225.0" font-size="23.2" font-family="'Segoe UI', 'Helvetica Neue', Arial, sans-serif" font-weight="400" fill="#0F172A" text-anchor="middle" dominant-baseline="middle">640x480</text>
+<text x="177.0" y="246.1" font-size="23.2" font-family="'Segoe UI', 'Helvetica Neue', Arial, sans-serif" font-weight="400" fill="#0F172A" text-anchor="middle" dominant-baseline="middle">zero-copy ByteBuffer</text>
+<rect x="350" y="150" width="270" height="150" rx="12" fill="#F1F5F9" stroke="#334155" stroke-width="2.5" filter="url(#ds)"/>
+<text x="485.0" y="203.9" font-size="26.1" font-family="'Segoe UI', 'Helvetica Neue', Arial, sans-serif" font-weight="700" fill="#0F172A" text-anchor="middle" dominant-baseline="middle">2 - Lens-correct</text>
+<text x="485.0" y="225.0" font-size="23.2" font-family="'Segoe UI', 'Helvetica Neue', Arial, sans-serif" font-weight="400" fill="#0F172A" text-anchor="middle" dominant-baseline="middle">undistort -&gt; normalized</text>
+<text x="485.0" y="246.1" font-size="23.2" font-family="'Segoe UI', 'Helvetica Neue', Arial, sans-serif" font-weight="400" fill="#0F172A" text-anchor="middle" dominant-baseline="middle">(fx ~ 451)</text>
+<rect x="658" y="150" width="270" height="150" rx="12" fill="#F1F5F9" stroke="#334155" stroke-width="2.5" filter="url(#ds)"/>
+<text x="793.0" y="203.9" font-size="26.1" font-family="'Segoe UI', 'Helvetica Neue', Arial, sans-serif" font-weight="700" fill="#0F172A" text-anchor="middle" dominant-baseline="middle">3 - KLT track</text>
+<text x="793.0" y="225.0" font-size="23.2" font-family="'Segoe UI', 'Helvetica Neue', Arial, sans-serif" font-weight="400" fill="#0F172A" text-anchor="middle" dominant-baseline="middle">pyramidal</text>
+<text x="793.0" y="246.1" font-size="23.2" font-family="'Segoe UI', 'Helvetica Neue', Arial, sans-serif" font-weight="400" fill="#0F172A" text-anchor="middle" dominant-baseline="middle">Lucas-Kanade</text>
+<rect x="966" y="150" width="270" height="150" rx="12" fill="#F1F5F9" stroke="#334155" stroke-width="2.5" filter="url(#ds)"/>
+<text x="1101.0" y="203.9" font-size="26.1" font-family="'Segoe UI', 'Helvetica Neue', Arial, sans-serif" font-weight="700" fill="#0F172A" text-anchor="middle" dominant-baseline="middle">4 - FB check</text>
+<text x="1101.0" y="225.0" font-size="23.2" font-family="'Segoe UI', 'Helvetica Neue', Arial, sans-serif" font-weight="400" fill="#0F172A" text-anchor="middle" dominant-baseline="middle">track fwd + back</text>
+<text x="1101.0" y="246.1" font-size="23.2" font-family="'Segoe UI', 'Helvetica Neue', Arial, sans-serif" font-weight="400" fill="#0F172A" text-anchor="middle" dominant-baseline="middle">reject blur / occlusion</text>
+<rect x="1274" y="150" width="270" height="150" rx="12" fill="#F1F5F9" stroke="#334155" stroke-width="2.5" filter="url(#ds)"/>
+<text x="1409.0" y="203.9" font-size="26.1" font-family="'Segoe UI', 'Helvetica Neue', Arial, sans-serif" font-weight="700" fill="#0F172A" text-anchor="middle" dominant-baseline="middle">5 - De-rotate flow</text>
+<text x="1409.0" y="225.0" font-size="23.2" font-family="'Segoe UI', 'Helvetica Neue', Arial, sans-serif" font-weight="400" fill="#0F172A" text-anchor="middle" dominant-baseline="middle">subtract gyro rotation</text>
+<text x="1409.0" y="246.1" font-size="23.2" font-family="'Segoe UI', 'Helvetica Neue', Arial, sans-serif" font-weight="400" fill="#0F172A" text-anchor="middle" dominant-baseline="middle">-&gt; translation only</text>
+<rect x="1582" y="150" width="270" height="150" rx="12" fill="#F1F5F9" stroke="#334155" stroke-width="2.5" filter="url(#ds)"/>
+<text x="1717.0" y="203.9" font-size="26.1" font-family="'Segoe UI', 'Helvetica Neue', Arial, sans-serif" font-weight="700" fill="#0F172A" text-anchor="middle" dominant-baseline="middle">6 - Feed IPM + EKF</text>
+<text x="1717.0" y="225.0" font-size="23.2" font-family="'Segoe UI', 'Helvetica Neue', Arial, sans-serif" font-weight="400" fill="#0F172A" text-anchor="middle" dominant-baseline="middle">speed + pose update</text>
+<text x="1717.0" y="246.1" font-size="23.2" font-family="'Segoe UI', 'Helvetica Neue', Arial, sans-serif" font-weight="400" fill="#0F172A" text-anchor="middle" dominant-baseline="middle">chi^2 22.5 gate</text>
+<rect x="1890" y="150" width="270" height="150" rx="12" fill="#FEF3C7" stroke="#D97706" stroke-width="2.5" filter="url(#ds)"/>
+<text x="2025.0" y="203.9" font-size="26.1" font-family="'Segoe UI', 'Helvetica Neue', Arial, sans-serif" font-weight="700" fill="#0F172A" text-anchor="middle" dominant-baseline="middle">Publish VioData</text>
+<text x="2025.0" y="225.0" font-size="23.2" font-family="'Segoe UI', 'Helvetica Neue', Arial, sans-serif" font-weight="400" fill="#0F172A" text-anchor="middle" dominant-baseline="middle">-&gt; UI</text>
+<text x="2025.0" y="246.1" font-size="23.2" font-family="'Segoe UI', 'Helvetica Neue', Arial, sans-serif" font-weight="400" fill="#0F172A" text-anchor="middle" dominant-baseline="middle">ball on road + speed</text>
+<line x1="312.0" y1="225.0" x2="350.0" y2="225.0" stroke="#475569" stroke-width="2.5" marker-end="url(#ah-slate)"/>
+<line x1="620.0" y1="225.0" x2="658.0" y2="225.0" stroke="#475569" stroke-width="2.5" marker-end="url(#ah-slate)"/>
+<line x1="928.0" y1="225.0" x2="966.0" y2="225.0" stroke="#475569" stroke-width="2.5" marker-end="url(#ah-slate)"/>
+<line x1="1236.0" y1="225.0" x2="1274.0" y2="225.0" stroke="#475569" stroke-width="2.5" marker-end="url(#ah-slate)"/>
+<line x1="1544.0" y1="225.0" x2="1582.0" y2="225.0" stroke="#475569" stroke-width="2.5" marker-end="url(#ah-slate)"/>
+<line x1="1852.0" y1="225.0" x2="1890.0" y2="225.0" stroke="#475569" stroke-width="2.5" marker-end="url(#ah-slate)"/>
+<rect x="42" y="360" width="2196" height="70" rx="12" fill="#DCFCE7" stroke="#16A34A" stroke-width="2.5"/>
+<text x="1140.0" y="395.0" font-size="26.1" font-family="'Segoe UI', 'Helvetica Neue', Arial, sans-serif" font-weight="700" fill="#14532D" text-anchor="middle" dominant-baseline="middle">Per-frame budget:  15.4 ms median  -  ~78 ms max     vs     200 ms SDD     =&gt;     13x under at the median, 2.5x worst-case margin</text>
+</svg>
