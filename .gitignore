@@ -57,3 +57,11 @@ tests/cpp/desktop_stubs/ORBvoc.txt
 /agentdb.rvf.lock
 /ruvector.db
 /architecture_map.html
+
+# Untracked 2026-08-16: build output / machine-local state that had been committed
+# before the ignore rules existed. The files stay on disk, they just leave git.
+__pycache__/
+*.pyc
+.kotlin/
+/.idea/deploymentTargetSelector.xml
+/.idea/deviceManager.xml
