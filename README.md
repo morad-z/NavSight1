@@ -31,7 +31,7 @@ two independent references (a map-measured route, and GPS screened for per-ride 
 | System test cases | **13 / 13 pass** |
 
 On the route where jammed GPS overstated the distance by 33%, NavSight stayed within 7% of
-the map-measured truth. Full method and evidence: `docs/project_book/`.
+the map-measured truth.
 
 ## How it works
 
@@ -53,7 +53,6 @@ to georeference the session and is otherwise used only as a validation reference
 |---|---|
 | `app/src/main/cpp/` | C++ VIO core: `Tracker`, `EKFState`, `IMUPreintegrator`, MSCKF updater |
 | `app/src/main/java/com/example/navsight1/` | Kotlin app: ViewModel, sensor pipeline, JNI bridge, map-matching stack, Compose UI |
-| `docs/project_book/` | The project book (sources, figures, build pipeline, PDF and DOCX) |
 | `docs/adr/`, `docs/study/` | Architecture decisions and research notes |
 | `presentation/` | Defense deck, presenter guides and diagram generators |
 | `tests/cpp/` | Desktop replay harness (same engine, MSYS2/MinGW build) |
@@ -107,5 +106,4 @@ Supervisors: Mr. Amit Dunsky and Dr. Dvir Ross, Shenkar College of Engineering.
 Out of scope by design: SLAM mapping and 3D reconstruction, iOS, any cloud backend, and
 voice-guided turn-by-turn navigation. SLAM landmarks, loop closure and windowed bundle
 adjustment were implemented and measured, then disabled once map matching proved to supply
-the same drift correction at a fraction of the memory and compute. That history is in
-chapter 9 of the project book.
+the same drift correction at a fraction of the memory and compute.

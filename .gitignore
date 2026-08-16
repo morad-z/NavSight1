@@ -83,3 +83,6 @@ docs/AI_HANDOFF*.md
 docs/HANDOFF_*.md
 docs/SLACK_SETUP.md
 "docs/old docs/"
+
+# Project book: carries the team's national ID numbers, kept out of the repo
+docs/project_book/
