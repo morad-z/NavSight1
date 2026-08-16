@@ -58,10 +58,27 @@ tests/cpp/desktop_stubs/ORBvoc.txt
 /ruvector.db
 /architecture_map.html
 
-# Untracked 2026-08-16: build output / machine-local state that had been committed
-# before the ignore rules existed. The files stay on disk, they just leave git.
+# Build output and machine-local state (kept on disk, not tracked)
 __pycache__/
 *.pyc
 .kotlin/
 /.idea/deploymentTargetSelector.xml
 /.idea/deviceManager.xml
+
+# Local tooling and editor state
+.claude/
+CLAUDE.md
+.vscode/
+Final-Project/Agent/
+slack_agent.py
+scripts/slack_activity_hook.py
+
+# Scratch files
+error.txt
+todo.txt
+
+ROADMAP.md
+docs/handoff/
+docs/AI_HANDOFF*.md
+docs/HANDOFF_*.md
+docs/SLACK_SETUP.md
